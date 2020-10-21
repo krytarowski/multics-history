@@ -1,0 +1,1307 @@
+	COMPILATION LISTING OF SEGMENT lm_per_process_
+	Compiled by: Multics PL/I Compiler, Release 28e, of February 14, 1985
+	Compiled at: Honeywell Multics Op. - System M
+	Compiled on: 04/04/85  0946.2 mst Thu
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        4*   *                                                         *
+        5*   *********************************************************** */
+        6 
+        7 /*  DESCRIPTION:
+        8*    Per-Process Pre-Processor for Data Management Locking
+        9*
+       10*    Handles the (crude) locking hierarchy and does some optimizations.
+       11*
+       12*    This involves the following:
+       13*
+       14*    1. The locking hierarchy is two-level: Page File (parent) and Control
+       15*       Interval (child). 
+       16*
+       17*    2. For each Control Interval lock, check whether a lock is required.
+       18*       It is not required if a sufficiently strong lock is already held
+       19*       on the parent Page File.
+       20*
+       21*    3. If a lock is required, obtain a lock on the parent of the appropriate
+       22*       type. Do not do so if a sufficiently strong lock is already held.
+       23*
+       24*    4. Obtain a lock on the Control Interval (child).
+       25*
+       26*    Note the following:
+       27*
+       28*    1. File Locks are optimized in several senses. If a strong lock is held
+       29*       on the File, it is not necessary to call per-system locking for
+       30*       each Control Interval. If a lock is already held on the File, it is
+       31*       not necessary to call per-system locking to determine this.
+       32**/
+       33 /* HISTORY:
+       34*
+       35*Written by J. Bongiovanni, 11/01/82.
+       36*Modified:
+       37*03/11/83 by Benson I. Margulies:  To make unlock_all work in the daemon without
+       38*            social services (Reagan cut them).
+       39*04/26/83 by Benson I. Margulies:  To log, optionally.
+       40*05/01/84 by R. Michael Tague:  Added %include dm_lm_meters.
+       41*10/15/84 by Stanford S. Cox:  MAIN: Chg all int proc to have prefix var names
+       42*	  and use ER, moved call to lm_log_ when tracing to LOCK_FILE.  ER:
+       43*	  Added for common return.
+       44*10/24/84 by Lindsey L. Spratt:  Added initialization of p_code to 0 for $lock
+       45*            entrypoint.  Removed spurious check of p_code after call to
+       46*            VALIDATE_MODE.  Added a check of p_code after call to 
+       47*	  lm_per_system_$unlock.
+       48*11/19/84 by Stanford S. Cox:  MAIN: Check for CHILD_LOCK = -1 (error).
+       49*02/26/85 by Lindsey L. Spratt:  Changed SETUP$$LOCK to reset
+       50*            lock_transaction_table.txn_id to the current_txn_id if it has
+       51*            gotten set to "0"b (by an lm_per_system_$unlock_all call).
+       52**/
+       53 
+       54 /* format: style3,idind30 */
+       55 lm_per_process_$lock:
+       56      proc (p_f_uid, p_ci_number, p_mode_req, p_timeout, p_mode_obtained, p_code);
+       57 
+       58 /*  Parameter  */
+       59 
+       60 declare	p_ci_number		fixed bin (27) parameter;
+       61 						/* Control Interval Number */
+       62 declare	p_checkpoint_id		bit (36) aligned parameter;
+       63 						/* Checkpoint Unique ID */
+       64 declare	p_code			fixed bin (35) parameter;
+       65 						/* Standard Error p_code */
+       66 declare	p_mode_obtained		fixed bin parameter;/* Lock Mode Obtained */
+       67 declare	p_mode_req		fixed bin parameter;/* Lock Mode Requested */
+       68 declare	p_f_uid			bit (36) aligned parameter;
+       69 						/* Page File Unique ID */
+       70 declare	p_timeout			fixed bin (71) parameter;
+       71 						/* How long to wait */
+       72 
+       73 /*  Automatic  */
+       74 
+       75 declare	area_handler		entry variable;
+       76 declare	ci_number			fixed bin (27);
+       77 declare	hashx			fixed bin;
+       78 declare	mode_obtained		fixed bin;
+       79 declare	mode_req			fixed bin;
+       80 declare	f_uid			bit (36) aligned;
+       81 declare	set_code_parm_on_error_return bit (1);
+       82 declare	timeout			fixed bin (71);
+       83 
+       84 /*  Static  */
+       85 
+       86 declare	CHILD_LOCK		(2:6, 2:6) fixed bin int static options (constant)
+       87 				init (0, 0, 2, 2, 0, -1, 0, -1, 3, 3, 0, 0, 0, 0, 0, -1, 0, -1, 0, 0, -1, 0, -1,
+       88 				6, 0);
+       89 declare	COMMON_MODE		(2:6, 2:6) fixed bin int static options (constant)
+       90 				init (2, 3, 2, 6, 6, 3, 3, 3, 3, 3, 2, 3, 4, 5, 6, 6, 3, 5, 5, 6, 6, 3, 6, 6, 6);
+       91 declare	PARENT_MODE		(2:6) fixed bin int static options (constant) init (4, 5, 4, 5, 5);
+       92 dcl	ME			char (15) int static options (constant) init ("lm_per_process_");
+       93 
+       94 
+       95 /*  Based  */
+       96 
+       97 declare	dm_area			area based (dm_data_$inner_ring_areap);
+       98 
+       99 /*  External  */
+      100 
+      101 declare	dm_system_data_$max_n_transactions
+      102 				fixed bin ext;
+      103 declare	dm_data_$current_txn_id	bit (36) aligned external;
+      104 
+      105 declare	dm_data_$current_txn_index	fixed bin ext;
+      106 declare	dm_data_$inner_ring_areap	ptr external;
+      107 
+      108 declare	dm_error_$lock_deadlock	fixed bin (35) external static;
+      109 declare	dm_error_$no_current_transaction
+      110 				fixed bin (35) external;
+      111 declare	dm_error_$unimplemented_entry fixed bin (35) external;
+      112 declare	dm_error_$lock_invalid_mode	fixed bin (35) external;
+      113 declare	dm_error_$per_process_area_overflow
+      114 				fixed bin (35) external;
+      115 dcl	error_table_$unimplemented_version
+      116 				fixed bin (35) ext static;
+      117 declare	lm_data_$trace		bit (1) aligned external static;
+      118 declare	lm_data_$lock_per_process_ptr pointer ext static;
+      119 declare	lm_data_$current_txn_id	bit (36) aligned ext static;
+      120 declare	lm_data_$lock_seg_ptr	pointer ext static;
+      121 declare	lm_data_$txn_table_ptr	pointer external static;
+      122 
+      123 /*  Entry  */
+      124 
+      125 declare	sub_err_			entry options (variable);
+      126 declare	lm_log_			entry options (variable);
+      127 declare	lm_per_system_$checkpoint	entry (bit (36) aligned, fixed bin (35));
+      128 declare	lm_per_system_$lock		entry (bit (36) aligned, fixed bin (27), fixed bin, fixed bin (71), fixed bin,
+      129 				fixed bin (35));
+      130 declare	lm_per_system_$lock_resolve_deadlock
+      131 				entry (bit (36) aligned, fixed bin (27), fixed bin, fixed bin (71), fixed bin,
+      132 				bit (36) aligned, fixed bin (35));
+      133 declare	lm_per_system_$unlock	entry (bit (36) aligned, fixed bin (27), fixed bin (35));
+      134 declare	lm_per_system_$unlock_all	entry;
+      135 declare	lm_per_system_$unlock_to_checkpoint
+      136 				entry (bit (36) aligned, fixed bin (35));
+      137 declare	lm_signal_deadlock_		entry (bit (36) aligned, bit (36) aligned, fixed bin (27), fixed bin);
+      138 declare	get_process_id_		entry returns (bit (36) aligned);
+      139 
+      140 /*  Condition  */
+      141 
+      142 declare	area			condition;
+      143 
+      144 /*  Builtin  */
+      145 
+      146 declare	addr			builtin;
+      147 declare	bit			builtin;
+      148 declare	fixed			builtin;
+      149 declare	null			builtin;
+      150 declare	unspec			builtin;
+      151 
+      152 
+      153 /* lm_per_process_$lock: entry (p_f_uid, p_ci_number, p_mode_req, p_timeout, p_mode_obtained, p_code); */
+      154 
+      155 	p_code = 0;
+      156 	f_uid = p_f_uid;
+      157 	ci_number = p_ci_number;
+      158 	mode_req = p_mode_req;
+      159 	timeout = p_timeout;
+      160 	set_code_parm_on_error_return = "1"b;
+      161 
+      162 	area_handler = NOOP;			/* handler in outer block to avoid nonquick */
+      163 	on area call area_handler;
+      164 
+      165 	call VALIDATE_MODE (mode_req);
+      166 
+      167 	call SETUP$$LOCK;
+      168 
+      169 	if ci_number = LOCK_ENTIRE_FILE
+      170 	then call LOCK_FILE (f_uid, mode_req, timeout, p_mode_obtained, ci_number, ("lock(entire file)"), "0"b);
+      171 	else do;
+      172 		call LOCK_FILE (f_uid, PARENT_MODE (mode_req), timeout, mode_obtained, ci_number, ("lock(file)"),
+      173 		     "1"b);
+      174 
+      175 		if CHILD_LOCK (mode_req, mode_obtained) > 0
+      176 		then call lm_per_system_$lock (f_uid, ci_number, mode_req, timeout, p_mode_obtained, p_code);
+      177 		else if CHILD_LOCK (mode_req, mode_obtained) = -1
+      178 		then call ERROR_RETURN (dm_error_$lock_invalid_mode);
+      179 		if lm_data_$trace
+      180 		then call lm_log_ (INFORM_SV, p_code, "lock", "TXN ^w File ^w CI ^d ModeReq ^a ^[ModeGot ^a^].",
+      181 			dm_data_$current_txn_id, f_uid, ci_number, LOCK_MODE_NAMES (mode_req), (p_code = 0),
+      182 			LOCK_MODE_NAMES (p_mode_obtained));
+      183 	     end;
+      184 MAIN_RETURN:
+      185 	return;
+      186 
+      187 unlock:
+      188      entry (p_f_uid, p_ci_number, p_code);
+      189 
+      190 	f_uid = p_f_uid;
+      191 	ci_number = p_ci_number;
+      192 	p_code = 0;
+      193 	set_code_parm_on_error_return = "1"b;
+      194 
+      195 	call SETUP;
+      196 
+      197 	if lm_data_$trace
+      198 	then call lm_log_ (INFORM_SV, 0, "unlock", "TXN ^w File ^w ^[CI ^d^].", dm_data_$current_txn_id, f_uid,
+      199 		(ci_number ^= LOCK_ENTIRE_FILE), ci_number);
+      200 
+      201 	if lock_transaction_table.txn_id = (36)"0"b	/* Never initialized */
+      202 	then return;				/* so there can be no locks */
+      203 
+      204 /*****      NOTE -- this will make per_system unlock calls *****/
+      205 /*****	  for control intervals that were never per_system locked. */
+      206 
+      207 	call lm_per_system_$unlock (f_uid, ci_number, p_code);
+      208 	if p_code ^= 0
+      209 	then call ERROR_RETURN (p_code);
+      210 
+      211 	if ci_number = LOCK_ENTIRE_FILE
+      212 	then call HASH_OUT (f_uid);
+      213 
+      214 
+      215 	return;
+      216 
+      217 
+      218 
+      219 unlock_all:
+      220      entry;
+      221 
+      222 	set_code_parm_on_error_return = "0"b;
+      223 	call SETUP;
+      224 
+      225 	if lock_transaction_table.txn_id = (36)"0"b	/* Never initialized */
+      226 	then return;				/* so there can be no locks */
+      227 
+      228 
+      229 	call lm_per_system_$unlock_all;
+      230 	call FLUSH_PER_PROCESS;
+      231 	return;
+      232 
+      233 
+      234 abandon:
+      235      entry (p_code);
+      236 
+      237 /**** Do not try to unlock locks, leave that for the daemon. However, */
+      238 /**** remove per_process garbage */
+      239 
+      240 	p_code = 0;
+      241 	set_code_parm_on_error_return = "0"b;
+      242 	call FLUSH_PER_PROCESS;
+      243 	return;
+      244 
+      245 
+      246 lock_resolve_deadlock:
+      247      entry (p_f_uid, p_ci_number, p_mode_req, p_timeout, p_mode_obtained, p_checkpoint_id, p_code);
+      248 
+      249 	p_code = dm_error_$unimplemented_entry;
+      250 	return;
+      251 
+      252 
+      253 checkpoint:
+      254      entry (p_checkpoint_id, p_code);
+      255 
+      256 	p_code = dm_error_$unimplemented_entry;
+      257 	return;
+      258 
+      259 
+      260 unlock_to_checkpoint:
+      261      entry (p_checkpoint_id, p_code);
+      262 
+      263 	p_code = dm_error_$unimplemented_entry;
+      264 	return;
+      265 
+      266 
+      267 
+      268 /*  Internal Procedure to establish global pointers  */
+      269 
+      270 SETUP:
+      271      procedure;
+      272 
+      273 declare	lock_entry		bit (1) aligned;
+      274 
+      275 	lock_entry = "0"b;
+      276 	go to Common;
+      277 
+      278 SETUP$$LOCK:
+      279      entry;
+      280 
+      281 	lock_entry = "1"b;
+      282 
+      283 Common:
+      284 	lock_per_process_ptr = lm_data_$lock_per_process_ptr;
+      285 	lock_seg_ptr = lm_data_$lock_seg_ptr;
+      286 	call CHECK_VERSION (LOCK_SEG_VERSION_1, lock_seg.version, "lock_seg");
+      287 	if dm_data_$current_txn_id = ""b
+      288 	then call sub_err_ (dm_error_$no_current_transaction, "lock_manager_", ACTION_CANT_RESTART, null (), (0),
+      289 		"lock_manager_ requires a transaction.");
+      290 	if lm_data_$current_txn_id ^= dm_data_$current_txn_id
+      291 	then do;
+      292 		lm_data_$txn_table_ptr = addr (lock_seg.transaction_table (dm_data_$current_txn_index));
+      293 		lock_transaction_table_ptr = lm_data_$txn_table_ptr;
+      294 		call FLUSH_PER_PROCESS;		/* no longer valid */
+      295 
+      296 		if lock_entry
+      297 		then call CLAIM_TRANSACTION_TABLE;	/* fill it in to us */
+      298 	     end;
+      299 	else lock_transaction_table_ptr = lm_data_$txn_table_ptr;
+      300 
+      301 	if lock_entry
+      302 	then if lock_transaction_table.txn_id = "0"b
+      303 	     then lock_transaction_table.txn_id = dm_data_$current_txn_id;
+      304 
+      305      end SETUP;
+      306 
+      307 CLAIM_TRANSACTION_TABLE:
+      308      procedure;
+      309 
+      310 	lock_transaction_table.process_id = get_process_id_ ();
+      311 	lock_transaction_table.txn_id = dm_data_$current_txn_id;
+      312 	lock_transaction_table.ev_channel = 0;
+      313 	lock_transaction_table.own_ptr = NULL_VPTR;
+      314 	lock_transaction_table.wait_ptr = NULL_VPTR;
+      315 	lm_data_$current_txn_id = dm_data_$current_txn_id;
+      316 	return;					/* Note that this is not done until all the proceeding has succeeded */
+      317      end CLAIM_TRANSACTION_TABLE;
+      318 
+      319 
+      320 
+      321 /*  Internal Procedure to validate a lock mode  */
+      322 
+      323 VALIDATE_MODE:
+      324      proc (vm_mode);
+      325 
+      326 declare	vm_mode			fixed bin;
+      327 
+      328 	if vm_mode < LOCK_MODE_S | vm_mode > LOCK_MODE_SIX
+      329 	then call ERROR_RETURN (dm_error_$lock_invalid_mode);
+      330 
+      331      end VALIDATE_MODE;
+      332 
+      333 /*  Internal Procedure to lock a file in the appropriate mode  */
+      334 
+      335 LOCK_FILE:
+      336      proc (lf_p_f_uid, lf_p_mode_req, lf_p_timeout, lf_p_mode_obtained, lf_p_ci_number, lf_p_caller, lf_p_log_errors_only)
+      337 	;
+      338 
+      339 declare	lf_p_f_uid		bit (36) aligned parameter;
+      340 declare	lf_p_mode_req		fixed bin parameter;
+      341 declare	lf_p_timeout		fixed bin (71) parameter;
+      342 declare	lf_p_mode_obtained		fixed bin parameter;
+      343 declare	lf_p_ci_number		fixed bin (27) parameter;
+      344 declare	lf_p_caller		char (17) parameter;
+      345 declare	lf_p_log_errors_only	bit (1) parameter;
+      346 
+      347 declare	lf_code			fixed bin (35);
+      348 declare	new_mode			fixed bin;
+      349 
+      350 	lf_code = 0;
+      351 
+      352 	per_process_file_lock_ptr = HASH_SEARCH (lf_p_f_uid);
+      353 	if per_process_file_lock_ptr = null ()
+      354 	then do;
+      355 		per_process_file_lock_ptr = ALLOCATE_FILE ();
+      356 		call lm_per_system_$lock (lf_p_f_uid, LOCK_ENTIRE_FILE, lf_p_mode_req, lf_p_timeout,
+      357 		     lf_p_mode_obtained, lf_code);
+      358 		if lf_code = 0
+      359 		then do;
+      360 			per_process_file_lock.f_uid = lf_p_f_uid;
+      361 			per_process_file_lock.mode = lf_p_mode_obtained;
+      362 			call HASH_IN (per_process_file_lock_ptr);
+      363 		     end;
+      364 	     end;
+      365 	else do;
+      366 		new_mode = COMMON_MODE (lf_p_mode_req, per_process_file_lock.mode);
+      367 		if new_mode = per_process_file_lock.mode
+      368 		then lf_p_mode_obtained = per_process_file_lock.mode;
+      369 		else do;
+      370 			call lm_per_system_$lock (lf_p_f_uid, LOCK_ENTIRE_FILE, new_mode, lf_p_timeout,
+      371 			     lf_p_mode_obtained, lf_code);
+      372 			if lf_code = 0
+      373 			then per_process_file_lock.mode = lf_p_mode_obtained;
+      374 		     end;
+      375 	     end;
+      376 
+      377 	if lm_data_$trace & ((lf_code ^= 0 & lf_p_log_errors_only) | ^lf_p_log_errors_only)
+      378 	then call lm_log_ (INFORM_SV, lf_code, lf_p_caller, "TXN ^w File ^w ModeReq ^a ^[CI ^d^;^s^[ModeGot ^a^]^]",
+      379 		dm_data_$current_txn_id, lf_p_f_uid, LOCK_MODE_NAMES (lf_p_mode_req),
+      380 		(lf_p_ci_number ^= LOCK_ENTIRE_FILE), lf_p_ci_number, (lf_code = 0),
+      381 		LOCK_MODE_NAMES (lf_p_mode_obtained));
+      382 
+      383 	if lf_code ^= 0
+      384 	then call ERROR_RETURN (lf_code);
+      385 
+      386      end LOCK_FILE;
+      387 
+      388 
+      389 
+      390 /*  Internal Procedures for Hash Table Operations
+      391*
+      392*    HASH_IN -     Hashes a block into the per-process hash table
+      393*
+      394*    HASH_OUT -    Hashes out and frees a block
+      395*
+      396*    HASH_SEARCH - Searches for a block given the Page File UID
+      397*
+      398**/
+      399 
+      400 HASH_IN:
+      401      proc (hi_p_file_ptr);
+      402 
+      403 declare	hi_p_file_ptr		ptr parameter;
+      404 
+      405 declare	hi_hashx			fixed bin;
+      406 
+      407 declare	1 hi_cur_file		aligned like per_process_file_lock based (hi_p_file_ptr);
+      408 
+      409 	hi_hashx = fixed (bit (hi_cur_file.f_uid & lock_per_process.ht_mask, 36), 36);
+      410 	hi_cur_file.ht_fp = lock_per_process.hash_table (hi_hashx);
+      411 	lock_per_process.hash_table (hi_hashx) = hi_p_file_ptr;
+      412 
+      413      end HASH_IN;
+      414 
+      415 
+      416 
+      417 HASH_OUT:
+      418      proc (ho_p_f_uid);
+      419 
+      420 declare	ho_p_f_uid		bit (36) aligned parameter;
+      421 
+      422 declare	ho_hashx			fixed bin;
+      423 declare	ho_file_ptr		ptr;
+      424 declare	ho_prev_file_ptr		ptr;
+      425 
+      426 declare	1 ho_cur_file		aligned like per_process_file_lock based (ho_file_ptr);
+      427 declare	1 ho_prev_file		aligned like per_process_file_lock based (ho_prev_file_ptr);
+      428 
+      429 	ho_hashx = fixed (bit (ho_p_f_uid & lock_per_process.ht_mask, 36), 36);
+      430 	ho_prev_file_ptr = null ();
+      431 	ho_file_ptr = lock_per_process.hash_table (ho_hashx);
+      432 	do while (ho_file_ptr ^= null ());
+      433 	     if ho_cur_file.f_uid = ho_p_f_uid
+      434 	     then do;
+      435 		     if ho_prev_file_ptr = null ()
+      436 		     then lock_per_process.hash_table (ho_hashx) = ho_cur_file.ht_fp;
+      437 		     else ho_prev_file.ht_fp = ho_cur_file.ht_fp;
+      438 		     call FREE_FILE (ho_file_ptr);
+      439 		     return;
+      440 		end;
+      441 	     else do;
+      442 		     ho_prev_file_ptr = ho_file_ptr;
+      443 		     ho_file_ptr = ho_cur_file.ht_fp;
+      444 		end;
+      445 	end;
+      446 
+      447      end HASH_OUT;
+      448 
+      449 
+      450 
+      451 HASH_SEARCH:
+      452      proc (hs_p_f_uid) returns (ptr);
+      453 
+      454 declare	hs_p_f_uid		bit (36) aligned parameter;
+      455 
+      456 declare	hs_hashx			fixed bin;
+      457 declare	hs_file_ptr		ptr;
+      458 
+      459 declare	1 hs_cur_file		aligned like per_process_file_lock based (hs_file_ptr);
+      460 
+      461 	hs_hashx = fixed (bit (hs_p_f_uid & lock_per_process.ht_mask, 36), 36);
+      462 	hs_file_ptr = lock_per_process.hash_table (hs_hashx);
+      463 	do while (hs_file_ptr ^= null ());
+      464 	     if hs_cur_file.f_uid = hs_p_f_uid
+      465 	     then return (hs_file_ptr);
+      466 	     else hs_file_ptr = hs_cur_file.ht_fp;
+      467 	end;
+      468 
+      469 	return (null ());
+      470 
+      471 
+      472      end HASH_SEARCH;
+      473 
+      474 
+      475 
+      476 ALLOCATE_FILE:
+      477      procedure () returns (pointer);
+      478 
+      479 declare	af_new_file_ptr		pointer;
+      480 declare	1 af_new_file		aligned like per_process_file_lock based (af_new_file_ptr);
+      481 
+      482 	area_handler = AREA_TOO_SMALL;
+      483 
+      484 RETRY_ALLOC:
+      485 	allocate af_new_file in (lm_per_process_area) set (af_new_file_ptr);
+      486 
+      487 	area_handler = NOOP;
+      488 	return (af_new_file_ptr);
+      489 
+      490 AREA_TOO_SMALL:					/* Nonquick procedure to reallocate area */
+      491      procedure;
+      492 
+      493 declare	new_area_size		fixed bin (35);
+      494 declare	new_area_ptr		pointer;
+      495 declare	new_area			area (new_area_size) based (new_area_ptr);
+      496 
+      497 	on area call ERROR_RETURN (dm_error_$per_process_area_overflow);
+      498 
+      499 	new_area_size = lock_per_process.area_size * 2;
+      500 	allocate new_area in (dm_area) set (new_area_ptr);
+      501 	new_area = lm_per_process_area;
+      502 	lock_per_process.area_ptr = new_area_ptr;
+      503 	lock_per_process.area_size = new_area_size;
+      504 	go to RETRY_ALLOC;
+      505      end AREA_TOO_SMALL;
+      506      end ALLOCATE_FILE;
+      507 
+      508 FREE_FILE:
+      509      procedure (ff_file_ptr);
+      510 declare	ff_file_ptr		pointer;
+      511 
+      512 	free ff_file_ptr -> per_process_file_lock;
+      513 	return;
+      514      end FREE_FILE;
+      515 
+      516 FLUSH_PER_PROCESS:
+      517      procedure;
+      518 
+      519 	lm_per_process_area = empty ();
+      520 	lock_per_process.hash_table (*) = null ();	/* aggregate */
+      521 	return;
+      522      end FLUSH_PER_PROCESS;
+      523 
+      524 NOOP:
+      525      entry;
+      526 	return;					/* format: off */
+      527 
+      528 CHECK_VERSION:
+      529    proc (cv_p_expected_version, cv_p_received_version, cv_p_structure_name);
+      530 
+      531 dcl	cv_p_expected_version
+      532 			char (8) aligned parameter;
+      533 dcl	cv_p_received_version
+      534 			char (8) aligned parameter;
+      535 dcl	cv_p_structure_name char (32) aligned parameter;
+      536 
+      537       if cv_p_expected_version ^= cv_p_received_version
+      538       then call sub_err_ (error_table_$unimplemented_version, ME, ACTION_CANT_RESTART, null (), 0,
+      539 	      "^/Expected version ^a of the ^a structure." || "^/Received version ^a instead.", cv_p_expected_version,
+      540 	      cv_p_structure_name, cv_p_received_version);
+      541    end CHECK_VERSION;
+      542 
+      543 ERROR_RETURN:
+      544 	 proc (er_p_code);
+      545 declare er_p_code fixed bin (35);
+      546 
+      547 	 if set_code_parm_on_error_return then p_code = er_p_code;
+      548 	 goto MAIN_RETURN;
+      549 end ERROR_RETURN;
+      550   /*  START OF:	dm_lock_modes.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+  1     2 
+  1     3 /* DESCRIPTION:
+  1     4*
+  1     5*     Hierarchical lock modes for Data Management control interval locking.  In
+  1     6*addition to conventional read and write locks, intention locks are provided
+  1     7*for finer locking granularity.
+  1     8**/
+  1     9 
+  1    10 /* HISTORY:
+  1    11*Written by Jeffrey D. Ives, 04/30/82.
+  1    12*Modified:
+  1    13*12/05/84 by Stanford S. Cox: Added Description.
+  1    14**/
+  1    15 /* format: style3,idind25 */
+  1    16 
+  1    17      dcl	   LOCK_MODE_S	      fixed bin static options (constant) init (2);
+  1    18      dcl	   LOCK_MODE_X	      fixed bin static options (constant) init (3);
+  1    19      dcl	   LOCK_MODE_IS	      fixed bin static options (constant) init (4);
+  1    20      dcl	   LOCK_MODE_IX	      fixed bin static options (constant) init (5);
+  1    21      dcl	   LOCK_MODE_SIX	      fixed bin static options (constant) init (6);
+  1    22 
+  1    23      dcl	   LOCK_ENTIRE_FILE	      fixed bin (27) static options (constant) init (-1);
+  1    24 
+  1    25      dcl	   LOCK_MODE_NAMES (2:6)  char (3) int static options (constant)
+  1    26 			      init ("  S", "  X", " IS", " IX", "SIX");
+  1    27 
+  1    28 /*
+  1    29*     S       Share                           Let others read it but not modify it.
+  1    30*     X	   Exclusive		     Let nobody else read or modify it.
+  1    31*     IS	   Intention Share		     I am only using S locks, because I am only reading CIs.
+  1    32*     IX	   Intention Exclusive	     I am using S and X locks, because I am reading and modifying CIs.
+  1    33*     SIX	   Share with Intention Exclusive  I am reading control intervals, but only locking the ones I modify.
+  1    34**/
+  1    35 
+  1    36 /*  END OF:	dm_lock_modes.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+      550 
+      551   /* BEGIN INCLUDE FILE sub_err_flags.incl.pl1 BIM 11/81 */
+  2     2 /* format: style3 */
+  2     3 
+  2     4 /* These constants are to be used for the flags argument of sub_err_ */
+  2     5 /* They are just "string (condition_info_header.action_flags)" */
+  2     6 
+  2     7 declare	(
+  2     8 	ACTION_CAN_RESTART	init (""b),
+  2     9 	ACTION_CANT_RESTART init ("1"b),
+  2    10 	ACTION_DEFAULT_RESTART
+  2    11 			init ("01"b),
+  2    12 	ACTION_QUIET_RESTART
+  2    13 			init ("001"b),
+  2    14 	ACTION_SUPPORT_SIGNAL
+  2    15 			init ("0001"b)
+  2    16 	)		bit (36) aligned internal static options (constant);
+  2    17 
+  2    18 /* End include file */
+      551 
+      552   /* Begin include file dm_lm_per_process_data_.incl.pl1 */
+  3     2 
+  3     3 /* DESCRIPTION:
+  3     4*
+  3     5*    Hash table for per-process control interval locks.
+  3     6**/
+  3     7 
+  3     8 /* HISTORY:
+  3     9*Written by Benson Margulies, 4/15/83.
+  3    10*Modified:
+  3    11*12/04/84 by Stanford S. Cox: Added description.
+  3    12**/
+  3    13 /* format: style3,idind25 */
+  3    14 
+  3    15 declare	lock_per_process_ptr     pointer;
+  3    16 
+  3    17 declare	1 lock_per_process	     aligned based (lock_per_process_ptr),
+  3    18 	  2 n_ht_entries	     fixed bin,		/* Number of hash table entries */
+  3    19 	  2 ht_mask	     bit (36) aligned,	/* Mask for hash table */
+  3    20 	  2 area_size	     fixed bin,
+  3    21 	  2 area_ptr	     pointer,
+  3    22 	  2 hash_table	     (0:n_hash_table_entries - 1 refer (lock_per_process.n_ht_entries))
+  3    23 			     offset (lm_per_process_area);
+  3    24 						/* Hash Table  */
+  3    25 
+  3    26 declare	n_hash_table_entries     fixed bin;
+  3    27 
+  3    28 declare	lm_per_process_area	     area (lock_per_process.area_size) based (lock_per_process.area_ptr);
+  3    29 
+  3    30 declare	per_process_file_lock_ptr
+  3    31 			     pointer;
+  3    32 declare	1 per_process_file_lock  aligned based (per_process_file_lock_ptr),
+  3    33 	  2 f_uid		     bit (36) aligned,
+  3    34 	  2 mode		     fixed bin,
+  3    35 	  2 ht_fp		     offset (lm_per_process_area);
+  3    36 
+  3    37 /* End include file dm_lm_per_process_data_.incl.pl1 */
+      552 
+      553   /* BEGIN INCLUDE FILE - dm_lm_system_data.incl.pl1 */
+  4     2 
+  4     3 /* format: style3,idind25 */
+  4     4 /* HISTORY:
+  4     5*
+  4     6*Written by Benson Margulies, 4/83.
+  4     7*Modified:
+  4     8*04/24/84 by R. Michael Tague:  moved the meters structure definition to
+  4     9*   dm_lm_meters.incl.pl1.  Added this history section.
+  4    10*05/01/84 by R. Michael Tague:  removed the %include dm_lm_meters.
+  4    11*10/17/84 by Stanford S. Cox:  Added version constant, and changed 
+  4    12*   transaction_table to use a refer extent (to allow outer ring reference).
+  4    13**/
+  4    14 
+  4    15 dcl	lock_seg_ptr	     ptr;
+  4    16 dcl	lock_transaction_table_ptr
+  4    17 			     ptr;
+  4    18 dcl	lock_hash_table_ptr	     ptr;
+  4    19 dcl	lock_aux_seg_ptr	     ptr;
+  4    20 dcl	lock_block_ptr	     ptr;
+  4    21 dcl	lock_block_array_ptr     ptr;
+  4    22 dcl	lock_free_block_ptr	     ptr;
+  4    23 dcl	lock_object_ptr	     ptr;
+  4    24 dcl	lock_owner_ptr	     ptr;
+  4    25 dcl	lock_segments_ptr	     ptr;
+  4    26 dcl	lock_waiter_ptr	     ptr;
+  4    27 dcl	lock_deadlock_ptr	     ptr;
+  4    28 
+  4    29 dcl	n_lock_blocks	     fixed bin;
+  4    30 dcl	n_lock_deadlock	     fixed bin;
+  4    31 
+  4    32 dcl	LOCK_SEG_VERSION_1	     char (8) aligned init ("locksg 1") int static options (constant);
+  4    33 
+  4    34 dcl	1 lock_seg	     aligned based (lock_seg_ptr),
+  4    35 						/* Per-system lock data */
+  4    36 	  2 version	     char (8) aligned,
+  4    37 	  2 header	     aligned,
+  4    38 	    3 lock	     fixed bin (71),	/* Fast Lock on system lock operations */
+  4    39 	    3 n_lock_segments    fixed bin,		/* Number of segments in system lock data */
+  4    40 	    3 lock_seg_size	     fixed bin (19),	/* Number of words per segment */
+  4    41 	    3 max_lock_segments  fixed bin,		/* Maximum number of segments */
+  4    42 	    3 n_transaction_table_entries
+  4    43 			     fixed bin,		/* Size of transaction table */
+  4    44 	    3 n_hash_table_entries
+  4    45 			     fixed bin,		/* Size of hash table */
+  4    46 	    3 hash_mask	     bit (36) aligned,	/* Used by hashing routine */
+  4    47 	    3 free_list_ptr	     aligned like lock_virtual_ptr,
+  4    48 						/* Thread of free blocks */
+  4    49 	    3 transaction_table_offset
+  4    50 			     fixed bin (18) unsigned aligned,
+  4    51 						/* Offset of transaction table */
+  4    52 	    3 hash_table_offset  fixed bin (18) unsigned aligned,
+  4    53 						/* Offset of hash table */
+  4    54 	    3 n_lock_blocks	     fixed bin,		/* Number of blocks crated */
+  4    55 	    3 lock_array_offset  fixed bin (18) unsigned aligned,
+  4    56 						/* Offset of block array */
+  4    57 	  2 transaction_table    (0 refer (lock_seg.n_transaction_table_entries)) aligned like lock_transaction_table,
+  4    58 	  2 hash_table	     aligned like lock_hash_table,
+  4    59 	  2 meters	     aligned like lock_meters,
+  4    60 	  2 free		     fixed bin (71);	/* Free space */
+  4    61 
+  4    62 dcl	1 lock_aux_seg	     aligned based (lock_aux_seg_ptr),
+  4    63 						/* Other than first segment */
+  4    64 	  2 n_lock_blocks	     fixed bin,		/* Number of blocks in this segment */
+  4    65 	  2 lock_array_offset    fixed bin (18) unsigned aligned,
+  4    66 						/* Offset of block array */
+  4    67 	  2 free		     fixed bin (71);	/* Free space */
+  4    68 
+  4    69 dcl	1 lock_transaction_table aligned based (lock_transaction_table_ptr),
+  4    70 						/* Process table entry */
+  4    71 	  2 deadlock_inx	     fixed bin,		/* Index used for deadlock detection */
+  4    72 	  2 process_id	     bit (36) aligned,	/* Multics process identifier */
+  4    73 	  2 txn_id	     bit (36) aligned,	/* Current transaction ID */
+  4    74 	  2 ev_channel	     fixed bin (71),
+  4    75 	  2 own_ptr	     aligned like lock_virtual_ptr,
+  4    76 						/* First in thread of owning blocks */
+  4    77 	  2 wait_ptr	     aligned like lock_virtual_ptr;
+  4    78 						/* Waiting block */
+  4    79 
+  4    80 dcl	1 lock_hash_table	     aligned based (lock_hash_table_ptr),
+  4    81 	  2 buckets	     (lock_seg.n_hash_table_entries) aligned like lock_virtual_ptr;
+  4    82 
+  4    83 
+  4    84 dcl	1 lock_block	     aligned based (lock_block_ptr),
+  4    85 						/* Generic block */
+  4    86 	  2 seg_inx	     fixed bin unal,
+  4    87 	  2 type		     fixed bin unal,
+  4    88 	  2 pad		     (5) bit (36) aligned;
+  4    89 
+  4    90 dcl	1 lock_block_array	     (n_lock_blocks) aligned like lock_block based (lock_block_array_ptr);
+  4    91 
+  4    92 dcl	1 lock_free_block	     aligned based (lock_free_block_ptr),
+  4    93 						/* Free block */
+  4    94 	  2 seg_inx	     fixed bin unal,
+  4    95 	  2 type		     fixed bin unal,	/* TYPE_FREE */
+  4    96 	  2 free_fp	     aligned like lock_virtual_ptr,
+  4    97 						/* Thread of free blocks */
+  4    98 	  2 pad		     (4) bit (36) aligned;
+  4    99 
+  4   100 dcl	1 lock_object	     aligned based (lock_object_ptr),
+  4   101 						/* That which is locked */
+  4   102 	  2 seg_inx	     fixed bin unal,
+  4   103 	  2 type		     fixed bin unal,	/* TYPE_OBJECT */
+  4   104 	  2 uid		     bit (36) aligned,	/* Page File UID */
+  4   105 	  2 ci_no		     fixed bin (35),	/* Control Interval (-1 => Page File) */
+  4   106 	  2 owners_ptr	     aligned like lock_virtual_ptr,
+  4   107 						/* First in thread of owning blocks */
+  4   108 	  2 waiters_ptr	     aligned like lock_virtual_ptr,
+  4   109 						/* First in thread of waiting blocks */
+  4   110 	  2 ht_fp		     aligned like lock_virtual_ptr;
+  4   111 						/* Hash Table thread */
+  4   112 
+  4   113 dcl	1 lock_owner	     aligned based (lock_owner_ptr),
+  4   114 						/* Owner of a lock */
+  4   115 	  2 seg_inx	     fixed bin unal,
+  4   116 	  2 type		     fixed bin unal,	/* TYPE_OWNER */
+  4   117 	  2 lock_ptr	     aligned like lock_virtual_ptr,
+  4   118 						/* Pointer to lock_object */
+  4   119 	  2 mode		     fixed bin,		/* Type of lock */
+  4   120 	  2 owners_fp	     aligned like lock_virtual_ptr,
+  4   121 						/* Thread of owners */
+  4   122 	  2 transaction_fp	     aligned like lock_virtual_ptr,
+  4   123 						/* Thread of locks owned by this transaction */
+  4   124 	  2 transaction_ptr	     aligned like lock_virtual_ptr;
+  4   125 						/* Pointer to transaction table entry */
+  4   126 
+  4   127 
+  4   128 dcl	1 lock_waiter	     aligned based (lock_waiter_ptr),
+  4   129 						/* Waiter for a lock */
+  4   130 	  2 seg_inx	     fixed bin unal,
+  4   131 	  2 type		     fixed bin unal,	/* TYPE_WAITER */
+  4   132 	  2 lock_ptr	     aligned like lock_virtual_ptr,
+  4   133 						/* Pointer to lock_object */
+  4   134 	  2 mode		     fixed bin,		/* Desired mode */
+  4   135 	  2 waiters_fp	     aligned like lock_virtual_ptr,
+  4   136 						/* Thread of waiters */
+  4   137 	  2 transaction_ptr	     aligned like lock_virtual_ptr,
+  4   138 						/* Process table entry of this proces */
+  4   139 	  2 pad		     bit (36) aligned;
+  4   140 
+  4   141 
+  4   142 dcl	1 lock_segments	     aligned based (lock_segments_ptr),
+  4   143 	  2 seg_baseptr	     (lock_seg.n_lock_segments) ptr unal;
+  4   144 
+  4   145 dcl	1 lock_virtual_ptr	     aligned based,
+  4   146 	  2 seg_inx	     fixed bin unal,
+  4   147 	  2 offset	     fixed bin (18) unsigned unal;
+  4   148 
+  4   149 dcl	1 lock_deadlock	     aligned based (lock_deadlock_ptr),
+  4   150 	  2 wait_own	     (n_lock_deadlock, n_lock_deadlock) bit (1) unaligned;
+  4   151 
+  4   152 declare	1 lock_deadlock_36	     aligned based (lock_deadlock_ptr),
+  4   153 	  2 wait_own	     (36, 36) bit (1) unaligned;
+  4   154 
+  4   155 declare	1 lock_deadlock_72	     aligned based (lock_deadlock_ptr),
+  4   156 	  2 wait_own	     (72, 72) bit (1) unaligned;
+  4   157 						/* (x,y) ON => x waiting for lock owned by y */
+  4   158 
+  4   159 declare	lock_deadlock_txn_ids_ptr
+  4   160 			     pointer;
+  4   161 declare	lock_deadlock_txn_ids    (n_lock_deadlock) bit (36) aligned based (lock_deadlock_txn_ids_ptr);
+  4   162 dcl	(
+  4   163 	TYPE_FREE		     init (1),
+  4   164 	TYPE_OBJECT	     init (2),
+  4   165 	TYPE_OWNER	     init (3),
+  4   166 	TYPE_WAITER	     init (4),
+  4   167 	MAX_TYPE		     init (4)
+  4   168 	)		     fixed bin int static options (constant);
+  4   169 
+  4   170 
+  4   171 dcl	1 NULL_VPTR	     aligned int static options (constant),
+  4   172 	  2 seg_inx	     fixed bin unal init (-1),
+  4   173 	  2 offset	     fixed bin (18) unsigned unal init (0);
+  4   174 
+  4   175 
+  4   176 dcl	LOCK_BLOCK_SIZE	     fixed bin int static options (constant) init (6);
+  4   177 						/* Size of all lock blocks */
+  4   178 
+  4   179 dcl	LOCK_SEGNAME	     char (9) int static options (constant) init ("lock_seg_");
+  4   180 
+  4   181 dcl	lock_segno	     pic "999";
+  4   182 
+  4   183 dcl	(
+  4   184 	LOCK_MESSAGE_DEADLOCK    init (1243657)
+  4   185 	)		     fixed bin (71) int static options (constant);
+  4   186 
+  4   187 
+  4   188 /* END INCLUDE FILE - dm_lm_system_data.incl.pl1 */
+      553 
+      554   /* BEGIN INCLUDE FILE - dm_lm_meters.incl.pl1 *
+  5     2*
+  5     3*/* format: style3,idind25 */
+  5     4 
+  5     5 /* DESCRIPTION:
+  5     6*
+  5     7*     This is the lock manager meters structure.
+  5     8**/
+  5     9 /* HISTORY:
+  5    10*Written by R. Michael Tague, 4/24/84.
+  5    11*Modified:
+  5    12*05/01/84 by R. Michael Tague:  Collected all of the meters together into
+  5    13*            the meters structure.
+  5    14**/
+  5    15 
+  5    16 dcl	lock_meters_ptr	     ptr;
+  5    17 dcl	LOCK_METERS_VERSION_1    char (8) aligned int static options (constant)
+  5    18 			     init ("LMMETER1");
+  5    19 
+  5    20 dcl	1 lock_meters	     aligned based (lock_meters_ptr),
+  5    21 	  2 version	     char (8),
+  5    22 	  2 lm_meters	     aligned,
+  5    23 	    3 lock_calls	     fixed bin (35),
+  5    24 	    3 unlock_all_calls   fixed bin (35),
+  5    25 	    3 waits	     fixed bin (35),
+  5    26 	    3 deadlock_checks    fixed bin (35),
+  5    27 	    3 real_deadlock_checks
+  5    28 			     fixed bin (35),
+  5    29 	    3 deadlock_checks_36 fixed bin (35),
+  5    30 	    3 deadlock_checks_72 fixed bin (35),
+  5    31 	    3 deadlock_self_youngest
+  5    32 			     fixed bin (35),
+  5    33 	    3 deadlock_other_youngest
+  5    34 			     fixed bin (35),
+  5    35 	    3 file_locks_by_mode (2:6) fixed bin (35),
+  5    36 	    3 ci_locks_by_mode   (2:3) fixed bin (35),
+  5    37 	    3 allocates	     fixed bin (35),
+  5    38 	    3 frees	     fixed bin (35),
+  5    39 	    3 dup_file_locks_by_mode
+  5    40 			     (2:6) fixed bin (35),
+  5    41 	    3 dup_ci_locks_by_mode
+  5    42 			     (2:3) fixed bin (35),
+  5    43 	    3 pad		     (11) fixed bin (35);
+  5    44 
+  5    45 /* END INCLUDE FILE - dm_lm_meters.incl.pl1 */
+      554 
+      555   /* BEGIN INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+  6     2 
+  6     3 /* format: ^indcom */
+  6     4 
+  6     5 /* DESCRIPTION:
+  6     6*   These are the severity codes used by the dms daemon when calling its logger.
+  6     7*   The severity is ranked thusly:
+  6     8*
+  6     9*   severity log write situation
+  6    10*   -------- --- ----- ---------
+  6    11*          0 no  yes   standard output, query, etc.
+  6    12*          1 yes yes   fatal error, terminate dms daemon.
+  6    13*          2 yes yes   nonfatal error.
+  6    14*          3 yes yes   informative message.
+  6    15*          4 yes no    log information only.
+  6    16**/
+  6    17 
+  6    18 /* HISTORY:
+  6    19*
+  6    20*Written by M. Pandolf, 10/06/82.
+  6    21*Modified:
+  6    22*12/10/84 by R. Michael Tague: Rename and reformat description/history.
+  6    23*01/13/85 by Lee A. Newcomb:  Renamed to dm_log_sv_codes from
+  6    24*            dm_daemon_sv_codes as the severity codes for the DM log are not
+  6    25*            restrained to the DM Daemon's use.
+  6    26*01/24/85 by Lee A. Newcomb:  Fixed to say dm_log_sv_codes.incl.pl1 in the
+  6    27*            BEGIN and END INCLUDE comments, instead of dm_daemon_sv_codes.==.
+  6    28**/
+  6    29 
+  6    30 /* format: style5 */
+  6    31 
+  6    32      dcl	   (PRINT_SV, QUERY_SV)    fixed bin internal static
+  6    33 			       options (constant) init (0);
+  6    34      dcl	   (CRASH_SV, FATAL_SV)    fixed bin internal static
+  6    35 			       options (constant) init (1);
+  6    36      dcl	   ERROR_SV	       fixed bin internal static
+  6    37 			       options (constant) init (2);
+  6    38      dcl	   INFORM_SV	       fixed bin internal static
+  6    39 			       options (constant) init (3);
+  6    40      dcl	   LOG_SV		       fixed bin internal static
+  6    41 			       options (constant) init (4);
+  6    42 
+  6    43 /* END INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+      555 
+      556 
+      557 end lm_per_process_$lock;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/04/85  0827.0  lm_per_process_.pl1               >spec>on>7192.pbf-04/04/85>lm_per_process_.pl1
+550          1    01/07/85  0901.4  dm_lock_modes.incl.pl1            >ldd>include>dm_lock_modes.incl.pl1
+551          2    04/16/82  0958.1  sub_err_flags.incl.pl1            >ldd>include>sub_err_flags.incl.pl1
+552          3    01/07/85  0901.3  dm_lm_per_process_data_.incl.pl1  >ldd>include>dm_lm_per_process_data_.incl.pl1
+553          4    01/07/85  0859.2  dm_lm_system_data.incl.pl1        >ldd>include>dm_lm_system_data.incl.pl1
+554          5    01/07/85  0859.1  dm_lm_meters.incl.pl1             >ldd>include>dm_lm_meters.incl.pl1
+555          6    03/06/85  1031.1  dm_log_sv_codes.incl.pl1          >ldd>include>dm_log_sv_codes.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+ACTION_CANT_RESTART             000123 constant        bit(36)                  initial dcl 2-7 set ref 287* 537*
+CHILD_LOCK                      000052 constant        fixed bin(17,0)          initial array dcl 86 ref 175 177
+COMMON_MODE                     000021 constant        fixed bin(17,0)          initial array dcl 89 ref 366
+INFORM_SV                       000130 constant        fixed bin(17,0)          initial dcl 6-38 set ref 179* 197* 377*
+LOCK_ENTIRE_FILE                000124 constant        fixed bin(27,0)          initial dcl 1-23 set ref 169 197 211 356* 370* 377
+LOCK_MODE_NAMES                 000004 constant        char(3)                  initial array unaligned dcl 1-25 set ref 179* 179*
+                                                                                  377* 377*
+LOCK_MODE_S                            constant        fixed bin(17,0)          initial dcl 1-17 ref 328
+LOCK_MODE_SIX                          constant        fixed bin(17,0)          initial dcl 1-21 ref 328
+LOCK_SEG_VERSION_1              000002 constant        char(8)                  initial dcl 4-32 set ref 286*
+ME                              000010 constant        char(15)                 initial unaligned dcl 92 set ref 537*
+NULL_VPTR                       000000 constant        structure                level 1 dcl 4-171 ref 313 314
+PARENT_MODE                     000014 constant        fixed bin(17,0)          initial array dcl 91 set ref 172*
+addr                                                   builtin function         dcl 146 ref 292
+af_new_file                            based           structure                level 1 dcl 480 ref 484
+af_new_file_ptr                 000236 automatic       pointer                  dcl 479 set ref 484* 488
+area                            000114 stack reference condition                dcl 142 ref 163 497
+area_handler                    000100 automatic       entry variable           dcl 75 set ref 162* 163 482* 487*
+area_ptr                  4            based           pointer                  level 2 dcl 3-17 set ref 411 431 443 462 466 484 501
+                                                                                  502* 519
+area_size                 2            based           fixed bin(17,0)          level 2 dcl 3-17 set ref 499 503* 519
+bit                                                    builtin function         dcl 147 ref 409 429 461
+ci_number                       000104 automatic       fixed bin(27,0)          dcl 76 set ref 157* 169 169* 172* 175* 179* 191* 197
+                                                                                  197* 207* 211
+cv_p_expected_version                  parameter       char(8)                  dcl 531 set ref 528 537 537*
+cv_p_received_version                  parameter       char(8)                  dcl 533 set ref 528 537 537*
+cv_p_structure_name                    parameter       char(32)                 dcl 535 set ref 528 537*
+dm_area                                based           area(1024)               dcl 97 ref 500
+dm_data_$current_txn_id         000012 external static bit(36)                  dcl 103 set ref 179* 197* 287 290 301 311 315 377*
+dm_data_$current_txn_index      000014 external static fixed bin(17,0)          dcl 105 ref 292
+dm_data_$inner_ring_areap       000016 external static pointer                  dcl 106 ref 500
+dm_error_$lock_invalid_mode     000024 external static fixed bin(35,0)          dcl 112 set ref 177* 328*
+dm_error_$no_current_transaction
+                                000020 external static fixed bin(35,0)          dcl 109 set ref 287*
+dm_error_$per_process_area_overflow
+                                000026 external static fixed bin(35,0)          dcl 113 set ref 497*
+dm_error_$unimplemented_entry   000022 external static fixed bin(35,0)          dcl 111 ref 249 256 263
+er_p_code                              parameter       fixed bin(35,0)          dcl 545 ref 543 547
+error_table_$unimplemented_version
+                                000030 external static fixed bin(35,0)          dcl 115 set ref 537*
+ev_channel                4            based           fixed bin(71,0)          level 2 dcl 4-69 set ref 312*
+f_uid                                  based           bit(36)                  level 2 in structure "hs_cur_file" dcl 459
+                                                                                  in procedure "HASH_SEARCH" ref 464
+f_uid                                  based           bit(36)                  level 2 in structure "hi_cur_file" dcl 407
+                                                                                  in procedure "HASH_IN" ref 409
+f_uid                           000107 automatic       bit(36)                  dcl 80 in procedure "lm_per_process_$lock" set ref
+                                                                                  156* 169* 172* 175* 179* 190* 197* 207* 211*
+f_uid                                  based           bit(36)                  level 2 in structure "per_process_file_lock"
+                                                                                  dcl 3-32 in procedure "lm_per_process_$lock" set
+                                                                                  ref 360*
+f_uid                                  based           bit(36)                  level 2 in structure "ho_cur_file" dcl 426
+                                                                                  in procedure "HASH_OUT" ref 433
+ff_file_ptr                            parameter       pointer                  dcl 510 ref 508 512
+fixed                                                  builtin function         dcl 148 ref 409 429 461
+get_process_id_                 000056 constant        entry                    external dcl 138 ref 310
+hash_table                6            based           offset                   array level 2 dcl 3-17 set ref 410 411* 431 435* 462
+                                                                                  520*
+hi_cur_file                            based           structure                level 1 dcl 407
+hi_hashx                        000200 automatic       fixed bin(17,0)          dcl 405 set ref 409* 410 411
+hi_p_file_ptr                          parameter       pointer                  dcl 403 ref 400 409 410 411
+ho_cur_file                            based           structure                level 1 dcl 426
+ho_file_ptr                     000212 automatic       pointer                  dcl 423 set ref 431* 432 433 435 437 438* 442 443*
+                                                                                  443
+ho_hashx                        000210 automatic       fixed bin(17,0)          dcl 422 set ref 429* 431 435
+ho_p_f_uid                             parameter       bit(36)                  dcl 420 ref 417 429 433
+ho_prev_file                           based           structure                level 1 dcl 427
+ho_prev_file_ptr                000214 automatic       pointer                  dcl 424 set ref 430* 435 437 442*
+hs_cur_file                            based           structure                level 1 dcl 459
+hs_file_ptr                     000226 automatic       pointer                  dcl 457 set ref 462* 463 464 464 466* 466
+hs_hashx                        000224 automatic       fixed bin(17,0)          dcl 456 set ref 461* 462
+hs_p_f_uid                             parameter       bit(36)                  dcl 454 ref 451 461 464
+ht_fp                     2            based           offset                   level 2 in structure "hs_cur_file" dcl 459
+                                                                                  in procedure "HASH_SEARCH" ref 466
+ht_fp                     2            based           offset                   level 2 in structure "hi_cur_file" dcl 407
+                                                                                  in procedure "HASH_IN" set ref 410*
+ht_fp                     2            based           offset                   level 2 in structure "ho_cur_file" dcl 426
+                                                                                  in procedure "HASH_OUT" ref 435 437 443
+ht_fp                     2            based           offset                   level 2 in structure "ho_prev_file" dcl 427
+                                                                                  in procedure "HASH_OUT" set ref 437*
+ht_mask                   1            based           bit(36)                  level 2 dcl 3-17 ref 409 429 461
+lf_code                         000170 automatic       fixed bin(35,0)          dcl 347 set ref 350* 356* 358 370* 372 377 377* 377
+                                                                                  383 383*
+lf_p_caller                            parameter       char(17)                 unaligned dcl 344 set ref 335 377*
+lf_p_ci_number                         parameter       fixed bin(27,0)          dcl 343 set ref 335 377 377*
+lf_p_f_uid                             parameter       bit(36)                  dcl 339 set ref 335 352* 356* 360 370* 377*
+lf_p_log_errors_only                   parameter       bit(1)                   unaligned dcl 345 ref 335 377 377
+lf_p_mode_obtained                     parameter       fixed bin(17,0)          dcl 342 set ref 335 356* 361 367* 370* 372 377
+lf_p_mode_req                          parameter       fixed bin(17,0)          dcl 340 set ref 335 356* 366 377
+lf_p_timeout                           parameter       fixed bin(71,0)          dcl 341 set ref 335 356* 370*
+lm_data_$current_txn_id         000036 external static bit(36)                  dcl 119 set ref 290 315*
+lm_data_$lock_per_process_ptr   000034 external static pointer                  dcl 118 ref 283
+lm_data_$lock_seg_ptr           000040 external static pointer                  dcl 120 ref 285
+lm_data_$trace                  000032 external static bit(1)                   dcl 117 ref 179 197 377
+lm_data_$txn_table_ptr          000042 external static pointer                  dcl 121 set ref 292* 293 299
+lm_log_                         000046 constant        entry                    external dcl 126 ref 179 197 377
+lm_per_process_area                    based           area                     dcl 3-28 set ref 411 431 443 462 466 484 501 519*
+lm_per_system_$lock             000050 constant        entry                    external dcl 128 ref 175 356 370
+lm_per_system_$unlock           000052 constant        entry                    external dcl 133 ref 207
+lm_per_system_$unlock_all       000054 constant        entry                    external dcl 134 ref 229
+lock_block                             based           structure                level 1 dcl 4-84
+lock_entry                      000144 automatic       bit(1)                   dcl 273 set ref 275* 281* 296 301
+lock_hash_table                        based           structure                level 1 dcl 4-80
+lock_meters                            based           structure                level 1 dcl 5-20
+lock_per_process                       based           structure                level 1 dcl 3-17
+lock_per_process_ptr            000122 automatic       pointer                  dcl 3-15 set ref 283* 409 410 411 411 429 431 431
+                                                                                  435 443 461 462 462 466 484 499 501 502 503 519
+                                                                                  519 520
+lock_seg                               based           structure                level 1 dcl 4-34
+lock_seg_ptr                    000126 automatic       pointer                  dcl 4-15 set ref 285* 286 292
+lock_transaction_table                 based           structure                level 1 dcl 4-69
+lock_transaction_table_ptr      000130 automatic       pointer                  dcl 4-16 set ref 201 225 293* 299* 301 301 310 311
+                                                                                  312 313 314
+lock_virtual_ptr                       based           structure                level 1 dcl 4-145
+mode                      1            based           fixed bin(17,0)          level 2 dcl 3-32 set ref 361* 366 367 367 372*
+mode_obtained                   000105 automatic       fixed bin(17,0)          dcl 78 set ref 172* 175 177
+mode_req                        000106 automatic       fixed bin(17,0)          dcl 79 set ref 158* 165* 169* 172 175 175* 177 179
+n_ht_entries                           based           fixed bin(17,0)          level 2 dcl 3-17 ref 520
+new_area                               based           area                     dcl 495 set ref 500 500* 501*
+new_area_ptr                    000102 automatic       pointer                  dcl 494 set ref 500* 501 502
+new_area_size                   000100 automatic       fixed bin(35,0)          dcl 493 set ref 499* 500 500 503
+new_mode                        000171 automatic       fixed bin(17,0)          dcl 348 set ref 366* 367 370*
+null                                                   builtin function         dcl 149 ref 287 287 353 430 432 435 463 469 520 537
+                                                                                  537
+own_ptr                   6            based           structure                level 2 dcl 4-69 set ref 313*
+p_checkpoint_id                        parameter       bit(36)                  dcl 62 ref 246 253 260
+p_ci_number                            parameter       fixed bin(27,0)          dcl 60 ref 55 157 187 191 246
+p_code                                 parameter       fixed bin(35,0)          dcl 64 set ref 55 155* 175* 179* 179 187 192* 207*
+                                                                                  208 208* 234 240* 246 249* 253 256* 260 263* 547*
+p_f_uid                                parameter       bit(36)                  dcl 68 ref 55 156 187 190 246
+p_mode_obtained                        parameter       fixed bin(17,0)          dcl 66 set ref 55 169* 175* 179 246
+p_mode_req                             parameter       fixed bin(17,0)          dcl 67 ref 55 158 246
+p_timeout                              parameter       fixed bin(71,0)          dcl 70 ref 55 159 246
+per_process_file_lock                  based           structure                level 1 dcl 3-32 set ref 512
+per_process_file_lock_ptr       000124 automatic       pointer                  dcl 3-30 set ref 352* 353 355* 360 361 362* 366 367
+                                                                                  367 372
+process_id                1            based           bit(36)                  level 2 dcl 4-69 set ref 310*
+set_code_parm_on_error_return   000110 automatic       bit(1)                   unaligned dcl 81 set ref 160* 193* 222* 241* 547
+sub_err_                        000044 constant        entry                    external dcl 125 ref 287 537
+timeout                         000112 automatic       fixed bin(71,0)          dcl 82 set ref 159* 169* 172* 175*
+transaction_table        20            based           structure                array level 2 dcl 4-34 set ref 292
+txn_id                    2            based           bit(36)                  level 2 dcl 4-69 set ref 201 225 301 301* 311*
+version                                based           char(8)                  level 2 dcl 4-34 set ref 286*
+vm_mode                                parameter       fixed bin(17,0)          dcl 326 ref 323 328 328
+wait_ptr                  7            based           structure                level 2 dcl 4-69 set ref 314*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+ACTION_CAN_RESTART                     internal static bit(36)                  initial dcl 2-7
+ACTION_DEFAULT_RESTART                 internal static bit(36)                  initial dcl 2-7
+ACTION_QUIET_RESTART                   internal static bit(36)                  initial dcl 2-7
+ACTION_SUPPORT_SIGNAL                  internal static bit(36)                  initial dcl 2-7
+CRASH_SV                               internal static fixed bin(17,0)          initial dcl 6-34
+ERROR_SV                               internal static fixed bin(17,0)          initial dcl 6-36
+FATAL_SV                               internal static fixed bin(17,0)          initial dcl 6-34
+LOCK_BLOCK_SIZE                        internal static fixed bin(17,0)          initial dcl 4-176
+LOCK_MESSAGE_DEADLOCK                  internal static fixed bin(71,0)          initial dcl 4-183
+LOCK_METERS_VERSION_1                  internal static char(8)                  initial dcl 5-17
+LOCK_MODE_IS                           internal static fixed bin(17,0)          initial dcl 1-19
+LOCK_MODE_IX                           internal static fixed bin(17,0)          initial dcl 1-20
+LOCK_MODE_X                            internal static fixed bin(17,0)          initial dcl 1-18
+LOCK_SEGNAME                           internal static char(9)                  initial unaligned dcl 4-179
+LOG_SV                                 internal static fixed bin(17,0)          initial dcl 6-40
+MAX_TYPE                               internal static fixed bin(17,0)          initial dcl 4-162
+PRINT_SV                               internal static fixed bin(17,0)          initial dcl 6-32
+QUERY_SV                               internal static fixed bin(17,0)          initial dcl 6-32
+TYPE_FREE                              internal static fixed bin(17,0)          initial dcl 4-162
+TYPE_OBJECT                            internal static fixed bin(17,0)          initial dcl 4-162
+TYPE_OWNER                             internal static fixed bin(17,0)          initial dcl 4-162
+TYPE_WAITER                            internal static fixed bin(17,0)          initial dcl 4-162
+dm_error_$lock_deadlock                external static fixed bin(35,0)          dcl 108
+dm_system_data_$max_n_transactions     external static fixed bin(17,0)          dcl 101
+hashx                                  automatic       fixed bin(17,0)          dcl 77
+lm_per_system_$checkpoint       000000 constant        entry                    external dcl 127
+lm_per_system_$lock_resolve_deadlock
+                                000000 constant        entry                    external dcl 130
+lm_per_system_$unlock_to_checkpoint
+                                000000 constant        entry                    external dcl 135
+lm_signal_deadlock_             000000 constant        entry                    external dcl 137
+lock_aux_seg                           based           structure                level 1 dcl 4-62
+lock_aux_seg_ptr                       automatic       pointer                  dcl 4-19
+lock_block_array                       based           structure                array level 1 dcl 4-90
+lock_block_array_ptr                   automatic       pointer                  dcl 4-21
+lock_block_ptr                         automatic       pointer                  dcl 4-20
+lock_deadlock                          based           structure                level 1 dcl 4-149
+lock_deadlock_36                       based           structure                level 1 dcl 4-152
+lock_deadlock_72                       based           structure                level 1 dcl 4-155
+lock_deadlock_ptr                      automatic       pointer                  dcl 4-27
+lock_deadlock_txn_ids                  based           bit(36)                  array dcl 4-161
+lock_deadlock_txn_ids_ptr              automatic       pointer                  dcl 4-159
+lock_free_block                        based           structure                level 1 dcl 4-92
+lock_free_block_ptr                    automatic       pointer                  dcl 4-22
+lock_hash_table_ptr                    automatic       pointer                  dcl 4-18
+lock_meters_ptr                        automatic       pointer                  dcl 5-16
+lock_object                            based           structure                level 1 dcl 4-100
+lock_object_ptr                        automatic       pointer                  dcl 4-23
+lock_owner                             based           structure                level 1 dcl 4-113
+lock_owner_ptr                         automatic       pointer                  dcl 4-24
+lock_segments                          based           structure                level 1 dcl 4-142
+lock_segments_ptr                      automatic       pointer                  dcl 4-25
+lock_segno                             automatic       picture(3)               unaligned dcl 4-181
+lock_waiter                            based           structure                level 1 dcl 4-128
+lock_waiter_ptr                        automatic       pointer                  dcl 4-26
+n_hash_table_entries                   automatic       fixed bin(17,0)          dcl 3-26
+n_lock_blocks                          automatic       fixed bin(17,0)          dcl 4-29
+n_lock_deadlock                        automatic       fixed bin(17,0)          dcl 4-30
+unspec                                                 builtin function         dcl 150
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+ALLOCATE_FILE                   001716 constant        entry                    internal dcl 476 ref 355
+AREA_TOO_SMALL                  001742 constant        entry                    internal dcl 490 ref 482
+CHECK_VERSION                   002071 constant        entry                    internal dcl 528 ref 286
+CLAIM_TRANSACTION_TABLE         001230 constant        entry                    internal dcl 307 ref 296
+Common                          001076 constant        label                    dcl 283 ref 276
+ERROR_RETURN                    002164 constant        entry                    internal dcl 543 ref 177 208 328 383 497
+FLUSH_PER_PROCESS               002046 constant        entry                    internal dcl 516 ref 230 242 294
+FREE_FILE                       002041 constant        entry                    internal dcl 508 ref 438
+HASH_IN                         001553 constant        entry                    internal dcl 400 ref 362
+HASH_OUT                        001574 constant        entry                    internal dcl 417 ref 211
+HASH_SEARCH                     001654 constant        entry                    internal dcl 451 ref 352
+LOCK_FILE                       001275 constant        entry                    internal dcl 335 ref 169 172
+MAIN_RETURN                     000570 constant        label                    dcl 184 ref 548
+NOOP                            001062 constant        entry                    external dcl 524 ref 162 487
+RETRY_ALLOC                     001723 constant        label                    dcl 484 ref 504
+SETUP                           001070 constant        entry                    internal dcl 270 ref 195 223
+SETUP$$LOCK                     001073 constant        entry                    internal dcl 278 ref 167
+VALIDATE_MODE                   001256 constant        entry                    internal dcl 323 ref 165
+abandon                         000757 constant        entry                    external dcl 234
+checkpoint                      001023 constant        entry                    external dcl 253
+lm_per_process_$lock            000265 constant        entry                    external dcl 55
+lock_resolve_deadlock           001001 constant        entry                    external dcl 246
+unlock                          000575 constant        entry                    external dcl 187
+unlock_all                      000733 constant        entry                    external dcl 219
+unlock_to_checkpoint            001043 constant        entry                    external dcl 260
+
+NAME DECLARED BY CONTEXT OR IMPLICATION.
+empty                                                  builtin function         ref 500 519
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      2616        2676    2224        2626
+Length      3264    2224        60         352     372           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+lm_per_process_$lock                440 external procedure  is an external procedure.  
+on unit on line 163                  64 on unit               
+SETUP                                   internal procedure  shares stack frame of external procedure lm_per_process_$lock.  
+CLAIM_TRANSACTION_TABLE                 internal procedure  shares stack frame of external procedure lm_per_process_$lock.  
+VALIDATE_MODE                           internal procedure  shares stack frame of external procedure lm_per_process_$lock.  
+LOCK_FILE                               internal procedure  shares stack frame of external procedure lm_per_process_$lock.  
+HASH_IN                                 internal procedure  shares stack frame of external procedure lm_per_process_$lock.  
+HASH_OUT                                internal procedure  shares stack frame of external procedure lm_per_process_$lock.  
+HASH_SEARCH                             internal procedure  shares stack frame of external procedure lm_per_process_$lock.  
+ALLOCATE_FILE                           internal procedure  shares stack frame of external procedure lm_per_process_$lock.  
+AREA_TOO_SMALL                       86 internal procedure  is assigned to an entry variable, and enables or reverts conditions.  
+on unit on line 497                  70 on unit               
+FREE_FILE                               internal procedure  shares stack frame of external procedure lm_per_process_$lock.  
+FLUSH_PER_PROCESS                       internal procedure  shares stack frame of external procedure lm_per_process_$lock.  
+CHECK_VERSION                           internal procedure  shares stack frame of external procedure lm_per_process_$lock.  
+ERROR_RETURN                         64 internal procedure  is called by several nonquick procedures.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+AREA_TOO_SMALL           000100 new_area_size               AREA_TOO_SMALL
+                         000102 new_area_ptr                AREA_TOO_SMALL
+lm_per_process_$lock     000100 area_handler                lm_per_process_$lock
+                         000104 ci_number                   lm_per_process_$lock
+                         000105 mode_obtained               lm_per_process_$lock
+                         000106 mode_req                    lm_per_process_$lock
+                         000107 f_uid                       lm_per_process_$lock
+                         000110 set_code_parm_on_error_return
+                                                            lm_per_process_$lock
+                         000112 timeout                     lm_per_process_$lock
+                         000122 lock_per_process_ptr        lm_per_process_$lock
+                         000124 per_process_file_lock_ptr   lm_per_process_$lock
+                         000126 lock_seg_ptr                lm_per_process_$lock
+                         000130 lock_transaction_table_ptr  lm_per_process_$lock
+                         000144 lock_entry                  SETUP
+                         000170 lf_code                     LOCK_FILE
+                         000171 new_mode                    LOCK_FILE
+                         000200 hi_hashx                    HASH_IN
+                         000210 ho_hashx                    HASH_OUT
+                         000212 ho_file_ptr                 HASH_OUT
+                         000214 ho_prev_file_ptr            HASH_OUT
+                         000224 hs_hashx                    HASH_SEARCH
+                         000226 hs_file_ptr                 HASH_SEARCH
+                         000236 af_new_file_ptr             ALLOCATE_FILE
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+r_e_as              r_ne_as             call_var            call_ext_out_desc   call_ext_out        call_int_this
+call_int_other      return              tra_ext             enable              ext_entry           int_entry
+pointer_hard        offset_hard         alloc_based         free_based          empty
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+area_assign_                  get_process_id_               lm_log_                       lm_per_system_$lock
+lm_per_system_$unlock         lm_per_system_$unlock_all     sub_err_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+dm_data_$current_txn_id       dm_data_$current_txn_index    dm_data_$inner_ring_areap     dm_error_$lock_invalid_mode
+dm_error_$no_current_transaction                            dm_error_$per_process_area_overflow
+dm_error_$unimplemented_entry error_table_$unimplemented_version                          lm_data_$current_txn_id
+lm_data_$lock_per_process_ptr lm_data_$lock_seg_ptr         lm_data_$trace                lm_data_$txn_table_ptr
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     55 000257       155 000275       156 000276       157 000300       158 000302       159 000304       160 000306
+    162 000310       163 000314       165 000336       167 000340       169 000341       172 000375       175 000425
+    177 000456       179 000467       184 000570       187 000571       190 000605       191 000610       192 000612
+    193 000613       195 000615       197 000616       201 000676       207 000701       208 000714       211 000724
+    215 000731       219 000732       222 000740       223 000741       225 000742       229 000745       230 000752
+    231 000753       234 000754       240 000767       241 000770       242 000771       243 000772       246 000773
+    249 001013       250 001016       253 001017       256 001035       257 001040       260 001041       263 001055
+    264 001060       524 001061       526 001067       270 001070       275 001071       276 001072       278 001073
+    281 001074       283 001076       285 001102       286 001105       287 001122       290 001175       292 001201
+    293 001206       294 001207       296 001210       298 001213       299 001214       301 001217       305 001227
+    307 001230       310 001231       311 001241       312 001245       313 001247       314 001251       315 001253
+    316 001255       323 001256       328 001260       331 001274       335 001275       350 001277       352 001300
+    353 001310       355 001314       356 001322       358 001344       360 001346       361 001351       362 001354
+    364 001356       366 001357       367 001366       370 001373       372 001414       377 001422       383 001542
+    386 001552       400 001553       409 001555       410 001563       411 001566       413 001573       417 001574
+    429 001576       430 001603       431 001605       432 001612       433 001616       435 001622       437 001634
+    438 001640       439 001642       442 001643       443 001645       445 001652       447 001653       451 001654
+    461 001656       462 001663       463 001667       464 001674       466 001703       467 001711       469 001712
+    476 001716       482 001720       484 001723       487 001731       488 001735       490 001741       497 001747
+    499 001773       500 002000       501 002011       502 002030       503 002034       504 002036       508 002041
+    512 002043       513 002045       516 002046       519 002047       520 002053       521 002070       528 002071
+    537 002073       541 002162       543 002163       547 002171       548 002177
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

@@ -1,0 +1,1635 @@
+	COMPILATION LISTING OF SEGMENT fm_do_
+	Compiled by: Multics PL/I Compiler, Release 29, of July 28, 1986
+	Compiled at: Honeywell Bull, Phx. Az., Sys-M 
+	Compiled on: 04/02/87  1311.2 mst Thu
+	    Options: optimize map
+
+        1 /****^  ***********************************************************
+        2*        *                                                         *
+        3*        * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        4*        *                                                         *
+        5*        *********************************************************** */
+        6 
+        7 
+        8 
+        9 /****^  HISTORY COMMENTS:
+       10*  1) change(87-01-15,Hergert), approve(87-04-01,MCR7632),
+       11*     audit(87-02-02,Dupuis), install(87-04-02,MR12.1-1020):
+       12*     For TR phx20754, added code to check the version (not *another* structure
+       13*     version check!?!) of the key_count_array and make sure that we really
+       14*     have a key_count_array in case it has moved on us.
+       15*                                                   END HISTORY COMMENTS */
+       16 
+       17 
+       18 /* DESCRIPTION:
+       19*   
+       20*        This procedure implements the "do" primitives of file_manager_:
+       21*   postcommit_do and undo.
+       22*   
+       23*   $undo: this entry rolls back an operation.  It implements
+       24*   file_manager_$undo, called by before_journal_manager_ while rolling
+       25*   back a transaction.  The information passed to this entry is that found
+       26*   in a rollback handler in a before journal.  One of two operations can
+       27*   be undone: file creation and file deletion.
+       28*   
+       29*   $postcommit_do: this entry completes an operation which
+       30*   started in a transaction and which, because of integrity constraints,
+       31*   cannot be completed until after the transaction commits.  This entry
+       32*   implements file_manager_$postcommit_do and is called by
+       33*   before_journal_manager_ while committing a transaction.  The
+       34*   information passed to this entry is that found in a postcommit handler
+       35*   in a before journal.  Only one operation needs to be completed after
+       36*   the transaction commits, file deletion.
+       37**/
+       38 
+       39 /* HISTORY:
+       40*
+       41*Written by Matthew C. Pierret, 10/17/84.
+       42*Modified:
+       43*12/10/84 by Matthew Pierret:  Changed to set validation level.
+       44*12/17/84 by Matthew Pierret:  Changed to set the file state in the
+       45*            file_access_info.
+       46*01/10/85 by Matthew C. Pierret:  Changed UNDO_DELETE to not check for a match
+       47*            between the given file uid and the file system uid.  It is not
+       48*            necessarily incorrect for these two values to be different.
+       49*02/28/85 by Matthew C. Pierret:  Changed UNDO_CREATE and DO_DELETE to delete
+       50*            the file before removing the entry in sys_pn_tbl.
+       51*03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+       52*03/11/85 by Matthew C. Pierret:  Added the increments postcommit handler.
+       53*03/11/85 by R. Michael Tague:  Completed implementation of the increments
+       54*	  postcommit handler.
+       55*04/22/85 by R. Michael Tague:  Changed to use $internal_get_ci_ptr instead of
+       56*	  $get_ci_ptr to get around the problem of updating increment info
+       57*	  on files that have been closed.  This returns a pointer even if the
+       58*	  file is closed.
+       59*04/25/85 by Matthew C. Pierret:  Changed UNDO_CREATE and DO_DELETE to not
+       60*            remove entries from sys_pn_tbl.  This guarantees that even if
+       61*            rollbacks are repeated, the file uid in each active before journal
+       62*            record can also be found in sys_pn_tbl.  The sys_pn_tbl entries
+       63*            are now deleted during the post-transaction phase of the
+       64*            commit/abort.  SET_ENTRY_STATE is used to be sure that the file is
+       65*            scheduled for post-transaction actions.
+       66*05/03/85 by Matthew Pierret:  Changed UNDO_CREATE and DO_DELETE to discard
+       67*            modified pages for the file to be deleted from the list of modified
+       68*            pages maintained for flushing.
+       69**/
+       70 
+       71 /* format: style2,ind3,ll79,comcol50,^indprocbody,^indnoniterdo,indnoniterend */
+       72 /* format: ^indblkcom,indcomtxt */
+       73 
+       74 fm_do_$undo:
+       75    proc (p_file_uid, p_file_oid, p_rollback_info_ptr, p_rollback_info_length,
+       76         p_code);
+       77 
+       78 /* START OF DECLARATIONS */
+       79 /* Parameter */
+       80 
+       81    dcl	 p_file_uid	    bit (36) aligned;
+       82 				         /* Unique id of file. */
+       83    dcl	 p_file_oid	    bit (36) aligned;
+       84 				         /* Opening id of file */
+       85    dcl	 p_rollback_info_ptr    ptr;	         /* points to rollback info. */
+       86    dcl	 p_rollback_info_length fixed bin;     /* byte length of rollback_info */
+       87    dcl	 p_postcommit_info_ptr  ptr;	         /* points to postcommit info. */
+       88    dcl	 p_postcommit_info_length
+       89 			    fixed bin;     /* byte length of postcommit_info */
+       90    dcl	 p_code		    fixed bin (35);
+       91 
+       92 /* Automatic */
+       93 
+       94    dcl	 my_file_oid	    bit (36) aligned init (""b);
+       95    dcl	 my_file_uid	    bit (36) aligned init (""b);
+       96    dcl	 saved_validation_level fixed bin init (0);
+       97 
+       98 /* Based */
+       99 /* Builtin */
+      100 
+      101    dcl	 (addbitno, addr, lbound, null, rtrim, stacq, substr)
+      102 			    builtin;
+      103 
+      104 /* Condition */
+      105 
+      106    dcl	 cleanup		    condition;
+      107 
+      108 /* Constant */
+      109 
+      110    dcl	 myname		    init ("fm_do_") char (32) varying
+      111 			    internal static options (constant);
+      112    dcl	 BITS_PER_BYTE	    fixed bin init (9) internal static
+      113 			    options (constant);
+      114    dcl	 BITS_PER_WORD	    fixed bin init (36) internal static
+      115 			    options (constant);
+      116    dcl	 MAX_UPDATE_ATTEMPTS    fixed bin (35) init (10000) internal
+      117 			    static options (constant);
+      118    dcl	 (
+      119 	 POSTCOMMIT_ACTION	    init ("complete"),
+      120 	 UNDO_ACTION	    init ("undo")
+      121 	 )		    char (8) internal static options (constant);
+      122 
+      123 /* Entry */
+      124 
+      125    dcl	 cu_$level_get	    entry (fixed bin);
+      126    dcl	 cu_$level_set	    entry (fixed bin);
+      127    dcl	 dm_misc_util_$log	    entry options (variable);
+      128    dcl	 get_ring_	    entry () returns (fixed bin (3));
+      129    dcl	 fm_get_$internal_get_ci_ptr
+      130 			    entry (bit (36) aligned,
+      131 			    fixed bin (27) aligned, ptr, fixed bin (35));
+      132    dcl	 fm_put_$discard_file_flush_list
+      133 			    entry (bit (36) aligned, fixed bin (35));
+      134    dcl	 fm_sys_pn_tbl_util_$rename
+      135 			    entry (bit (36) aligned, fixed bin,
+      136 			    char (32));
+      137    dcl	 fm_sys_pn_tbl_util_$redelete_force
+      138 			    entry (bit (36) aligned, fixed bin);
+      139    dcl	 hcs_$chname_file	    entry (char (*), char (*), char (*),
+      140 			    char (*), fixed bin (35));
+      141    dcl	 hcs_$del_dir_tree	    entry (char (*), char (*), fixed bin (35));
+      142    dcl	 hcs_$delentry_file	    entry (char (*), char (*), fixed bin (35));
+      143    dcl	 hcs_$set_safety_sw	    entry (char (*), char (*), bit (1),
+      144 			    fixed bin (35));
+      145    dcl	 ioa_$rsnnl	    entry () options (variable);
+      146    dcl	 pathname_	    entry (char (*), char (*))
+      147 			    returns (char (168));
+      148 
+      149 /* External */
+      150 
+      151    dcl	 dm_error_$bad_file_oid fixed bin (35) ext;
+      152    dcl	 dm_error_$fm_bad_postcommit_operation
+      153 			    fixed bin (35) ext;
+      154    dcl	 dm_error_$fm_bad_undo_op
+      155 			    fixed bin (35) ext;
+      156    dcl	 dm_error_$fm_word_increment_error
+      157 			    fixed bin (35) ext;
+      158    dcl	 dm_error_$incr_array_not_found
+      159 			    fixed bin (35) ext;
+      160    dcl	 error_table_$segnamedup
+      161 			    fixed bin (35) ext;
+      162    dcl	 error_table_$noentry   fixed bin (35) ext;
+      163    dcl	 error_table_$unimplemented_version
+      164 			    fixed bin (35) ext;
+      165 
+      166 /* END OF DECLARATIONS */
+      167 
+      168 /* undo: entry (p_file_uid, p_file_oid, p_rollback_info_ptr, p_rollback_info_length, p_code); */
+      169 
+      170 /* DESCRIPTION:
+      171*
+      172*   This entry implements file_manager_$undo.  It rolls back the
+      173*   creation and deletion of files.  The undo algorithm must be
+      174*   idempotent so that it can be interrupted and restarted without
+      175*   causing an error.  The algorithms used for each of creation
+      176*   and deletion are described in the subroutine which implements
+      177*   the algorithm (UNDO_CREATE and UNDO_DELETE).
+      178*
+      179*   The create_rollback_info and delete_rollback_info are of fixed sizes,
+      180*   so p_rollback_info_length is presently not used.
+      181**/
+      182 
+      183    p_code = 0;
+      184    my_file_uid = p_file_uid;
+      185    my_file_oid = p_file_oid;
+      186    rollback_info_ptr = p_rollback_info_ptr;
+      187    if rollback_info_header.version ^= ROLLBACK_INFO_VERSION_1
+      188    then call ERROR_RETURN (error_table_$unimplemented_version,
+      189 	   VERSION_ERROR_MESSAGE (ROLLBACK_INFO_VERSION_1,
+      190 	   rollback_info_header.version, "rollback_info"));
+      191 
+      192    call cu_$level_get (saved_validation_level);
+      193    on cleanup call RESET_LEVEL ();
+      194 
+      195    if rollback_info_header.operation = DELETE_ROLLBACK_OPERATION
+      196    then call UNDO_DELETE (my_file_uid, my_file_oid, rollback_info_ptr);
+      197    else if rollback_info_header.operation = CREATE_ROLLBACK_OPERATION
+      198    then call UNDO_CREATE (my_file_uid, my_file_oid, rollback_info_ptr);
+      199    else call ERROR_RETURN (dm_error_$fm_bad_undo_op,
+      200 	   rollback_info_header.operation);
+      201 
+      202    call RESET_LEVEL ();
+      203 
+      204    call RETURN ();
+      205 
+      206 postcommit_do:
+      207    entry (p_file_uid, p_file_oid, p_postcommit_info_ptr,
+      208         p_postcommit_info_length, p_code);
+      209 
+      210 /* DESCRIPTION:
+      211*
+      212*   This entry implement file_manager_$postcommit_do.  It performs
+      213*   actions which cannot be done during a transaction, but must wait
+      214*   until the transaction has committed.  Currently there are two
+      215*   such sets of actions, those being for file deletion and for
+      216*   incrementing an array of words.  File deletion is delayed to
+      217*   save us from having to make a before image of each control interval
+      218*   in the file.  Incrementing an array of words is specifically for
+      219*   handling the index_mnager_'s key_count_array, which is too heavily hit
+      220*   to be exclusively locked.
+      221*
+      222*   The algorithms used are described in the DO_DELETE and DO_INCREMENT
+      223*   subroutines.  The delete_postcommit_info is fixed size, so the
+      224*   p_postcommit_info_length is not used presently.
+      225**/
+      226 
+      227    p_code = 0;
+      228    my_file_uid = p_file_uid;
+      229    my_file_oid = p_file_oid;
+      230    postcommit_info_ptr = p_postcommit_info_ptr;
+      231    if postcommit_info_header.version ^= POSTCOMMIT_INFO_VERSION_1
+      232    then call ERROR_RETURN (error_table_$unimplemented_version,
+      233 	   VERSION_ERROR_MESSAGE (POSTCOMMIT_INFO_VERSION_1,
+      234 	   postcommit_info_header.version, "postcommit_info"));
+      235 
+      236    call cu_$level_get (saved_validation_level);
+      237    on cleanup call RESET_LEVEL ();
+      238 
+      239    if postcommit_info_header.operation = DELETE_POSTCOMMIT_OPERATION
+      240    then call DO_DELETE (my_file_uid, my_file_oid, postcommit_info_ptr);
+      241    else if postcommit_info_header.operation = INCREMENT_POSTCOMMIT_OPERATION
+      242    then call DO_INCREMENT (my_file_uid, my_file_oid, postcommit_info_ptr);
+      243    else call ERROR_RETURN (dm_error_$fm_bad_postcommit_operation,
+      244 	   postcommit_info_header.operation);
+      245 
+      246    call RESET_LEVEL ();
+      247 
+      248    call RETURN ();
+      249 
+      250 MAIN_RETURN:
+      251    return;
+      252 
+      253 RETURN:
+      254    proc ();
+      255    p_code = 0;
+      256    go to MAIN_RETURN;
+      257    end RETURN;
+      258 
+      259 ERROR_RETURN:
+      260    proc (er_p_code, er_p_message);
+      261 
+      262    dcl	 er_p_code	    fixed bin (35);
+      263    dcl	 er_p_message	    char (*);
+      264 
+      265    p_code = er_p_code;
+      266    call LOG_ERROR (er_p_code, er_p_message);
+      267    call RESET_LEVEL ();
+      268    go to MAIN_RETURN;
+      269    end ERROR_RETURN;
+      270 
+      271 
+      272 
+      273 LOG_ERROR:
+      274    proc (le_p_code, le_p_message);
+      275 
+      276    dcl	 le_p_code	    fixed bin (35);
+      277    dcl	 le_p_message	    char (*);
+      278 
+      279    call dm_misc_util_$log (LOG_SV, le_p_code, myname, le_p_message);
+      280    return;
+      281    end LOG_ERROR;
+      282 
+      283 ACTION_ERROR_MESSAGE:
+      284    proc (aem_p_action, aem_p_operation, aem_p_file) returns (char (*));
+      285 
+      286    dcl	 aem_p_action	    char (8);
+      287    dcl	 aem_p_operation	    char (8);
+      288    dcl	 aem_p_file	    char (168);
+      289    dcl	 aem_return_string	    char (256);
+      290    dcl	 aem_return_length	    fixed bin (21);
+      291 
+      292    call ioa_$rsnnl ("Unable to ^a the ^a of ^a.", aem_return_string,
+      293         aem_return_length, aem_p_action, aem_p_operation, aem_p_file);
+      294    return (substr (aem_return_string, 1, aem_return_length));
+      295 
+      296    end ACTION_ERROR_MESSAGE;
+      297 
+      298 VERSION_ERROR_MESSAGE:
+      299    proc (vem_p_expected_version, vem_p_given_version, vem_p_structure)
+      300         returns (char (*));
+      301 
+      302    dcl	 vem_p_expected_version char (8);
+      303    dcl	 vem_p_given_version    char (8);
+      304    dcl	 vem_p_structure	    char (*);
+      305    dcl	 vem_return_string	    char (256);
+      306    dcl	 vem_return_length	    fixed bin (21);
+      307 
+      308    call ioa_$rsnnl ("Expected version ^a of ^a; received ^a.",
+      309         vem_return_string, vem_return_length, vem_p_expected_version,
+      310         vem_p_structure, vem_p_given_version);
+      311    return (substr (vem_return_string, 1, vem_return_length));
+      312 
+      313    end VERSION_ERROR_MESSAGE;
+      314 
+      315 RESET_LEVEL:
+      316    proc ();
+      317 
+      318    if saved_validation_level > 0
+      319    then call cu_$level_set (saved_validation_level);
+      320 
+      321    end RESET_LEVEL;
+      322 
+      323 UNDO_CREATE:
+      324    proc (uc_p_file_uid, uc_p_file_oid, uc_p_create_rollback_info_ptr);
+      325 
+      326 /* DESCRIPTION of UNDO_CREATE:
+      327*
+      328*   The algorithm to undo creation is:
+      329*
+      330*   1) Discard entries for this file in the list of modified pages
+      331*   for this transaction.  We don't want the segment numbers in that list
+      332*   re-used while flushing.
+      333*   2) If uc_p_file_oid is non-null, meaning that the undo is being
+      334*   performed by the process which created the transaction, mark
+      335*   the per-process file access info to have a state of
+      336*   FILE_DOES_NOT_EXIST.
+      337*   3) Delete the file.
+      338*   4) If uc_p_file_oid is non-null, mark the file access info as
+      339*   requiring post-transaction actions.  In the post-transaction
+      340*   phase of the abort, the file's uid will be removed from the
+      341*   uid-pathname table (sys_pn_tbl).  This action is delayed so
+      342*   that if the abort is repeated, the uid will still be in sys_pn_tbl.
+      343**/
+      344 
+      345    dcl	 uc_p_file_uid	    bit (36) aligned parameter;
+      346    dcl	 uc_p_file_oid	    bit (36) aligned parameter;
+      347    dcl	 uc_p_create_rollback_info_ptr
+      348 			    ptr parameter;
+      349    dcl	 uc_sys_pn_tbl_index    fixed bin;
+      350    dcl	 uc_dir_path	    char (168);
+      351    dcl	 uc_file_name	    char (32);
+      352    dcl	 uc_code		    fixed bin (35);
+      353 
+      354    uc_sys_pn_tbl_index =
+      355         uc_p_create_rollback_info_ptr -> create_rollback_info.sys_pn_tbl_index;
+      356    uc_dir_path =
+      357         uc_p_create_rollback_info_ptr -> create_rollback_info.dir_path;
+      358    uc_file_name =
+      359         uc_p_create_rollback_info_ptr -> create_rollback_info.file_name;
+      360 
+      361    call cu_$level_set ((get_ring_ ()));
+      362 
+      363 
+      364    call SET_FILE_STATE (uc_p_file_oid, FILE_DOES_NOT_EXIST);
+      365 
+      366    uc_code = 0;
+      367    call fm_put_$discard_file_flush_list (uc_p_file_uid, uc_code);
+      368    if uc_code ^= 0
+      369    then call ERROR_RETURN (uc_code,
+      370 	   ACTION_ERROR_MESSAGE (UNDO_ACTION, CREATE_ROLLBACK_OPERATION,
+      371 	   pathname_ (rtrim (uc_dir_path), uc_file_name)));
+      372    call hcs_$set_safety_sw (uc_dir_path, uc_file_name, "0"b, uc_code);
+      373    if uc_code ^= 0 & uc_code ^= error_table_$noentry
+      374    then call ERROR_RETURN (uc_code,
+      375 	   ACTION_ERROR_MESSAGE (UNDO_ACTION, CREATE_ROLLBACK_OPERATION,
+      376 	   pathname_ (rtrim (uc_dir_path), uc_file_name)));
+      377    if uc_code ^= error_table_$noentry
+      378    then
+      379       do;
+      380       call hcs_$del_dir_tree (uc_dir_path, uc_file_name, uc_code);
+      381       if uc_code ^= 0
+      382       then call ERROR_RETURN (uc_code,
+      383 	      ACTION_ERROR_MESSAGE (UNDO_ACTION, CREATE_ROLLBACK_OPERATION,
+      384 	      pathname_ (rtrim (uc_dir_path), uc_file_name)));
+      385       call hcs_$delentry_file (uc_dir_path, uc_file_name, uc_code);
+      386       if uc_code ^= 0
+      387       then call ERROR_RETURN (uc_code,
+      388 	      ACTION_ERROR_MESSAGE (UNDO_ACTION, CREATE_ROLLBACK_OPERATION,
+      389 	      pathname_ (rtrim (uc_dir_path), uc_file_name)));
+      390       end;
+      391 
+      392    call SET_ENTRY_STATE (uc_p_file_oid);
+      393 
+      394    return;
+      395 
+      396    end UNDO_CREATE;
+      397 
+      398 UNDO_DELETE:
+      399    proc (ud_p_file_uid, ud_p_file_oid, ud_p_delete_rollback_info_ptr);
+      400 
+      401 /* DESCRIPTION of UNDO_DELETE:
+      402*
+      403*   The algorithm to undo deletion is:
+      404*
+      405*   0) The initial state should have a file with a delete-name
+      406*   and an entry in sys_pn_tbl with the delete-name, or any
+      407*   intermediate state during this algorithm.
+      408*   1) Add the predelete-name back to the file. If no error
+      409*   occurs, or an error occurs because then name is already on
+      410*   the entry or the entry does not exist, continue.
+      411*   Otherwise, a real error has occured.
+      412*   2) Change the file name in the sys_pn_tbl from the delete-name
+      413*   to the predelete-name.  Whether this step has been done once
+      414*   before or not, an entry must exist in the sys_pn_tbl, so
+      415*   a real error occurs if this step fails. fm_sys_pn_tbl_util_$rename
+      416*   does not return if an error occurs (it signals fm_sub_error_).
+      417*   3) Remove the delete-name from the file.  If the file is
+      418*   not found, assume we have already done this step.  Any other
+      419*   error is a real error.
+      420**/
+      421 
+      422    dcl	 ud_p_file_uid	    bit (36) aligned parameter;
+      423    dcl	 ud_p_file_oid	    bit (36) aligned parameter;
+      424    dcl	 ud_p_delete_rollback_info_ptr
+      425 			    ptr parameter;
+      426    dcl	 ud_sys_pn_tbl_index    fixed bin;
+      427    dcl	 ud_dir_path	    char (168);
+      428    dcl	 ud_predelete_name	    char (32);
+      429    dcl	 ud_postdelete_name	    char (32);
+      430    dcl	 ud_postdelete_path	    char (168);
+      431    dcl	 ud_code		    fixed bin (35);
+      432 
+      433    ud_sys_pn_tbl_index =
+      434         ud_p_delete_rollback_info_ptr -> delete_rollback_info.sys_pn_tbl_index;
+      435    ud_dir_path =
+      436         ud_p_delete_rollback_info_ptr -> delete_rollback_info.dir_path;
+      437    ud_predelete_name =
+      438         ud_p_delete_rollback_info_ptr -> delete_rollback_info.predelete_name;
+      439    ud_postdelete_name =
+      440         ud_p_delete_rollback_info_ptr -> delete_rollback_info.postdelete_name;
+      441 
+      442    call cu_$level_set ((get_ring_ ()));
+      443    ud_postdelete_path = pathname_ (ud_dir_path, ud_postdelete_name);
+      444    ud_code = 0;
+      445 
+      446    call hcs_$chname_file (ud_dir_path, ud_postdelete_name, "",
+      447         ud_predelete_name, ud_code);
+      448    if ud_code ^= 0 & ud_code ^= error_table_$noentry
+      449         & ud_code ^= error_table_$segnamedup
+      450    then call ERROR_RETURN (ud_code,
+      451 	   ACTION_ERROR_MESSAGE (UNDO_ACTION, DELETE_ROLLBACK_OPERATION,
+      452 	   pathname_ (rtrim (ud_dir_path), ud_postdelete_name)));
+      453 
+      454    call fm_sys_pn_tbl_util_$rename (ud_p_file_uid, ud_sys_pn_tbl_index,
+      455         ud_predelete_name);
+      456 
+      457    call SET_FILE_STATE (ud_p_file_oid, FILE_EXISTS);
+      458 
+      459    call hcs_$chname_file (ud_dir_path, ud_postdelete_name, ud_postdelete_name,
+      460         "", ud_code);
+      461    if ud_code ^= 0 & ud_code ^= error_table_$noentry
+      462    then call ERROR_RETURN (ud_code,
+      463 	   ACTION_ERROR_MESSAGE (UNDO_ACTION, DELETE_ROLLBACK_OPERATION,
+      464 	   pathname_ (rtrim (ud_dir_path), ud_postdelete_name)));
+      465 
+      466    return;
+      467 
+      468    end UNDO_DELETE;
+      469 
+      470 DO_DELETE:
+      471    proc (dd_p_file_uid, dd_p_file_oid, dd_p_delete_postcommit_info_ptr);
+      472 
+      473 /* DESCRIPTION of DO_DELETE:
+      474*
+      475*   This routine does the actual deletion of an already logically deleted file.
+      476*   The algorithm to actually delete a file is:
+      477*
+      478*   0) Normally the file will have a unique name and will have an
+      479*   entry in the sys_pn_tbl with that name.
+      480*   1) Discard entries for this file in the list of modified pages
+      481*   for this transaction.  We don't want the segment numbers in that list
+      482*   re-used while flushing.
+      483*   2) Delete the file.
+      484*   3) If dd_p_file_oid is non-null, meaning that the process which
+      485*   created this transaction is performing this postcommit_do,
+      486*   mark the per-process file access info to state that the file is
+      487*   deleted.
+      488*   4) The file's entry is sys_pn_tbl must be removed, but cannot until
+      489*   after the transaction commits.  If dd_p_file_oid is non-null, then
+      490*   it was scheduled for such post-transaction actions when the file
+      491*   was logically deleted.  If dd_p_file_oid is null, then we can't
+      492*   schedule a post-transaction action.  The entry will stay in sys_pn_tbl
+      493*   until it is salvaged by fm_sys_pn_tbl_util_$insert.
+      494**/
+      495 
+      496    dcl	 dd_p_file_uid	    bit (36) aligned parm;
+      497    dcl	 dd_p_file_oid	    bit (36) aligned parm;
+      498    dcl	 dd_p_delete_postcommit_info_ptr
+      499 			    ptr parameter;
+      500    dcl	 dd_sys_pn_tbl_index    fixed bin;
+      501    dcl	 dd_dir_path	    char (168);
+      502    dcl	 dd_file_name	    char (32);
+      503    dcl	 dd_code		    fixed bin (35);
+      504 
+      505    dd_sys_pn_tbl_index =
+      506         dd_p_delete_postcommit_info_ptr
+      507         -> delete_postcommit_info.sys_pn_tbl_index;
+      508    dd_dir_path =
+      509         dd_p_delete_postcommit_info_ptr -> delete_postcommit_info.dir_path;
+      510    dd_file_name =
+      511         dd_p_delete_postcommit_info_ptr -> delete_postcommit_info.file_name;
+      512 
+      513    call cu_$level_set ((get_ring_ ()));
+      514 
+      515 
+      516    dd_code = 0;
+      517    call fm_put_$discard_file_flush_list (dd_p_file_uid, dd_code);
+      518    if dd_code ^= 0
+      519    then call ERROR_RETURN (dd_code,
+      520 	   ACTION_ERROR_MESSAGE (POSTCOMMIT_ACTION,
+      521 	   DELETE_POSTCOMMIT_OPERATION,
+      522 	   pathname_ (dd_dir_path, dd_file_name)));
+      523    call hcs_$set_safety_sw (dd_dir_path, dd_file_name, "0"b, dd_code);
+      524    if dd_code ^= 0 & dd_code ^= error_table_$noentry
+      525    then call ERROR_RETURN (dd_code,
+      526 	   ACTION_ERROR_MESSAGE (POSTCOMMIT_ACTION,
+      527 	   DELETE_POSTCOMMIT_OPERATION,
+      528 	   pathname_ (rtrim (dd_dir_path), dd_file_name)));
+      529    if dd_code ^= error_table_$noentry
+      530    then
+      531       do;
+      532       call hcs_$del_dir_tree (dd_dir_path, dd_file_name, dd_code);
+      533       if dd_code ^= 0
+      534       then call ERROR_RETURN (dd_code,
+      535 	      ACTION_ERROR_MESSAGE (POSTCOMMIT_ACTION,
+      536 	      DELETE_POSTCOMMIT_OPERATION,
+      537 	      pathname_ (rtrim (dd_dir_path), dd_file_name)));
+      538       call hcs_$delentry_file (dd_dir_path, dd_file_name, dd_code);
+      539       if dd_code ^= 0
+      540       then call ERROR_RETURN (dd_code,
+      541 	      ACTION_ERROR_MESSAGE (POSTCOMMIT_ACTION,
+      542 	      DELETE_POSTCOMMIT_OPERATION,
+      543 	      pathname_ (rtrim (dd_dir_path), dd_file_name)));
+      544       end;
+      545 
+      546    call SET_FILE_STATE (dd_p_file_oid, FILE_DOES_NOT_EXIST);
+      547 
+      548    call SET_ENTRY_STATE (dd_p_file_oid);
+      549 
+      550    return;
+      551 
+      552    end DO_DELETE;
+      553 
+      554 DO_INCREMENT:
+      555    proc (di_p_file_uid, di_p_file_oid, di_p_increment_postcommit_info_ptr);
+      556 
+      557 /* DESCRIPTION of DO_INCREMENT
+      558*
+      559*   This procedure updates an array of words with increment values pointed to by
+      560*   a pointer in the increment postcommit handler.  Since the increment values
+      561*   are stored per process, if this is not the process that wrote the postcommit
+      562*   handler then, we cannot update the file increments.
+      563*
+      564*   The accurate updating of the file values is done using the stacq builtin.
+      565*   Up to MAX_UPDATE_ATTEMPTS attempts at updating the file value using stacq
+      566*   are made before we give up trying.  di_file_word is the word in the DM file
+      567*   to be updated, di_old_file_word is the local copy of this word,
+      568*   di_file_word_increment is the value to be added to the local copy, and
+      569*   di_new_file_word is the local variable containing the sum of the old value
+      570*   and the increment.  The stacq builtin replaces the value in the DM file with
+      571*   the new value if the file value has not changed since it was copied to the
+      572*   local old value.
+      573**/
+      574 
+      575    dcl	 di_p_file_uid	    bit (36) aligned parameter;
+      576    dcl	 di_p_file_oid	    bit (36) aligned parameter;
+      577    dcl	 di_p_increment_postcommit_info_ptr
+      578 			    ptr parameter;
+      579 
+      580    dcl	 1 my_inc_postcommit_info
+      581 			    aligned like increment_postcommit_info;
+      582    dcl	 di_increment_ptr	    ptr;
+      583    dcl	 di_number_of_words	    fixed bin (35);
+      584    dcl	 di_ci_number	    fixed bin (27);
+      585    dcl	 di_offset_in_bytes	    fixed bin (35);
+      586 
+      587    dcl	 di_increment_index	    fixed bin (35);
+      588    dcl	 di_update_attempts	    fixed bin (35);
+      589    dcl	 di_increment_word_ptr  ptr;
+      590    dcl	 di_file_word	    fixed bin (35) aligned
+      591 			    based (di_increment_word_ptr);
+      592    dcl	 di_old_file_word	    fixed bin (35) aligned;
+      593    dcl	 di_new_file_word	    fixed bin (35) aligned;
+      594    dcl	 di_file_word_increment fixed bin (35) aligned
+      595 			    based (di_increment_ptr);
+      596 
+      597    dcl	 di_file_state	    fixed bin;
+      598    dcl	 di_code		    fixed bin (35);
+      599 
+      600    if di_p_file_oid = ""b
+      601    then return;
+      602 
+      603    call GET_FILE_STATE (di_p_file_oid, di_file_state);
+      604    if di_file_state = FILE_DOES_NOT_EXIST
+      605    then return;
+      606 
+      607    call cu_$level_set ((get_ring_ ()));
+      608 
+      609    unspec (my_inc_postcommit_info) =
+      610         unspec (di_p_increment_postcommit_info_ptr
+      611         -> increment_postcommit_info);
+      612    di_increment_ptr = my_inc_postcommit_info.increments_ptr;
+      613    di_number_of_words = my_inc_postcommit_info.number_of_words;
+      614    di_ci_number = my_inc_postcommit_info.ci_number;
+      615    di_offset_in_bytes = my_inc_postcommit_info.offset_in_bytes;
+      616 
+      617    call fm_get_$internal_get_ci_ptr (di_p_file_oid, di_ci_number,
+      618         di_increment_word_ptr, di_code);
+      619    if di_code ^= 0
+      620    then call ERROR_RETURN (di_code,
+      621 	   " Cannot get CI pointer to update increment words.");
+      622 
+      623    di_increment_word_ptr =
+      624         addbitno (di_increment_word_ptr, di_offset_in_bytes * BITS_PER_BYTE);
+      625 
+      626 /* there should be a key_count_array here */
+      627    key_count_array_ptr = addcharno(di_increment_word_ptr,-KEY_COUNT_OFFSET_IN_CHARACTERS);
+      628    if key_count_array.version ^= KEY_COUNT_ARRAY_VERSION_2 then 
+      629         call ERROR_RETURN (dm_error_$incr_array_not_found, "");
+      630 
+      631    do di_increment_index = 1 to di_number_of_words;	
+      632       di_old_file_word = di_file_word;
+      633       di_new_file_word = di_old_file_word + di_file_word_increment;
+      634       do di_update_attempts = 1 to MAX_UPDATE_ATTEMPTS
+      635 	 while (
+      636 	 ^
+      637 	 stacq (unspec (di_file_word), unspec (di_new_file_word),
+      638 	 unspec (di_old_file_word)));
+      639          di_old_file_word = di_file_word;
+      640          di_new_file_word = di_old_file_word + di_file_word_increment;
+      641       end;
+      642       if di_update_attempts > MAX_UPDATE_ATTEMPTS
+      643       then call ERROR_RETURN (dm_error_$fm_word_increment_error,
+      644 	      " Unable to increment DM file word after several tries.");
+      645       di_increment_ptr = addbitno (di_increment_ptr, BITS_PER_WORD);
+      646       di_increment_word_ptr = addbitno (di_increment_word_ptr, BITS_PER_WORD);
+      647    end;
+      648    return;
+      649 
+      650    end DO_INCREMENT;
+      651 
+      652 GET_FILE_STATE:
+      653    proc (gfs_p_file_oid, gfs_p_file_state);
+      654 
+      655 /* DESCRIPTION of GET_FILE_STATE:
+      656*
+      657*   This routine returns the file_state of the file from the process'
+      658*   file_access_info entry in the file_access_table.
+      659*
+      660**/
+      661 
+      662    dcl	 gfs_p_file_oid	    bit (36) aligned parameter;
+      663    dcl	 gfs_p_file_state	    fixed bin parameter;
+      664 
+      665    dcl	 gfs_file_access_table_idx
+      666 			    fixed bin;
+      667    dcl	 gfs_file_uid_tail	    bit (18);
+      668 
+      669    gfs_file_access_table_idx =
+      670         addr (gfs_p_file_oid) -> file_oid.file_access_table_idx;
+      671    gfs_file_uid_tail = addr (gfs_p_file_oid) -> file_oid.uid_tail;
+      672 
+      673    if gfs_file_access_table_idx < lbound (file_access_table.e, 1)
+      674         | gfs_file_access_table_idx > file_access_table.h.last_entry
+      675    then call ERROR_RETURN (dm_error_$bad_file_oid,
+      676 	   " File access table index out of range.");
+      677 
+      678    if gfs_file_uid_tail
+      679         ^= substr (file_access_table.e (gfs_file_access_table_idx).uid, 19, 18)
+      680    then call ERROR_RETURN (dm_error_$bad_file_oid,
+      681 	   " File access table entry uid does not match uid tail.");
+      682 
+      683    gfs_p_file_state =
+      684         file_access_table.e (gfs_file_access_table_idx).state.file_state;
+      685 
+      686    return;
+      687 
+      688    end GET_FILE_STATE;
+      689 
+      690 SET_FILE_STATE:
+      691    proc (sfs_p_file_oid, sfs_p_file_state);
+      692 
+      693 /* DESCRIPTION of SET_FILE_STATE:
+      694*
+      695*   This routine sets the file_state of the file in the process'
+      696*   file_access_info entry in the file_access_table for this file.
+      697*   If sfs_p_file_oid is equal to ""b, this process is a process other
+      698*   than the one which wrote the postcommit/rollback handler which is
+      699*   now executing and does not need to have its file_access_info updated.
+      700*   By contract, before_journal_manager_ passes in a ""b sfs_p_file_oid in
+      701*   this case.
+      702*
+      703*   If sfs_p_file_oid is not ""b, it is used to find the file_access_info
+      704*   entry.  The file_state is updated to the given value.
+      705*
+      706*   file_access_table is based on the external pointer variable
+      707*   fm_data_$file_access_table_ptr, so is file_access_table is accessible
+      708*   merely because fm_data_$file_access_table_ptr is declared in the
+      709*   main procedure.
+      710*
+      711*   If the sfs_p_file_oid and the file_access_info entry are not in synch,
+      712*   just return quietly.
+      713**/
+      714 
+      715    dcl	 sfs_p_file_oid	    bit (36) aligned parameter;
+      716    dcl	 sfs_p_file_state	    fixed bin parameter;
+      717 
+      718    dcl	 sfs_file_access_table_idx
+      719 			    fixed bin;
+      720    dcl	 sfs_file_uid_tail	    bit (18);
+      721 
+      722    sfs_file_access_table_idx =
+      723         addr (sfs_p_file_oid) -> file_oid.file_access_table_idx;
+      724    sfs_file_uid_tail = addr (sfs_p_file_oid) -> file_oid.uid_tail;
+      725 
+      726    if sfs_file_access_table_idx < lbound (file_access_table.e, 1)
+      727         | sfs_file_access_table_idx > file_access_table.h.last_entry
+      728    then return;
+      729 
+      730    if sfs_file_uid_tail
+      731         ^= substr (file_access_table.e (sfs_file_access_table_idx).uid, 19, 18)
+      732    then return;
+      733 
+      734    file_access_table.e (sfs_file_access_table_idx).state.file_state =
+      735         sfs_p_file_state;
+      736 
+      737    return;
+      738 
+      739    end SET_FILE_STATE;
+      740 
+      741 SET_ENTRY_STATE:
+      742    proc (ses_p_file_oid);
+      743 
+      744 /* DESCRIPTION of SET_ENTRY_STATE:
+      745*
+      746*   This routine sets the entry_state of the file in the process'
+      747*   file_access_info entry in the file_access_table for this file
+      748*   such that it is scheduled for post-transaction actions.
+      749*
+      750*   If ses_p_file_oid is equal to ""b, this process is a process other
+      751*   than the one which wrote the postcommit/rollback handler which is
+      752*   now executing and does not need to have its file_access_info updated.
+      753*   By contract, before_journal_manager_ passes in a ""b ses_p_file_oid in
+      754*   this case.
+      755*
+      756*   If ses_p_file_oid is not ""b, it is used to find the file_access_info
+      757*   entry.  The entry is added to the list of entries scheduled for
+      758*   post-transaction actions by setting entry_state to the value of
+      759*   the entry index of the last entry so scheduled.
+      760*
+      761*   file_access_table is based on the external pointer variable
+      762*   fm_data_$file_access_table_ptr, so is file_access_table is accessible
+      763*   merely because fm_data_$file_access_table_ptr is declared in the
+      764*   main procedure.
+      765**/
+      766 
+      767    dcl	 ses_p_file_oid	    bit (36) aligned parameter;
+      768 
+      769    dcl	 ses_file_access_table_idx
+      770 			    fixed bin;
+      771    dcl	 ses_file_uid_tail	    bit (18);
+      772    dcl	 ses_entry_idx	    fixed bin;
+      773 
+      774    ses_file_access_table_idx =
+      775         addr (ses_p_file_oid) -> file_oid.file_access_table_idx;
+      776    ses_file_uid_tail = addr (ses_p_file_oid) -> file_oid.uid_tail;
+      777 
+      778    if ses_file_access_table_idx < lbound (file_access_table.e, 1)
+      779         | ses_file_access_table_idx > file_access_table.h.last_entry
+      780    then return;
+      781 
+      782    if ses_file_uid_tail
+      783         ^= substr (file_access_table.e (ses_file_access_table_idx).uid, 19, 18)
+      784    then return;
+      785 
+      786    if file_access_table.e (ses_file_access_table_idx).pn_tbl_idx <= 0
+      787    then return;
+      788 
+      789    do ses_entry_idx = file_access_table.h.post_transaction_actions
+      790         repeat (file_access_table.e (ses_entry_idx).state.entry_state)
+      791         while (ses_entry_idx > 0 & ses_entry_idx ^= ses_file_access_table_idx);
+      792    end;
+      793    if ses_entry_idx = ses_file_access_table_idx
+      794    then return /* already on the list */;
+      795    else
+      796       do /* add to list */;
+      797       file_access_table.e (ses_file_access_table_idx).state.entry_state =
+      798 	 file_access_table.h.post_transaction_actions;
+      799       file_access_table.h.post_transaction_actions = ses_file_access_table_idx;
+      800       end;
+      801 
+      802    return;
+      803 
+      804    end SET_ENTRY_STATE;
+      805 
+  1     1 /* BEGIN INCLUDE FILE - dm_key_count_array.incl.pl1 */
+  1     2 
+  1     3 
+  1     4 
+  1     5 /****^  HISTORY COMMENTS:
+  1     6*  1) change(87-01-15,Hergert), approve(87-04-01,MCR7632),
+  1     7*     audit(87-02-09,Dupuis), install(87-04-02,MR12.1-1020):
+  1     8*     Added the KEY_COUNT_OFFSET_IN_CHARACTERS. This is the offset from the
+  1     9*     beginning of the structure to the element key_count_array.count in
+  1    10*     characters. Using this it is possible to calculate the key_count_array_ptr
+  1    11*     given the "addr (key_count_array.count (0))".
+  1    12*                                                   END HISTORY COMMENTS */
+  1    13 
+  1    14 
+  1    15 /* DESCRIPTION:
+  1    16*
+  1    17*          The key_count_array holds counts of the number of unique key values
+  1    18*     in an index.  These values are used by the search optimization done by
+  1    19*     MRDS.  count(0) is the number of keys in the index.  count(N) is the
+  1    20*     number of keys in the index which have at least fields 1 through N
+  1    21*     having the same value as another key in the index, i.e. count(N)
+  1    22*     is the number of partial duplicates with number of partial
+  1    23*     duplication fields equal to N.
+  1    24*
+  1    25**/
+  1    26 
+  1    27 /* HISTORY:
+  1    28*
+  1    29*Written by Lindsey Spratt, 11/09/82.
+  1    30*Modified:
+  1    31*10/27/84 by Lindsey L. Spratt:  Changed the version to char(8) aligned.
+  1    32*	  Added a description, fixed the history section.
+  1    33**/
+  1    34 
+  1    35 /* format: style2,ind3 */
+  1    36      dcl	   1 key_count_array      aligned based (key_count_array_ptr),
+  1    37 	     2 version	      char (8) aligned,
+  1    38 	     2 number_of_counts   fixed bin (17) unal,
+  1    39 	     2 pad	      bit (18) unal,
+  1    40 	     2 count	      (0:kca_number_of_counts refer (key_count_array.number_of_counts)) fixed
+  1    41 			      bin (35) aligned;
+  1    42 
+  1    43      dcl	   KEY_COUNT_ARRAY_VERSION_2
+  1    44 			      init ("KeyCnt 2") char (8) aligned internal static options (constant);
+  1    45      dcl     KEY_COUNT_OFFSET_IN_CHARACTERS
+  1    46 			      init (12) fixed bin internal static options (constant);
+  1    47 
+  1    48      dcl	   key_count_array_ptr    ptr init (null);
+  1    49      dcl	   kca_number_of_counts   fixed bin (17) init (0);
+  1    50 
+  1    51 
+  1    52 /* END INCLUDE FILE - dm_key_count_array.incl.pl1 */
+      806 
+      807 
+  2     1 /*  BEGIN INCLUDE FILE: dm_fm_file_oid.incl.pl1 */
+  2     2 
+  2     3 /* DESCRIPTION:
+  2     4*        This include file contains the file_oid (file opening identifier)
+  2     5*   structure.  File opening ids are passed across the file_manager_
+  2     6*   interface as bit(36)aligned strings.  The file_oid structure defines
+  2     7*   the contents of the string.  Two components make up a file opening id:
+  2     8*   the index of the file opening in the file_access_table structure, which
+  2     9*   contains per-process information on each file which is open, and the
+  2    10*   last 18 bits of the file's unique id, used for verification of the entry
+  2    11*   in the file_access_table.
+  2    12**/
+  2    13 
+  2    14 /*
+  2    15*HISTORY:
+  2    16*Written by Matthew Pierret, 07/16/84.
+  2    17*Modified:
+  2    18*11/02/84 by Matthew Pierret:  Made file_oid based.
+  2    19**/
+  2    20 
+  2    21 /* format: style2,ind3 */
+  2    22 
+  2    23      dcl	   1 file_oid	      aligned based,
+  2    24 	     2 file_access_table_idx
+  2    25 			      fixed bin (17) unal,	/* index into file_access_table */
+  2    26 	     2 uid_tail	      bit (18) unal;	/* Last 18 bits of file unique id */
+  2    27 
+  2    28 
+  2    29 /* END INCLUDE FILE:  dm_fm_file_oid.incl.pl1 */
+      808 
+      809 
+  3     1 /* BEGIN INCLUDE FILE:	dm_fm_file_access_info.incl.pl1 */
+  3     2 
+  3     3 /* DESCRIPTION:
+  3     4*        The file_access_info structure contains per-process information
+  3     5*   about a DM file.  Each file_access_info structure is one entry in
+  3     6*   the file_access_table.e array.  The entry can be in one of three states:
+  3     7*   not-in-use (file_access_info.entry_state is 0), in-use (entry_state is
+  3     8*   -1) or still in-use, but to be discarded at the end of the transaction
+  3     9*   (any number > 0).  An entry needs to be discarded when the file is 
+  3    10*   completely closed by the user.  This last state is useful because it is 
+  3    11*   better not to discard the entry when it is completely closed until the
+  3    12*   end of the current transaction, so that if the transaction is aborted, the 
+  3    13*   file need not be re-opened to apply the before images.  A list of entries
+  3    14*   to be discarded is maintained using the entry_state variable.
+  3    15*        The file can be in one of three states: exists (file_state = 1), 
+  3    16*   does not exist (file_state = 0), and logically_deleted (file_state = 3).
+  3    17**/
+  3    18 
+  3    19 /* HISTORY:
+  3    20*Written by Jeffrey D. Ives, 10/11/82.
+  3    21*  (Original design by Andre Bensoussan, 01/28/82.)
+  3    22*Modified:
+  3    23*10/05/83 Jeffrey D. Ives: Added fields for lock advice and expanded seg_nums.
+  3    24*07/12/84 by Matthew Pierret: Re-named proc_ad to file_access_info.
+  3    25*12/17/84 by Matthew Pierret: Changed post_transaction_actions sub-structure
+  3    26*            to state, with entry_state (replacing thread) and the new
+  3    27*            file_state.  Added a DESCRIPTION section. Added constants for
+  3    28*            possible file_state values.
+  3    29**/
+  3    30 
+  3    31 /* format: style2,^inddcls,dclind5 */
+  3    32 
+  3    33 dcl  1 file_access_info     aligned based (file_access_info_ptr),
+  3    34        2 state	        aligned,
+  3    35          3 entry_state      fixed bin (17) unal,
+  3    36          3 file_state       fixed bin (17) unal,
+  3    37        2 uid	        bit (36),
+  3    38        2 blocking_factor    fixed bin (17) unal,
+  3    39        2 ring_brackets      unal,
+  3    40          3 write	        fixed bin (3) unsigned unal,
+  3    41          3 read	        fixed bin (3) unsigned unal,
+  3    42          3 mbz_rb	        fixed bin (3) unsigned unal,
+  3    43        2 integrity_switches unal,
+  3    44          3 record_time_modified
+  3    45 		        bit (1) unal,		/* record time modified in ci_header and trailer	*/
+  3    46          3 transaction      bit (1) unal,		/* permit access only during a transaction	*/
+  3    47          3 lock	        bit (1) unal,		/* lock control intervals before accessing them	*/
+  3    48          3 bj	        bit (1) unal,		/* put undo records in the before journal	*/
+  3    49          3 aj	        bit (1) unal,		/* put redo records in the after journal	*/
+  3    50          3 mbz_is	        bit (4) unal,
+  3    51        2 last_transaction_id
+  3    52 		        bit (36),
+  3    53        2 msf_ptr	        ptr unal,
+  3    54        2 pn_tbl_idx	        fixed bin (17) unal,
+  3    55        2 lock_advice        fixed bin (17) unal,
+  3    56        2 opens	        fixed bin (17) unal,
+  3    57        2 seg_0_num	        bit (18) unal,
+  3    58        2 seg_nums	        (27) fixed bin (12) uns unal;
+  3    59 
+  3    60 
+  3    61 dcl  file_access_info_ptr   ptr init (null ());
+  3    62 
+  3    63 dcl  (
+  3    64      FILE_ACCESS_INFO_IN_USE
+  3    65 		        init (-1),
+  3    66      FILE_ACCESS_INFO_NOT_IN_USE
+  3    67 		        init (0),
+  3    68      FILE_DOES_NOT_EXIST init (0),
+  3    69      FILE_EXISTS	        init (1),
+  3    70      FILE_LOGICALLY_DELETED init (3)
+  3    71      )		        fixed bin internal static options (constant);
+  3    72 
+  3    73 
+  3    74 /* END INCLUDE FILE:	dm_fm_file_access_info.incl.pl1  */
+      810 
+      811 
+  4     1 /* BEGIN INCLUDE FILE:	dm_fm_file_access_tbl.incl.pl1  */
+  4     2 
+  4     3 /* DESCRIPTION:
+  4     4*
+  4     5*        This include file contains the file_access_table structure.  This
+  4     6*   is a per-process table which contains one entry for each file which the
+  4     7*   process has open.  The table is set up during per-process initialization 
+  4     8*   and is pointed to by fm_data_$file_access_table_ptr.  The bounds limit
+  4     9*   on the array of entries is abritrary and can be changed.
+  4    10**/
+  4    11 
+  4    12 /* HISTORY:
+  4    13*Written by Jeffrey D. Ives, 10/11/82. 
+  4    14*  (01/28/82 Andre Bensoussan, Design.)
+  4    15*Modified:
+  4    16*07/11/84 by Matthew Pierret:  Changed name of structure from proc_ad_tbl to
+  4    17*            file_access_table.
+  4    18*11/07/84 by Matthew Pierret:  Removed the un-used post_commit_actions element.
+  4    19*            Removed the now-obsolete oid structure.  It has been replaced by
+  4    20*            file_oid in dm_fm_file_oid.incl.pl1.
+  4    21**/
+  4    22 
+  4    23 /* format: style2,ind3 */
+  4    24 
+  4    25 
+  4    26      dcl	   fm_data_$file_access_table_ptr
+  4    27 			      ptr ext;
+  4    28 
+  4    29      dcl	   1 file_access_table    aligned based (fm_data_$file_access_table_ptr),
+  4    30 	     2 h,
+  4    31 	       3 version	      char (8) aligned,
+  4    32 	       3 last_entry	      fixed bin,
+  4    33 	       3 post_transaction_actions
+  4    34 			      fixed bin,
+  4    35 	       3 mbz_1	      (6) fixed bin (71),
+  4    36 	     2 e		      (1024) like file_access_info;
+  4    37 
+  4    38 
+  4    39      dcl	   FILE_ACCESS_TABLE_VERSION_1
+  4    40 			      init ("FileAT 1") char (8) aligned static options (constant);
+  4    41 
+  4    42 /*  END INCLUDE FILE:    dm_fm_file_access_tbl.incl.pl1  */
+      812 
+      813 
+  5     1 /* BEGIN INCLUDE FILE  dm_fm_rollback_info.incl.pl1 */
+  5     2 
+  5     3 /* DESCRIPTION:
+  5     4*
+  5     5*   This include file contains the structures which define the rollback
+  5     6*   handlers for the creation and deletion of files.  They are used by
+  5     7*   file_manager_$undo.
+  5     8*
+  5     9*   All structure elements are unaligned because we don't trust
+  5    10*   before_journal_manager_ to align the buffer in which it places
+  5    11*   the structure.
+  5    12**/
+  5    13 
+  5    14 /* HISTORY:
+  5    15*Written by Matthew Pierret, 10/16/84.
+  5    16*Modified:
+  5    17**/
+  5    18 
+  5    19 /* format: style2,ind3 */
+  5    20 
+  5    21      dcl	   1 rollback_info_header based (rollback_info_ptr),
+  5    22 	     2 version	      char (8) unal,
+  5    23 	     2 operation	      char (8) unal;
+  5    24 
+  5    25      dcl	   1 delete_rollback_info based (rollback_info_ptr),
+  5    26 	     2 header	      like rollback_info_header,
+  5    27 	     2 sys_pn_tbl_index   fixed bin unal,
+  5    28 	     2 dir_path	      char (168) unal,
+  5    29 	     2 predelete_name     char (32) unal,
+  5    30 	     2 postdelete_name    char (32) unal;
+  5    31 
+  5    32      dcl	   1 create_rollback_info based (rollback_info_ptr),
+  5    33 	     2 header	      like rollback_info_header,
+  5    34 	     2 sys_pn_tbl_index   fixed bin unal,
+  5    35 	     2 dir_path	      char (168) unal,
+  5    36 	     2 file_name	      char (32) unal;
+  5    37 
+  5    38      dcl	   rollback_info_ptr      ptr init (null ());
+  5    39      dcl	   (
+  5    40 	   ROLLBACK_INFO_VERSION_1
+  5    41 			      init ("RBInfo 1"),
+  5    42 	   DELETE_ROLLBACK_OPERATION
+  5    43 			      init ("deletion"),
+  5    44 	   CREATE_ROLLBACK_OPERATION
+  5    45 			      init ("creation")
+  5    46 	   )		      char (8) internal static options (constant);
+  5    47 
+  5    48 
+  5    49 /* END INCLUDE FILE  dm_fm_rollback_info.incl.pl1 */
+      814 
+      815 
+  6     1 /* BEGIN INCLUDE FILE  dm_fm_postcommit_info.incl.pl1 */
+  6     2 
+  6     3 /* DESCRIPTION:
+  6     4*
+  6     5*   This include file contains the structures which define the postcommit
+  6     6*   handlers for the creation and deletion of files.  They are used by
+  6     7*   file_manager_$postcommit_do.
+  6     8*
+  6     9*   All structure elements are unaligned because we don't trust
+  6    10*   before_journal_manager_ to align the buffer in which it places
+  6    11*   the structure.
+  6    12**/
+  6    13 
+  6    14 /* HISTORY:
+  6    15*Written by Matthew Pierret, 10/16/84.
+  6    16*Modified:
+  6    17*03/07/85 by R. Michael Tague:  Added increment_postcommit_info.
+  6    18**/
+  6    19 
+  6    20 /****^  HISTORY COMMENTS:
+  6    21*  1) change(87-01-15,Hergert), approve(87-04-01,MCR7632),
+  6    22*     audit(87-01-30,Dupuis), install(87-04-02,MR12.1-1020):
+  6    23*     For TR phx20754. Added element_id so that we can save the id of the
+  6    24*     key_count_array and use it at post commit time, if necessary.
+  6    25*                                                   END HISTORY COMMENTS */
+  6    26 
+  6    27 
+  6    28 /* format: style2,ind3 */
+  6    29 
+  6    30      dcl	   1 postcommit_info_header
+  6    31 			      based (postcommit_info_ptr),
+  6    32 	     2 version	      char (8) unal,
+  6    33 	     2 operation	      char (8) unal;
+  6    34 
+  6    35      dcl	   1 delete_postcommit_info
+  6    36 			      based (postcommit_info_ptr),
+  6    37 	     2 header	      like postcommit_info_header,
+  6    38 	     2 sys_pn_tbl_index   fixed bin unal,
+  6    39 	     2 dir_path	      char (168) unal,
+  6    40 	     2 file_name	      char (32) unal;
+  6    41 
+  6    42      dcl	   1 increment_postcommit_info
+  6    43 			      based (postcommit_info_ptr),
+  6    44 	     2 header	      like postcommit_info_header,
+  6    45 	     2 increments_ptr     ptr,
+  6    46 	     2 element_id         bit (36),
+  6    47 	     2 number_of_words    fixed bin (35),
+  6    48 	     2 ci_number	      fixed bin (27),
+  6    49 	     2 offset_in_bytes    fixed bin (35);
+  6    50 
+  6    51      dcl	   postcommit_info_ptr    ptr init (null ());
+  6    52      dcl	   (
+  6    53 	   POSTCOMMIT_INFO_VERSION_1
+  6    54 			      init ("PCInfo 1"),
+  6    55 	   DELETE_POSTCOMMIT_OPERATION
+  6    56 			      init ("deletion"),
+  6    57 	   CREATE_POSTCOMMIT_OPERATION
+  6    58 			      init ("creation"),
+  6    59 	   INCREMENT_POSTCOMMIT_OPERATION
+  6    60 			      init ("incremen")
+  6    61 	   )		      char (8) internal static options (constant);
+  6    62 
+  6    63 
+  6    64 /* END INCLUDE FILE  dm_fm_postcommit_info.incl.pl1 */
+      816 
+      817 
+  7     1 /* BEGIN INCLUDE FILE dm_file_validation_name.incl.pl1  */
+  7     2 
+  7     3 /* DESCRIPTION:
+  7     4*
+  7     5*        This include file contains the file validation name which is 
+  7     6*   added to the first component of each DM file and is used to 
+  7     7*   determine if an MSF is a DM file. 
+  7     8**/
+  7     9 
+  7    10 /* HISTORY:
+  7    11*Written by Matthew Pierret, 11/07/84.
+  7    12*Modified:
+  7    13**/
+  7    14 
+  7    15 /* format: style2,ind3 */
+  7    16 
+  7    17      dcl	   DM_FILE_VALIDATION_NAME
+  7    18 			      init ("_Data_Management_file_._") char (24) internal static options (constant);
+  7    19 
+  7    20 
+  7    21 /*  END INCLUDE FILE dm_file_validation_name.incl.pl1 */
+      818 
+      819 
+  8     1 /* BEGIN INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+  8     2 
+  8     3 /* format: ^indcom */
+  8     4 
+  8     5 /* DESCRIPTION:
+  8     6*   These are the severity codes used by the dms daemon when calling its logger.
+  8     7*   The severity is ranked thusly:
+  8     8*
+  8     9*   severity log write situation
+  8    10*   -------- --- ----- ---------
+  8    11*          0 no  yes   standard output, query, etc.
+  8    12*          1 yes yes   fatal error, terminate dms daemon.
+  8    13*          2 yes yes   nonfatal error.
+  8    14*          3 yes yes   informative message.
+  8    15*          4 yes no    log information only.
+  8    16**/
+  8    17 
+  8    18 /* HISTORY:
+  8    19*
+  8    20*Written by M. Pandolf, 10/06/82.
+  8    21*Modified:
+  8    22*12/10/84 by R. Michael Tague: Rename and reformat description/history.
+  8    23*01/13/85 by Lee A. Newcomb:  Renamed to dm_log_sv_codes from
+  8    24*            dm_daemon_sv_codes as the severity codes for the DM log are not
+  8    25*            restrained to the DM Daemon's use.
+  8    26*01/24/85 by Lee A. Newcomb:  Fixed to say dm_log_sv_codes.incl.pl1 in the
+  8    27*            BEGIN and END INCLUDE comments, instead of dm_daemon_sv_codes.==.
+  8    28**/
+  8    29 
+  8    30 /* format: style5 */
+  8    31 
+  8    32      dcl	   (PRINT_SV, QUERY_SV)    fixed bin internal static
+  8    33 			       options (constant) init (0);
+  8    34      dcl	   (CRASH_SV, FATAL_SV)    fixed bin internal static
+  8    35 			       options (constant) init (1);
+  8    36      dcl	   ERROR_SV	       fixed bin internal static
+  8    37 			       options (constant) init (2);
+  8    38      dcl	   INFORM_SV	       fixed bin internal static
+  8    39 			       options (constant) init (3);
+  8    40      dcl	   LOG_SV		       fixed bin internal static
+  8    41 			       options (constant) init (4);
+  8    42 
+  8    43 /* END INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+      820 
+      821 
+      822    end fm_do_$undo;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/02/87  1258.8  fm_do_.pl1                        >spec>install>MR12.1-1020>fm_do_.pl1
+806          1    04/02/87  1300.6  dm_key_count_array.incl.pl1       >spec>install>MR12.1-1020>dm_key_count_array.incl.pl1
+808          2    01/07/85  0900.9  dm_fm_file_oid.incl.pl1           >ldd>include>dm_fm_file_oid.incl.pl1
+810          3    03/06/85  1031.2  dm_fm_file_access_info.incl.pl1   >ldd>include>dm_fm_file_access_info.incl.pl1
+812          4    01/07/85  0901.1  dm_fm_file_access_tbl.incl.pl1    >ldd>include>dm_fm_file_access_tbl.incl.pl1
+814          5    01/07/85  0900.4  dm_fm_rollback_info.incl.pl1      >ldd>include>dm_fm_rollback_info.incl.pl1
+816          6    04/02/87  1300.6  dm_fm_postcommit_info.incl.pl1    >spec>install>MR12.1-1020>dm_fm_postcommit_info.incl.pl1
+818          7    01/07/85  0901.0  dm_file_validation_name.incl.pl1  >ldd>include>dm_file_validation_name.incl.pl1
+820          8    03/06/85  1031.1  dm_log_sv_codes.incl.pl1          >ldd>include>dm_log_sv_codes.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+BITS_PER_BYTE                          constant        fixed bin(17,0)          initial dcl 112 ref 623
+BITS_PER_WORD                          constant        fixed bin(17,0)          initial dcl 114 ref 645 646
+CREATE_ROLLBACK_OPERATION       000006 constant        char(8)                  initial unaligned dcl 5-39 set ref 197 368* 373*
+                                                                                  381* 386*
+DELETE_POSTCOMMIT_OPERATION     000002 constant        char(8)                  initial unaligned dcl 6-52 set ref 239 518* 524*
+                                                                                  533* 539*
+DELETE_ROLLBACK_OPERATION       000010 constant        char(8)                  initial unaligned dcl 5-39 set ref 195 448* 461*
+FILE_DOES_NOT_EXIST             000055 constant        fixed bin(17,0)          initial dcl 3-63 set ref 364* 546* 604
+FILE_EXISTS                     000064 constant        fixed bin(17,0)          initial dcl 3-63 set ref 457*
+INCREMENT_POSTCOMMIT_OPERATION  000000 constant        char(8)                  initial unaligned dcl 6-52 ref 241
+KEY_COUNT_ARRAY_VERSION_2       000014 constant        char(8)                  initial dcl 1-43 ref 628
+KEY_COUNT_OFFSET_IN_CHARACTERS         constant        fixed bin(17,0)          initial dcl 1-45 ref 627
+LOG_SV                          000061 constant        fixed bin(17,0)          initial dcl 8-40 set ref 279*
+MAX_UPDATE_ATTEMPTS                    constant        fixed bin(35,0)          initial dcl 116 ref 634 642
+POSTCOMMIT_ACTION               000020 constant        char(8)                  initial unaligned dcl 118 set ref 518* 524* 533*
+                                                                                  539*
+POSTCOMMIT_INFO_VERSION_1       000004 constant        char(8)                  initial unaligned dcl 6-52 set ref 231 231*
+ROLLBACK_INFO_VERSION_1         000012 constant        char(8)                  initial unaligned dcl 5-39 set ref 187 187*
+UNDO_ACTION                     000016 constant        char(8)                  initial unaligned dcl 118 set ref 368* 373* 381*
+                                                                                  386* 448* 461*
+addbitno                                               builtin function         dcl 101 ref 623 645 646
+addr                                                   builtin function         dcl 101 ref 669 671 722 724 774 776
+aem_p_action                           parameter       char(8)                  unaligned dcl 286 set ref 283 292*
+aem_p_file                             parameter       char(168)                unaligned dcl 288 set ref 283 292*
+aem_p_operation                        parameter       char(8)                  unaligned dcl 287 set ref 283 292*
+aem_return_length               000200 automatic       fixed bin(21,0)          dcl 290 set ref 292* 294
+aem_return_string               000100 automatic       char(256)                unaligned dcl 289 set ref 292* 294
+ci_number                10     000500 automatic       fixed bin(27,0)          level 2 dcl 580 set ref 614
+cleanup                         000104 stack reference condition                dcl 106 ref 193 237
+create_rollback_info                   based           structure                level 1 packed unaligned dcl 5-32
+cu_$level_get                   000010 constant        entry                    external dcl 125 ref 192 236
+cu_$level_set                   000012 constant        entry                    external dcl 126 ref 318 361 442 513 607
+dd_code                         000471 automatic       fixed bin(35,0)          dcl 503 set ref 516* 517* 518 518* 523* 524 524 524*
+                                                                                  529 532* 533 533* 538* 539 539*
+dd_dir_path                     000407 automatic       char(168)                unaligned dcl 501 set ref 508* 518* 518* 523* 524
+                                                                                  524 524 524 532* 533 533 533 533 538* 539 539 539
+                                                                                  539
+dd_file_name                    000461 automatic       char(32)                 unaligned dcl 502 set ref 510* 518* 518* 523* 524*
+                                                                                  524* 532* 533* 533* 538* 539* 539*
+dd_p_delete_postcommit_info_ptr        parameter       pointer                  dcl 498 ref 470 505 508 510
+dd_p_file_oid                          parameter       bit(36)                  dcl 497 set ref 470 546* 548*
+dd_p_file_uid                          parameter       bit(36)                  dcl 496 set ref 470 517*
+dd_sys_pn_tbl_index             000406 automatic       fixed bin(17,0)          dcl 500 set ref 505*
+delete_postcommit_info                 based           structure                level 1 packed unaligned dcl 6-35
+delete_rollback_info                   based           structure                level 1 packed unaligned dcl 5-25
+di_ci_number                    000515 automatic       fixed bin(27,0)          dcl 584 set ref 614* 617*
+di_code                         000527 automatic       fixed bin(35,0)          dcl 598 set ref 617* 619 619*
+di_file_state                   000526 automatic       fixed bin(17,0)          dcl 597 set ref 603* 604
+di_file_word                           based           fixed bin(35,0)          dcl 590 ref 632 634 639
+di_file_word_increment                 based           fixed bin(35,0)          dcl 594 ref 633 640
+di_increment_index              000517 automatic       fixed bin(35,0)          dcl 587 set ref 631*
+di_increment_ptr                000512 automatic       pointer                  dcl 582 set ref 612* 633 640 645* 645
+di_increment_word_ptr           000522 automatic       pointer                  dcl 589 set ref 617* 623* 623 627 632 634 639 646*
+                                                                                  646
+di_new_file_word                000525 automatic       fixed bin(35,0)          dcl 593 set ref 633* 634 640*
+di_number_of_words              000514 automatic       fixed bin(35,0)          dcl 583 set ref 613* 631
+di_offset_in_bytes              000516 automatic       fixed bin(35,0)          dcl 585 set ref 615* 623
+di_old_file_word                000524 automatic       fixed bin(35,0)          dcl 592 set ref 632* 633 634 639* 640
+di_p_file_oid                          parameter       bit(36)                  dcl 576 set ref 554 600 603* 617*
+di_p_file_uid                          parameter       bit(36)                  dcl 575 ref 554
+di_p_increment_postcommit_info_ptr     parameter       pointer                  dcl 577 ref 554 609
+di_update_attempts              000520 automatic       fixed bin(35,0)          dcl 588 set ref 634* 642
+dir_path                  4(18)        based           char(168)                level 2 in structure "delete_postcommit_info" packed
+                                                                                  unaligned dcl 6-35 in procedure "fm_do_$undo" ref
+                                                                                  508
+dir_path                  4(18)        based           char(168)                level 2 in structure "create_rollback_info" packed
+                                                                                  unaligned dcl 5-32 in procedure "fm_do_$undo" ref
+                                                                                  356
+dir_path                  4(18)        based           char(168)                level 2 in structure "delete_rollback_info" packed
+                                                                                  unaligned dcl 5-25 in procedure "fm_do_$undo" ref
+                                                                                  435
+dm_error_$bad_file_oid          000042 external static fixed bin(35,0)          dcl 151 set ref 673* 678*
+dm_error_$fm_bad_postcommit_operation
+                                000044 external static fixed bin(35,0)          dcl 152 set ref 243*
+dm_error_$fm_bad_undo_op        000046 external static fixed bin(35,0)          dcl 154 set ref 199*
+dm_error_$fm_word_increment_error
+                                000050 external static fixed bin(35,0)          dcl 156 set ref 642*
+dm_error_$incr_array_not_found  000052 external static fixed bin(35,0)          dcl 158 set ref 628*
+dm_misc_util_$log               000014 constant        entry                    external dcl 127 ref 279
+e                        20            based           structure                array level 2 dcl 4-29 set ref 673 726 778
+entry_state              20            based           fixed bin(17,0)          array level 4 packed unaligned dcl 4-29 set ref 792
+                                                                                  797*
+er_p_code                              parameter       fixed bin(35,0)          dcl 262 set ref 259 265 266*
+er_p_message                           parameter       char                     unaligned dcl 263 set ref 259 266*
+error_table_$noentry            000056 external static fixed bin(35,0)          dcl 162 ref 373 377 448 461 524 529
+error_table_$segnamedup         000054 external static fixed bin(35,0)          dcl 160 ref 448
+error_table_$unimplemented_version
+                                000060 external static fixed bin(35,0)          dcl 163 set ref 187* 231*
+file_access_info                       based           structure                level 1 dcl 3-33
+file_access_info_ptr            000116 automatic       pointer                  initial dcl 3-61 set ref 3-61*
+file_access_table                      based           structure                level 1 dcl 4-29
+file_access_table_idx                  based           fixed bin(17,0)          level 2 packed unaligned dcl 2-23 ref 669 722 774
+file_name                56(18)        based           char(32)                 level 2 in structure "delete_postcommit_info" packed
+                                                                                  unaligned dcl 6-35 in procedure "fm_do_$undo" ref
+                                                                                  510
+file_name                56(18)        based           char(32)                 level 2 in structure "create_rollback_info" packed
+                                                                                  unaligned dcl 5-32 in procedure "fm_do_$undo" ref
+                                                                                  358
+file_oid                               based           structure                level 1 dcl 2-23
+file_state               20(18)        based           fixed bin(17,0)          array level 4 packed unaligned dcl 4-29 set ref 683
+                                                                                  734*
+fm_data_$file_access_table_ptr  000062 external static pointer                  dcl 4-26 ref 673 673 678 683 726 726 730 734 778 778
+                                                                                  782 786 789 792 797 797 799
+fm_get_$internal_get_ci_ptr     000020 constant        entry                    external dcl 129 ref 617
+fm_put_$discard_file_flush_list 000022 constant        entry                    external dcl 132 ref 367 517
+fm_sys_pn_tbl_util_$rename      000024 constant        entry                    external dcl 134 ref 454
+get_ring_                       000016 constant        entry                    external dcl 128 ref 361 442 513 607
+gfs_file_access_table_idx       000540 automatic       fixed bin(17,0)          dcl 665 set ref 669* 673 673 678 683
+gfs_file_uid_tail               000541 automatic       bit(18)                  unaligned dcl 667 set ref 671* 678
+gfs_p_file_oid                         parameter       bit(36)                  dcl 662 set ref 652 669 671
+gfs_p_file_state                       parameter       fixed bin(17,0)          dcl 663 set ref 652 683*
+h                                      based           structure                level 2 dcl 4-29
+hcs_$chname_file                000026 constant        entry                    external dcl 139 ref 446 459
+hcs_$del_dir_tree               000030 constant        entry                    external dcl 141 ref 380 532
+hcs_$delentry_file              000032 constant        entry                    external dcl 142 ref 385 538
+hcs_$set_safety_sw              000034 constant        entry                    external dcl 143 ref 372 523
+increment_postcommit_info              based           structure                level 1 unaligned dcl 6-42 ref 609
+increments_ptr            4     000500 automatic       pointer                  level 2 dcl 580 set ref 612
+ioa_$rsnnl                      000036 constant        entry                    external dcl 145 ref 292 308
+kca_number_of_counts            000114 automatic       fixed bin(17,0)          initial dcl 1-49 set ref 1-49*
+key_count_array                        based           structure                level 1 dcl 1-36
+key_count_array_ptr             000112 automatic       pointer                  initial dcl 1-48 set ref 1-48* 627* 628
+last_entry                2            based           fixed bin(17,0)          level 3 dcl 4-29 ref 673 726 778
+lbound                                                 builtin function         dcl 101 ref 673 726 778
+le_p_code                              parameter       fixed bin(35,0)          dcl 276 set ref 273 279*
+le_p_message                           parameter       char                     unaligned dcl 277 set ref 273 279*
+my_file_oid                     000100 automatic       bit(36)                  initial dcl 94 set ref 94* 185* 195* 197* 229* 239*
+                                                                                  241*
+my_file_uid                     000101 automatic       bit(36)                  initial dcl 95 set ref 95* 184* 195* 197* 228* 239*
+                                                                                  241*
+my_inc_postcommit_info          000500 automatic       structure                level 1 dcl 580 set ref 609*
+myname                          000022 constant        varying char(32)         initial dcl 110 set ref 279*
+null                                                   builtin function         dcl 101 ref 1-48 3-61 5-38 6-51
+number_of_words           7     000500 automatic       fixed bin(35,0)          level 2 dcl 580 set ref 613
+offset_in_bytes          11     000500 automatic       fixed bin(35,0)          level 2 dcl 580 set ref 615
+operation                 2            based           char(8)                  level 2 in structure "rollback_info_header" packed
+                                                                                  unaligned dcl 5-21 in procedure "fm_do_$undo" set
+                                                                                  ref 195 197 199*
+operation                 2            based           char(8)                  level 2 in structure "postcommit_info_header" packed
+                                                                                  unaligned dcl 6-30 in procedure "fm_do_$undo" set
+                                                                                  ref 239 241 243*
+p_code                                 parameter       fixed bin(35,0)          dcl 90 set ref 74 183* 206 227* 255* 265*
+p_file_oid                             parameter       bit(36)                  dcl 83 ref 74 185 206 229
+p_file_uid                             parameter       bit(36)                  dcl 81 ref 74 184 206 228
+p_postcommit_info_length               parameter       fixed bin(17,0)          dcl 88 ref 206
+p_postcommit_info_ptr                  parameter       pointer                  dcl 87 ref 206 230
+p_rollback_info_length                 parameter       fixed bin(17,0)          dcl 86 ref 74
+p_rollback_info_ptr                    parameter       pointer                  dcl 85 ref 74 186
+pathname_                       000040 constant        entry                    external dcl 146 ref 368 368 373 373 381 381 386 386
+                                                                                  443 448 448 461 461 518 518 524 524 533 533 539
+                                                                                  539
+pn_tbl_idx               25            based           fixed bin(17,0)          array level 3 packed unaligned dcl 4-29 ref 786
+post_transaction_actions
+                          3            based           fixed bin(17,0)          level 3 dcl 4-29 set ref 789 797 799*
+postcommit_info_header                 based           structure                level 1 packed unaligned dcl 6-30
+postcommit_info_ptr             000122 automatic       pointer                  initial dcl 6-51 set ref 230* 231 231 239 239* 241
+                                                                                  241* 243 6-51*
+postdelete_name          66(18)        based           char(32)                 level 2 packed unaligned dcl 5-25 ref 439
+predelete_name           56(18)        based           char(32)                 level 2 packed unaligned dcl 5-25 ref 437
+rollback_info_header                   based           structure                level 1 packed unaligned dcl 5-21
+rollback_info_ptr               000120 automatic       pointer                  initial dcl 5-38 set ref 186* 187 187 195 195* 197
+                                                                                  197* 199 5-38*
+rtrim                                                  builtin function         dcl 101 ref 368 368 368 368 373 373 373 373 381 381
+                                                                                  381 381 386 386 386 386 448 448 448 448 461 461
+                                                                                  461 461 524 524 524 524 533 533 533 533 539 539
+                                                                                  539 539
+saved_validation_level          000102 automatic       fixed bin(17,0)          initial dcl 96 set ref 96* 192* 236* 318 318*
+ses_entry_idx                   000562 automatic       fixed bin(17,0)          dcl 772 set ref 789* 789 789* 792 793
+ses_file_access_table_idx       000560 automatic       fixed bin(17,0)          dcl 769 set ref 774* 778 778 782 786 789 793 797 799
+ses_file_uid_tail               000561 automatic       bit(18)                  unaligned dcl 771 set ref 776* 782
+ses_p_file_oid                         parameter       bit(36)                  dcl 767 set ref 741 774 776
+sfs_file_access_table_idx       000550 automatic       fixed bin(17,0)          dcl 718 set ref 722* 726 726 730 734
+sfs_file_uid_tail               000551 automatic       bit(18)                  unaligned dcl 720 set ref 724* 730
+sfs_p_file_oid                         parameter       bit(36)                  dcl 715 set ref 690 722 724
+sfs_p_file_state                       parameter       fixed bin(17,0)          dcl 716 ref 690 734
+stacq                                                  builtin function         dcl 101 ref 634
+state                    20            based           structure                array level 3 dcl 4-29
+substr                                                 builtin function         dcl 101 ref 294 311 678 730 782
+sys_pn_tbl_index          4            based           fixed bin(17,0)          level 2 in structure "create_rollback_info" packed
+                                                                                  unaligned dcl 5-32 in procedure "fm_do_$undo" ref
+                                                                                  354
+sys_pn_tbl_index          4            based           fixed bin(17,0)          level 2 in structure "delete_rollback_info" packed
+                                                                                  unaligned dcl 5-25 in procedure "fm_do_$undo" ref
+                                                                                  433
+sys_pn_tbl_index          4            based           fixed bin(17,0)          level 2 in structure "delete_postcommit_info" packed
+                                                                                  unaligned dcl 6-35 in procedure "fm_do_$undo" ref
+                                                                                  505
+uc_code                         000223 automatic       fixed bin(35,0)          dcl 352 set ref 366* 367* 368 368* 372* 373 373 373*
+                                                                                  377 380* 381 381* 385* 386 386*
+uc_dir_path                     000141 automatic       char(168)                unaligned dcl 350 set ref 356* 368 368 368 368 372*
+                                                                                  373 373 373 373 380* 381 381 381 381 385* 386 386
+                                                                                  386 386
+uc_file_name                    000213 automatic       char(32)                 unaligned dcl 351 set ref 358* 368* 368* 372* 373*
+                                                                                  373* 380* 381* 381* 385* 386* 386*
+uc_p_create_rollback_info_ptr          parameter       pointer                  dcl 347 ref 323 354 356 358
+uc_p_file_oid                          parameter       bit(36)                  dcl 346 set ref 323 364* 392*
+uc_p_file_uid                          parameter       bit(36)                  dcl 345 set ref 323 367*
+uc_sys_pn_tbl_index             000140 automatic       fixed bin(17,0)          dcl 349 set ref 354*
+ud_code                         000377 automatic       fixed bin(35,0)          dcl 431 set ref 444* 446* 448 448 448 448* 459* 461
+                                                                                  461 461*
+ud_dir_path                     000233 automatic       char(168)                unaligned dcl 427 set ref 435* 443* 446* 448 448 448
+                                                                                  448 459* 461 461 461 461
+ud_p_delete_rollback_info_ptr          parameter       pointer                  dcl 424 ref 398 433 435 437 439
+ud_p_file_oid                          parameter       bit(36)                  dcl 423 set ref 398 457*
+ud_p_file_uid                          parameter       bit(36)                  dcl 422 set ref 398 454*
+ud_postdelete_name              000315 automatic       char(32)                 unaligned dcl 429 set ref 439* 443* 446* 448* 448*
+                                                                                  459* 459* 461* 461*
+ud_postdelete_path              000325 automatic       char(168)                unaligned dcl 430 set ref 443*
+ud_predelete_name               000305 automatic       char(32)                 unaligned dcl 428 set ref 437* 446* 454*
+ud_sys_pn_tbl_index             000232 automatic       fixed bin(17,0)          dcl 426 set ref 433* 454*
+uid                      21            based           bit(36)                  array level 3 dcl 4-29 ref 678 730 782
+uid_tail                  0(18)        based           bit(18)                  level 2 packed unaligned dcl 2-23 ref 671 724 776
+vem_p_expected_version                 parameter       char(8)                  unaligned dcl 302 set ref 298 308*
+vem_p_given_version                    parameter       char(8)                  unaligned dcl 303 set ref 298 308*
+vem_p_structure                        parameter       char                     unaligned dcl 304 set ref 298 308*
+vem_return_length               000200 automatic       fixed bin(21,0)          dcl 306 set ref 308* 311
+vem_return_string               000100 automatic       char(256)                unaligned dcl 305 set ref 308* 311
+version                                based           char(8)                  level 2 in structure "key_count_array" dcl 1-36
+                                                                                  in procedure "fm_do_$undo" ref 628
+version                                based           char(8)                  level 2 in structure "rollback_info_header" packed
+                                                                                  unaligned dcl 5-21 in procedure "fm_do_$undo" set
+                                                                                  ref 187 187*
+version                                based           char(8)                  level 2 in structure "postcommit_info_header" packed
+                                                                                  unaligned dcl 6-30 in procedure "fm_do_$undo" set
+                                                                                  ref 231 231*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+CRASH_SV                               internal static fixed bin(17,0)          initial dcl 8-34
+CREATE_POSTCOMMIT_OPERATION            internal static char(8)                  initial unaligned dcl 6-52
+DM_FILE_VALIDATION_NAME                internal static char(24)                 initial unaligned dcl 7-17
+ERROR_SV                               internal static fixed bin(17,0)          initial dcl 8-36
+FATAL_SV                               internal static fixed bin(17,0)          initial dcl 8-34
+FILE_ACCESS_INFO_IN_USE                internal static fixed bin(17,0)          initial dcl 3-63
+FILE_ACCESS_INFO_NOT_IN_USE            internal static fixed bin(17,0)          initial dcl 3-63
+FILE_ACCESS_TABLE_VERSION_1            internal static char(8)                  initial dcl 4-39
+FILE_LOGICALLY_DELETED                 internal static fixed bin(17,0)          initial dcl 3-63
+INFORM_SV                              internal static fixed bin(17,0)          initial dcl 8-38
+PRINT_SV                               internal static fixed bin(17,0)          initial dcl 8-32
+QUERY_SV                               internal static fixed bin(17,0)          initial dcl 8-32
+fm_sys_pn_tbl_util_$redelete_force
+                                000000 constant        entry                    external dcl 137
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+ACTION_ERROR_MESSAGE            000712 constant        entry                    internal dcl 283 ref 368 373 381 386 448 461 518 524
+                                                                                  533 539
+DO_DELETE                       002304 constant        entry                    internal dcl 470 ref 239
+DO_INCREMENT                    003071 constant        entry                    internal dcl 554 ref 241
+ERROR_RETURN                    000604 constant        entry                    internal dcl 259 ref 187 199 231 243 368 373 381 386
+                                                                                  448 461 518 524 533 539 619 628 642 673 678
+GET_FILE_STATE                  003345 constant        entry                    internal dcl 652 ref 603
+LOG_ERROR                       000650 constant        entry                    internal dcl 273 ref 266
+MAIN_RETURN                     000576 constant        label                    dcl 250 ref 256 268
+RESET_LEVEL                     001052 constant        entry                    internal dcl 315 ref 193 202 237 246 267
+RETURN                          000577 constant        entry                    internal dcl 253 ref 204 248
+SET_ENTRY_STATE                 003502 constant        entry                    internal dcl 741 ref 392 548
+SET_FILE_STATE                  003446 constant        entry                    internal dcl 690 ref 364 457 546
+UNDO_CREATE                     001071 constant        entry                    internal dcl 323 ref 197
+UNDO_DELETE                     001677 constant        entry                    internal dcl 398 ref 195
+VERSION_ERROR_MESSAGE           000767 constant        entry                    internal dcl 298 ref 187 231
+fm_do_$undo                     000227 constant        entry                    external dcl 74
+postcommit_do                   000414 constant        entry                    external dcl 206
+
+NAMES DECLARED BY CONTEXT OR IMPLICATION.
+addcharno                                              builtin function         ref 627
+unspec                                                 builtin function         ref 609 609 634 634 634
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      4216        4302    3614        4226
+Length      4740    3614        64         422     402           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+fm_do_$undo                         766 external procedure  is an external procedure.  
+on unit on line 193                  64 on unit               
+on unit on line 237                  64 on unit               
+RETURN                                  internal procedure  shares stack frame of external procedure fm_do_$undo.  
+ERROR_RETURN                        104 internal procedure  is called during a stack extension.  
+LOG_ERROR                               internal procedure  shares stack frame of internal procedure ERROR_RETURN.  
+ACTION_ERROR_MESSAGE                164 internal procedure  uses returns(char(*)) or returns(bit(*)).  
+VERSION_ERROR_MESSAGE               166 internal procedure  uses returns(char(*)) or returns(bit(*)).  
+RESET_LEVEL                          68 internal procedure  is called by several nonquick procedures.  
+UNDO_CREATE                             internal procedure  shares stack frame of external procedure fm_do_$undo.  
+UNDO_DELETE                             internal procedure  shares stack frame of external procedure fm_do_$undo.  
+DO_DELETE                               internal procedure  shares stack frame of external procedure fm_do_$undo.  
+DO_INCREMENT                            internal procedure  shares stack frame of external procedure fm_do_$undo.  
+GET_FILE_STATE                          internal procedure  shares stack frame of external procedure fm_do_$undo.  
+SET_FILE_STATE                          internal procedure  shares stack frame of external procedure fm_do_$undo.  
+SET_ENTRY_STATE                         internal procedure  shares stack frame of external procedure fm_do_$undo.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+ACTION_ERROR_MESSAGE     000100 aem_return_string           ACTION_ERROR_MESSAGE
+                         000200 aem_return_length           ACTION_ERROR_MESSAGE
+VERSION_ERROR_MESSAGE    000100 vem_return_string           VERSION_ERROR_MESSAGE
+                         000200 vem_return_length           VERSION_ERROR_MESSAGE
+fm_do_$undo              000100 my_file_oid                 fm_do_$undo
+                         000101 my_file_uid                 fm_do_$undo
+                         000102 saved_validation_level      fm_do_$undo
+                         000112 key_count_array_ptr         fm_do_$undo
+                         000114 kca_number_of_counts        fm_do_$undo
+                         000116 file_access_info_ptr        fm_do_$undo
+                         000120 rollback_info_ptr           fm_do_$undo
+                         000122 postcommit_info_ptr         fm_do_$undo
+                         000140 uc_sys_pn_tbl_index         UNDO_CREATE
+                         000141 uc_dir_path                 UNDO_CREATE
+                         000213 uc_file_name                UNDO_CREATE
+                         000223 uc_code                     UNDO_CREATE
+                         000232 ud_sys_pn_tbl_index         UNDO_DELETE
+                         000233 ud_dir_path                 UNDO_DELETE
+                         000305 ud_predelete_name           UNDO_DELETE
+                         000315 ud_postdelete_name          UNDO_DELETE
+                         000325 ud_postdelete_path          UNDO_DELETE
+                         000377 ud_code                     UNDO_DELETE
+                         000406 dd_sys_pn_tbl_index         DO_DELETE
+                         000407 dd_dir_path                 DO_DELETE
+                         000461 dd_file_name                DO_DELETE
+                         000471 dd_code                     DO_DELETE
+                         000500 my_inc_postcommit_info      DO_INCREMENT
+                         000512 di_increment_ptr            DO_INCREMENT
+                         000514 di_number_of_words          DO_INCREMENT
+                         000515 di_ci_number                DO_INCREMENT
+                         000516 di_offset_in_bytes          DO_INCREMENT
+                         000517 di_increment_index          DO_INCREMENT
+                         000520 di_update_attempts          DO_INCREMENT
+                         000522 di_increment_word_ptr       DO_INCREMENT
+                         000524 di_old_file_word            DO_INCREMENT
+                         000525 di_new_file_word            DO_INCREMENT
+                         000526 di_file_state               DO_INCREMENT
+                         000527 di_code                     DO_INCREMENT
+                         000540 gfs_file_access_table_idx   GET_FILE_STATE
+                         000541 gfs_file_uid_tail           GET_FILE_STATE
+                         000550 sfs_file_access_table_idx   SET_FILE_STATE
+                         000551 sfs_file_uid_tail           SET_FILE_STATE
+                         000560 ses_file_access_table_idx   SET_ENTRY_STATE
+                         000561 ses_file_uid_tail           SET_ENTRY_STATE
+                         000562 ses_entry_idx               SET_ENTRY_STATE
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+alloc_char_temp     call_ext_out_desc   call_ext_out        call_int_this_desc  call_int_this       call_int_other
+return_mac          tra_ext_1           enable_op           shorten_stack       ext_entry           int_entry
+int_entry_desc      return_chars_eis    stacq_mac
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+cu_$level_get                 cu_$level_set                 dm_misc_util_$log             fm_get_$internal_get_ci_ptr
+fm_put_$discard_file_flush_list                             fm_sys_pn_tbl_util_$rename    get_ring_
+hcs_$chname_file              hcs_$del_dir_tree             hcs_$delentry_file            hcs_$set_safety_sw
+ioa_$rsnnl                    pathname_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+dm_error_$bad_file_oid        dm_error_$fm_bad_postcommit_operation                       dm_error_$fm_bad_undo_op
+dm_error_$fm_word_increment_error                           dm_error_$incr_array_not_found
+error_table_$noentry          error_table_$segnamedup       error_table_$unimplemented_version
+fm_data_$file_access_table_ptr
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     94 000207        95 000210        96 000211    1   48 000212    1   49 000214    3   61 000215    5   38 000216
+ 6   51 000217        74 000222       183 000235       184 000237       185 000241       186 000243       187 000246
+    192 000316       193 000326       195 000350       197 000362       199 000367       202 000404       204 000410
+    206 000411       227 000422       228 000424       229 000426       230 000430       231 000433       236 000503
+    237 000513       239 000535       241 000547       243 000554       246 000571       248 000575       250 000576
+    253 000577       255 000600       256 000602       259 000603       265 000617       266 000624       267 000640
+    268 000645       273 000650       279 000661       280 000710       283 000711       292 000717       294 000756
+    298 000766       308 001002       311 001041       315 001051       318 001057       321 001070       323 001071
+    354 001073       356 001103       358 001106       361 001111       364 001131       366 001142       367 001143
+    368 001155       372 001257       373 001307       377 001413       380 001420       381 001440       385 001542
+    386 001564       390 001666       392 001667       394 001676       398 001677       433 001701       435 001711
+    437 001714       439 001717       442 001722       443 001742       444 001762       446 001763       448 002013
+    454 002121       457 002136       459 002147       461 002176       466 002302       470 002304       505 002306
+    508 002316       510 002321       513 002324       516 002344       517 002345       518 002357       523 002440
+    524 002470       529 002574       532 002601       533 002621       538 002723       539 002745       544 003047
+    546 003050       548 003061       550 003070       554 003071       600 003073       603 003076       604 003106
+    607 003111       609 003131       612 003137       613 003141       614 003143       615 003145       617 003147
+    619 003164       623 003205       627 003212       628 003216       631 003237       632 003247       633 003251
+    634 003255       639 003272       640 003274       641 003300       642 003305       645 003330       646 003334
+    647 003337       648 003344       652 003345       669 003347       671 003352       673 003355       678 003404
+    683 003434       686 003445       690 003446       722 003450       724 003453       726 003456       730 003466
+    734 003475       737 003501       741 003502       774 003504       776 003507       778 003512       782 003522
+    786 003531       789 003535       792 003544       793 003553       797 003556       799 003570       802 003572
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

@@ -1,0 +1,2426 @@
+	COMPILATION LISTING OF SEGMENT device_acct_
+	Compiled by: Multics PL/I Compiler, Release 30, of February 16, 1988
+	Compiled at: Honeywell Bull, Phoenix AZ, SysM
+	Compiled on: 07/13/88  1032.8 mst Wed
+	    Options: optimize map
+
+        1 /****^  ***********************************************************
+        2*        *                                                         *
+        3*        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        4*        *                                                         *
+        5*        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        6*        *                                                         *
+        7*        * Copyright (c) 1972 by Massachusetts Institute of        *
+        8*        * Technology and Honeywell Information Systems, Inc.      *
+        9*        *                                                         *
+       10*        *********************************************************** */
+       11 
+       12 /* format: style4 */
+       13 device_acct_: proc;
+       14 
+       15 /* DEVICE_ACCT_ - program to account for process device usage  */
+       16 /* Written by VanVleck ---
+       17*   Modified 8/1/77 by Greenberg for $broom
+       18*   .            and by T. Casey to lock the pdt entry while modifying it
+       19*   Modified Feb 1980 by M. B. Armstrong to implement multiple rate structures (UNCA).
+       20*   Modified June 1981 by E. N. Kittlitz for UNCA rate structures
+       21*   Modified November 1981, E. N. Kittlitz.  user_table_entry conversion.
+       22*   Modified May 1982, E. N. Kittlitz. New AS initialization.
+       23**/
+       24 
+       25 
+       26 /****^  HISTORY COMMENTS:
+       27*  1) change(87-04-26,GDixon), approve(87-07-13,MCR7741),
+       28*     audit(87-07-23,Brunelle), install(87-08-04,MR12.1-1055):
+       29*     Upgraded for change to answer_table.incl.pl1 and user_table_entry.incl.pl1
+       30*  2) change(87-07-20,GDixon), approve(87-07-20,MCR7741),
+       31*     audit(87-07-23,Brunelle), install(87-08-04,MR12.1-1055):
+       32*      A) Add operator message documentation.
+       33*      B) Use sys_log_constants.incl.pl1 for severity parameter to sys_log_.
+       34*                                                   END HISTORY COMMENTS */
+       35 
+       36 
+       37 dcl  (addr, clock, null) builtin;
+       38 
+       39 dcl  cur_rs_ptr ptr;
+       40 dcl  devep ptr;					/* ptr to entry in device table */
+       41 dcl  pdtep ptr;					/* ptr to entry in pdt to be charged */
+       42 dcl  (dix, dix1) fixed bin;				/* subscript in device table */
+       43 dcl  cost float bin;				/* cost, for setup operation. */
+       44 
+       45 dcl  unlock_pdte_sw bit (1) aligned;			/* to remember to unlock the pdt entry */
+       46 dcl  ec fixed bin (35);				/* errcode */
+       47 
+       48 dcl  error_table_$lock_wait_time_exceeded ext fixed bin (35);
+       49 dcl  error_table_$locked_by_this_process ext fixed bin (35);
+       50 dcl  error_table_$out_of_sequence fixed bin (35) ext static;
+       51 
+       52 
+       53 dcl  hcs_$make_seg entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35));
+       54 dcl  hcs_$truncate_seg entry (ptr, fixed bin, fixed bin (35));
+       55 dcl  (sys_log_$error_log, sys_log_) entry options (variable);
+       56 dcl  (ipc_$mask_ev_calls, ipc_$unmask_ev_calls) entry (fixed bin (35));
+       57 dcl  set_lock_$lock entry (bit (36) aligned, fixed bin, fixed bin (35));
+       58 dcl  set_lock_$unlock entry (bit (36) aligned, fixed bin (35));
+       59 dcl  sub_err_ entry () options (variable);
+       60 
+       61 
+       62 /* =======================================================  */
+       63 
+       64 on:  entry (a_dev, a_devname, a_utep);
+       65 
+       66 dcl  a_dev fixed bin,				/* device type number */
+       67      a_devname char (*),				/* device identifier */
+       68      a_utep ptr;					/* ptr ot answer table entry */
+       69 
+       70 	if a_dev = 0 then return;			/* see comments in devid.incl.pl1 */
+       71 	ansp = as_data_$ansp;
+       72 	anstbl.current_time = clock ();		/* use accurate clock value to start charging */
+       73 	if devtab.freep = 0 then do;			/* Allocate new device table entry. */
+       74 	     dix, devtab.current_size = devtab.current_size + 1;
+       75 	     devep = addr (devtab.entry (dix));		/* Grew new entry. */
+       76 	end;
+       77 	else do;					/* Re-use free entry from free chain. */
+       78 	     dix = devtab.freep;
+       79 	     devep = addr (devtab.entry (dix));
+       80 	     devtab.freep = process_chain_f;		/* Shorten free chain by one. LIFO */
+       81 	end;
+       82 
+       83 	utep = a_utep;				/* Copy ptr to anstbl */
+       84 	ute.ndevices = ute.ndevices + 1;		/* Count devices. */
+       85 	deve.process_chain_f = ute.device_head;		/* Set up chain pointers in new entry. */
+       86 	deve.process_chain_b = 0;			/* Add new entry to front of chain. */
+       87 	ute.device_head = dix;			/* Make anstbl entry point at new entry. */
+       88 	if ute.device_tail = 0 then ute.device_tail = dix;
+       89 	if deve.process_chain_f ^= 0
+       90 	then addr (devtab.entry (deve.process_chain_f)) -> deve.process_chain_b = dix;
+       91 
+       92 	deve.mount_time, deve.update_time = anstbl.current_time; /* Fill in device entry. */
+       93 	deve.devid = a_dev;
+       94 	deve.dev_name = a_devname;
+       95 	deve.pdtep = ute.pdtep;			/* set pointer to accounting data. */
+       96 	deve.state = 1;
+       97 
+       98 	return;
+       99 
+      100 /* -------------------------------------------------------- */
+      101 
+      102 setup: entry (a_dev, a_devname, a_utep);
+      103 
+      104 dcl  devtab_ix fixed bin;				/* id of device that the setup is being done on */
+      105 
+      106 	if a_dev = 0 then return;			/* see comments in devid.incl.pl1 */
+      107 	utep = a_utep;				/* Copy ptr to anstbl entry. */
+      108 	pdtep = ute.pdtep;				/* Extract ptr to pdt entry. */
+      109 	if lock_pdte () then do;			/* if we can't lock PDT entry, user gets out of being charged */
+      110 	     if a_dev = devtab_ix_tape then devtab_ix = devtab_ix_tape_mt; /* tape setup */
+      111 	     else if a_dev = devtab_ix_disk then devtab_ix = devtab_ix_disk_mt; /* io disk setup */
+      112 	     else devtab_ix = 0;			/* something else - should never happen */
+      113 	     if devtab_ix ^= 0 then do;		/* see comments in devid.incl.pl1 */
+      114 		devtab.usage_total (devtab_ix) = devtab.usage_total (devtab_ix) + 1;
+      115 		ansp = as_data_$ansp;
+      116 		cost = rs_ptrs (ute.rs_number) -> rate_structure.device_price (devtab_ix, anstbl.shift); /* Obtain price for setup operation. */
+      117 		user.devices (devtab_ix) = user.devices (devtab_ix) + cost;
+      118 		user.dollar_charge = user.dollar_charge + cost;
+      119 		user.absolute_spent = user.absolute_spent + cost;
+      120 		ute.session_cost = ute.session_cost + cost;
+      121 	     end;
+      122 	     call unlock_pdte;
+      123 	end;
+      124 	return;					/* All done. */
+      125 
+      126 /* -------------------------------------------------------- */
+      127 
+      128 off: entry (a_dev, a_devname, a_utep);
+      129 
+      130 	if a_dev = 0 then return;			/* see comments in devid.incl.pl1 */
+      131 	utep = a_utep;				/* Copy ptr to anstbl entry. */
+      132 	do dix = ute.device_head repeat (deve.process_chain_f) while (dix ^= 0); /* Scan chain */
+      133 	     devep = addr (devtab.entry (dix));
+      134 	     if deve.devid = a_dev & deve.dev_name = a_devname then do; /* got it */
+      135 	          ansp = as_data_$ansp;
+      136 		anstbl.current_time = clock ();	/* use accurate clock value to compute charges */
+      137 		call upcharge;
+      138 		call free_devtab_entry;
+      139 		return;
+      140 	     end;
+      141 	end;
+      142 
+      143 	call sys_log_ (SL_LOG_SILENT,
+      144 	     "device_acct_$off: device ^d (^a, ^a) not in device table for ^a.^a",
+      145 	     a_dev, installation_parms.devtab (a_dev).device_id, a_devname, ute.person, ute.project);
+      146 	return;					/* device table probably messed up. nothing operator can do */
+      147 
+      148 
+      149 /* ------------------------------------------------------- */
+      150 
+      151 update: entry (a_utep);				/* called by act_ctl_ */
+      152 
+      153 	utep = a_utep;				/* Copy ptr to anstbl entry. */
+      154 	ansp = as_data_$ansp;
+      155 	if ute.ndevices = 0 then return;		/* If no device chain, quit. */
+      156 	do dix = ute.device_head repeat (deve.process_chain_f) while (dix ^= 0);
+      157 	     devep = addr (devtab.entry (dix));
+      158 	     call upcharge;				/* $$$$$ */
+      159 	end;
+      160 
+      161 	return;					/* All through. */
+      162 
+      163 /* ------------------------------------------------------- */
+      164 
+      165 broom: entry (a_utep);				/* Charge and clean up all process entries. */
+      166 
+      167 	utep = a_utep;
+      168 	if ute.ndevices = 0 then return;		/* avoid some paging */
+      169 
+      170 	ansp = as_data_$ansp;
+      171 	anstbl.current_time = clock ();		/* use accurate clock value to compute charges */
+      172 	do dix = ute.device_head repeat dix1 while (dix ^= 0); /* dix1 is set by the free_devtab_entry internal procedure */
+      173 	     devep = addr (devtab.entry (dix));
+      174 	     call upcharge;				/* charge to this point */
+      175 	     call free_devtab_entry;
+      176 	end;
+      177 	return;
+      178 
+      179 /* -------------------------------------------------------- */
+      180 
+      181 init: entry;					/* Called by as_init_ */
+      182 
+      183 	if ^sc_stat_$Multics_typed | sc_stat_$Go_typed then do;
+      184 	     ec = error_table_$out_of_sequence;
+      185 	     go to init_sub_err;
+      186 	end;
+      187           ansp = as_data_$ansp;
+      188 	call hcs_$make_seg (anstbl.sysdir, "device_table", "", 1010b, devtabp, ec);
+      189 	if devtabp = null then go to init_error;
+      190 
+      191 	call hcs_$truncate_seg (devtabp, 0, ec);	/* zero the entire segment */
+      192 	if ec ^= 0 then go to init_error;
+      193 	devtab.current_size = 0;			/* Clean up device table. */
+      194 	devtab.freep = 0;				/* Make it all empty. */
+      195 	devtab.version = DEVTAB_version;		/* Set state. */
+      196 	devtab.n_devices = 0;
+      197 
+      198 /* Look up the devtab entries for tape, tape_mt, disk, and disk_mt, and remember their indices in static variables */
+      199 
+      200 	do devtab_ix_tape = 1 to installation_parms.ndevices /* look up tape in devtab */
+      201 	     while (installation_parms.devtab (devtab_ix_tape).device_id ^= dev_id (dev_tape));
+      202 	end;
+      203 	if devtab_ix_tape = installation_parms.ndevices + 1 then /* if not there, we won't charge for tape */
+      204 	     devtab_ix_tape = 0;
+      205 
+      206 	do devtab_ix_tape_mt = 1 to installation_parms.ndevices /* look up tape_mt in devtab */
+      207 	     while (installation_parms.devtab (devtab_ix_tape_mt).device_id ^= dev_id (dev_tape_mt));
+      208 	end;
+      209 	if devtab_ix_tape_mt = installation_parms.ndevices + 1 then /* if not there, we won't charge for tape mounts */
+      210 	     devtab_ix_tape_mt = 0;
+      211 
+      212 	do devtab_ix_disk = 1 to installation_parms.ndevices /* look up disk in devtab */
+      213 	     while (installation_parms.devtab (devtab_ix_disk).device_id ^= dev_id (dev_disk));
+      214 	end;
+      215 	if devtab_ix_disk = installation_parms.ndevices + 1 then /* if not there, we won't charge for disk */
+      216 	     devtab_ix_disk = 0;
+      217 
+      218 	do devtab_ix_disk_mt = 1 to installation_parms.ndevices /* look up disk_mt in devtab */
+      219 	     while (installation_parms.devtab (devtab_ix_disk_mt).device_id ^= dev_id (dev_disk_mt));
+      220 	end;
+      221 	if devtab_ix_disk_mt = installation_parms.ndevices + 1 then /* if not there, we won't charge for disk mounts */
+      222 	     devtab_ix_disk_mt = 0;
+      223 
+      224 	return;
+      225 
+      226 init_error: call sys_log_$error_log (SL_LOG_BEEP, ec, "device_acct_$init",
+      227 	     "device_table");
+      228 init_sub_err: call sub_err_ (ec, "device_acct_$init", "s");
+      229 
+      230 /* ------------------------------------------------------- */
+      231 
+      232 upcharge: proc;
+      233 
+      234 dcl  delta fixed bin (71),				/* Delta time for usage. */
+      235      cost float bin (63);				/* Charge for the time. */
+      236 
+      237 	pdtep = deve.pdtep;				/* Get ptr to place where charges go. */
+      238 	if pdtep ^= ute.pdtep then do;		/* trap bug in maintenance of device table threads */
+      239 	     call sys_log_ (SL_LOG_BEEP,
+      240 	          "device_acct_: deve.pdtep (^p) not = ute.pdtep (^p) for ^a.^a",
+      241 		pdtep, ute.pdtep, ute.person, ute.project);
+      242 	     return;
+      243 	end;
+      244 
+      245 	if lock_pdte () then do;			/* if we can't lock PDT entry, user gets out of being charged */
+      246 	     delta = anstbl.current_time - deve.update_time; /* Calculate time mounted. */
+      247 	     deve.update_time = anstbl.current_time;
+      248 	     devtab.usage_total (deve.devid) = devtab.usage_total (deve.devid) + delta;
+      249 	     cost = rs_ptrs (ute.rs_number) -> rate_structure.device_price (deve.devid, anstbl.shift) * delta / 36e8;
+      250 	     user.devices (deve.devid) = user.devices (deve.devid) + cost;
+      251 	     user.dollar_charge = user.dollar_charge + cost;
+      252 	     user.absolute_spent = user.absolute_spent + cost;
+      253 	     ute.session_cost = ute.session_cost + cost;
+      254 	     call unlock_pdte;
+      255 	end;
+      256 	return;
+      257 
+      258      end upcharge;
+      259 
+      260 /* ---------- */
+      261 
+      262 free_devtab_entry: proc;
+      263 
+      264 	dix1 = deve.process_chain_f;			/* Save for broom loop. */
+      265 
+      266 	if deve.process_chain_f = 0 then ute.device_tail = deve.process_chain_b;
+      267 	else addr (devtab.entry (deve.process_chain_f)) -> deve.process_chain_b = deve.process_chain_b;
+      268 
+      269 	if deve.process_chain_b = 0 then ute.device_head = deve.process_chain_f;
+      270 	else addr (devtab.entry (deve.process_chain_b)) -> deve.process_chain_f = deve.process_chain_f;
+      271 
+      272 	ute.ndevices = ute.ndevices - 1;		/* Decrement count in ATE */
+      273 	deve.state = 0;				/* free */
+      274 	deve.process_chain_f = devtab.freep;		/* thread to free list */
+      275 	deve.process_chain_b = -1;			/* watch for bugs */
+      276 	devtab.freep = dix;
+      277 	return;
+      278 
+      279      end free_devtab_entry;
+      280 
+      281 /* ---------- */
+      282 
+      283 lock_pdte: proc returns (bit (1) aligned);
+      284 
+      285 	unlock_pdte_sw = "1"b;			/* remember to unlock it */
+      286 	call ipc_$mask_ev_calls ((0));		/* in case we have to wait on the lock */
+      287 	call set_lock_$lock (user.lock, 15, ec);	/* wait 15 seconds only */
+      288 	call ipc_$unmask_ev_calls ((0));		/* unmask before doing anything else, so we don't forget */
+      289 
+      290 /* an undocumented feature of ipc_ masking is that it counts mask and unmask calls,
+      291*   and does the right thing - so we can unmask here without worrying about whether
+      292*   the caller of device_acct_ was already masked (which he sometines is).
+      293*   If he is, the process stays masked in spite of our unmasking.
+      294**/
+      295 
+      296 	if ec = error_table_$lock_wait_time_exceeded then do; /* if we could not lock it */
+      297 	     call sys_log_$error_log (SL_LOG_BEEP, ec, "device_acct_",
+      298 		"Attempting to lock PDT entry of ^a.^a",
+      299 		ute.person, ute.project);		/* tell the operator */
+      300 	     unlock_pdte_sw = ""b;			/* don't try to unlock it */
+      301 	     return (""b);				/* tell our caller what happened */
+      302 	end;
+      303 
+      304 	else if ec = error_table_$locked_by_this_process then /* caller of device_acct_ already had it locked */
+      305 	     unlock_pdte_sw = ""b;			/* so remember to leave it that way */
+      306 
+      307 	return ("1"b);				/* tell caller that it is locked */
+      308 
+      309      end lock_pdte;
+      310 
+      311 /* ---------- */
+      312 
+      313 unlock_pdte: proc;
+      314 
+      315 	if unlock_pdte_sw then
+      316 	     call set_lock_$unlock (user.lock, (0));
+      317 
+      318 	return;
+      319 
+      320      end unlock_pdte;
+      321 
+      322 /* BEGIN MESSAGE DOCUMENTATION
+      323*
+      324*   Message:
+      325*   device_acct_: deve.pdtep (PTR1) not = ute.pdtep (PTR2) for PERSON.PROJECT.
+      326*
+      327*   A:	$as2
+      328*
+      329*   T:	$run
+      330*
+      331*   M:	The Project Definition Table entry pointer (PTR1) stored in the
+      332*   device table for PERSON.PROJECT differs from the PDT entry pointer stored
+      333*   in that user's User Table Entry (UTE).  $err
+      334*
+      335*   A:	$notify
+      336*
+      337*
+      338*   Message:
+      339*   device_acct_: ERROR_MESSAGE.  Attempting to lock PDT entry of PERSON.PROJECT
+      340*
+      341*   S:	$as2
+      342*
+      343*   T:	$run
+      344*
+      345*   M:	An attempt was made to lock the Project Definition Table (PDT) entry
+      346*   for PERSON.PROJECT to update device usage charges for the user.  Locking
+      347*   did not succeed within 15 seconds, so the charges were not updated.  If
+      348*   the attempt occurred during an accounting update, the charges will continue
+      349*   to accrue until the next update, at which time locking the PDT entry is
+      350*   again attempted.  If the original attempt occurred as part of a
+      351*   logout or new_proc operation, the device charges are lost.
+      352*
+      353*   A:    $notify_sa
+      354*
+      355*
+      356*   Message:
+      357*   device_acct_$init: ERROR_MESSAGE.  device_table
+      358*
+      359*   S: 	$as2
+      360*
+      361*   T:	$init
+      362*
+      363*   M:	An error occurred which initializing the device_table.  ERROR_MESSAGE
+      364*   is the text associated with the error code describing the error.  Device
+      365*   accounting is disabled, and system initialization fails.
+      366*
+      367*   A:	$notify
+      368*
+      369*
+      370*   Message:
+      371*   device_acct_$off: device N (ACCT_TYPE_NAME, DEV_NAME) not in device table for PERSON.PROJECT
+      372*
+      373*   S: 	$as0
+      374*
+      375*   T:	$run
+      376*
+      377*   M:	Device DEV_NAME, which has device accounting type number N associated
+      378*   with ACCT_TYPE_NAME devices, was not found in PERSON.PROJECT's device 
+      379*   table entries.  Probable cause is damage to the device table.
+      380*
+      381*   A:	$notify_sa
+      382*
+      383*   END MESSAGE DOCUMENTATION */
+      384 
+      385  /* BEGIN INCLUDE FILE ... answer_table.incl.pl1 */
+  1     2 
+  1     3 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+  1     4 /*							       */
+  1     5 /* The answer table has one entry per "login instance" whether completed or  */
+  1     6 /* not.  It is connected to the Channel Definition Table by the pointer      */
+  1     7 /* "channel".  The header is used mostly by dialup_.		       */
+  1     8 /*							       */
+  1     9 /* Programs which use this file must also include user_table_header.incl.pl1 */
+  1    10 /*							       */
+  1    11 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+  1    12 
+  1    13 /****^  HISTORY COMMENTS:
+  1    14*  1) change(81-09-10,Kittlitz), approve(), audit(), install():
+  1    15*     Replace anstbl.incl.pl1.
+  1    16*  2) change(85-01-15,Swenson), approve(), audit(), install():
+  1    17*     Add anstbl.session_uid_counter.
+  1    18*  3) change(85-08-21,Coren), approve(), audit(), install():
+  1    19*     Add anstbl.message_update_time and named constants for values of
+  1    20*     anstbl.session, and to make all padding explicit.
+  1    21*  4) change(85-08-23,Coren), approve(), audit(), install():
+  1    22*     Change "entry" to a placeholder so as not to require
+  1    23*     user_table_entry.incl.pl1.
+  1    24*  5) change(86-06-29,Swenson), approve(87-07-13,MCR7741),
+  1    25*     audit(87-04-14,GDixon), install(87-08-04,MR12.1-1056):
+  1    26*     Added the flag login_server_present which indicates whether a login
+  1    27*     server request has been received.  This is used to determine whether
+  1    28*     dial_ctl_ should call uc_cleanup_network_dials_ (and thus
+  1    29*     hpriv_connection_list_, which only exists with the MNA RPQ software).
+  1    30*  6) change(87-04-14,GDixon), approve(87-07-13,MCR7741),
+  1    31*     audit(87-07-16,Brunelle), install(87-08-04,MR12.1-1056):
+  1    32*      A) Moved constants for ute.pw_flags.mask_ctl into
+  1    33*         user_table_entry.incl.pl1.
+  1    34*      B) Added common table header to all user tables.
+  1    35*                                                   END HISTORY COMMENTS */
+  1    36 
+  1    37 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+  1    38 /*							       */
+  1    39 /* The anstbl structure below is divided into sections.  Each section begins */
+  1    40 /* with a comment describing the elements in the section.  Elements are      */
+  1    41 /* placed within a section, based upon their function or the programs that   */
+  1    42 /* use them.  Each section begins on a double word and is an even number of  */
+  1    43 /* words long.						       */
+  1    44 /*							       */
+  1    45 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+  1    46 
+  1    47 
+  1    48 
+  1    49 /* format: style4 */
+  1    50 
+  1    51 dcl  ANSTBL_version_4 static options (constant) init (4);	/* version of this declaration */
+  1    52 
+  1    53 dcl  ansp ptr automatic init (null);
+  1    54 
+  1    55 dcl  1 anstbl based (ansp) aligned,			/* Structure of answer table */
+  1    56        2 header like ut_header,			/* Header common to all user tables. */
+  1    57 
+  1    58 /* Counter elements. */
+  1    59        2 nlin fixed bin,				/* number of active lines */
+  1    60        2 mxlin fixed bin,				/* maximum number of active lines */
+  1    61        2 n_users fixed bin,				/* number of logged-in users */
+  1    62        2 max_users fixed bin,				/* maximum number of users allowed */
+  1    63        2 n_units fixed bin,				/* number of logged in units */
+  1    64        2 max_units fixed bin,				/* maximum number of units */
+  1    65        2 n_sessions fixed bin,			/* number of Multics sessions */
+  1    66        2 n_pad fixed bin,
+  1    67 
+  1    68 /* Name elements. */
+  1    69        2 sysdir char (64) unal,			/* name of main system control directory */
+  1    70        2 as_tty char (8) unal,			/* name of main answering service device. */
+  1    71 
+  1    72 /* Login elements. */
+  1    73        2 login_word char (8) unal,			/* login word if special_session=1  */
+  1    74        2 session char (8) unal,			/* session indicator */
+  1    75        2 special_message char (128) unal,		/* message to be printed for special session */
+  1    76        2 message_update_time fixed bin (71),		/* time at which special_message was last updated */
+  1    77        2 message_lng fixed bin,			/* length of special message */
+  1    78        2 login_pad fixed bin,
+  1    79 
+  1    80 /* Table update elements. */
+  1    81        2 lock_count fixed bin,			/* global lock for all system control tables */
+  1    82        2 update_pending bit (1) aligned,		/* flag indicating that update is required */
+  1    83        2 update_channel fixed binary (71),		/* event channel of update procedure */
+  1    84        2 acct_update_chn fixed bin (71) aligned,		/* Timer IPC channel */
+  1    85        2 acct_last_update_time fixed bin (71) aligned,	/* Time of last accounting update */
+  1    86        2 acct_alarm_fail fixed bin,			/* non-zero if alarm has failed */
+  1    87        2 update_pad fixed bin,
+  1    88 
+  1    89 /* dialup_ data values. */
+  1    90        2 current_time fixed bin (71),			/* Time of last transaction */
+  1    91        2 processid_index fixed bin (18),		/* unique index for process id generation */
+  1    92        2 session_uid_counter fixed bin (35),		/* current session_uid */
+  1    93 
+  1    94 /* load_ctl_ elements. */
+  1    95        2 shift fixed bin,				/* Shift, set by act_ctl_ */
+  1    96        2 auto_maxu fixed bin,				/* 0 = manual, 1 = config, 2 = load-level */
+  1    97        2 extra_units fixed bin,			/* Total daemon and abs units. */
+  1    98 						/* load_ctl_ load leveling desired response range: */
+  1    99        2 response_high fixed bin,			/* bad if user response time slower than this */
+  1   100        2 response_low fixed bin,			/* bad if user response time faster than this */
+  1   101        2 load_ctl_pad fixed bin,
+  1   102 
+  1   103 /* Login server request server data. */
+  1   104        2 ls_request_server_event_channel fixed bin (71),	/* channel for login server requests */
+  1   105        2 ls_request_server_process_id bit (36) aligned,	/* process serving login server requests */
+  1   106        2 login_server_present bit (1) aligned,		/* On IFF a login server request has been processed */
+  1   107 
+  1   108        2 entry_pad (28) fixed bin,			/* pad to 128 words */
+  1   109        2 entry (0 refer (anstbl.current_size)),		/* user entries */
+  1   110          3 contents (UTE_SIZE) fixed bin;
+  1   111 
+  1   112 /* constants */
+  1   113 
+  1   114 /* values for anstbl.session */
+  1   115 
+  1   116 dcl  (AT_NORMAL init ("normal  "),
+  1   117      AT_SPECIAL init ("special "),
+  1   118      AT_SHUTDOWN init ("shutdown")) char (8) internal static options (constant);
+  1   119 
+  1   120 dcl  UTE_SIZE fixed bin internal static initial (300);
+  1   121 
+  1   122 /* END INCLUDE FILE ... answer_table.incl.pl1 */
+      385 
+      386  /* BEGIN INCLUDE FILE ... as_data_.incl.pl1 ... */
+  2     2 
+  2     3 /* format: style4 */
+  2     4 
+  2     5 /* This file must be kept in sync with as_data_.alm */
+  2     6 
+  2     7 /****^  HISTORY COMMENTS:
+  2     8*  1) change(86-09-21,Beattie), approve(86-09-22,MCR7542),
+  2     9*     audit(86-10-31,Brunelle), install(86-11-12,MR12.0-1211):
+  2    10*     Remove references to the 963 and 029 preaccess commands and remove support
+  2    11*     for ARDS, 202_ETX, 2741 and 1050 in system interfaces.
+  2    12*  2) change(86-09-25,Swenson), approve(87-07-20,MCR7737),
+  2    13*     audit(87-07-20,GDixon), install(87-08-04,MR12.1-1056):
+  2    14*     Add references to as_data_ entrypoints added for Login Server.
+  2    15*  3) change(87-03-03,Brunelle), approve(87-07-20,MCR7697),
+  2    16*     audit(87-07-20,GDixon), install(87-08-04,MR12.1-1056):
+  2    17*     Added new user signal field of inacrcvd (14) to handle inactivity response
+  2    18*     from user.
+  2    19*                                                   END HISTORY COMMENTS */
+  2    20 
+  2    21 dcl  as_data_$BS char (1) aligned ext static;		/* BACKSPACE character */
+  2    22 dcl  as_data_$CR char (1) aligned ext static;		/* CARRIAGE RETURN character */
+  2    23 dcl  as_data_$abs_dim char (32) ext static;		/* absentee DIM */
+  2    24 dcl  as_data_$acct_update_priority fixed bin ext static;	/* accounting update IPC priority */
+  2    25 dcl  as_data_$acsdir char (168) ext static;		/* Access Control Segment directory */
+  2    26 dcl  as_data_$ansp ptr ext static;			/* answer_table */
+  2    27 dcl  as_data_$as_procid bit (36) aligned ext static;	/* Answering Service process id */
+  2    28 dcl  as_data_$as_ring fixed bin (3) ext static;		/* AS operating ring */
+  2    29 dcl  as_data_$as_tty char (6);			/* AS master tty channel */
+  2    30 dcl  as_data_$asmtp ptr ext static;			/* AS meter table */
+  2    31 dcl  as_data_$autp ptr ext static;			/* absentee_user_table */
+  2    32 dcl  as_data_$buzzardp ptr ext static;			/* dpg_ list of buteo processes */
+  2    33 dcl  as_data_$cdtp ptr ext static;			/* CDT */
+  2    34 dcl  as_data_$default_weight fixed bin (35) ext;		/* default user process load control weight */
+  2    35 dcl  as_data_$devtabp ptr ext static;			/* device_table */
+  2    36 dcl  as_data_$dft_user_ring fixed bin (3) ext static;	/* default user ring */
+  2    37 dcl  as_data_$dutp ptr ext static;			/* daemon_user_table */
+  2    38 dcl  as_data_$g115_dim char (32) ext static;
+  2    39 dcl  as_data_$lct_initialized bit (1) aligned ext static;	/* LCT allocated in ring 0 */
+  2    40 dcl  as_data_$lct_size fixed bin ext static;		/* CDT tty channels + spares */
+  2    41 dcl  as_data_$max_user_ring fixed bin (3) ext static;	/* maximum user ring */
+  2    42 dcl  as_data_$mgtp ptr ext static;			/* master group table */
+  2    43 dcl  as_data_$mrd_dim char (32) ext static;		/* daemon's message routing DIM */
+  2    44 dcl  as_data_$ntty_dim char (32) ext static;		/* network connection DIM */
+  2    45 dcl  as_data_$pdtdir char (168) ext static;		/* PDT directory */
+  2    46 dcl  as_data_$pit_ptr ptr ext static;			/* pit_temp_ */
+  2    47 dcl  as_data_$rcpdir char (168) ext static;		/* RCP directory */
+  2    48 dcl  as_data_$request_priority fixed bin ext static;
+  2    49 dcl  as_data_$rs_ptrs (0:9) ptr ext static;		/* rate_structures */
+  2    50 dcl  as_data_$rtdtp ptr ext static;			/* RTDT */
+  2    51 dcl  as_data_$sat_htp ptr ext static;			/* SAT hash table */
+  2    52 dcl  as_data_$satp ptr ext static;			/* SAT */
+  2    53 dcl  as_data_$suffix (0:9) char (2) unaligned ext static;
+  2    54 dcl  as_data_$sysdir char (168) ext static;		/* system control directory */
+  2    55 dcl  as_data_$teens_suffix (10:19) char (2) unaligned ext static;
+  2    56 dcl  as_data_$terminet_tabs_string char (144) varying ext static;
+  2    57 dcl  as_data_$tty_dim char (32) ext static;		/* standard interactive DIM */
+  2    58 dcl  as_data_$update_priority fixed bin ext static;	/* ??? */
+  2    59 dcl  as_data_$version char (8) ext static;		/* AS version */
+  2    60 dcl  as_data_$whoptr ptr ext static;			/* whotab */
+  2    61 
+  2    62 dcl  1 as_data_$login_args aligned ext static,		/* control arguments for login */
+  2    63        2 n_login_args fixed bin,
+  2    64        2 pad fixed bin,
+  2    65        2 login_args (55 /* as_data_$login_args.n_login_args */) char (24) unaligned;
+  2    66 
+  2    67 dcl  1 as_data_$signal_types ext static aligned,		/* IPC process control signals */
+  2    68        2 n_signals fixed bin,
+  2    69        2 pad fixed bin,
+  2    70        2 signals (14 /* as_data_$signal_types.n_signals */) char (8) unaligned;
+  2    71 
+  2    72 dcl  1 as_data_$system_signal_types ext static aligned,	/* IPC process control signals */
+  2    73        2 n_system_signals fixed bin,
+  2    74        2 pad fixed bin,
+  2    75        2 system_signals (10 /* as_data_$system_signal_types.n_system_signals */) char (8) unaligned;
+  2    76 
+  2    77 dcl  as_data_$login_words fixed bin ext static aligned,
+  2    78 						/* interactive login words */
+  2    79      1 as_data_login_words aligned based (addr (as_data_$login_words)),
+  2    80        2 n_words fixed bin,
+  2    81        2 pad fixed bin,
+  2    82        2 words (0 refer (as_data_login_words.n_words)) char (16) unaligned;
+  2    83 
+  2    84 dcl  as_data_$debug_flag bit (1) aligned external static;
+  2    85 dcl  as_data_$ls_request_server_info_ptr ptr external static;
+  2    86 dcl  as_data_$ls_message_buffer_cur_lth fixed bin (18) external static;
+  2    87 dcl  as_data_$ls_message_buffer_max_lth fixed bin (18) external static;
+  2    88 dcl  as_data_$ls_message_buffer_ptr ptr external static;
+  2    89 
+  2    90 /* END INCLUDE FILE ... as_data_.incl.pl1 ... */
+      386 
+      387  /* BEGIN INCLUDE FILE ... as_data_definitions_.incl.pl1 ... */
+  3     2 
+  3     3 
+  3     4 /****^  HISTORY COMMENTS:
+  3     5*  1) change(87-04-26,GDixon), approve(87-07-13,MCR7741),
+  3     6*     audit(87-07-16,Brunelle), install(87-08-04,MR12.1-1056):
+  3     7*     Removed ansp, autp and dutp from this include file, adding them to
+  3     8*     answer_table.incl.pl1, absentee_user_table.incl.pl1 and
+  3     9*     daemon_user_table.incl.pl1.
+  3    10*                                                   END HISTORY COMMENTS */
+  3    11 
+  3    12 
+  3    13 /* This include file requires as_data_.incl.pl1 */
+  3    14 
+  3    15 /* format: style4 */
+  3    16 
+  3    17 dcl  as_procid bit (36) aligned defined (as_data_$as_procid);
+  3    18 dcl  as_tty char (6) based (addr (as_data_$as_tty));
+  3    19 dcl  asmtp ptr defined (as_data_$asmtp);
+  3    20 dcl  devtabp ptr defined (as_data_$devtabp);
+  3    21 dcl  ip ptr defined (as_data_$rs_ptrs (0));
+  3    22 dcl  mgtp ptr defined (as_data_$mgtp);
+  3    23 dcl  pdtdir char (168) based (addr (as_data_$pdtdir));
+  3    24 dcl  rs_ptrs (0:9) ptr based (addr (as_data_$rs_ptrs (0)));
+  3    25 dcl  sat_htp ptr defined (as_data_$sat_htp);
+  3    26 dcl  satp ptr defined (as_data_$satp);
+  3    27 dcl  scdtp ptr defined (as_data_$cdtp);
+  3    28 dcl  sysdir char (168) defined (as_data_$sysdir);
+  3    29 dcl  whoptr ptr defined (as_data_$whoptr);
+  3    30 
+  3    31 /* END INCLUDE FILE ... as_data_definitions_.incl.pl1 ... */
+      387 
+      388  /* BEGIN INCLUDE FILE devid.incl.pl1 */
+  4     2 
+  4     3 /* Rewritten September 1977 by T. Casey to implement a new method of device charging. */
+  4     4 
+  4     5 
+  4     6 /****^  HISTORY COMMENTS:
+  4     7*  1) change(85-10-07,Herbst), approve(87-07-21,MCR7694),
+  4     8*     audit(87-07-21,GDixon), install(87-08-04,MR12.1-1056):
+  4     9*     Add dsa_kbyt, dsa_kpkt and dsa_hour device types.
+  4    10*                                                   END HISTORY COMMENTS */
+  4    11 
+  4    12 
+  4    13 /* This include file is used to avoid conflicts between system code and customer
+  4    14*   sites over the use of elements of the devtab array in installation_parms.
+  4    15*
+  4    16*   Sites can define new device types for terminal channel charging (for high-speed
+  4    17*   lines, for example), set prices for them in installation_parms, and use their
+  4    18*   names in the charge statement in the CMF.
+  4    19*
+  4    20*   There also exists a set of system-defined devices, such as tape and disk, and
+  4    21*   this set must be expandable. Code to charge for each one of these devices is
+  4    22*   built into the system. That code can not reference specific elements in the
+  4    23*   devtab array, since a site may have used any given element in that array for
+  4    24*   one of its own devices. This include file solves that problem.
+  4    25*
+  4    26*   The dev_id array contains the names of devices for which charging code is
+  4    27*   built into the system. That array should be changed whenever new device
+  4    28*   charging code is added. The order of device names in that array is insignificant.
+  4    29*   The constants with names of the form dev_DEVICE are used for program
+  4    30*   readability, to avoid having to reference specific entries in the dev_id
+  4    31*   array with numeric constants as subscripts.
+  4    32*
+  4    33*   The site must define devices of each of the names in the dev_id array, and
+  4    34*   set prices for them. Otherwise, no charges will be made for use of those
+  4    35*   devices. The ed_installation_parms procedure prints a warning, when
+  4    36*   printing device prices, if any of the required devices is not defined.
+  4    37*
+  4    38*   The static variables with names of the form devtab_ix_DEVICE are used to
+  4    39*   hold the subscripts of the respective devices' devtab entries. These variables
+  4    40*   must be assigned values at initialization time by the procedures that use them.
+  4    41*   These procedures should call system_info_$device_prices to get a copy of devtab,
+  4    42*   and then search devtab for a device_id equal to dev_id(dev_DEVICE) and remember
+  4    43*   the subscript in devtab_ix_DEVICE. If the device is not defined, the devtab_ix
+  4    44*   variable should remain zero, as an indication that charging for the device is
+  4    45*   to be bypassed.
+  4    46*
+  4    47**/
+  4    48 dcl  dev_id (8) char (8) aligned int static options (constant) init
+  4    49     ("tape", "tape_mt", "disk", "disk_mt", "lv",
+  4    50      "dsa_kbyt", "dsa_kpkt", "dsa_hour");
+  4    51 
+  4    52 dcl  dev_tape fixed bin int static options (constant) init (1);
+  4    53 dcl  dev_tape_mt fixed bin int static options (constant) init (2);
+  4    54 dcl  dev_disk fixed bin int static options (constant) init (3);
+  4    55 dcl  dev_disk_mt fixed bin int static options (constant) init (4);
+  4    56 dcl  dev_lv fixed bin int static options (constant) init (5);
+  4    57 dcl  dev_dsa_kilobyte fixed bin int static options (constant) init (6);
+  4    58 dcl  dev_dsa_kilopacket fixed bin int static options (constant) init (7);
+  4    59 dcl  dev_dsa_hour fixed bin int static options (constant) init (8);
+  4    60 
+  4    61 dcl  devtab_ix_tape fixed bin int static init (0);
+  4    62 dcl  devtab_ix_tape_mt fixed bin int static init (0);
+  4    63 dcl  devtab_ix_disk fixed bin int static init (0);
+  4    64 dcl  devtab_ix_disk_mt fixed bin int static init (0);
+  4    65 dcl  devtab_ix_lv fixed bin int static init (0);
+  4    66 dcl  devtab_ix_dsa_kilobyte fixed bin int static init (0);
+  4    67 dcl  devtab_ix_dsa_kilopacket fixed bin int static init (0);
+  4    68 dcl  devtab_ix_dsa_hour fixed bin int static init (0);
+  4    69 
+  4    70 /* END INCLUDE FILE devid.incl.pl1 */
+      388 
+      389  /* BEGIN INCLUDE FILE ... devtab.incl.pl1 */
+  5     2 
+  5     3 /* The device table contains one entry for each device attached to a process */
+  5     4 
+  5     5 dcl  DEVTAB_version fixed bin int static init (0);	/* version of this dcl */
+  5     6 
+  5     7 dcl 1 devtab based (devtabp) aligned,
+  5     8     2 current_size fixed bin,				/* number of slots in table */
+  5     9     2 max_size fixed bin,				/* maximum number of slots */
+  5    10     2 n_devices fixed bin,				/* number of devices in used */
+  5    11     2 freep fixed bin,				/* free chain head ptr */
+  5    12     2 version fixed bin,				/* version number of this dcl, currently 0 */
+  5    13     2 pad1 fixed bin,
+  5    14     2 usage_total (16) fixed bin (71),			/* total device hours */
+  5    15     2 pad (26) fixed bin,
+  5    16     2 entry (100),					/* device entries */
+  5    17       3 fill (32) fixed bin;
+  5    18 
+  5    19 dcl 1 deve based (devep) aligned,			/* individual device */
+  5    20     2 state fixed bin,				/* 0 = free */
+  5    21     2 devid fixed bin,				/* device type */
+  5    22     2 process_chain_f fixed bin,			/* forward chain (also free list) */
+  5    23     2 process_chain_b fixed bin,			/* backward chain */
+  5    24     2 dev_name char (32),				/* name of device */
+  5    25     2 mount_time fixed bin (71),			/* time mounted */
+  5    26     2 update_time fixed bin (71),			/* time last updated */
+  5    27     2 pdtep ptr,					/* ptr to pdt entry */
+  5    28     2 pad (12) fixed bin;
+  5    29 
+  5    30 /* END INCLUDE FILE ... devtab.incl.pl1 */
+      389 
+      390  /* BEGIN INCLUDE FILE ... installation_parms.incl.pl1 */
+  6     2 
+  6     3 /* Modified 740723 by PG to add short AIM access names */
+  6     4 /* Modified Fall 1977 by T. Casey to add fatal loop and trm_ signal parameters */
+  6     5 /* Modified 04/03/78 by CDT to add rcp_init_flags structure */
+  6     6 /* Modified May 1978 by T. Casey to add resource timer and resource price list parameters */
+  6     7 /* Modified November 1978 by T. Casey for MR7.0, to add absentee control parameters */
+  6     8 /* Modified 17 September 1980 by G. Palter to add default absentee queue */
+  6     9 /* Modified April 1981 by E. N. Kittlitz for chn_wakeup_error_loop, chn_wakeup_error_count */
+  6    10 /* Modified June 1981 by E. N. Kittlitz for nrates/rate_structures UNCA rate_structure support.
+  6    11*     Version, expand foregound_cpu_default_limit and abs_cpu_max_limit to fixed bin (35) fields.
+  6    12*     nrscp & resource array moved from offset 2064 (octal) to 2400 (octal). */
+  6    13 /* Modified 1984-06-19 BIM to remove obsolete fields, and add 
+  6    14*		       strict_trusted_path. */
+  6    15 /* Modified 1984-10-24 BIM for default_pdir_quota. */
+  6    16 /* Modified 1984-12-05 BIM for require_operator_login. */
+  6    17 /* Modified 1985-03-01 by E. Swenson for password flags. */
+  6    18 
+  6    19 
+  6    20 /****^  HISTORY COMMENTS:
+  6    21*  1) change(86-01-27,MSharpe), approve(87-05-25,MCR7690),
+  6    22*     audit(87-03-29,GDixon), install(87-08-04,MR12.1-1056):
+  6    23*     added vchn_requires_accept parameter.
+  6    24*  2) change(87-02-17,GDixon), approve(87-05-25,MCR7680),
+  6    25*     audit(87-06-02,Parisek), install(87-08-04,MR12.1-1056):
+  6    26*     Correct formatting problems.
+  6    27*                                                   END HISTORY COMMENTS */
+  6    28 
+  6    29 
+  6    30 /* NOTE: rate_structure.incl.pl1 uses these declarations */
+  6    31 
+  6    32 
+  6    33 dcl 1 installation_parms based (ip) aligned,		/* describes installation parameters */
+  6    34     2 part_1 like installation_parms_part_1 aligned,
+  6    35     2 resource (0 refer (installation_parms.nrscp)) like installation_parms_resource_array_part aligned;
+  6    36 
+  6    37 dcl  installation_parms_version_1 fixed bin init (1) static internal options (constant);
+  6    38 dcl  installation_parms_version_2 fixed bin init (2) static internal options (constant);
+  6    39 
+  6    40 dcl 1 installation_parms_part_1 based aligned,		/* Used only by installation_parms and rate_structure */
+  6    41     2 installation_id char (32),			/* Name printed at dialup and in who */
+  6    42     2 company char (64),				/* company name */
+  6    43     2 department char (64),				/* department */
+  6    44     2 companyds char (120),				/* company, double spaced */
+  6    45     2 departmentds char (120),			/* dpeartment double spaced */
+  6    46     2 shifttab (336) bit (3) unal,			/* half-hrs from 0000 Mon, value is shift no */
+  6    47     2 cpu_price (0: 7) float bin,			/* price for cpu hour, by shift */
+  6    48     2 log_base_price (0: 7) float bin,			/* price for log hour, by shift */
+  6    49     2 io_ops_price (0: 7) float bin,			/* price per 1000 terminal io ops */
+  6    50     2 core_price (0: 7) float bin,			/* price for core page-hour, by shift */
+  6    51     2 ndevices fixed bin,				/* number of devices to charge */
+  6    52     2 devtab (16),					/* Maximum 16 */
+  6    53       3 device_id char (8),				/* Name of device */
+  6    54       3 device_price (0: 7) float bin,			/* Price by shift */
+  6    55     2 inactive_time fixed bin,			/* seconds of inactivity permitted */
+  6    56     2 warning_time fixed bin,				/* seconds from warning to logout */
+  6    57     2 login_time fixed bin,				/* seconds in which to complete login */
+  6    58     2 acct_update fixed bin,				/* seconds between acct update */
+  6    59     2 login_tries fixed bin,				/* number of login tries allowed */
+  6    60     2 disk_price float bin,				/* disk rate, in $/page-sec */
+  6    61     2 registration_price float bin,			/* fee per month per user */
+  6    62     2 dolsign char (1),				/* "dollar sign" */
+  6    63     2 abs_cpu_price (4) float bin,			/* price for absentee cpu by queue */
+  6    64     2 abs_mem_price (4) float bin,			/* Absentee memory charge */
+  6    65     2 iod_rec_price (4) float bin,			/* price for io daemon lines, per K, by queue */
+  6    66     2 abs_timax (4) fixed bin (35),			/* Absentee TIMAX parameter */
+  6    67     2 abs_cpu_default_limit (4) fixed bin (35),		/* default absentee cpu limit in seconds (changed from usec.) */
+  6    68     2 syserr_log_copy_threshold fixed bin (9),		/* Threshold (in PAGES) at which the
+  6    69*						   Initializer will copy the syserr_log */
+  6    70     2 default_pdir_seg_quota fixed bin (17) unaligned,	/* if system and project say 0 */
+  6    71     2 default_pdir_dir_quota fixed bin (17) unaligned,       /* Always used */
+  6    72     2 fatal_error_loop_count fixed bin (17) unaligned,
+  6    73     2 fatal_error_loop_seconds fixed bin (17) unaligned,
+  6    74     2 term_real_time_seconds fixed bin (17) unaligned,
+  6    75     2 term_cpu_time_seconds fixed bin (17) unaligned,
+  6    76     2 rcp_init_flags like rcp_init_flags aligned,		/* one word long */
+  6    77     2 rsc_timer_seconds fixed bin (17) unaligned,		/* time interval at which to check for resource availability */
+  6    78     2 pad_old_fg_cpu_default_limit bit (18) unaligned,
+  6    79     2 foreground_queue_position fixed bin (17) unal,	/* queue that foreground queue comes after */
+  6    80     2 idle_time_constant_seconds fixed bin (17) unal,	/* how far back to maintain moving average of load */
+  6    81     2 sus_cpu_time_seconds fixed bin (17) unal,		/* allow suspended process this much cpu time */
+  6    82     2 sus_real_time_seconds fixed bin (17) unal,		/* and this much real time, before bumping it */
+  6    83     2 foreground_cpu_default_limit fixed bin (35),	/* default cpu time limit (sec) for foreground absentee jobs */
+  6    84     2 access_authorization_ceiling bit (72),		/* "System high" access authorization. */
+  6    85     2 level_names (0:7) char (32),			/* Names for security levels. */
+  6    86     2 category_names (18) char (32),			/* Names for security categories. */
+  6    87     2 short_level_names (0:7) char (8),			/* Abbreviated level names. */
+  6    88     2 short_category_names (18) char (8),		/* Abbreviated category names. */
+  6    89     2 ncon fixed bin,				/* Number of config elements. */
+  6    90     2 cona (51),					/* each entry is 5 words long */
+  6    91       3 cpu fixed bin (5) unal,			/* Number of CPU's */
+  6    92       3 shift fixed bin (5) unal,			/* Shift number */
+  6    93       3 x1 fixed bin (23) unal,
+  6    94       3 kmem fixed bin (17) unal,			/* Memory size */
+  6    95       3 kbulk fixed bin (17) unal,			/* Bulk store size */
+  6    96       3 x2 fixed bin (17) unal,
+  6    97       3 maxa fixed bin (11) unal,			/* Max abs users */
+  6    98       3 maxq fixed bin (5) unal,			/* Max abs q */
+  6    99       3 maxu_base fixed bin (17) unal,
+  6   100       3 response_high fixed bin (17) unal,
+  6   101       3 response_low fixed bin (17) unal,
+  6   102       3 x3 fixed bin (17) unal,
+  6   103 
+  6   104 /* Absentee control parameters. New for MR7.0 */
+  6   105 
+  6   106     2 max_abs (0:7) fixed bin (17) unal,		/* per-shift upper limit on abs_maxu */
+  6   107     2 min_abs (0:7) fixed bin (17) unal,		/* per-shift lower limit on abs_maxu */
+  6   108     2 pct_abs (0:7) fixed bin (17) unal,		/* abs_maxu is this pct (per-shift) of idle units */
+  6   109 
+  6   110     2 max_qres (0:7, 4) fixed bin (17) unal,		/* per-shift-and-queue upper limit on reserved slots */
+  6   111     2 min_qres (0:7, 4) fixed bin (17) unal,		/* per-shift-and-queue lower limit on reserved slots */
+  6   112     2 pct_qres (0:7, 4) fixed bin (17) unal,		/* reserved slots are these pcts of abs_maxu */
+  6   113 
+  6   114     2 abs_cpu_max_limit (0:7, 4) fixed bin (35),		/* per-shift-and-queue upper limit (sec) on jobs' cpu times */
+  6   115 
+  6   116     2 default_absentee_queue fixed binary (17) unaligned,	/* default absentee queue for ear, etc. */
+  6   117 
+  6   118     2 chn_wakeup_error_loop_count fixed bin (17) unaligned, /* maximum number of channel wakeups in following interval */
+  6   119     2 chn_wakeup_error_loop_seconds fixed bin (17) unaligned, /* works like fatal_error_loop_count/seconds */
+  6   120     2 rate_structure_number fixed bin (17) unaligned,	/* rate_structure number of this RS */
+  6   121     2 version fixed bin (35),				/* must be 2 */
+  6   122     2 nrates fixed bin,				/* number of rate structures */
+  6   123     2 rate_structures (0:9) char (32),			/* names of rate_structures */
+  6   124     2 trusted_path_login bit (1) aligned,		/* forbid logout -hold and new_proc -auth */
+  6   125     2 require_operator_login bit (1) aligned,		/* just what it says */
+  6   126     2 operator_inactive_time fixed bin,			/* seconds between commands --> not logged in. */
+  6   127     2 validate_daemon_commands bit (1) aligned,		/* force existence and adequate access to 
+  6   128*						   mcacs segments for operators */
+  6   129     2 password_min_length fixed bin,			/* minimum length of passwords */
+  6   130     2 password_gpw_length fixed bin,			/* length of generated passwords */
+  6   131     2 password_change_interval fixed bin,		/* number of days until must change */
+  6   132     2 password_expiration_interval fixed bin,		/* number of days that a password may remain unused */
+  6   133     2 vchn_requires_accept bit (1) aligned,		/* "login personid -op -vchn foo" must be
+  6   134*						   "accepted" by operator if personid is not 
+  6   135*						   signed on system console */
+  6   136     2 end_pad (219) bit (36) aligned,			/* leave plenty of pad before the variable length price list */
+  6   137     2 nrscp fixed bin;				/* length of resource price array; must have offset 2400 (octal),
+  6   138*						   or someone miscounted when using part of pad2 */
+  6   139 
+  6   140 
+  6   141 /* Entries in the following array may be accessed via system_info_$resource_price.
+  6   142*   This array should not be accessed directly, since its format will change in subsequent releases of Multics. */
+  6   143 
+  6   144 dcl 1 installation_parms_resource_array_part (0 refer (installation_parms.nrscp)) based,
+  6   145       2 name char (32),
+  6   146       2 price float bin;
+  6   147 
+  7     1 /* BEGIN INCLUDE FILE ... rcp_init_flags.incl.pl1 */
+  7     2 
+  7     3 /* Created on 04/24/78 by Michael R. Jordan */
+  7     4 /* Modified 04/10/79 by C. D. Tavares */
+  7     5 
+  7     6 dcl  rifp ptr;
+  7     7 
+  7     8 dcl 1 rcp_init_flags based (rifp),
+  7     9     2 unload_on_detach bit (1) unaligned,		/* ON => tape volumes are unloaded after detaching */
+  7    10     2 pad1 bit (2) unaligned,				/* obsolete */
+  7    11     2 resource_mgmt_enabled bit (1) unaligned,		/* ON => resource management has been enabled */
+  7    12     2 auto_registration bit (1) unaligned,		/* ON => auto registration allowed */
+  7    13     2 pad2 bit (2) unaligned,				/* future expansion, possibly of authentication_level */
+  7    14     2 authentication_level fixed bin (2) unaligned unsigned; /* see below for values */
+  7    15 
+  7    16 dcl (No_authentication initial (0),
+  7    17      Nominal_authentication initial (1),
+  7    18      Automatic_authentication initial (2),
+  7    19      Manual_authentication initial (3)) fixed bin internal static options (constant);
+  7    20 
+  7    21 dcl  authentication_level_names (0:3) char (12) internal static options (constant) initial
+  7    22     ("none", "nominal", "automatic", "manual");
+  7    23 
+  7    24 /* END INCLUDE FILE ... rcp_init_flags.incl.pl1 */
+  6   148 
+  6   149 
+  6   150 /* END INCLUDE FILE ... installation_parms.incl.pl1 */
+      390 
+      391  /* BEGIN INCLUDE FILE ... pdt.incl.pl1 */
+  8     2 /* Requires user_attributes.incl.pl1 */
+  8     3 
+  8     4 /* Modified 740723 by PG to add AIM info */
+  8     5 /* Modified 750604 by T. Casey to add priority scheduler parameters */
+  8     6 /* Modified May 1976 by T. Casey to add cutoff warning thresholds and change version to 3 */
+  8     7 /* Modified May 1977 by John Gintell to add reqfile, projfile, and SAT to header */
+  8     8 /* Modified May 1978 by T. Casey to add pdir_quota to user entry */
+  8     9 /* Modified June 1978 by T. Casey to add rel ptr to pdt hash table */
+  8    10 /* Modified November 1978 by T. Casey to add max_(fore back)ground, n_(fore back)ground and abs_foreground_cpu_limit */
+  8    11 /* Modified October 1979 by T. Casey to add counters for interactive and disconnected processes. */
+  8    12 /* Modified Feb 1980 by M. B. Armstrong to implement multiple rate structures (UNCA). */
+  8    13 /* Modified May 1980 by R. McDonald to use iod cpu time field for page charging (UNCA) */
+  8    14 /* Modified December 1981 by E. N. Kittlitz for user_warn fields */
+  8    15 /* Modified January 1982 by E. N. Kittlitz for user_attributes.incl.pl1 changes */
+  8    16 /* Modified September 1982 by E. N. Kittlitz for default ring. */
+  8    17 /* Modified 1984-07-05 BIM for min authorization, version to 4 */
+  8    18 
+  8    19 dcl (PDT_version init (4),				/* version of this declaration */
+  8    20      PDT_header_lth init (256),			/* length in words of PDT head */
+  8    21      PDT_entry_lth init (256),			/* length in words of PDT entry */
+  8    22 
+  8    23      PDT_project_name_length init (9),			/* proper length of pdt.project_name */
+  8    24      PDT_person_id_length init (22)			/* proper length of user.person_id */
+  8    25      ) fixed bin internal static options (constant);
+  8    26 
+  8    27 dcl 1 pdt based (pdtp) aligned,
+  8    28 
+  9     1 /* BEGIN INCLUDE FILE author.incl.pl1 */
+  9     2 
+  9     3 /* the "author" items must always be the first ones in the table. The
+  9     4*   module which moves the converted table to the System Control process
+  9     5*   fills in these data items and assumes them to be at the head of the segment
+  9     6*   regardless of the specific table's actual declaration. The variables
+  9     7*   "lock" and "last_install_time" used to be "process_id" and "ev_channel"
+  9     8*    respectively. For tables installed in multiple processes, these
+  9     9*    are to be used to lock out multiple installations. */
+  9    10 
+  9    11 /*  Lock should be used as a modification lock. Since, in general,
+  9    12*    entries may not be moved in system tables, even by installations,
+  9    13*    it is sufficient for only installers and programs that change threads
+  9    14*    to set or respect the lock. Simply updating data in an entry
+  9    15*    requires no such protection.
+  9    16*
+  9    17*    Last_install_time is used by readers of system tables to detect
+  9    18*    installations or other serious modifications. By checking it before
+  9    19*    and after copying a block of data, they can be protected against
+  9    20*    modifications.
+  9    21*
+  9    22*    Modules that set the lock should save proc_group_id, and then
+  9    23*    put their group id there for the time they hold the lock.
+  9    24*    if they do not actually install the, they should restore the group id.
+  9    25**/
+  9    26 
+  9    27     2 author aligned,				/* validation data about table's author */
+  9    28       3 proc_group_id char (32),			/* process-group-id  (personid.projectid.tag) */
+  9    29       3 lock bit (36),				/* installation lock */
+  9    30       3 update_attributes bit (1) unal,			/* update/add/delete attributes */
+  9    31       3 update_authorization bit (1) unal,		/* update only authorizations */
+  9    32       3 deferral_notified bit (1) unal,			/* installer notified of deferral of installation */
+  9    33       3 pad bit (33) unaligned,
+  9    34       3 last_install_time fixed bin (71),
+  9    35       3 table char (4),				/* name of table, e.g., SAT MGT TTT RTDT PDT etc. */
+  9    36       3 w_dir char (64),				/* author's working directory */
+  9    37 
+  9    38 /* END INCLUDE FILE author.incl.pl1 */
+  8    29 
+  8    30     2 max_size fixed bin,				/* max number of entries table can grow */
+  8    31     2 current_size fixed bin,				/* current size of table (in entries) */
+  8    32     2 version fixed bin,				/* table version */
+  8    33     2 freep fixed bin,				/* relptr to begin of free chain */
+  8    34     2 n_users fixed bin,				/* number of entries actually used */
+  8    35     2 project_name char (28),				/* name of project */
+  8    36     2 project_dir char (64),				/* treename of project's directory */
+  8    37     2 projfile_version fixed bin,
+  8    38     2 projentry bit (66*36),
+  8    39     2 pad3 (5) bit (36) aligned,
+  8    40     2 reqfile_version fixed bin,
+  8    41     2 reqentry bit (40*36),
+  8    42     2 pad4 (9) fixed bin,
+  8    43     2 sat_version fixed bin,
+  8    44     2 satentry bit (52*36),				/* everything in sat.project from project.at on */
+  8    45     2 pad5 (4) bit (36) aligned,
+  8    46     2 date_reqfile_copied fixed bin (71),
+  8    47     2 rs_number fixed bin (9) unsigned unaligned,		/* rate structure number, easier than looking in satentry */
+  8    48     2 pad2l bit (27) unaligned,
+  8    49     2 pad2 (16) fixed bin,				/* make header 256 words long */
+  8    50     2 ht_relp fixed bin (18) aligned,			/* if nonzero, pdt has hash table at that loc */
+  8    51     2 user (1019) aligned,				/* the project definition table entries */
+  8    52       3 pad (256) bit (36) aligned;			/* each entry is 256 words long  */
+  8    53 
+  8    54 /* The hash table, if there is one, is right after the last user, and is described in hashst.incl.pl1 */
+  8    55 
+  8    56 
+  8    57 
+  8    58 dcl 1 user based (pdtep) aligned,			/* declaration of a single PDT entry  */
+  8    59     2 state fixed bin,				/* 1 = normal, 2 = deleted 0 = free */
+  8    60     2 lock bit (36),				/* update lock */
+  8    61     2 person_id char (24) aligned,			/* login name of user */
+  8    62     2 now_in fixed bin,				/* count of users logged in on this entry */
+  8    63     2 password char (8) aligned,			/* password for anonymous user */
+  8    64     2 at like user_attributes aligned,			/* include user_attributes.incl.pl1 */
+  8    65     2 initial_procedure char (64) aligned,		/* initproc and subsystem name packed into one string */
+  8    66     2 home_dir char (64) aligned,			/* user's default working directory */
+  8    67     2 bump_grace fixed bin,				/* number of minutes he is protected */
+  8    68     2 high_ring fixed bin,				/* highest ring user may use */
+  8    69     2 default_ring fixed bin (17) unal,			/* ring user will start in */
+  8    70     2 low_ring fixed bin (17) unal,			/* lowest ring user may use */
+  8    71     2 outer_module char (32),				/* outer module used if user is interactive */
+  8    72     2 lot_size fixed bin,				/* size of linkage offset table */
+  8    73     2 kst_size fixed bin,				/* size of known segment table */
+  8    74     2 cls_size fixed bin,				/* size of combined linkage */
+  8    75     2 uflags,					/* various flags */
+  8    76       3 dont_call_init_admin bit (1) unal,		/* call overseer direct */
+  8    77       3 ip_given bit (1) unal,			/* ip_len gives length of initproc packed in initial_procedure */
+  8    78       3 ss_given bit (1) unal,			/* subsystem name is packed in initial_procedure */
+  8    79       3 flagpad bit (33) unal,
+  8    80     2 ip_len fixed bin (17) unal,			/* length of initproc name packed in initial_procedure */
+  8    81     2 ss_len fixed bin (17) unal,			/* length of subsystem name packed in initial_procedure */
+  8    82     2 dollar_limit float bin,
+  8    83     2 dollar_charge float bin,			/* total dollars spent this month */
+  8    84     2 shift_limit (0: 7) float bin,
+  8    85     2 daton fixed bin (71),				/* date user added to system */
+  8    86     2 datof fixed bin (71),				/* date user deleted */
+  8    87     2 last_login_time fixed bin (71),			/* time of last login */
+  8    88     2 last_login_unit char (4),			/* terminal id last used */
+  8    89     2 last_login_type fixed bin (17) unal,		/* terminal type */
+  8    90     2 last_login_line_type fixed bin (17) unal,		/* terminal line type */
+  8    91     2 time_last_bump fixed bin (71),			/* for bump-wait */
+  8    92     2 last_update fixed bin (71),			/* time of last transaction */
+  8    93     2 logins fixed bin,				/* number of logins */
+  8    94     2 crashes fixed bin,				/* sessions abnormally terminated */
+  8    95     2 interactive (0: 7),				/* interactive use, shifts 0-7 */
+  8    96       3 charge float bin,				/* total dollar charge this shift */
+  8    97       3 xxx fixed bin,
+  8    98       3 cpu fixed bin (71),				/* cpu usage in microseconds */
+  8    99       3 core fixed bin (71),				/* core demand in page-microseconds */
+  8   100       3 connect fixed bin (71),			/* total console time in microseconds */
+  8   101       3 io_ops fixed bin (71),			/* total i/o ops on terminal */
+  8   102     2 absentee (4),					/* absentee use, queues 1-4 */
+  8   103       3 charge float bin,				/* dollar charge this queue */
+  8   104       3 jobs fixed bin,				/* number of jobs submitted */
+  8   105       3 cpu fixed bin (71),				/* total cpu time in microseconds */
+  8   106       3 memory fixed bin (71),			/* total memory demand */
+  8   107     2 iod (4),					/* io daemon use, queues 1-4 */
+  8   108       3 charge float bin,				/* dollar charge this queue */
+  8   109       3 pieces fixed bin,				/* pieces of output requested */
+  8   110       3 pad fixed bin (35),
+  8   111       3 pages fixed bin (35),				/* number of pages output */
+  8   112       3 lines fixed bin (71),				/* total record count of output */
+  8   113     2 devices (16) float bin,				/* device charges */
+  8   114     2 time_last_reset fixed bin (71),			/* time PDT last updated */
+  8   115     2 absolute_limit float bin,			/* Limit, not reset monthly */
+  8   116     2 absolute_spent float bin,			/* Spending against this */
+  8   117     2 absolute_cutoff fixed bin (71),			/* Spending will be reset on this date */
+  8   118     2 absolute_increm fixed bin,			/* .. time increment code. 0 = don't reset */
+  8   119     2 pad_was_authorization bit (72) aligned,
+  8   120     2 group char (8),				/* group for this user (if at.igroup = "1"b) */
+  8   121     2 warn_days fixed bin (17) unaligned,		/* warn user if less than this many days to cutoff */
+  8   122     2 warn_pct fixed bin (17) unaligned,		/* warn user if less than this percent of funds left */
+  8   123     2 warn_dollars float bin,				/* warn user if less than this amount of funds left */
+  8   124     2 n_foreground fixed bin (9) unsigned unaligned,	/* number of foreground and background processes */
+  8   125     2 n_background fixed bin (9) unsigned unaligned,	/* that this user has. see limits just below */
+  8   126     2 max_foreground fixed bin (9) unsigned unaligned,	/* max simultaneous foreground and */
+  8   127     2 max_background fixed bin (9) unsigned unaligned,	/* background processes that this user can have */
+  8   128     2 n_interactive fixed bin (9) unsigned unaligned,	/* number of interactive processes that user has */
+  8   129     2 n_disconnected fixed bin (9) unsigned unaligned,	/* number of disconnected processes that user has */
+  8   130     2 pdtupad1 fixed bin (18) unsigned unaligned,
+  8   131     2 user_warn_days fixed bin (17) unaligned,		/* warn user if less than this many days to user cutoff */
+  8   132     2 user_warn_pct fixed bin (17) unaligned,		/* warn user if less than this percent of user funds left */
+  8   133     2 user_warn_dollars float bin,			/* warn user if less than this amount of user funds left */
+  8   134     2 user_authorization (2) bit (72) aligned,		/* range */
+  8   135     2 pdtupad (5) fixed bin,
+  8   136     2 abs_foreground_cpu_limit fixed bin (17) unaligned,	/* time limit (sec) on foreground absentee jobs */
+  8   137     2 pdir_quota fixed bin (17) unaligned,		/* quota to put on user's pdir (0 => use default) */
+  8   138     2 chain fixed bin;				/* free chain */
+  8   139 
+  8   140 /* END INCLUDE FILE ... pdt.incl.pl1 */
+      391 
+      392 
+      393 dcl  pdtp ptr automatic init (null);			/* pdt needs it. */
+      394  /* BEGIN INCLUDE FILE ... rate_structure.incl.pl1 */
+ 10     2 
+ 10     3 /* Created 81-06-10 by E. N. Kittlitz */
+ 10     4 
+ 10     5 /* The declaration of rate_structure requires declarations contained in
+ 10     6*     installation_parms.incl.pl1.
+ 10     7**/
+ 10     8 
+ 10     9 dcl 1 rate_structure based (cur_rs_ptr) aligned,		/* describes a rate strcture */
+ 10    10     2 part_1 like installation_parms_part_1 aligned,
+ 10    11     2 resource (0 refer (rate_structure.nrscp)) like installation_parms_resource_array_part aligned;
+ 10    12 
+ 10    13 /* END INCLUDE FILE ... rate_structure.incl.pl1 */
+      394 
+      395  /*  BEGIN:   sc_stat_.incl.pl1			  *  *  *  *  *  */
+ 11     2 
+ 11     3 
+ 11     4 /****^  HISTORY COMMENTS:
+ 11     5*  1) change(87-02-04,GDixon), approve(87-05-25,MCR7690),
+ 11     6*     audit(87-06-02,Parisek), install(87-08-04,MR12.1-1056):
+ 11     7*     Add sc_stat_$vchn_requires_accept in support of DSA virtual channels.
+ 11     8*  2) change(87-02-04,GDixon), approve(87-05-25,MCR7680),
+ 11     9*     audit(87-06-02,Parisek), install(87-08-04,MR12.1-1056):
+ 11    10*     Reorganized by type of data to improve readability.
+ 11    11*                                                   END HISTORY COMMENTS */
+ 11    12 
+ 11    13 
+ 11    14 			      /* ACCESS NAMES		       */
+ 11    15 dcl (
+ 11    16  sc_stat_$exec_access_name,	      /* check MC access in an exec request    */
+ 11    17  sc_stat_$unidentified_access_name  /* check access if no one is logged in.  */
+ 11    18     ) char(32) ext static;
+ 11    19 
+ 11    20 		        /* PATHNAMES			       */
+ 11    21 dcl (
+ 11    22  sc_stat_$info_dir,	        /* admin info segs directory		       */
+ 11    23  sc_stat_$log_dir,	        /* as log segs directory		       */
+ 11    24  sc_stat_$mc_acs_dir,       /* message coordinator ACS segments (.mcacs) dir */
+ 11    25  sc_stat_$sysdir	        /* system control directory		       */
+ 11    26     ) char(168) ext static;
+ 11    27 
+ 11    28 		        /* OTHER CHAR STRINGS			       */
+ 11    29 dcl (
+ 11    30  sc_stat_$master_channel    /* Master TTY channel.		       */
+ 11    31     )  char(6) aligned ext static;
+ 11    32 
+ 11    33 			       /* LABELS			       */
+ 11    34 dcl (
+ 11    35  sc_stat_$admin_listener_exit_label, /* GO here to exit admin mode.  Set to  */
+ 11    36 			       /*    ssu_$null_label unless 	       */
+ 11    37 			       /*	   admin_listener is active.	       */
+ 11    38  sc_stat_$master_abort_label,	       /* GO here after fault that is not      */
+ 11    39 			       /*    attributable to a particular      */
+ 11    40 			       /*	   command.		       */
+ 11    41  sc_stat_$system_shutdown_label      /* GO here to shut down system	       */
+ 11    42     ) label variable ext static;
+ 11    43 
+ 11    44 			 /* POINTERS TO			       */
+ 11    45 dcl (
+ 11    46  sc_stat_$admin_log_iocb,	 /* IOCB for admin log		       */
+ 11    47  sc_stat_$admin_log_write_ptr, /* DATA for log_write_ calls on the admin log */
+ 11    48  sc_stat_$admin_sci_ptr,	 /* DATA ssu_ for terminal currently executing */
+ 11    49  sc_stat_$as_log_write_ptr,	 /* DATA for log_write_ calls on as log, used  */
+ 11    50 			 /*      by sys_log_.		       */
+ 11    51  sc_stat_$initzer_ttyp,	 /* ENT  mc_ate for initializer terminal       */
+ 11    52  sc_stat_$master_iocb,	 /* IOCB for "master_i/o"		       */
+ 11    53  sc_stat_$master_sci_ptr,	 /* DATA ssu_ (permanent) for system control   */
+ 11    54  sc_stat_$mc_ansp,		 /* HEAD of mc_anstbl		       */
+ 11    55  sc_stat_$mc_iocb,		 /* IOCB ptr for "mc_i/o"		       */
+ 11    56  sc_stat_$sv1_iocb,		 /* IOCB ptr for "severity1"		       */
+ 11    57  sc_stat_$sv2_iocb,		 /* IOCB ptr for "severity2"		       */
+ 11    58  sc_stat_$sv3_iocb		 /* IOCB ptr for "severity3"		       */
+ 11    59     ) ptr ext static;
+ 11    60 
+ 11    61 			   /* SWITCHES			       */
+ 11    62 dcl (
+ 11    63  sc_stat_$Go,		   /* TRUE after answering service is listening*/
+ 11    64  sc_stat_$Go_typed,		   /* TRUE immediately after 'go' is typed     */
+ 11    65  sc_stat_$Multics,		   /* TRUE after answering service started     */
+ 11    66  sc_stat_$Multics_typed,	   /* TRUE immediately after 'mult' is typed   */
+ 11    67  sc_stat_$Star_typed,	   /* TRUE if 'mult' and 'go' came from 'star' */
+ 11    68  sc_stat_$admin_listener_switch, /* TRUE if in the admin listener	       */
+ 11    69  sc_stat_$did_part1,	   /* TRUE if part 1 of system startup ec done */
+ 11    70  sc_stat_$did_part2,	   /* TRUE if part 2 of system startup ec done */
+ 11    71  sc_stat_$did_part3,	   /* TRUE if part 3 of system startup ec done */
+ 11    72  sc_stat_$mc_is_on,		   /* TRUE if message coordinator running      */
+ 11    73  sc_stat_$no_operator_login,	   /* TRUE if operator login not required, or  */
+ 11    74 			   /*	 if PNT not yet available.	       */
+ 11    75  sc_stat_$shutdown_typed,	   /* TRUE if 'shutdown' command in progress.  */
+ 11    76  sc_stat_$test_mode,	   /* TRUE if in test environment	       */
+ 11    77  sc_stat_$vchn_requires_accept   /* TRUE if vchn may only be used if accepted*/
+ 11    78 			   /*      by operator signed on system console*/
+ 11    79     ) bit(1) aligned ext static;
+ 11    80 
+ 11    81 
+ 11    82 /*  END OF:  sc_stat_.incl.pl1			  *  *  *  *  *  */
+      395 
+      396  /* BEGIN INCLUDE FILE sys_log_constants.incl.pl1 ... 82-09-24 E. N. Kittlitz */
+ 12     2 
+ 12     3 
+ 12     4 /****^  HISTORY COMMENTS:
+ 12     5*  1) change(87-04-22,GDixon), approve(87-06-10,MCR7708),
+ 12     6*     audit(87-06-02,Parisek), install(87-08-04,MR12.1-1056):
+ 12     7*     Added sl_info structure and associated named constants for use in calling
+ 12     8*     sys_log_$general.
+ 12     9*                                                   END HISTORY COMMENTS */
+ 12    10 
+ 12    11 
+ 12    12 /* format: style4 */
+ 12    13 
+ 12    14 dcl  (
+ 12    15      SL_TYPE_CRASH init (-3),				/* type message with banner & kill system */
+ 12    16      SL_TYPE_BEEP init (-2),				/* type message with banner */
+ 12    17      SL_TYPE init (-1),				/* type message */
+ 12    18      SL_LOG_SILENT init (0),				/* log message */
+ 12    19      SL_LOG init (1),				/* log & type message */
+ 12    20      SL_LOG_BEEP init (2),				/* log & type message with banner */
+ 12    21      SL_LOG_CRASH init (3)				/* log & type message with banner & kill system */
+ 12    22      ) fixed bin internal static options (constant);
+ 12    23 
+ 12    24 dcl  1 sl_info aligned automatic,
+ 12    25        2 version char(8),			/* structure version       */
+ 12    26        2 arg_list_ptr ptr,			/* arg_list with values    */
+ 12    27        2 loc,
+ 12    28          3 (mode, severity, code, caller, data, class, ioa_msg) fixed bin,
+ 12    29            /* These flags control where the corresponding data item is found.*/
+ 12    30 	 /*  -1: data appears in the corresponding structure element below */
+ 12    31 	 /*   0: data is not present anywhere			       */
+ 12    32 	 /*  +N: data is Nth item in argument list pointed to by 	       */
+ 12    33 	 /*      sl_info.arg_list_ptr.  Upon return, data copied into      */
+ 12    34 	 /*      corresponding structure element.		       */
+ 12    35 	 /*  if data = +N:					       */
+ 12    36 	 /*      argN is data_ptr, argN+1 is data_len		       */
+ 12    37 	 /*  if ioa_msg = +N:				       */
+ 12    38 	 /*      argN+1, ... argLAST are arguments substituted into the    */
+ 12    39 	 /*      ioa_msg control string.  The formatted msg is returned.   */
+ 12    40        2 flags,
+ 12    41          3 ioa_msg_is_error_code bit(1) unal,	/* ioa_ctl is error code.  */
+ 12    42          3 flags_pad bit(35) unal,
+ 12    43        2 mode fixed bin,			/* as-mode, command-mode   */
+ 12    44        2 severity fixed bin,			/* error severity	       */
+ 12    45        2 code fixed bin(35),			/* error table code        */
+ 12    46        2 caller char(65) varying,		/* caller refname$entryname*/
+ 12    47        2 data,				/* binary data ptr/length  */
+ 12    48          3 data_ptr ptr,
+ 12    49          3 data_lth fixed bin(21),
+ 12    50        2 class char(10) varying,		/* binary data class       */
+ 12    51        2 ioa_msg char(500) varying;		/* formatted message text  */
+ 12    52 
+ 12    53 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+ 12    54 /*							       */
+ 12    55 /* If data values (eg, sl_info.caller) are passed in the argument list,      */
+ 12    56 /* their data types should be as shown in the structure above, except that   */
+ 12    57 /* character strings should be char(*) nonvarying.		       */
+ 12    58 /*							       */
+ 12    59 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+ 12    60 
+ 12    61 /* value for sl_info.version */
+ 12    62 dcl  SL_INFO_version_1 char (8) int static options(constant) init("sl_info1");
+ 12    63 
+ 12    64 /* values for sl_info.mode */
+ 12    65 dcl (SL_INFO_as_mode init(1),
+ 12    66      SL_INFO_command_mode init(2)) fixed bin int static options(constant);
+ 12    67 
+ 12    68 /* values for sl_info.loc.(severity code caller data class ioa_ctl arg) */
+ 12    69 dcl (SL_INFO_arg_given_in_structure init(-1),
+ 12    70      SL_INFO_arg_not_given init(0)) fixed bin int static options(constant);
+ 12    71 
+ 12    72 
+ 12    73 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+ 12    74 /*							       */
+ 12    75 /* The following static structures are commonly used in the Login Server     */
+ 12    76 /* user control software.					       */
+ 12    77 /*							       */
+ 12    78 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+ 12    79 
+ 12    80 /* Syntax: call Abort (severity, code, ioa_ctl, args);		       */
+ 12    81 
+ 12    82 dcl  1 sl_info_sev_code_msg		aligned int static options(constant),
+ 12    83        2 version char(8)		init ("sl_info1"),
+ 12    84        2 arg_list_ptr ptr		init (null),
+ 12    85        2 loc,
+ 12    86          3 (mode			init (-1),
+ 12    87 	  severity  		init ( 1),
+ 12    88 	  code 			init ( 2),
+ 12    89 	  caller 			init (-1),
+ 12    90 	  data 			init ( 0),
+ 12    91 	  class 			init ( 0),
+ 12    92 	  ioa_msg			init ( 3)) fixed bin,
+ 12    93        2 flags,
+ 12    94          3 ioa_msg_is_error_code bit(1) unal init ("0"b),
+ 12    95          3 flags_pad bit(35) unal	init ("0"b),
+ 12    96        2 mode fixed bin		init ( 1),
+ 12    97        2 severity fixed bin		init ( 0),
+ 12    98        2 code fixed bin(35)		init ( 0),
+ 12    99        2 caller char(65) varying	init (""),
+ 12   100        2 data,
+ 12   101          3 data_ptr ptr		init (null),
+ 12   102          3 data_lth fixed bin(21)	init ( 0),
+ 12   103        2 class char(10) varying	init (""),
+ 12   104        2 ioa_msg char(500) varying	init ("");
+ 12   105 
+ 12   106 /* Syntax: call Abort (severity, ioa_ctl, args);			       */
+ 12   107 
+ 12   108 dcl  1 sl_info_sev_msg		aligned int static options(constant),
+ 12   109        2 version char(8)		init ("sl_info1"),
+ 12   110        2 arg_list_ptr ptr		init (null),
+ 12   111        2 loc,
+ 12   112          3 (mode			init (-1),
+ 12   113 	  severity  		init ( 1),
+ 12   114 	  code 			init ( 0),
+ 12   115 	  caller 			init (-1),
+ 12   116 	  data 			init ( 0),
+ 12   117 	  class 			init ( 0),
+ 12   118 	  ioa_msg			init ( 2)) fixed bin,
+ 12   119        2 flags,
+ 12   120          3 ioa_msg_is_error_code bit(1) unal init ("0"b),
+ 12   121          3 flags_pad bit(35) unal	init ("0"b),
+ 12   122        2 mode fixed bin		init ( 1),
+ 12   123        2 severity fixed bin		init ( 0),
+ 12   124        2 code fixed bin(35)		init ( 0),
+ 12   125        2 caller char(65) varying	init (""),
+ 12   126        2 data,
+ 12   127          3 data_ptr ptr		init (null),
+ 12   128          3 data_lth fixed bin(21)	init ( 0),
+ 12   129        2 class char(10) varying	init (""),
+ 12   130        2 ioa_msg char(500) varying	init ("");
+ 12   131 
+ 12   132 /* Syntax: call Abort (severity, ioa_ctl_as_error_code, args);	       */
+ 12   133 
+ 12   134 dcl  1 sl_info_sev_coded_msg		aligned int static options(constant),
+ 12   135        2 version char(8)		init ("sl_info1"),
+ 12   136        2 arg_list_ptr ptr		init (null),
+ 12   137        2 loc,
+ 12   138          3 (mode			init (-1),
+ 12   139 	  severity  		init ( 1),
+ 12   140 	  code 			init ( 0),
+ 12   141 	  caller 			init (-1),
+ 12   142 	  data 			init ( 0),
+ 12   143 	  class 			init ( 0),
+ 12   144 	  ioa_msg			init ( 2)) fixed bin,
+ 12   145        2 flags,
+ 12   146          3 ioa_msg_is_error_code bit(1) unal init ("1"b),
+ 12   147          3 flags_pad bit(35) unal	init ("0"b),
+ 12   148        2 mode fixed bin		init ( 1),
+ 12   149        2 severity fixed bin		init ( 0),
+ 12   150        2 code fixed bin(35)		init ( 0),
+ 12   151        2 caller char(65) varying	init (""),
+ 12   152        2 data,
+ 12   153          3 data_ptr ptr		init (null),
+ 12   154          3 data_lth fixed bin(21)	init ( 0),
+ 12   155        2 class char(10) varying	init (""),
+ 12   156        2 ioa_msg char(500) varying	init ("");
+ 12   157 
+ 12   158 
+ 12   159 /* Syntax: call Abort (severity, code, error_return_label, ioa_ctl, args);   */
+ 12   160 
+ 12   161 dcl  1 sl_info_sev_code_label_msg	aligned int static options(constant),
+ 12   162        2 version char(8)		init ("sl_info1"),
+ 12   163        2 arg_list_ptr ptr		init (null),
+ 12   164        2 loc,
+ 12   165          3 (mode			init (-1),
+ 12   166 	  severity  		init ( 1),
+ 12   167 	  code 			init ( 2),
+ 12   168 	  caller 			init (-1),
+ 12   169 	  data 			init ( 0),
+ 12   170 	  class 			init ( 0),
+ 12   171 	  ioa_msg			init ( 4)) fixed bin,
+ 12   172        2 flags,
+ 12   173          3 ioa_msg_is_error_code bit(1) unal init ("0"b),
+ 12   174          3 flags_pad bit(35) unal	init ("0"b),
+ 12   175        2 mode fixed bin		init ( 1),
+ 12   176        2 severity fixed bin		init ( 0),
+ 12   177        2 code fixed bin(35)		init ( 0),
+ 12   178        2 caller char(65) varying	init (""),
+ 12   179        2 data,
+ 12   180          3 data_ptr ptr		init (null),
+ 12   181          3 data_lth fixed bin(21)	init ( 0),
+ 12   182        2 class char(10) varying	init (""),
+ 12   183        2 ioa_msg char(500) varying	init ("");
+ 12   184 
+ 12   185 /* Syntax:  call Log_error (code, ioa_ctl, args);			       */
+ 12   186 
+ 12   187 dcl  1 sl_info_code_msg		aligned int static options(constant),
+ 12   188        2 version char(8)		init ("sl_info1"),
+ 12   189        2 arg_list_ptr ptr		init (null),
+ 12   190        2 loc,
+ 12   191          3 (mode			init (-1),
+ 12   192 	  severity  		init (-1),
+ 12   193 	  code 			init ( 1),
+ 12   194 	  caller 			init (-1),
+ 12   195 	  data 			init ( 0),
+ 12   196 	  class 			init ( 0),
+ 12   197 	  ioa_msg			init ( 2)) fixed bin,
+ 12   198        2 flags,
+ 12   199          3 ioa_msg_is_error_code bit(1) unal init ("0"b),
+ 12   200          3 flags_pad bit(35) unal	init ("0"b),
+ 12   201        2 mode fixed bin		init ( 1),
+ 12   202        2 severity fixed bin		init ( 0),
+ 12   203        2 code fixed bin(35)		init ( 0),
+ 12   204        2 caller char(65) varying	init (""),
+ 12   205        2 data,
+ 12   206          3 data_ptr ptr		init (null),
+ 12   207          3 data_lth fixed bin(21)	init ( 0),
+ 12   208        2 class char(10) varying	init (""),
+ 12   209        2 ioa_msg char(500) varying	init ("");
+ 12   210 
+ 12   211 
+ 12   212 /* Syntax:  call Trace (ioa_ctl, args);				       */
+ 12   213 
+ 12   214 dcl  1 sl_info_msg			aligned int static options(constant),
+ 12   215        2 version char(8)		init ("sl_info1"),
+ 12   216        2 arg_list_ptr ptr		init (null),
+ 12   217        2 loc,
+ 12   218          3 (mode			init (-1),
+ 12   219 	  severity  		init (-1),
+ 12   220 	  code 			init ( 0),
+ 12   221 	  caller 			init (-1),
+ 12   222 	  data 			init ( 0),
+ 12   223 	  class 			init ( 0),
+ 12   224 	  ioa_msg			init ( 1)) fixed bin,
+ 12   225        2 flags,
+ 12   226          3 ioa_msg_is_error_code bit(1) unal init ("0"b),
+ 12   227          3 flags_pad bit(35) unal	init ("0"b),
+ 12   228        2 mode fixed bin		init ( 1),
+ 12   229        2 severity fixed bin		init ( 0),
+ 12   230        2 code fixed bin(35)		init ( 0),
+ 12   231        2 caller char(65) varying	init (""),
+ 12   232        2 data,
+ 12   233          3 data_ptr ptr		init (null),
+ 12   234          3 data_lth fixed bin(21)	init ( 0),
+ 12   235        2 class char(10) varying	init (""),
+ 12   236        2 ioa_msg char(500) varying	init ("");
+ 12   237 
+ 12   238 /* END INCLUDE FILE sys_log_constants.incl.pl1 */
+      396 
+      397  /* BEGIN INCLUDE FILE ... user_attributes.incl.pl1  TAC 10/79 */
+ 13     2 
+ 13     3 
+ 13     4 /****^  HISTORY COMMENTS:
+ 13     5*  1) change(86-12-11,Brunelle), approve(87-07-13,MCR7741),
+ 13     6*     audit(87-04-19,GDixon), install(87-08-04,MR12.1-1056):
+ 13     7*     Add incl for abs_attributes.incl.pl1 to automatically include absentee
+ 13     8*     attribute switches.
+ 13     9*  2) change(87-04-19,GDixon), approve(87-07-13,MCR7741),
+ 13    10*     audit(87-07-16,Brunelle), install(87-08-04,MR12.1-1056):
+ 13    11*      A) Add USER_ATTRIBUTE_NAMES arrays.  attribute_names.incl.pl1 can thereby
+ 13    12*         be deleted.
+ 13    13*      B) Add constants identifying attributes that can be changed by user at
+ 13    14*         login, etc.
+ 13    15*                                                   END HISTORY COMMENTS */
+ 13    16 
+ 13    17 
+ 13    18 /* Modified 82-01-03  E. N. Kittlitz.  to declare a complete level-1 structure */
+ 13    19 
+ 13    20 /* format: style4 */
+ 13    21 dcl  1 user_attributes aligned based,			/* the user user_attributes */
+ 13    22        (2 administrator bit (1),			/* 1  system administrator privileges */
+ 13    23        2 primary_line bit (1),			/* 2  user has primary-line privileges  */
+ 13    24        2 nobump bit (1),				/* 2  user cannot be bumped */
+ 13    25        2 guaranteed_login bit (1),			/* 4  user has guaranteed login privileges */
+ 13    26        2 anonymous bit (1),				/* 5  used only in SAT. project may have anon.users */
+ 13    27        2 nopreempt bit (1),				/* 6  used only in PDT. user not preemptable by others
+ 13    28*						   .  of same project (distinct from "nobump") */
+ 13    29        2 nolist bit (1),				/* 7  don't list user on "who" */
+ 13    30        2 dialok bit (1),				/* 8  user may have multiple consoles */
+ 13    31        2 multip bit (1),				/* 9  user may have several processes */
+ 13    32        2 bumping bit (1),				/* 10 in SAT. Can users in project bump each other? */
+ 13    33        2 brief bit (1),				/* 11 no login or logout message */
+ 13    34        2 vinitproc bit (1),				/* 12 user may change initial procedure */
+ 13    35        2 vhomedir bit (1),				/* 13 user may change homedir */
+ 13    36        2 nostartup bit (1),				/* 14 user does not want start_up.ec */
+ 13    37        2 sb_ok bit (1),				/* 15 user may be standby */
+ 13    38        2 pm_ok bit (1),				/* 16 user may be primary */
+ 13    39        2 eo_ok bit (1),				/* 17 user may be edit_only */
+ 13    40        2 daemon bit (1),				/* 18 user may login as daemon */
+ 13    41        2 vdim bit (1),				/* 19 * OBSOLETE * user may change outer mdle */
+ 13    42        2 no_warning bit (1),				/* 20 no warning message */
+ 13    43        2 igroup bit (1),				/* 21 in SAT: this project may give its users individual groups
+ 13    44*						   .  in PDT: this user has an individual load control group */
+ 13    45        2 save_pdir bit (1),				/* 22 save pdir after fatal process error */
+ 13    46        2 disconnect_ok bit (1),			/* 23 ok to save user's disconnected processes */
+ 13    47        2 save_on_disconnect bit (1),			/* 24 save them unless -nosave login arg is given */
+ 13    48        2 pad bit (12)) unaligned;
+ 13    49 
+ 13    50 dcl  USER_ATTRIBUTE_NAMES (0:24) char (20) int static options (constant) init
+ 13    51     ("none",					/* 0 */
+ 13    52      "administrator",				/* 1 */
+ 13    53      "primary_line",				/* 2 */
+ 13    54      "nobump",					/* 3 */
+ 13    55      "guaranteed_login",				/* 4 */
+ 13    56      "anonymous",					/* 5 */
+ 13    57      "nopreempt",					/* 6 */
+ 13    58      "nolist",					/* 7 */
+ 13    59      "dialok",					/* 8 */
+ 13    60      "multip",					/* 9 */
+ 13    61      "bumping",					/* 10 */
+ 13    62      "brief",					/* 11 */
+ 13    63      "vinitproc",					/* 12 */
+ 13    64      "vhomedir",					/* 13 */
+ 13    65      "nostartup",					/* 14 */
+ 13    66      "no_secondary",				/* 15 */
+ 13    67      "no_prime",					/* 16 */
+ 13    68      "no_eo",					/* 17 */
+ 13    69      "daemon",					/* 18 */
+ 13    70      "",						/* 19 vdim OBSOLETE */
+ 13    71      "no_warning",					/* 20 */
+ 13    72      "igroup",					/* 21 */
+ 13    73      "save_pdir",					/* 22 */
+ 13    74      "disconnect_ok",				/* 23 */
+ 13    75      "save_on_disconnect");				/* 24 */
+ 13    76 
+ 13    77 dcl  ALT_USER_ATTRIBUTE_NAMES (0:24) char (20) int static options (constant) init
+ 13    78     ("null",					/* 0 */
+ 13    79      "admin",					/* 1 */
+ 13    80      "", "",					/* 2 - 3 */
+ 13    81      "guar",					/* 4 */
+ 13    82      "anon",					/* 5 */
+ 13    83      "", "",					/* 6 - 7 */
+ 13    84      "dial",					/* 8 */
+ 13    85      "multi_login",					/* 9 */
+ 13    86      "preempting",					/* 10 */
+ 13    87      "",						/* 11 */
+ 13    88      "v_process_overseer",				/* 12 */
+ 13    89      "v_home_dir",					/* 13 */
+ 13    90      "no_start_up",					/* 14 */
+ 13    91      "no_sec",					/* 15 */
+ 13    92      "no_primary",					/* 16 */
+ 13    93      "no_edit_only",				/* 17 */
+ 13    94      "op_login",					/* 18 */
+ 13    95      "",						/* 19 */
+ 13    96      "nowarn",					/* 20 */
+ 13    97      "", "", "",					/* 21 - 23 */
+ 13    98      "save");					/* 24 */
+ 13    99 
+ 13   100 dcl  USER_ATTRIBUTES_always_allowed bit (36) aligned int static
+ 13   101      options(constant) init("000000000010000000010000000000000000"b);
+ 13   102     /* SAT/PDT attributes not needed for user to give (brief, no_warning) */
+ 13   103 
+ 13   104 dcl  USER_ATTRIBUTES_default_in_pdt bit (36) aligned int static
+ 13   105      options(constant) init("000000000010000000010000000000000000"b);
+ 13   106     /* PDT value for (brief, no_warning) is default */
+ 13   107 
+ 13   108 dcl  USER_ATTRIBUTES_settable_by_user bit (36) aligned int static
+ 13   109      options(constant) init("000100000110010000010000000000000000"b);	
+ 13   110     /* user MIGHT set (bump, ns, brief, guar, no_warning) */
+ 13   111 
+ 14     1 /* BEGIN INCLUDE FILE ... user_abs_attributes.incl.pl1 */
+ 14     2 
+ 14     3 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+ 14     4 /*							       */
+ 14     5 /* This include file describes the attributes of an absentee job.  It is     */
+ 14     6 /* used by user_table_entry.incl.pl1, abs_message_format.incl.pl1            */
+ 14     7 /* and PIT.incl.pl1.   */
+ 14     8 /*							       */
+ 14     9 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+ 14    10 
+ 14    11 /****^  HISTORY COMMENTS:
+ 14    12*  1) change(86-12-08,GDixon), approve(87-07-13,MCR7741),
+ 14    13*     audit(87-07-16,Brunelle), install(87-08-04,MR12.1-1056):
+ 14    14*     Separated abs_attributes from the request structure
+ 14    15*     (abs_message_format.incl.pl1) so that the identical structure could be
+ 14    16*     used in the ute structure (user_table_entry.incl.pl1).
+ 14    17*  2) change(87-04-19,GDixon), approve(87-07-13,MCR7741),
+ 14    18*     audit(87-07-16,Brunelle), install(87-08-04,MR12.1-1056):
+ 14    19*     Added ABS_ATTRIBUTE_NAMES array.
+ 14    20*  3) change(87-11-11,Parisek), approve(88-02-11,MCR7849),
+ 14    21*     audit(88-03-22,Lippard), install(88-07-13,MR12.2-1047):
+ 14    22*     Added the no_start_up flag. SCP6367
+ 14    23*                                                   END HISTORY COMMENTS */
+ 14    24 
+ 14    25 dcl 1 user_abs_attributes		aligned based,
+ 14    26       2 restartable			bit (1) unaligned,	/* 1 if request may be started over from the beginning */
+ 14    27       2 user_deferred_until_time	bit (1) unaligned,	/* 1 if request was specified as deferred */
+ 14    28       2 proxy			bit (1) unaligned,	/* 1 if request submitted for someone else */
+ 14    29       2 set_bit_cnt			bit (1) unaligned,	/* 1 if should set bit count after every write call */
+ 14    30       2 time_in_gmt			bit (1) unaligned,	/* 1 if deferred_time is in GMT */
+ 14    31       2 user_deferred_indefinitely	bit (1) unaligned,	/* 1 if operator is to say when to run it */
+ 14    32       2 secondary_ok		bit (1) unaligned,	/* 1 if ok to log in as secondary foreground user */
+ 14    33       2 truncate_absout		bit (1) unaligned,	/* 1 if .absout is to be truncated */
+ 14    34       2 restarted			bit (1) unaligned,	/* 1 if job is restarted */
+ 14    35       2 no_start_up                     bit (1) unaligned,	/* 1 if requested -ns */
+ 14    36       2 attributes_pad		bit (26) unaligned;
+ 14    37 
+ 14    38 dcl  ABS_ATTRIBUTE_NAMES (10) char (28) varying int static options(constant) init(
+ 14    39 	"restartable",
+ 14    40 	"user_deferred_until_time",
+ 14    41 	"proxy",
+ 14    42 	"set_bit_cnt",
+ 14    43 	"time_in_gmt",
+ 14    44 	"user_deferred_indefinitely",
+ 14    45 	"secondary_ok",
+ 14    46 	"truncate_absout",
+ 14    47 	"restarted",
+ 14    48 	"no_start_up");
+ 14    49 
+ 14    50 /* END INCLUDE FILE ... user_abs_attributes.incl.pl1 */
+ 14    51 
+ 13   112 
+ 13   113 
+ 13   114 /* END INCLUDE FILE ... user_attributes.incl.pl1 */
+      397 
+      398  /*  BEGIN INCLUDE FILE ... user_table_entry.incl.pl1 */
+ 15     2 
+ 15     3 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+ 15     4 /*							       */
+ 15     5 /* This include file requires that the user include		       */
+ 15     6 /* user_attributes.incl.pl1 as well.  It also includes		       */
+ 15     7 /* abs_attributes.incl.pl1 itself.				       */
+ 15     8 /*							       */
+ 15     9 /* This include file must be included to use absentee_user_table.incl.pl1,   */
+ 15    10 /* answer_table.incl.pl1, and daemon_user_table.incl.pl1.		       */
+ 15    11 /*							       */
+ 15    12 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+ 15    13 
+ 15    14 /****^  HISTORY COMMENTS:
+ 15    15*  1) change(81-12-21,Gilcrease), approve(86-03-27,MCR7370),
+ 15    16*     audit(86-06-23,Lippard), install(86-06-30,MR12.0-1082):
+ 15    17*     This comment for hcom.
+ 15    18*     81-12-21  E. N. Kittlitz. derived from abs_user_tab.incl.pl1,
+ 15    19*     anstbl.incl.pl1, and dutbl.incl.pl1.
+ 15    20*     82-01-02 E. N. Kittlitz. user_attributes.incl.pl1 changes
+ 15    21*     84-04-04 BIM added privileged_dial_server and dial_server_ring
+ 15    22*     84-07-12 BIM added min_process_authorization
+ 15    23*     84-12-31 Keith Loepere added pdir_dir_quota
+ 15    24*     85-01-16 by E. Swenson to add ute.session_uid
+ 15    25*  2) change(85-11-16,Swenson), approve(87-07-13,MCR7737),
+ 15    26*     audit(87-04-14,GDixon), install(87-08-04,MR12.1-1056):
+ 15    27*     Added fields for DSA login server support.
+ 15    28*  3) change(86-03-27,Gilcrease), approve(86-03-27,MCR7370),
+ 15    29*     audit(86-06-23,Lippard), install(86-06-30,MR12.0-1082):
+ 15    30*     Add truncate_absout and restarted bit for -truncate absout, SCP6297.
+ 15    31*  4) change(86-04-09,Herbst), approve(87-07-13,MCR7697),
+ 15    32*     audit(87-04-14,GDixon), install(87-08-04,MR12.1-1056):
+ 15    33*     Added disconnection_rel_minutes.
+ 15    34*  5) change(86-12-08,GDixon), approve(87-07-13,MCR7741),
+ 15    35*     audit(87-07-16,Brunelle), install(87-08-04,MR12.1-1056):
+ 15    36*     Changed structure under ute.abs_attributes to use like structure in
+ 15    37*     abs_attributes.incl.pl1.  This allows the same attributes to be used
+ 15    38*     in abs_message_format.incl.pl1 and pit.incl.pl1 as well as this include
+ 15    39*     file.
+ 15    40*  6) change(87-04-14,GDixon), approve(87-07-13,MCR7741),
+ 15    41*     audit(87-07-16,Brunelle), install(87-08-04,MR12.1-1056):
+ 15    42*     Move constants for ute.pw_flags.mask_ctl from answer_table.incl.pl1.
+ 15    43*  7) change(87-04-16,GDixon), approve(87-07-13,MCR7741),
+ 15    44*     audit(87-07-16,Brunelle), install(87-08-04,MR12.1-1056):
+ 15    45*      A) Global reorganization to locate things by type of data.
+ 15    46*      B) Eliminate ute.uflags.logged_in.
+ 15    47*  8) change(87-05-10,GDixon), approve(87-07-13,MCR7741),
+ 15    48*     audit(87-07-16,Brunelle), install(87-08-04,MR12.1-1056):
+ 15    49*      A) Reduced overlength person and project fields to proper length.
+ 15    50*      B) Adjusted dialed-console section to begin on even word boundary.
+ 15    51*  9) change(87-05-13,GDixon), approve(87-07-13,MCR7741),
+ 15    52*     audit(87-07-16,Brunelle), install(87-08-04,MR12.1-1056):
+ 15    53*     Add ute.line_type.
+ 15    54* 10) change(87-11-19,Parisek), approve(88-02-11,MCR7849),
+ 15    55*     audit(88-02-23,Lippard), install(88-07-13,MR12.2-1047):
+ 15    56*     Added the lowest_ring element. Used the upper half of ute.highest_ring
+ 15    57*     for the storage.  SCP6367
+ 15    58*                                                   END HISTORY COMMENTS */
+ 15    59 
+ 15    60 /* format: style4 */
+ 15    61 
+ 15    62 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+ 15    63 /*							       */
+ 15    64 /* Each of the named sections below defines a type of data.  Typing comes    */
+ 15    65 /* from data associated with the ute entry itself, with the person, with     */
+ 15    66 /* login argument data, from the main user of the data (eg, dialup_,	       */
+ 15    67 /* load_ctl_, login server).  Each section begins on a double-word boundary  */
+ 15    68 /* and is an even number of words long.  The total structure is 300 decimal  */
+ 15    69 /* words long.						       */
+ 15    70 /*							       */
+ 15    71 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+ 15    72 
+ 15    73 
+ 15    74 dcl  UTE_version_4 fixed bin internal static options (constant) init (4);
+ 15    75 
+ 15    76 dcl  utep pointer automatic init (null);
+ 15    77 
+ 15    78 dcl  1 ute based (utep) aligned,			/* individual entry in one of the user control tables */
+ 15    79 
+ 15    80 /* Variables which give state of this entry */
+ 15    81        2 active fixed bin,				/* state of entry. 0=>free. see dialup_values.incl.pl1 */
+ 15    82        2 process_type fixed bin,			/* 1=interactive, 2=absentee, 3=daemon */
+ 15    83        2 ute_index fixed bin,				/* index of ute in (anstbl autbl dutbl).entry array */
+ 15    84        2 next_free fixed bin,				/* points to previous free entry */
+ 15    85 
+ 15    86 /* Information user gave about person_id associated with this entry. */
+ 15    87        2 person char (24) unal,			/* user's name */
+ 15    88        2 project char (12) unal,			/* project of absentee user */
+ 15    89        2 tag char (1) unal,				/* instance tag - someday will be generated */
+ 15    90        2 tag_pad bit (27) unal,
+ 15    91        2 anonymous fixed bin,				/* 1 if anonymous, otherwise 0 */
+ 15    92        2 login_flags,				/* flags for login data */
+ 15    93          3 cpw bit (1) unal,				/* flag for wish to change password */
+ 15    94          3 generate_pw bit (1) unal,			/* flag meaning -generate_pw (-gpw) was used. */
+ 15    95          3 special_pw unal,				/* dial or slave */
+ 15    96 	 4 dial_pw bit (1) unal,			/* true if dial -user */
+ 15    97 	 4 slave_pw bit (1) unal,			/* true if slave -user */
+ 15    98          3 cdp bit (1) unal,				/* flag for wish to change default project */
+ 15    99          3 cda bit (1) unal,				/* flag to change default authorization */
+ 15   100          3 auth_given bit (1) unal,			/* flag to mean -authorization was used. */
+ 15   101          3 noprint bit (1) unal,			/* used at logout. inhibits printing. */
+ 15   102          3 operator bit (1) unaligned,			/* user specified -operator on login command line */
+ 15   103          3 pw_pad bit (25) unal,			/* spare parts */
+ 15   104          3 mask_ctl bit (2) unal,			/* bits controlling pw mask. See constants, below */
+ 15   105 						/* Must remain last in pw_flags so it does not */
+ 15   106 						/* appear in PW_FLAG_VALUES array below. */
+ 15   107        2 generated_pw char (8) unal,			/* user must type this as new password */
+ 15   108        2 old_password char (8) unal,			/* must match user's previous password (value scrambled) */
+ 15   109        2 process_authorization bit (72),		/* access_authorization of this process */
+ 15   110 
+ 15   111 /* Information user gave about process associated with this entry. */
+ 15   112        2 outer_module char (32) unal,			/* Name of console dim */
+ 15   113        2 home_dir char (64) unal,			/* initial home directory */
+ 15   114        2 init_proc char (64) unal,			/* name of login responder */
+ 15   115        2 ip_len fixed bin (17) unal,			/* length of initproc string */
+ 15   116        2 ss_len fixed bin (17) unal,			/* length of subsystem string */
+ 15   117        2 ur_at like user_attributes aligned,		/* bits on means attributes given by user */
+ 15   118        2 at like user_attributes aligned,		/* bits on means attribute is on */
+ 15   119        2 initial_ring fixed bin,			/* ring process will be started in */
+ 15   120        2 arg_count fixed bin,				/* number of arguments to absentee control segment */
+ 15   121        2 ln_args fixed bin,				/* length of string containing arguments */
+ 15   122        2 arg_lengths_ptr ptr,				/* pointer to array of argument lengths */
+ 15   123        2 args_ptr ptr,				/* pointer to arguments to absentee control segment */
+ 15   124 
+ 15   125 /* Most of the following information is relevant only to absentee processes */
+ 15   126        2 input_seg char (168) unal,			/* pathname of absentee control segment */
+ 15   127        2 output_seg char (168) unal,			/* pathname of absentee output file */
+ 15   128        2 request_id fixed bin (71),			/* time request was entered - used as uid of request */
+ 15   129        2 reservation_id fixed bin (71),			/* nonzero if job has a resource reservation */
+ 15   130        2 message_id bit (72),				/* message segment id assoc with absentee request */
+ 15   131        2 deferred_time fixed bin (71),			/* time at which absentee process should be created */
+ 15   132        2 max_cpu_time fixed bin (35),			/* maximum number of seconds this process can run */
+ 15   133        2 queue fixed bin,				/* -1=daemon;0=interactive or foreground;>0=queue no.
+ 15   134*						   (but see uflags.adjust_abs_q_no). */
+ 15   135        2 real_queue fixed bin,			/* real queue number; ute.queue gets fudged sometimes */
+ 15   136        2 abs_attributes aligned like user_abs_attributes,	/* include abs_attributes.incl.pl1 */
+ 15   137        2 abs_flags,
+ 15   138          3 abs_run bit (1) unal,			/* on if job was started by abs run command */
+ 15   139          3 notify bit (1) unal,			/* on if user wants notification at login and logout */
+ 15   140          3 abs_flags_pad bit (34) unal,
+ 15   141        2 abs_group char (8) unal,			/* original group before load_ctl_ moves it to absentee group */
+ 15   142        2 sender char (32) unal,			/* name of RJE station that job is from */
+ 15   143        2 proxy_person char (28) unal,			/* name of user who actually entered the request, if proxy */
+ 15   144        2 proxy_project char (9) unal,
+ 15   145        2 proxy_project_pad char (3) unal,
+ 15   146        2 abs_pad fixed bin,
+ 15   147 
+ 15   148 /* Information about process actually created */
+ 15   149        2 proc_id bit (36),				/* process id of absentee process */
+ 15   150        2 session_uid fixed bin (35),			/* Unique authentication session id */
+ 15   151        2 process_authorization_range (2) bit (72) aligned,
+ 15   152        2 audit bit (36),				/* audit flags for user */
+ 15   153        2 lot_size fixed bin,				/* Size of linkage offset table */
+ 15   154        2 kst_size fixed bin,				/* Size of process known segment table */
+ 15   155        2 cls_size fixed bin,				/* Size of process combined linkage */
+ 15   156        2 sus_channel fixed bin (71),			/* event channel on which suspended process is blocked */
+ 15   157        2 lowest_ring fixed bin (17) unal,		/* lowest ring permitted */
+ 15   158        2 highest_ring fixed bin (17) unal,		/* highest ring permitted */
+ 15   159        2 pdir_lvix fixed bin (17) unal,			/* index in disk table of lv where pdir is */
+ 15   160        2 pdir_quota fixed bin (17) unal,		/* process directory quota */
+ 15   161        2 pdir_dir_quota fixed bin (17) unal,		/* process directory quota for dirs */
+ 15   162        2 pdir_pad fixed bin(17) unal,
+ 15   163        2 process_pad fixed bin,
+ 15   164 
+ 15   165 /* Information about primary terminal associated with this entry */
+ 15   166        2 tty_name char (32) unal,			/* absentee=>"abs1", etc.  daemon=>"bk", etc. */
+ 15   167        2 terminal_type char (32) unaligned,		/* terminal type */
+ 15   168        2 line_type fixed bin,				/* line type */
+ 15   169        2 tty_id_code char (4) unal,			/* "none" for absentee */
+ 15   170        2 network_connection_type fixed bin,		/* see net_event_message.incl.pl1 */
+ 15   171        2 channel ptr unal,				/* points to CDT entry for user, if any */
+ 15   172 
+ 15   173 /* Variables useful for dialed terminals */
+ 15   174        2 ndialed_consoles fixed bin,			/* if master, number of slaves */
+ 15   175        2 dial_qualifier char (22) unal,			/* first argument to dial command */
+ 15   176        2 dial_server_ring fixed bin (3) unsigned unaligned, /* dial server intends to attach dialing in channels at this ring. */
+ 15   177        2 dial_server_flags,
+ 15   178          3 registered_dial_server bit (1) unal,		/* process is a registered dial server */
+ 15   179          3 privileged_dial_server bit (1) unal,		/* "1"b -> serves range of AIM classes */
+ 15   180          3 dial_server_flags_pad bit (13) unal,		/* fill out the word */
+ 15   181        2 dial_ev_chn fixed bin (71),			/* if master, control event channel */
+ 15   182 
+ 15   183 /* Information about usage/accounting.  Device usage meters are in a
+ 15   184*   separate segment, "devtab" */
+ 15   185        2 pdtep ptr,					/* ptr to user's pdt entry, where usage meters live */
+ 15   186        2 cpu_this_process fixed bin (71),		/* cpu used so far this process */
+ 15   187        2 cpu_usage fixed bin (71),			/* total cpu time used in this session */
+ 15   188        2 mem_usage fixed bin (71),			/* memory usage for previous processes in session */
+ 15   189        2 mem_this_process fixed bin (71),		/* memory usage at last update */
+ 15   190        2 last_update_time fixed bin (71),		/* time of last account update */
+ 15   191        2 session_cost float bin,			/* dollar cost of session, for printing in logout messages */
+ 15   192        2 ndevices fixed bin,				/* Count of attached devices */
+ 15   193        2 device_head fixed bin,			/* Table index of head of device chain */
+ 15   194        2 device_tail fixed bin,			/* Table index of tail of device chain */
+ 15   195        2 rs_number fixed bin (6) unsigned unal,		/* rate structure number */
+ 15   196        2 rs_number_pad bit(30) unal,
+ 15   197        2 usage_pad fixed bin,
+ 15   198 
+ 15   199 /* Information for dialup_ (control variables). */
+ 15   200        2 event fixed bin (71),			/* event associated with channel or user manager */
+ 15   201        2 uprojp ptr,				/* ptr to user project sat entry */
+ 15   202        2 login_time fixed bin (71),			/* time when absentee user approved by lg_ctl_ */
+ 15   203        2 cant_bump_until fixed bin (71),		/* bump-protection clock */
+ 15   204        2 recent_fatal_error_time fixed bin (71),		/* time of first error in the suspected loop */
+ 15   205        2 recent_fatal_error_count fixed bin,		/* counter to detect fatal process error loops */
+ 15   206        2 failure_reason fixed bin,			/* why login refused 1=lg_ctl, 2=act_ctl, 3=load_ctl */
+ 15   207        2 count fixed bin,				/* counter for logins and dialups */
+ 15   208        2 n_processes fixed bin,			/* number of processes created in this session */
+ 15   209        2 lock_value fixed bin,			/* number of locks set for this entry */
+ 15   210        2 login_result fixed bin,			/* 0=logged in;1=hopeless,hang him up;2=allow another attempt */
+ 15   211        2 login_code char (8) unal,			/* login command from LOGIN line */
+ 15   212        2 preempted fixed bin,				/* if ^= 0 user preempted (never for abs) */
+ 15   213        2 destroy_flag fixed bin,			/* >8 when awaiting destroy */
+ 15   214        2 logout_type char (4) unal,			/* type of logout */
+ 15   215        2 logout_index fixed bin,			/* to save logout handler index while waiting for termsgnl */
+ 15   216        2 disconnection_rel_minutes fixed bin (17) unal,	/* disconnected this many minutes after login_time */
+ 15   217        2 next_disconnected_ate_index fixed bin (17) unal,	/* thread of list of user's disconnected processes */
+ 15   218        2 work_class fixed bin,			/* work class used by priority scheduler */
+ 15   219        2 group char (8) unal,				/* party group identifier */
+ 15   220        2 whotabx fixed bin,				/* index of user's entry in whotab */
+ 15   221 
+ 15   222        2 uflags,					/* Miscellaneous flags */
+ 15   223          3 dont_call_init_admin bit (1) unal,		/* Call overseer directly */
+ 15   224          3 ip_given bit (1) unal,			/* user gave an initproc arg on login line */
+ 15   225          3 ss_given bit (1) unal,			/* initial_procedure contains a subsystem name */
+ 15   226          3 lvs_attached bit (1) unal,			/* set and used by the lv_request_ procedure */
+ 15   227          3 send_initial_string bit (1) unal,		/* initial string should be sent after login line read */
+ 15   228          3 adjust_abs_q_no bit (1) unal,		/* this is an absentee job; user_profile.queue is NOT true Q # */
+ 15   229          3 foreground_secondary_ok bit (1) unal,		/* ok to login foreground absentee job as secondary */
+ 15   230          3 foreground_job bit (1) unal,			/* job was originally from foreground queue */
+ 15   231          3 sus_sent bit (1) unal,			/* sus_ ips signal has been sent to process */
+ 15   232          3 suspended bit (1) unal,			/* process has responded to sus_ signal */
+ 15   233          3 ignore_cpulimit bit (1) unal,		/* process is released, but timer can't be turned off */
+ 15   234          3 deferral_logged bit (1) unal,		/* abs job deferral has already been logged once */
+ 15   235          3 save_if_disconnected bit (1) unal,		/* user wants process preserved across hangups */
+ 15   236          3 disconnected bit (1) unal,			/* process is disconnected from terminal */
+ 15   237          3 disconnected_list bit (1) unal,		/* this ate is on a list of disconnected processes */
+ 15   238          3 proc_create_ok bit (1) unal,			/* lg_ctl_ has set the process creation variables */
+ 15   239          3 activity_can_unbump bit (1) unal,		/* only bump pending is for inactivity */
+ 15   240          3 fpe_causes_logout bit (1) unal,		/* "1"b means don't try to new_proc after fatal process error */
+ 15   241          3 user_specified_immediate bit (1) unal,		/* "1"b -> don't wait around for process destruction. */
+ 15   242          3 uflags_pad bit (17) unal,
+ 15   243 
+ 15   244 /* Information used by load_ctl_ for the process */
+ 15   245        2 user_weight fixed bin,			/* usually 10 - used in load control */
+ 15   246        2 standby_line fixed bin,			/* 0=user has primary line, 1=standby user */
+ 15   247        2 bump_grace fixed bin (71),			/* bump grace in microseconds */
+ 15   248 
+ 15   249 
+ 15   250 /* Information for login server */
+ 15   251        2 login_server_info,
+ 15   252          3 our_handle bit (72) aligned,			/* how LS refers to us. */
+ 15   253          3 his_handle bit (72) aligned,			/* how we talk to LS */
+ 15   254          3 termination_event_channel fixed bin (71),	/* for process termination notifications to the LS */
+ 15   255          3 response_event_channel fixed bin (71),		/* for other communications with the LS */
+ 15   256          3 process_id bit (36) aligned,			/* process_id of login server */
+ 15   257        2 ls_pad (5) fixed bin;			/* pad to 300 decimal words */
+ 15   258 
+ 15   259 /* values for ute.process_type */
+ 15   260 
+ 15   261 dcl  (PT_INTERACTIVE initial (1),
+ 15   262      PT_ABSENTEE initial (2),
+ 15   263      PT_DAEMON initial (3)) fixed bin internal static options (constant);
+ 15   264 
+ 15   265 dcl  PROCESS_TYPE_NAMES (0:3) char(12) varying int static options(constant) init(
+ 15   266 	"INVALID-TYPE",
+ 15   267 	"interactive",
+ 15   268 	"absentee",
+ 15   269 	"daemon");
+ 15   270 
+ 15   271 dcl  TABLE_NAMES (0:3) char(20) int static options(constant) init(
+ 15   272 	"UNKNOWN-TABLE",
+ 15   273 	"answer_table",
+ 15   274 	"absentee_user_table",
+ 15   275 	"daemon_user_table");
+ 15   276 
+ 15   277 
+ 15   278 /* values for ute.pw_flags.mask_ctl  */
+ 15   279 
+ 15   280 dcl  (DO_MASK init ("00"b),
+ 15   281      DONT_MASK init ("01"b),
+ 15   282      DERIVE_MASK init ("10"b)) bit (2) internal static options (constant);
+ 15   283 
+ 15   284 dcl  MASK_CTL_NAMES (0:3) char(12) varying int static options(constant) init(
+ 15   285 	"do_mask", "dont_mask", "derive_mask", "");
+ 15   286 
+ 15   287 
+ 15   288 /* names for ute.pw_flags */
+ 15   289 
+ 15   290 dcl  PW_FLAG_NAMES (9) char (12) varying int static options(constant) init(
+ 15   291 	"cpw",
+ 15   292 	"generate_pw",
+ 15   293 	"dial_pw",
+ 15   294 	"slave_pw",
+ 15   295 	"cdp",
+ 15   296 	"cda",
+ 15   297 	"auth_given",
+ 15   298 	"noprint",
+ 15   299 	"operator");
+ 15   300 
+ 15   301 /* names for ute.uflags */
+ 15   302 
+ 15   303 dcl  UFLAG_NAMES (19) char (24) varying int static options (constant) init (
+ 15   304 	"dont_call_init_admin",
+ 15   305 	"ip_given",
+ 15   306 	"ss_given",
+ 15   307 	"lvs_attached",
+ 15   308 	"send_initial_string",
+ 15   309 	"adjust_abs_q_no",
+ 15   310 	"foreground_secondary_ok",
+ 15   311 	"foreground_job",
+ 15   312 	"sus_sent",
+ 15   313 	"suspended",
+ 15   314 	"ignore_cpulimit",
+ 15   315 	"deferral_logged",
+ 15   316 	"save_if_disconnected",
+ 15   317 	"disconnected",
+ 15   318 	"disconnected_list",
+ 15   319 	"proc_create_ok",
+ 15   320 	"activity_can_unbump",
+ 15   321 	"fpe_causes_logout",
+ 15   322 	"user_specified_immediate");
+ 15   323 
+ 15   324 /* names for ute.abs_flags */
+ 15   325 
+ 15   326 dcl  ABS_FLAG_NAMES (2) char (8) varying int static options (constant) init (
+ 15   327 	"abs_run",
+ 15   328 	"notify");
+ 15   329 
+ 15   330 /* names of ute.dial_server_flags */
+ 15   331 
+ 15   332 dcl  DIAL_SERVER_FLAG_NAMES (2) char (12) varying int static options (constant) init (
+ 15   333 	"registered",
+ 15   334 	"privileged");
+ 15   335 
+ 15   336 /* values of ute.login_result */
+ 15   337 
+ 15   338 dcl  LOGIN_RESULT_VALUES (0:2) char(24) varying int static options(constant) init(
+ 15   339 	"logged in",
+ 15   340 	"login failed, hangup",
+ 15   341 	"login failed, try again");
+ 15   342 
+ 15   343 /*  END INCLUDE FILE ... user_table_entry.incl.pl1 */
+      398 
+      399  /* BEGIN INCLUDE FILE ... user_table_header.incl.pl1 */
+ 16     2 
+ 16     3 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+ 16     4 /*							       */
+ 16     5 /* This include file declares the header shared by the answer_table,	       */
+ 16     6 /* absentee_user_table and daemon_user_table include files.		       */
+ 16     7 /*							       */
+ 16     8 /* *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+ 16     9 
+ 16    10 /****^  HISTORY COMMENTS:
+ 16    11*  1) change(87-04-26,GDixon), approve(87-07-13,MCR7741),
+ 16    12*     audit(87-07-16,Brunelle), install(87-08-04,MR12.1-1056):
+ 16    13*     Initial coding.
+ 16    14*                                                   END HISTORY COMMENTS */
+ 16    15 
+ 16    16 dcl  1 ut_header			aligned based,	/* header shared by all user control tables. */
+ 16    17        2 header_version fixed bin,			/* version of the header (3) */
+ 16    18        2 entry_version fixed bin,			/* version of user table entries */
+ 16    19        2 user_table_type fixed bin,			/* 1 interactive, 2 absentee, 3 daemon */
+ 16    20        2 header_length fixed bin,			/* length of the header */
+ 16    21        2 max_size fixed bin,				/* max number of entries in this table */
+ 16    22        2 current_size fixed bin,			/* actual size of table (in entries) */
+ 16    23        2 number_free fixed bin,			/* number of free entries in the table. */
+ 16    24        2 first_free fixed bin,			/* index of first entry in the free list. */
+ 16    25        2 as_procid bit (36),				/* process ID of user table manager process */
+ 16    26        2 ut_header_pad fixed bin;
+ 16    27 
+ 16    28 /* END INCLUDE FILE ... user_table_header.incl.pl1 */
+      399 
+      400 
+      401      end device_acct_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    07/13/88  0938.0  device_acct_.pl1                  >special_ldd>install>MR12.2-1047>device_acct_.pl1
+385          1    08/06/87  0913.0  answer_table.incl.pl1             >ldd>include>answer_table.incl.pl1
+386          2    08/06/87  0913.4  as_data_.incl.pl1                 >ldd>include>as_data_.incl.pl1
+387          3    08/06/87  0913.4  as_data_definitions_.incl.pl1     >ldd>include>as_data_definitions_.incl.pl1
+388          4    08/06/87  0913.4  devid.incl.pl1                    >ldd>include>devid.incl.pl1
+389          5    05/06/74  1743.0  devtab.incl.pl1                   >ldd>include>devtab.incl.pl1
+390          6    08/06/87  0913.4  installation_parms.incl.pl1       >ldd>include>installation_parms.incl.pl1
+6-148        7    11/21/79  1458.3  rcp_init_flags.incl.pl1           >ldd>include>rcp_init_flags.incl.pl1
+391          8    09/13/84  0921.6  pdt.incl.pl1                      >ldd>include>pdt.incl.pl1
+8-29         9    04/21/82  1211.8  author.incl.pl1                   >ldd>include>author.incl.pl1
+394         10    03/27/82  0435.1  rate_structure.incl.pl1           >ldd>include>rate_structure.incl.pl1
+395         11    08/06/87  0913.5  sc_stat_.incl.pl1                 >ldd>include>sc_stat_.incl.pl1
+396         12    08/06/87  0913.5  sys_log_constants.incl.pl1        >ldd>include>sys_log_constants.incl.pl1
+397         13    08/06/87  0913.6  user_attributes.incl.pl1          >ldd>include>user_attributes.incl.pl1
+13-112      14    07/13/88  0900.1  user_abs_attributes.incl.pl1      >special_ldd>install>MR12.2-1047>user_abs_attributes.incl.pl1
+398         15    07/13/88  0903.2  user_table_entry.incl.pl1         >special_ldd>install>MR12.2-1047>user_table_entry.incl.pl1
+399         16    08/06/87  0913.6  user_table_header.incl.pl1        >ldd>include>user_table_header.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+DEVTAB_version                         constant        fixed bin(17,0)          initial dcl 5-5 ref 195
+SL_LOG_BEEP                     000042 constant        fixed bin(17,0)          initial dcl 12-14 set ref 226* 239* 297*
+SL_LOG_SILENT                   000036 constant        fixed bin(17,0)          initial dcl 12-14 set ref 143*
+a_dev                                  parameter       fixed bin(17,0)          dcl 66 set ref 64 70 93 102 106 110 111 128 130 134
+                                                                                  143* 143
+a_devname                              parameter       char                     packed unaligned dcl 66 set ref 64 94 102 128 134
+                                                                                  143*
+a_utep                                 parameter       pointer                  dcl 66 ref 64 83 102 107 128 131 151 153 165 167
+absolute_spent          347            based           float bin(27)            level 2 dcl 8-58 set ref 119* 119 252* 252
+addr                                                   builtin function         dcl 37 ref 75 79 89 116 133 157 173 249 267 270
+ansp                            000112 automatic       pointer                  initial dcl 1-53 set ref 71* 72 92 115* 116 135* 136
+                                                                                  154* 170* 171 187* 188 1-53* 246 247 249
+anstbl                                 based           structure                level 1 dcl 1-55
+as_data_$ansp                   000044 external static pointer                  dcl 2-26 ref 71 115 135 154 170 187
+as_data_$devtabp                000046 external static pointer                  dcl 2-35 ref 73 73 74 74 74 74 75 75 78 78 79 79 80
+                                                                                  80 89 89 114 114 114 114 133 133 157 157 173 173
+                                                                                  188 188 189 189 191 191 193 193 194 194 195 195
+                                                                                  196 196 248 248 248 248 267 267 270 270 274 274
+                                                                                  276 276
+as_data_$rs_ptrs                000050 external static pointer                  array dcl 2-49 set ref 116 143 143 200 200 200 200
+                                                                                  203 203 206 206 206 206 209 209 212 212 212 212
+                                                                                  215 215 218 218 218 218 221 221 249
+clock                                                  builtin function         dcl 37 ref 72 136 171
+cost                            000106 automatic       float bin(27)            dcl 43 in procedure "device_acct_" set ref 116* 117
+                                                                                  118 119 120
+cost                            000136 automatic       float bin(63)            dcl 234 in procedure "upcharge" set ref 249* 250 251
+                                                                                  252 253
+current_size                           based           fixed bin(17,0)          level 2 dcl 5-7 set ref 74 74* 193*
+current_time            126            based           fixed bin(71,0)          level 2 dcl 1-55 set ref 72* 92 136* 171* 246 247
+delta                           000134 automatic       fixed bin(71,0)          dcl 234 set ref 246* 248 249
+dev_disk                               constant        fixed bin(17,0)          initial dcl 4-54 ref 212
+dev_disk_mt                            constant        fixed bin(17,0)          initial dcl 4-55 ref 218
+dev_id                          000000 constant        char(8)                  initial array dcl 4-48 ref 200 206 212 218
+dev_name                  4            based           char(32)                 level 2 dcl 5-19 set ref 94* 134
+dev_tape                               constant        fixed bin(17,0)          initial dcl 4-52 ref 200
+dev_tape_mt                            constant        fixed bin(17,0)          initial dcl 4-53 ref 206
+deve                                   based           structure                level 1 dcl 5-19
+devep                           000100 automatic       pointer                  dcl 40 set ref 75* 79* 80 85 86 89 89 92 92 93 94 95
+                                                                                  96 133* 134 134 141 157* 159 173* 237 246 247 248
+                                                                                  248 249 250 250 264 266 266 267 267 269 269 270
+                                                                                  270 273 274 275
+device_head             372            based           fixed bin(17,0)          level 2 dcl 15-78 set ref 85 87* 132 156 172 269*
+device_id               241            based           char(8)                  array level 4 dcl 6-33 set ref 143* 200 206 212 218
+device_price            243            based           float bin(27)            array level 4 dcl 10-9 ref 116 249
+device_tail             373            based           fixed bin(17,0)          level 2 dcl 15-78 set ref 88 88* 266*
+devices                 324            based           float bin(27)            array level 2 dcl 8-58 set ref 117* 117 250* 250
+devid                     1            based           fixed bin(17,0)          level 2 dcl 5-19 set ref 93* 134 248 248 249 250 250
+devtab                                 based           structure                level 1 dcl 5-7 in procedure "device_acct_"
+devtab                  241            based           structure                array level 3 in structure "rate_structure" dcl 10-9
+                                                                                  in procedure "device_acct_"
+devtab                  241            based           structure                array level 3 in structure "installation_parms"
+                                                                                  dcl 6-33 in procedure "device_acct_"
+devtab_ix                       000111 automatic       fixed bin(17,0)          dcl 104 set ref 110* 111* 112* 113 114 114 116 117
+                                                                                  117
+devtab_ix_disk                  000012 internal static fixed bin(17,0)          initial dcl 4-63 set ref 111 212* 212* 215 215*
+devtab_ix_disk_mt               000013 internal static fixed bin(17,0)          initial dcl 4-64 set ref 111 218* 218* 221 221*
+devtab_ix_tape                  000010 internal static fixed bin(17,0)          initial dcl 4-61 set ref 110 200* 200* 203 203*
+devtab_ix_tape_mt               000011 internal static fixed bin(17,0)          initial dcl 4-62 set ref 110 206* 206* 209 209*
+devtabp                                defined         pointer                  dcl 3-20 set ref 73 74 74 75 78 79 80 89 114 114 133
+                                                                                  157 173 188* 189 191* 193 194 195 196 248 248 267
+                                                                                  270 274 276
+dix                             000104 automatic       fixed bin(17,0)          dcl 42 set ref 74* 75 78* 79 87 88 89 132* 132* 133*
+                                                                                  156* 156* 157* 172* 172* 173* 276
+dix1                            000105 automatic       fixed bin(17,0)          dcl 42 set ref 176 264*
+dollar_charge            75            based           float bin(27)            level 2 dcl 8-58 set ref 118* 118 251* 251
+ec                              000110 automatic       fixed bin(35,0)          dcl 46 set ref 184* 188* 191* 192 226* 228* 287* 296
+                                                                                  297* 304
+entry                   100            based           structure                array level 2 dcl 5-7 set ref 75 79 89 133 157 173
+                                                                                  267 270
+error_table_$lock_wait_time_exceeded
+                                000014 external static fixed bin(35,0)          dcl 48 ref 296
+error_table_$locked_by_this_process
+                                000016 external static fixed bin(35,0)          dcl 49 ref 304
+error_table_$out_of_sequence    000020 external static fixed bin(35,0)          dcl 50 ref 184
+freep                     3            based           fixed bin(17,0)          level 2 dcl 5-7 set ref 73 78 80* 194* 274 276*
+hcs_$make_seg                   000022 constant        entry                    external dcl 53 ref 188
+hcs_$truncate_seg               000024 constant        entry                    external dcl 54 ref 191
+installation_parms                     based           structure                level 1 dcl 6-33
+installation_parms_part_1              based           structure                level 1 dcl 6-40
+installation_parms_resource_array_part based           structure                array level 1 unaligned dcl 6-144
+ip                                     defined         pointer                  dcl 3-21 ref 143 200 200 203 206 206 209 212 212 215
+                                                                                  218 218 221
+ipc_$mask_ev_calls              000032 constant        entry                    external dcl 56 ref 286
+ipc_$unmask_ev_calls            000034 constant        entry                    external dcl 56 ref 288
+lock                      1            based           bit(36)                  level 2 dcl 8-58 set ref 287* 315*
+mount_time               14            based           fixed bin(71,0)          level 2 dcl 5-19 set ref 92*
+n_devices                 2            based           fixed bin(17,0)          level 2 dcl 5-7 set ref 196*
+ndevices                240            based           fixed bin(17,0)          level 3 in structure "installation_parms" dcl 6-33
+                                                                                  in procedure "device_acct_" ref 200 203 206 209
+                                                                                  212 215 218 221
+ndevices                371            based           fixed bin(17,0)          level 2 in structure "ute" dcl 15-78 in procedure
+                                                                                  "device_acct_" set ref 84* 84 155 168 272* 272
+null                                                   builtin function         dcl 37 ref 189 1-53 393 15-76
+part_1                                 based           structure                level 2 in structure "rate_structure" dcl 10-9
+                                                                                  in procedure "device_acct_"
+part_1                                 based           structure                level 2 in structure "installation_parms" dcl 6-33
+                                                                                  in procedure "device_acct_"
+pdtep                    20            based           pointer                  level 2 in structure "deve" dcl 5-19 in procedure
+                                                                                  "device_acct_" set ref 95* 237
+pdtep                           000102 automatic       pointer                  dcl 41 in procedure "device_acct_" set ref 108* 117
+                                                                                  117 118 118 119 119 237* 238 239* 250 250 251 251
+                                                                                  252 252 287 315
+pdtep                   354            based           pointer                  level 2 in structure "ute" dcl 15-78 in procedure
+                                                                                  "device_acct_" set ref 95 108 238 239*
+pdtp                            000114 automatic       pointer                  initial dcl 393 set ref 393*
+person                    4            based           char(24)                 level 2 packed packed unaligned dcl 15-78 set ref
+                                                                                  143* 239* 297*
+process_chain_b           3            based           fixed bin(17,0)          level 2 dcl 5-19 set ref 86* 89* 266 267* 267 269
+                                                                                  270 275*
+process_chain_f           2            based           fixed bin(17,0)          level 2 dcl 5-19 set ref 80 85* 89 89 141 159 264
+                                                                                  266 267 269 270* 270 274*
+project                  12            based           char(12)                 level 2 packed packed unaligned dcl 15-78 set ref
+                                                                                  143* 239* 297*
+rate_structure                         based           structure                level 1 dcl 10-9
+rcp_init_flags                         based           structure                level 1 packed packed unaligned dcl 7-8
+rs_number               374            based           fixed bin(6,0)           level 2 packed packed unsigned unaligned dcl 15-78
+                                                                                  ref 116 249
+rs_ptrs                                based           pointer                  array dcl 3-24 ref 116 249
+sc_stat_$Go_typed               000052 external static bit(1)                   dcl 11-62 ref 183
+sc_stat_$Multics_typed          000054 external static bit(1)                   dcl 11-62 ref 183
+session_cost            370            based           float bin(27)            level 2 dcl 15-78 set ref 120* 120 253* 253
+set_lock_$lock                  000036 constant        entry                    external dcl 57 ref 287
+set_lock_$unlock                000040 constant        entry                    external dcl 58 ref 315
+shift                   132            based           fixed bin(17,0)          level 2 dcl 1-55 ref 116 249
+state                                  based           fixed bin(17,0)          level 2 dcl 5-19 set ref 96* 273*
+sub_err_                        000042 constant        entry                    external dcl 59 ref 228
+sys_log_                        000030 constant        entry                    external dcl 55 ref 143 239
+sys_log_$error_log              000026 constant        entry                    external dcl 55 ref 226 297
+sysdir                   22            based           char(64)                 level 2 packed packed unaligned dcl 1-55 set ref
+                                                                                  188*
+unlock_pdte_sw                  000107 automatic       bit(1)                   dcl 45 set ref 285* 300* 304* 315
+update_time              16            based           fixed bin(71,0)          level 2 dcl 5-19 set ref 92* 246 247*
+usage_total               6            based           fixed bin(71,0)          array level 2 dcl 5-7 set ref 114* 114 248* 248
+user                                   based           structure                level 1 dcl 8-58
+user_abs_attributes                    based           structure                level 1 dcl 14-25
+user_attributes                        based           structure                level 1 dcl 13-21
+ut_header                              based           structure                level 1 dcl 16-16
+ute                                    based           structure                level 1 dcl 15-78
+utep                            000116 automatic       pointer                  initial dcl 15-76 set ref 83* 84 84 85 87 88 88 95
+                                                                                  107* 108 116 120 120 131* 132 143 143 153* 155 156
+                                                                                  167* 168 172 15-76* 238 239 239 239 249 253 253
+                                                                                  266 269 272 272 297 297
+version                   4            based           fixed bin(17,0)          level 2 dcl 5-7 set ref 195*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+ABS_ATTRIBUTE_NAMES                    internal static varying char(28)         initial array dcl 14-38
+ABS_FLAG_NAMES                         internal static varying char(8)          initial array dcl 15-326
+ALT_USER_ATTRIBUTE_NAMES               internal static char(20)                 initial array packed unaligned dcl 13-77
+ANSTBL_version_4                       internal static fixed bin(17,0)          initial dcl 1-51
+AT_NORMAL                              internal static char(8)                  initial packed unaligned dcl 1-116
+AT_SHUTDOWN                            internal static char(8)                  initial packed unaligned dcl 1-116
+AT_SPECIAL                             internal static char(8)                  initial packed unaligned dcl 1-116
+Automatic_authentication               internal static fixed bin(17,0)          initial dcl 7-16
+DERIVE_MASK                            internal static bit(2)                   initial packed unaligned dcl 15-280
+DIAL_SERVER_FLAG_NAMES                 internal static varying char(12)         initial array dcl 15-332
+DONT_MASK                              internal static bit(2)                   initial packed unaligned dcl 15-280
+DO_MASK                                internal static bit(2)                   initial packed unaligned dcl 15-280
+LOGIN_RESULT_VALUES                    internal static varying char(24)         initial array dcl 15-338
+MASK_CTL_NAMES                         internal static varying char(12)         initial array dcl 15-284
+Manual_authentication                  internal static fixed bin(17,0)          initial dcl 7-16
+No_authentication                      internal static fixed bin(17,0)          initial dcl 7-16
+Nominal_authentication                 internal static fixed bin(17,0)          initial dcl 7-16
+PDT_entry_lth                          internal static fixed bin(17,0)          initial dcl 8-19
+PDT_header_lth                         internal static fixed bin(17,0)          initial dcl 8-19
+PDT_person_id_length                   internal static fixed bin(17,0)          initial dcl 8-19
+PDT_project_name_length                internal static fixed bin(17,0)          initial dcl 8-19
+PDT_version                            internal static fixed bin(17,0)          initial dcl 8-19
+PROCESS_TYPE_NAMES                     internal static varying char(12)         initial array dcl 15-265
+PT_ABSENTEE                            internal static fixed bin(17,0)          initial dcl 15-261
+PT_DAEMON                              internal static fixed bin(17,0)          initial dcl 15-261
+PT_INTERACTIVE                         internal static fixed bin(17,0)          initial dcl 15-261
+PW_FLAG_NAMES                          internal static varying char(12)         initial array dcl 15-290
+SL_INFO_arg_given_in_structure         internal static fixed bin(17,0)          initial dcl 12-69
+SL_INFO_arg_not_given                  internal static fixed bin(17,0)          initial dcl 12-69
+SL_INFO_as_mode                        internal static fixed bin(17,0)          initial dcl 12-65
+SL_INFO_command_mode                   internal static fixed bin(17,0)          initial dcl 12-65
+SL_INFO_version_1                      internal static char(8)                  initial packed unaligned dcl 12-62
+SL_LOG                                 internal static fixed bin(17,0)          initial dcl 12-14
+SL_LOG_CRASH                           internal static fixed bin(17,0)          initial dcl 12-14
+SL_TYPE                                internal static fixed bin(17,0)          initial dcl 12-14
+SL_TYPE_BEEP                           internal static fixed bin(17,0)          initial dcl 12-14
+SL_TYPE_CRASH                          internal static fixed bin(17,0)          initial dcl 12-14
+TABLE_NAMES                            internal static char(20)                 initial array packed unaligned dcl 15-271
+UFLAG_NAMES                            internal static varying char(24)         initial array dcl 15-303
+USER_ATTRIBUTES_always_allowed         internal static bit(36)                  initial dcl 13-100
+USER_ATTRIBUTES_default_in_pdt         internal static bit(36)                  initial dcl 13-104
+USER_ATTRIBUTES_settable_by_user       internal static bit(36)                  initial dcl 13-108
+USER_ATTRIBUTE_NAMES                   internal static char(20)                 initial array packed unaligned dcl 13-50
+UTE_SIZE                               internal static fixed bin(17,0)          initial dcl 1-120
+UTE_version_4                          internal static fixed bin(17,0)          initial dcl 15-74
+as_data_$BS                            external static char(1)                  dcl 2-21
+as_data_$CR                            external static char(1)                  dcl 2-22
+as_data_$abs_dim                       external static char(32)                 packed unaligned dcl 2-23
+as_data_$acct_update_priority          external static fixed bin(17,0)          dcl 2-24
+as_data_$acsdir                        external static char(168)                packed unaligned dcl 2-25
+as_data_$as_procid                     external static bit(36)                  dcl 2-27
+as_data_$as_ring                       external static fixed bin(3,0)           dcl 2-28
+as_data_$as_tty                        automatic       char(6)                  packed unaligned dcl 2-29
+as_data_$asmtp                         external static pointer                  dcl 2-30
+as_data_$autp                          external static pointer                  dcl 2-31
+as_data_$buzzardp                      external static pointer                  dcl 2-32
+as_data_$cdtp                          external static pointer                  dcl 2-33
+as_data_$debug_flag                    external static bit(1)                   dcl 2-84
+as_data_$default_weight                external static fixed bin(35,0)          dcl 2-34
+as_data_$dft_user_ring                 external static fixed bin(3,0)           dcl 2-36
+as_data_$dutp                          external static pointer                  dcl 2-37
+as_data_$g115_dim                      external static char(32)                 packed unaligned dcl 2-38
+as_data_$lct_initialized               external static bit(1)                   dcl 2-39
+as_data_$lct_size                      external static fixed bin(17,0)          dcl 2-40
+as_data_$login_args                    external static structure                level 1 dcl 2-62
+as_data_$login_words                   external static fixed bin(17,0)          dcl 2-77
+as_data_$ls_message_buffer_cur_lth     external static fixed bin(18,0)          dcl 2-86
+as_data_$ls_message_buffer_max_lth     external static fixed bin(18,0)          dcl 2-87
+as_data_$ls_message_buffer_ptr         external static pointer                  dcl 2-88
+as_data_$ls_request_server_info_ptr    external static pointer                  dcl 2-85
+as_data_$max_user_ring                 external static fixed bin(3,0)           dcl 2-41
+as_data_$mgtp                          external static pointer                  dcl 2-42
+as_data_$mrd_dim                       external static char(32)                 packed unaligned dcl 2-43
+as_data_$ntty_dim                      external static char(32)                 packed unaligned dcl 2-44
+as_data_$pdtdir                        external static char(168)                packed unaligned dcl 2-45
+as_data_$pit_ptr                       external static pointer                  dcl 2-46
+as_data_$rcpdir                        external static char(168)                packed unaligned dcl 2-47
+as_data_$request_priority              external static fixed bin(17,0)          dcl 2-48
+as_data_$rtdtp                         external static pointer                  dcl 2-50
+as_data_$sat_htp                       external static pointer                  dcl 2-51
+as_data_$satp                          external static pointer                  dcl 2-52
+as_data_$signal_types                  external static structure                level 1 dcl 2-67
+as_data_$suffix                        external static char(2)                  array packed unaligned dcl 2-53
+as_data_$sysdir                        external static char(168)                packed unaligned dcl 2-54
+as_data_$system_signal_types           external static structure                level 1 dcl 2-72
+as_data_$teens_suffix                  external static char(2)                  array packed unaligned dcl 2-55
+as_data_$terminet_tabs_string          external static varying char(144)        dcl 2-56
+as_data_$tty_dim                       external static char(32)                 packed unaligned dcl 2-57
+as_data_$update_priority               external static fixed bin(17,0)          dcl 2-58
+as_data_$version                       external static char(8)                  packed unaligned dcl 2-59
+as_data_$whoptr                        external static pointer                  dcl 2-60
+as_data_login_words                    based           structure                level 1 dcl 2-77
+as_procid                              defined         bit(36)                  dcl 3-17
+as_tty                                 based           char(6)                  packed unaligned dcl 3-18
+asmtp                                  defined         pointer                  dcl 3-19
+authentication_level_names             internal static char(12)                 initial array packed unaligned dcl 7-21
+cur_rs_ptr                             automatic       pointer                  dcl 39
+dev_dsa_hour                           internal static fixed bin(17,0)          initial dcl 4-59
+dev_dsa_kilobyte                       internal static fixed bin(17,0)          initial dcl 4-57
+dev_dsa_kilopacket                     internal static fixed bin(17,0)          initial dcl 4-58
+dev_lv                                 internal static fixed bin(17,0)          initial dcl 4-56
+devtab_ix_dsa_hour                     internal static fixed bin(17,0)          initial dcl 4-68
+devtab_ix_dsa_kilobyte                 internal static fixed bin(17,0)          initial dcl 4-66
+devtab_ix_dsa_kilopacket               internal static fixed bin(17,0)          initial dcl 4-67
+devtab_ix_lv                           internal static fixed bin(17,0)          initial dcl 4-65
+installation_parms_version_1           internal static fixed bin(17,0)          initial dcl 6-37
+installation_parms_version_2           internal static fixed bin(17,0)          initial dcl 6-38
+mgtp                                   defined         pointer                  dcl 3-22
+pdt                                    based           structure                level 1 dcl 8-27
+pdtdir                                 based           char(168)                packed unaligned dcl 3-23
+rifp                                   automatic       pointer                  dcl 7-6
+sat_htp                                defined         pointer                  dcl 3-25
+satp                                   defined         pointer                  dcl 3-26
+sc_stat_$Go                            external static bit(1)                   dcl 11-62
+sc_stat_$Multics                       external static bit(1)                   dcl 11-62
+sc_stat_$Star_typed                    external static bit(1)                   dcl 11-62
+sc_stat_$admin_listener_exit_label     external static label variable           dcl 11-34
+sc_stat_$admin_listener_switch         external static bit(1)                   dcl 11-62
+sc_stat_$admin_log_iocb                external static pointer                  dcl 11-45
+sc_stat_$admin_log_write_ptr           external static pointer                  dcl 11-45
+sc_stat_$admin_sci_ptr                 external static pointer                  dcl 11-45
+sc_stat_$as_log_write_ptr              external static pointer                  dcl 11-45
+sc_stat_$did_part1                     external static bit(1)                   dcl 11-62
+sc_stat_$did_part2                     external static bit(1)                   dcl 11-62
+sc_stat_$did_part3                     external static bit(1)                   dcl 11-62
+sc_stat_$exec_access_name              external static char(32)                 packed unaligned dcl 11-15
+sc_stat_$info_dir                      external static char(168)                packed unaligned dcl 11-21
+sc_stat_$initzer_ttyp                  external static pointer                  dcl 11-45
+sc_stat_$log_dir                       external static char(168)                packed unaligned dcl 11-21
+sc_stat_$master_abort_label            external static label variable           dcl 11-34
+sc_stat_$master_channel                external static char(6)                  dcl 11-29
+sc_stat_$master_iocb                   external static pointer                  dcl 11-45
+sc_stat_$master_sci_ptr                external static pointer                  dcl 11-45
+sc_stat_$mc_acs_dir                    external static char(168)                packed unaligned dcl 11-21
+sc_stat_$mc_ansp                       external static pointer                  dcl 11-45
+sc_stat_$mc_iocb                       external static pointer                  dcl 11-45
+sc_stat_$mc_is_on                      external static bit(1)                   dcl 11-62
+sc_stat_$no_operator_login             external static bit(1)                   dcl 11-62
+sc_stat_$shutdown_typed                external static bit(1)                   dcl 11-62
+sc_stat_$sv1_iocb                      external static pointer                  dcl 11-45
+sc_stat_$sv2_iocb                      external static pointer                  dcl 11-45
+sc_stat_$sv3_iocb                      external static pointer                  dcl 11-45
+sc_stat_$sysdir                        external static char(168)                packed unaligned dcl 11-21
+sc_stat_$system_shutdown_label         external static label variable           dcl 11-34
+sc_stat_$test_mode                     external static bit(1)                   dcl 11-62
+sc_stat_$unidentified_access_name      external static char(32)                 packed unaligned dcl 11-15
+sc_stat_$vchn_requires_accept          external static bit(1)                   dcl 11-62
+scdtp                                  defined         pointer                  dcl 3-27
+sl_info                                automatic       structure                level 1 dcl 12-24
+sl_info_code_msg                       internal static structure                level 1 dcl 12-187
+sl_info_msg                            internal static structure                level 1 dcl 12-214
+sl_info_sev_code_label_msg             internal static structure                level 1 dcl 12-161
+sl_info_sev_code_msg                   internal static structure                level 1 dcl 12-82
+sl_info_sev_coded_msg                  internal static structure                level 1 dcl 12-134
+sl_info_sev_msg                        internal static structure                level 1 dcl 12-108
+sysdir                                 defined         char(168)                packed unaligned dcl 3-28
+whoptr                                 defined         pointer                  dcl 3-29
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+broom                           000632 constant        entry                    external dcl 165
+device_acct_                    000140 constant        entry                    external dcl 13
+free_devtab_entry               001435 constant        entry                    internal dcl 262 ref 138 175
+init                            000701 constant        entry                    external dcl 181
+init_error                      001212 constant        label                    dcl 226 ref 189 192
+init_sub_err                    001246 constant        label                    dcl 228 ref 185
+lock_pdte                       001512 constant        entry                    internal dcl 283 ref 109 245
+off                             000423 constant        entry                    external dcl 128
+on                              000153 constant        entry                    external dcl 64
+setup                           000277 constant        entry                    external dcl 102
+unlock_pdte                     001640 constant        entry                    internal dcl 313 ref 122 254
+upcharge                        001275 constant        entry                    internal dcl 232 ref 137 158 174
+update                          000566 constant        entry                    external dcl 151
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      2146        2224    1670        2156
+Length      3014    1670        56         553     256           4
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+device_acct_                        290 external procedure  is an external procedure.  
+upcharge                                internal procedure  shares stack frame of external procedure device_acct_.  
+free_devtab_entry                       internal procedure  shares stack frame of external procedure device_acct_.  
+lock_pdte                               internal procedure  shares stack frame of external procedure device_acct_.  
+unlock_pdte                             internal procedure  shares stack frame of external procedure device_acct_.  
+
+STORAGE FOR INTERNAL STATIC VARIABLES.
+
+   LOC IDENTIFIER                  BLOCK NAME
+000010 devtab_ix_tape              device_acct_
+000011 devtab_ix_tape_mt           device_acct_
+000012 devtab_ix_disk              device_acct_
+000013 devtab_ix_disk_mt           device_acct_
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+device_acct_             000100 devep                       device_acct_
+                         000102 pdtep                       device_acct_
+                         000104 dix                         device_acct_
+                         000105 dix1                        device_acct_
+                         000106 cost                        device_acct_
+                         000107 unlock_pdte_sw              device_acct_
+                         000110 ec                          device_acct_
+                         000111 devtab_ix                   device_acct_
+                         000112 ansp                        device_acct_
+                         000114 pdtp                        device_acct_
+                         000116 utep                        device_acct_
+                         000134 delta                       upcharge
+                         000136 cost                        upcharge
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+call_ext_out_desc   call_ext_out        return_mac          ext_entry           ext_entry_desc      clock_mac
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+hcs_$make_seg                 hcs_$truncate_seg             ipc_$mask_ev_calls            ipc_$unmask_ev_calls
+set_lock_$lock                set_lock_$unlock              sub_err_                      sys_log_
+sys_log_$error_log
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+as_data_$ansp                 as_data_$devtabp              as_data_$rs_ptrs
+error_table_$lock_wait_time_exceeded                        error_table_$locked_by_this_process
+error_table_$out_of_sequence  sc_stat_$Go_typed             sc_stat_$Multics_typed
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+ 1   53 000131       393 000133   15   76 000134        13 000137        64 000146        70 000172        71 000175
+     72 000201        73 000204        74 000211        75 000215        76 000220        78 000221        79 000222
+     80 000225        83 000227        84 000232        85 000233        86 000235        87 000236        88 000240
+     89 000244        92 000253        93 000256        94 000261        95 000266        96 000272        98 000274
+    102 000275       106 000316       107 000321       108 000324       109 000326       110 000333       111 000343
+    112 000350       113 000351       114 000353       115 000362       116 000365       117 000402       118 000406
+    119 000411       120 000414       122 000417       124 000420       128 000421       130 000442       131 000445
+    132 000450       133 000454       134 000462       135 000474       136 000477       137 000502       138 000503
+    139 000504       141 000505       143 000510       146 000562       151 000563       153 000577       154 000602
+    155 000606       156 000610       157 000614       158 000622       159 000623       161 000627       165 000630
+    167 000643       168 000646       170 000650       171 000654       172 000657       173 000664       174 000672
+    175 000673       176 000674       177 000677       181 000700       183 000707       184 000714       185 000716
+    187 000717       188 000722       189 000765       191 000772       192 001005       193 001007       194 001012
+    195 001014       196 001016       200 001017       202 001046       203 001050       206 001057       208 001104
+    209 001106       212 001115       214 001142       215 001144       218 001153       220 001200       221 001202
+    224 001211       226 001212       228 001246       401 001274       232 001275       237 001276       238 001301
+    239 001306       242 001345       245 001346       246 001353       247 001360       248 001362       249 001373
+    250 001416       251 001422       252 001425       253 001430       254 001433       256 001434       262 001435
+    264 001436       266 001441       267 001446       269 001456       270 001464       272 001474       273 001477
+    274 001500       275 001505       276 001507       277 001511       283 001512       285 001514       286 001516
+    287 001526       288 001544       296 001554       297 001560       300 001625       301 001626       304 001631
+    307 001634       313 001640       315 001641       318 001656
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

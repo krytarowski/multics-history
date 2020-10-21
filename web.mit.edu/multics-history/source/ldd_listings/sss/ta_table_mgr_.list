@@ -1,0 +1,2542 @@
+	COMPILATION LISTING OF SEGMENT ta_table_mgr_
+	Compiled by: Multics PL/I Compiler, Release 28d, of October 4, 1983
+	Compiled at: Honeywell Multics Op. - System M
+	Compiled on: 02/16/84  1256.4 mst Thu
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   *                                                         *
+        4*   * Copyright, (C) Honeywell Information Systems Inc., 1981 *
+        5*   *                                                         *
+        6*   *                                                         *
+        7*   *********************************************************** */
+        8 
+        9 /* ******************************************************
+       10*   *                                                    *
+       11*   *                                                    *
+       12*   * Copyright (c) 1972 by Massachusetts Institute of   *
+       13*   * Technology and Honeywell Information Systems, Inc. *
+       14*   *                                                    *
+       15*   *                                                    *
+       16*   ****************************************************** */
+       17 
+       18 ta_table_mgr_: proc;
+       19 	return;
+       20 
+       21 /* This subroutine manages the online table for tape_archive.  It performs
+       22*   operations on the header fields and other operations on the table proper
+       23*   (as distinct from one particular entry-- other modules modify individual
+       24*   entries.) It also does particular operations on entries when that operation
+       25*   is simply a bookkeeping operation (e.g.  deleting a component is simply
+       26*   setting a flag;  no tapes are mounted, and the file system is never
+       27*   consulted..)
+       28*
+       29*   Written 05/09/77 by C. D. Tavares
+       30*   Modified 09/24/79 by CDT to implement star convention entry, star
+       31*   convention in cancel, new table version with longer volume names,
+       32*   and to diddle n_queued_requests when canceling deletions.
+       33*   Modified 09/03/80 by CDT for version 3, adding density field;
+       34*   also added "alter density" operation.
+       35*   Modified 09/21/80 by CDT to implement indivisible table update
+       36*   strategy (setup_workspace, complete_table_op).
+       37*   Modified 10/24/80 by CDT to add "alter module".
+       38*   Last modified 83-03-16 by S. G. Harris (UNCA) for version 4.
+       39*   Modified 7/83 by S. Krupp for conversion to mtape_.  This
+       40*      involved:  addition of the volume_type alterspec and addition
+       41*      of the -volume_type (-vt) control argument to the load_table key.
+       42*
+       43**/
+       44 
+  1     1 /* ---------- BEGIN include file tape_archive_table_dcl.incl.pl1 ---------- */
+  1     2 
+  1     3 /* Version 2 lengthened volume names from 6 to 32 characters */
+  1     4 /* Version 3 introduced density field, workspace strategy for updates, */
+  1     5 /* and the mount lock, which is less of a lock than a retain indicator. */
+  1     6 /* Version 4 expanded density field to an array for independent volume set */
+  1     7 /* densities and added uid fields for table deletion checking. */
+  1     8 /* Modified 09/21/80 by C. D. Tavares for version 3 */
+  1     9 /* Modified 12/9/81 by CDT to add highest_mount_type field */
+  1    10 /* Last modified 83-03-16 by S. G. Harris (UNCA) for version 4. */
+  1    11 /* Modified 09/16/83 by S. Krupp to add the TAPE_ARCHIVE_IO_MODULE
+  1    12*   declaration for conversion to the mtape_ I/O module. */
+  1    13 
+  1    14 dcl 1 tape_archive_table aligned based (table_ptr),	/* online segment for tape_archive command */
+  1    15     2 nonvolatile_part aligned,			/* temp table moving doesn't touch these */
+  1    16       3 version_number fixed bin,			/* of table */
+  1    17       3 magic_constant char (8),			/* "ta table" */
+  1    18       3 compaction_warning_threshold float bin,		/* when to suggest compaction to user */
+  1    19       3 auto_compaction_threshold float bin,		/* when to compact when user doesn't take hint */
+  1    20       3 table_is_consistent bit (1) unaligned,		/* update in progress indicator */
+  1    21       3 lock bit (36),				/* allows shared tape archives */
+  1    22       3 lock_reason fixed bin,			/* reason seg already locked, for failure msg */
+  1    23       3 locker_id char (32),				/* userid of locking process, for failure msg */
+  1    24       3 io_module_name char (32),			/* tape_ansi_ or tape_ibm_ */
+  1    25       3 recovery_info_offset bit (18) aligned,		/* holds address of workspace for table updates */
+  1    26       3 perm_table_uid bit (36),			/* used to prevent table deletion */
+  1    27       3 future_expansion (6) bit (36),			/* ... */
+  1    28     2 volatile_part aligned,				/* these can get altered due to temp table moves */
+  1    29       3 n_components fixed bin,			/* number valid (undeleted) components in archive */
+  1    30       3 n_component_slots fixed bin,			/* number of used component slots in table */
+  1    31       3 n_queued_requests fixed bin,			/* number requests to be performed next mount */
+  1    32       3 n_request_slots fixed bin,			/* number of used request slots in table */
+  1    33       3 next_mount_type fixed bin,			/* read only, write, or compact */
+  1    34       3 date_time_tape_modified bit (36),		/* last time tape written on */
+  1    35       3 date_time_last_compacted bit (36),		/* last time tape compacted */
+  1    36       3 total_records fixed bin (35),			/* data out on tape, in Multics records */
+  1    37       3 dead_records fixed bin (35),			/* records wasted (deletions, replacements) */
+  1    38       3 incomplete_write_op_last bit (1),		/* ON if determined that user or sys crashed while writing tape */
+  1    39       3 last_tape_file_no fixed bin,			/* number of last file existing on volume set */
+  1    40       3 last_table_no fixed bin,			/* number of copies of online table on this volume set */
+  1    41       3 mount_lock bit (36) aligned,			/* set to lock_id while volume set mounted */
+  1    42       3 highest_mount_type fixed bin,			/* max of next_mount_type since retained */
+  1    43       3 future_expansion (6) bit (36),			/* ... */
+  1    44       3 tape_info aligned,
+  1    45         4 density (2) fixed bin (17) unal,		/* post version 3 volume set densities */
+  1    46         4 active_set fixed bin,			/* which of the two is most current */
+  1    47         4 n_volumes_in_set (2) fixed bin,		/* how many reels comprise volume set */
+  1    48         4 volume_set (2) aligned,
+  1    49 	5 volume_id (8) char (168),			/* physical reel and slot info */
+  1    50       3 component_table (0 refer (tape_archive_table.n_component_slots)) aligned like component,
+  1    51       3 request_queue (0 refer (tape_archive_table.n_request_slots)) aligned like request;
+  1    52 
+  1    53 dcl 1 component aligned based (component_ptr),		/* format of one component entry */
+  1    54     2 entry_status_descriptor like entry_status_descriptor aligned,
+  1    55     2 previous_instance_backchain fixed bin,		/* index of file it replaced, if any */
+  1    56     2 associated_request_index fixed bin,		/* if extract pending, index of request with dirpath */
+  1    57     2 date_time_deleted bit (36) aligned,		/* if logically deleted, when. */
+  1    58     2 future_expansion (5) bit (36) aligned;		/* ... */
+  1    59 
+  1    60 dcl 1 request aligned based (request_ptr),		/* format of a queued request */
+  1    61     2 entry_status_descriptor like entry_status_descriptor aligned,
+  1    62     2 directory_name char (168) unaligned,		/* in Multics file system */
+  1    63     2 requested_ops unaligned,
+  1    64       3 append bit (1) unaligned,			/* add to tape */
+  1    65       3 replace bit (1) unaligned,			/* replace to tape */
+  1    66       3 extract bit (1) unaligned,			/* extract from tape */
+  1    67       3 delete bit (1) unaligned,			/* delete from tape or file system */
+  1    68       3 force bit (1) unaligned,			/* forcibly do any of the above */
+  1    69       3 single_name bit (1) unaligned,			/* append/extract with only given name */
+  1    70       3 future_expansion bit (30) unaligned,
+  1    71     2 existing_reference fixed bin,			/* index of component block, if exists (e.g. read) */
+  1    72     2 future_expansion (4) bit (36) aligned;
+  1    73 
+  1    74 dcl 1 entry_status_descriptor aligned based,
+  1    75     2 valid bit (1) unaligned,			/* an undeleted component or request if on */
+  1    76     2 no_final_newline bit (1) unaligned,		/* ON if last char in file was not newline */
+  1    77     2 safety_switch bit (1) unaligned,			/* reflects safety switch of file while online */
+  1    78     2 pad bit (33) unaligned,
+  1    79     2 file_info aligned,				/* main tape file for this entry */
+  1    80       3 tape_file_name char (17),
+  1    81       3 entry_name char (32) unaligned,			/* for Multics file system */
+  1    82       3 date_time_archived bit (36),			/* when it was put on tape */
+  1    83       3 recording_mode char (8) aligned,		/* "ascii", "binary", "ebcdic", etc. */
+  1    84       3 date_time_branch_modified bit (36),		/* last modified while in file system */
+  1    85       3 date_time_dumped bit (36),			/* by backup facility */
+  1    86       3 bitcount_author char (32),			/* last person who modified it while online */
+  1    87       3 file_length fixed bin (35),			/* in Multics pages */
+  1    88       3 attribute_file_no fixed bin,			/* file number of attribute file on tape */
+  1    89       3 n_tape_records fixed bin (35),			/* number of logical records on tape for this file */
+  1    90     2 uid bit (36) aligned,				/* used to prevent table deletion */
+  1    91     2 future_expansion bit (36) aligned;
+  1    92 
+  1    93 dcl 1 workspace based (workspace_ptr) aligned,		/* to prevent update inconsistencies */
+  1    94     2 workspace_id char (8),				/* "wrkspace" */
+  1    95     2 component_no fixed bin,
+  1    96     2 request_no fixed bin,
+  1    97     2 n_queued_requests fixed bin,
+  1    98     2 dead_records fixed bin,
+  1    99     2 total_records fixed bin,
+  1   100     2 n_components fixed bin,
+  1   101     2 n_request_slots fixed bin,
+  1   102     2 next_mount_type fixed bin,
+  1   103     2 future_expansion (70) fixed bin (35),
+  1   104     2 tape_info_copy aligned like tape_archive_table.tape_info,
+  1   105     2 future_expansion2 (16) fixed bin (35),
+  1   106     2 component_copy like component aligned,
+  1   107     2 future_expansion3 (16) fixed bin (35),
+  1   108     2 request_copy like request aligned;
+  1   109 
+  1   110 dcl 1 based_tape_info based (tape_info_ptr) like tape_archive_table.tape_info aligned;
+  1   111 
+  1   112 dcl (table_ptr, component_ptr, request_ptr, workspace_ptr, tape_info_ptr) pointer;
+  1   113 
+  1   114 dcl ((None initial (0),				/* next scheduled processing flags */
+  1   115      Delete initial (1),
+  1   116      Read initial (2),
+  1   117      Write initial (3),
+  1   118      Compact initial (4),
+  1   119 
+  1   120      Examine initial (1),				/* current lock reason flags */
+  1   121      Modify initial (2),
+  1   122      Process_tape initial (3),
+  1   123 
+  1   124      Deletion initial (1),				/* pending_operation flags */
+  1   125      Extraction initial (2),
+  1   126      Replacement initial (3),
+  1   127      Cancellation initial (4),
+  1   128      Deletion_cancellation initial (5),
+  1   129      Volume_alteration initial (6),
+  1   130      Table_creation initial (7),
+  1   131      Table_copy initial (8),
+  1   132 
+  1   133      Default_density initial (1600),
+  1   134 
+  1   135      tape_archive_version_4 initial (4)) fixed bin,
+  1   136 
+  1   137      TAPE_ARCHIVE_IO_MODULE char(6) init("mtape_"),
+  1   138 
+  1   139      Lock_reasons (0:3) char (24) initial
+  1   140     ("no discernable reason", "table examination", "table modification", "tape processing"),
+  1   141 
+  1   142      Magic_constant char (8) initial ("ta table"),
+  1   143      Magic_workspace_constant char (8) initial ("wrkspace")) static options (constant);
+  1   144 
+  1   145 /* ---------------- END include file tape_archive_table_dcl.incl.pl1 ---------------- */
+       45 
+       46 
+  2     1 /* --------------- BEGIN include file tape_archive_star.incl.pl1 --------------- */
+  2     2 
+  2     3 dcl 1 ta_filesys_star_info aligned based (ta_filesys_star_ptr),
+  2     4     2 n_entries fixed bin,
+  2     5     2 ename (ta_star_match_count refer (ta_filesys_star_info.n_entries)) char (32) unaligned;
+  2     6 
+  2     7 dcl 1 ta_component_star_info aligned based (ta_component_star_ptr),
+  2     8     2 n_entries fixed bin,
+  2     9     2 entry (ta_star_match_count refer (ta_component_star_info.n_entries)),
+  2    10       3 ename char (32) unaligned,
+  2    11       3 type fixed bin,
+  2    12       3 table_idx fixed bin;
+  2    13 
+  2    14 dcl  ta_star_match_count fixed bin,
+  2    15      ta_filesys_star_ptr pointer,
+  2    16      ta_component_star_ptr pointer;
+  2    17 
+  2    18 dcl (Component initial (1),
+  2    19      Request initial (2)) fixed bin static options (constant);
+  2    20 
+  2    21 /* ---------------- END include file tape_archive_star.incl.pl1 ---------------- */
+       47 
+       48 
+  3     1 /*	BEGIN INCLUDE FILE query_info.incl.pl1		TAC June 1, 1973 */
+  3     2 /*        Renamed to query_info.incl.pl1 and cp_escape_control added, 08/10/78 WOS */
+  3     3 /*	version number changed to 4, 08/10/78 WOS */
+  3     4 /* Version 5 adds explanation_(ptr len) 05/08/81 S. Herbst */
+  3     5 /* Version 6 adds literal_sw, prompt_after_explanation switch 12/15/82 S. Herbst */
+  3     6 
+  3     7 dcl 1 query_info aligned,				/* argument structure for command_query_ call */
+  3     8     2 version fixed bin,				/* version of this structure - must be set, see below */
+  3     9     2 switches aligned,                                     /* various bit switch values */
+  3    10       3 yes_or_no_sw bit (1) unaligned init ("0"b),		/* not a yes-or-no question, by default */
+  3    11       3 suppress_name_sw bit (1) unaligned init ("0"b),	/* do not suppress command name */
+  3    12       3 cp_escape_control bit (2) unaligned init ("00"b),   /* obey static default value */
+  3    13                                                             /* "01" -> invalid, "10" -> don't allow, "11" -> allow */
+  3    14       3 suppress_spacing bit (1) unaligned init ("0"b),     /* whether to print extra spacing */
+  3    15       3 literal_sw bit (1) unaligned init ("0"b),		/* ON => do not strip leading/trailing white space */
+  3    16       3 prompt_after_explanation bit (1) unaligned init ("0"b),  /* ON => repeat question after explanation */
+  3    17       3 padding bit (29) unaligned init (""b),		/* pads it out to t word */
+  3    18     2 status_code fixed bin (35) init (0),		/* query not prompted by any error, by default */
+  3    19     2 query_code fixed bin (35) init (0),		/* currently has no meaning */
+  3    20 
+  3    21 /*  Limit of data defined for version 2 */
+  3    22 
+  3    23     2 question_iocbp ptr init (null ()),		/* IO switch to write question */
+  3    24     2 answer_iocbp ptr init (null ()),			/* IO switch to read answer */
+  3    25     2 repeat_time fixed bin (71) init (0),		/* repeat question every N seconds if no answer */
+  3    26 						/* minimum of 30 seconds required for repeat */
+  3    27 						/* otherwise, no repeat will occur */
+  3    28 /* Limit of data defined for version 4 */
+  3    29 
+  3    30     2 explanation_ptr ptr init (null ()),		/* explanation of question to be printed if */
+  3    31     2 explanation_len fixed bin (21) init (0);		/* user answers "?" (disabled if ptr=null or len=0) */
+  3    32 
+  3    33 dcl  query_info_version_3 fixed bin int static options (constant) init (3);
+  3    34 dcl  query_info_version_4 fixed bin int static options (constant) init (4);
+  3    35 dcl  query_info_version_5 fixed bin int static options (constant) init (5);
+  3    36 dcl  query_info_version_6 fixed bin int static options (constant) init (6); /* the current version number */
+  3    37 
+  3    38 /*	END INCLUDE FILE query_info.incl.pl1 */
+       49 
+       50 
+       51 create_table: entry (table_dir, table_name, table_ptr, code);
+       52 
+       53 dcl  table_dir char (*) parameter,
+       54      table_name char (*) parameter,
+       55      code fixed bin (35) parameter;
+       56 
+       57 /* STATIC */
+       58 
+       59 dcl  group_id char (32) static initial (""),
+       60      initialized bit (1) aligned static initial (""b);
+       61 
+       62 /* CONDITIONS */
+       63 
+       64 dcl  cleanup condition;
+       65 
+       66 /* ENTRIES */
+       67 
+       68 dcl (com_err_, com_err_$suppress_name) ext entry options (variable),
+       69      get_group_id_ ext entry returns (char (32)),
+       70      hcs_$truncate_seg entry (ptr, fixed bin (18), fixed bin (35)),
+       71      hcs_$set_bc_seg ext entry (pointer, fixed bin (24), fixed bin (35)),
+       72      hcs_$set_safety_sw_seg entry (pointer, bit (1), fixed bin (35)),
+       73      hcs_$make_seg ext entry (char (*), char (*), char (*), fixed bin, pointer, fixed bin (35)),
+       74      ioa_ ext entry options (variable),
+       75      set_lock_$lock ext entry (bit (36) aligned, fixed bin, fixed bin (35)),
+       76      set_lock_$unlock ext entry (bit (36) aligned, fixed bin (35));
+       77 
+       78 dcl  ta_upgrade_version_ ext entry (char (*), char (*), pointer, bit (1) aligned, fixed bin (35));
+       79 
+       80 
+       81 	call ioa_ ("tape_archive:  Creating ^a>^a.", table_dir, table_name);
+       82 
+       83 	call hcs_$make_seg (table_dir, table_name, "", 1010b, table_ptr, code);
+       84 	if code ^= 0 then do;			/* If we didn't flat out CREATE this one */
+       85 create_err:    call com_err_ (code, "tape_archive", "Creating ^a>^a", table_dir, table_name);
+       86 	     return;
+       87 	end;
+       88 
+       89 	on cleanup call unlock_table (code);
+       90 
+       91 	call set_lock_$lock (tape_archive_table.lock, 0, code);
+       92 	if code ^= 0 then goto create_err;
+       93 
+       94 	group_id = get_group_id_ ();
+       95 	initialized = "1"b;
+       96 	tape_archive_table.locker_id = group_id;
+       97 	tape_archive_table.lock_reason = Modify;
+       98 
+       99 	tape_archive_table.version_number = tape_archive_version_4;
+      100 	tape_archive_table.magic_constant = Magic_constant;
+      101 	tape_archive_table.compaction_warning_threshold = 0.5e0;
+      102 	tape_archive_table.auto_compaction_threshold = 1.0e0;
+      103 	tape_archive_table.io_module_name = "tape_ansi_";
+      104 	tape_archive_table.tape_info.density (*) = Default_density;
+      105 	tape_archive_table.tape_info.active_set = 1;
+      106 	tape_archive_table.tape_info.volume_id (*, *) = " ";
+      107 
+      108 	call hcs_$set_bc_seg (table_ptr, size (tape_archive_table) * 36, code);
+      109 	call hcs_$set_safety_sw_seg (table_ptr, "1"b, code);
+      110 
+      111 	tape_archive_table.table_is_consistent = "1"b;
+      112 
+      113 	call set_lock_$unlock (tape_archive_table.lock, code);
+      114 	return;
+      115 
+      116 find_and_verify: entry (table_dir, table_name, table_ptr, w_permit, code);
+      117 
+      118 dcl  w_permit bit (1) aligned;
+      119 
+      120 /* ENTRIES */
+      121 
+      122 dcl  hcs_$fs_get_mode ext entry (pointer, fixed bin, fixed bin (35)),
+      123      hcs_$initiate ext entry (char (*), char (*), char (*), fixed bin, fixed bin, pointer, fixed bin (35));
+      124 
+      125 /* AUTOMATIC */
+      126 
+      127 dcl  mode fixed bin;
+      128 
+      129 /* EXTERNAL STATIC */
+      130 
+      131 dcl (error_table_$bad_segment,
+      132      error_table_$improper_data_format,
+      133      error_table_$moderr,
+      134      error_table_$too_many_args) external fixed bin (35) static;
+      135 
+      136 /* BUILTINS */
+      137 
+      138 dcl (bit, clock, currentsize, divide, float, hbound, lbound, length,
+      139      max, mod, null, pointer, substr) builtin;
+      140 
+      141 	w_permit = "1"b;				/* until we find out otherwise */
+      142 
+      143 	call hcs_$initiate (table_dir, table_name, "", 0, 0, table_ptr, code);
+      144 	if table_ptr = null then return;		/* no error, maybe this invocation will create one */
+      145 
+      146 	if tape_archive_table.magic_constant ^= Magic_constant then do;
+      147 	     code = error_table_$improper_data_format;
+      148 	     call com_err_ (code, "tape_archive", "^a>^a is not a tape_archive table.",
+      149 		table_dir, table_name);
+      150 	     return;
+      151 	end;
+      152 
+      153 	call hcs_$fs_get_mode (table_ptr, mode, code);
+      154 	if code ^= 0 then do;
+      155 	     call com_err_ (code, "tape_archive", "^a>^a", table_dir, table_name);
+      156 	     return;
+      157 	end;
+      158 
+      159 	if mod (mode, 4) < 2 then w_permit = ""b;
+      160 
+      161           if tape_archive_table.version_number ^= tape_archive_version_4
+      162           then do;
+      163                call ta_upgrade_version_ (table_dir, table_name, table_ptr, w_permit, code);
+      164 	     if code ^= 0 then return;			/* message already printed */
+      165           end;
+      166 
+      167 	if w_permit then do;
+      168 	     on cleanup call unlock_table (0);
+      169 
+      170 	     call lock_table (Examine, code);
+      171 	     if code ^= 0 then return;
+      172 	end;
+      173 
+      174 	if ^tape_archive_table.table_is_consistent then
+      175 	     if ^w_permit then do;
+      176 		code = error_table_$bad_segment;
+      177 		call com_err_ (code, "tape_archive", "^a>^a", table_dir, table_name);
+      178 		call com_err_$suppress_name (error_table_$moderr, "tape_archive", "Write permission needed to salvage this table.");
+      179 	     end;
+      180 	     else call complete_table_op (table_ptr);	/* salvage the table */
+      181 
+      182 	if w_permit then call unlock_table (0);
+      183 	return;
+      184 
+      185 find_component: entry (table_ptr, table_name, component_name, must_be_there, component_slot, request_slot, code);
+      186 
+      187 dcl  component_name char (*) parameter,
+      188      must_be_there bit (1) aligned parameter,
+      189      component_slot fixed bin parameter,
+      190      request_slot fixed bin parameter;
+      191 
+      192 /* EXTERNAL STATIC */
+      193 
+      194 dcl  error_table_$action_not_performed ext fixed bin (35) static;
+      195 
+      196 /* ENTRIES */
+      197 
+      198 dcl  sub_err_ ext entry options (variable);
+      199 
+      200 /* AUTOMATIC */
+      201 
+      202 dcl  words char (24);
+      203 
+      204 	code = error_table_$action_not_performed;	/* assume the worst */
+      205 
+      206 	do request_slot = 1 to tape_archive_table.n_request_slots
+      207 		while (^request_queue (request_slot).valid
+      208 		| (request_queue (request_slot).entry_name ^= component_name));
+      209 	end;
+      210 
+      211 	if request_slot ^> tape_archive_table.n_request_slots then do;
+      212 	     request_ptr = addr (request_queue (request_slot));
+      213 	     if request.append then words = "appended to";
+      214 	     else if request.replace then words = "replaced onto";
+      215 	     else if request.extract then words = "extracted from";
+      216 	     else call sub_err_ (code, "tape_archive", "s", null, 0,
+      217 		"Valid request found with no request bits.");
+      218 
+      219 	     call com_err_ (code, "tape_archive",
+      220 		"^/^5x^a is already scheduled to be ^a the volume set.",
+      221 		component_name, words);
+      222 	     return;
+      223 	end;
+      224 
+      225 	do component_slot = tape_archive_table.n_component_slots to 1 by -1
+      226 		while (component_table (component_slot).entry_name ^= component_name
+      227 		| ^component_table (component_slot).valid);
+      228 	end;
+      229 
+      230 	if component_slot = 0 then
+      231 	     if must_be_there then do;
+      232 		call com_err_ (code, "tape_archive", "^a not found in ^a.", component_name, table_name);
+      233 		return;
+      234 	     end;
+      235 	     else;				/* no such component found, ok */
+      236 
+      237 	else if component_table (component_slot).date_time_deleted then do;
+      238 	     call com_err_ (code, "tape_archive",
+      239 		"^/^5x^a is already scheduled to be deleted from the volume set.",
+      240 		component_name);
+      241 
+      242 	     return;
+      243 	end;
+      244 
+      245 	do request_slot = 1 to tape_archive_table.n_request_slots
+      246 		while (request_queue (request_slot).valid);
+      247 	end;
+      248 
+      249 	code = 0;
+      250 	return;
+      251 
+      252 alter_attributes: entry (table_ptr, arg_array, table_name, code);
+      253 
+      254 /* This entry implements the "alter" key of tape_archive. */
+      255 
+      256 dcl  arg_array (*) char (168) parameter;
+      257 
+      258 /* AUTOMATIC */
+      259 
+      260 dcl  alter_module bit(1) aligned,
+      261      alter_vol_type bit(1) aligned,
+      262      alterspec char (32),
+      263      args_ok bit (1) aligned,
+      264      old_vol_idx fixed bin,
+      265      fixnum fixed bin,
+      266      floatnum float bin,
+      267     (old_volume_spec, new_volume_spec) char (8),
+      268      prev_retain_sw bit(1) aligned,
+      269      value_arg char (32),
+      270      which_set fixed bin;
+      271 
+      272 /* EXTERNAL STATIC */
+      273 
+      274 dcl (error_table_$noarg,
+      275      error_table_$badopt) ext fixed bin (35) static;
+      276 
+      277 /* CONSTANTS */
+      278 
+      279 dcl  known_alterspecs (7) char (32) static options (constant) initial
+      280     ("volume_type", "module", "warning_limit", "auto_limit", "compaction", "volume", "density");
+      281 
+      282 dcl  known_densities (3) fixed bin static options (constant) initial
+      283     (800, 1600, 6250);
+      284 
+      285 dcl  known_vol_types (2) char (4) var static options (constant) initial
+      286     ("ansi", "ibm");
+      287 
+      288 dcl  known_io_modules (2) char(10) var static options (constant) initial
+      289     ("tape_ansi_", "tape_ibm_");
+      290 
+      291 /* ENTRIES */
+      292 
+      293 dcl  cv_dec_check_ ext entry (char (*), fixed bin (35)) returns (fixed bin),
+      294      cv_float_ ext entry (char (*), fixed bin (35)) returns (float bin),
+      295      get_lock_id_ entry() returns(bit(36) aligned);
+      296 
+      297 	nargs = dim (arg_array, 1);
+      298 	if nargs = 0 then do;
+      299 	     code = error_table_$noarg;
+      300 	     call com_err_ (code, "tape_archive", "Attributes to be altered.");
+      301 	     return;
+      302 	end;
+      303 
+      304 	on cleanup call unlock_table (code);
+      305 
+      306 	call lock_table (Modify, code);
+      307 	if code ^= 0 then do;
+      308 	     call com_err_ (code, "tape_archive", "alter request not processed.");
+      309 	     return;
+      310 	end;
+      311 
+      312 	do i = 1 to nargs by 2;
+      313 	     alterspec = arg_array (i);
+      314 	     value_arg = alterspec;
+      315 
+      316 	     do j = lbound (known_alterspecs, 1) to hbound (known_alterspecs, 1)
+      317 		     while (alterspec ^= known_alterspecs (j));
+      318 	     end;
+      319 
+      320 	     if j > hbound (known_alterspecs, 1) then
+      321 		call alter_err (error_table_$badopt, "^a", alterspec);
+      322 
+      323 	     if i+1 > nargs then
+      324 		call alter_err (error_table_$noarg, "^a must be followed by another argument.", alterspec);
+      325 
+      326 	     value_arg = arg_array (i+1);
+      327 
+      328 	     goto alter (j);
+      329 
+      330 alter (1):					/* volume_type */
+      331 
+      332                alter_vol_type = "1"b;
+      333 	     alter_module = "0"b;
+      334 	     goto ALTER_MOD_VOL;
+      335 
+      336 alter (2):					/* module */
+      337 
+      338                alter_module = "1"b;
+      339 	     alter_vol_type = "0"b;
+      340 
+      341 ALTER_MOD_VOL:
+      342 
+      343 	     prev_retain_sw = (tape_archive_table.mount_lock = get_lock_id_());
+      344 
+      345 	     if prev_retain_sw
+      346 	     then call alter_err(0, "Cannot change this attribute while the volume set is retained: ^a", known_alterspecs(j));
+      347 
+      348 	     if tape_archive_table.n_component_slots > 0 then
+      349 		call alter_err (error_table_$badopt,
+      350 		"The tape archive must be empty if the ""^a"" attribute is to be changed.", known_alterspecs(j));
+      351 
+      352                if alter_vol_type
+      353 	     then do;
+      354 	          do j = lbound (known_vol_types, 1) to hbound (known_vol_types, 1) while (value_arg ^= known_vol_types (j));
+      355 	          end;
+      356 
+      357 	          if j > hbound (known_vol_types, 1)
+      358 		then call alter_err (error_table_$badopt, """^a"" is not a valid volume type.", value_arg);
+      359 	     end;
+      360 	     else do;
+      361 	          do j = lbound (known_io_modules, 1) to hbound (known_io_modules, 1) while (value_arg ^= known_io_modules (j));
+      362 		end;
+      363 
+      364 		if j > hbound (known_io_modules, 1)
+      365 		then call alter_err(error_table_$badopt, """^a"" is not a valid I/O module.", value_arg);
+      366 	     end;
+      367 
+      368 	     if alter_vol_type
+      369 	     then do;
+      370 	          if value_arg = known_vol_types(1)
+      371 		then tape_archive_table.io_module_name = known_io_modules(1);
+      372 		else tape_archive_table.io_module_name = known_io_modules(2);
+      373 	     end;
+      374 	     else tape_archive_table.io_module_name = value_arg;
+      375 
+      376 	     goto alter_end;
+      377 
+      378 alter (3):					/* warning_limit */
+      379 	     floatnum = cv_float_ (value_arg, code);
+      380 	     if code ^= 0 then call alter_err (0, "^a non-numeric.", value_arg);
+      381 	     if (floatnum < 0 | floatnum > 1e0) then call alter_err (0, "^a not between 0 and 1.", value_arg);
+      382 	     else tape_archive_table.compaction_warning_threshold = floatnum;
+      383 	     call test_waste_thresholds (""b);
+      384 	     goto alter_end;
+      385 
+      386 alter (4):					/* auto_limit */
+      387 	     floatnum = cv_float_ (value_arg, code);
+      388 	     if code ^= 0 then call alter_err (0, "^a non-numeric.", value_arg);
+      389 	     if (floatnum < 0e0 | floatnum > 1e0) then call alter_err (0, "^a not between 0 and 1.", value_arg);
+      390 	     else tape_archive_table.auto_compaction_threshold = floatnum;
+      391 	     call test_waste_thresholds (""b);
+      392 	     goto alter_end;
+      393 
+      394 alter (5):					/* compaction */
+      395 	     if value_arg = "on" then tape_archive_table.next_mount_type = Compact;
+      396 	     else if value_arg = "off" then call compute_mount_type (-1, -1, tape_archive_table.next_mount_type);
+      397 	     else call alter_err (error_table_$badopt, """^a"" not ""off"" or ""on"".", value_arg);
+      398 	     goto alter_end;
+      399 
+      400 alter (6):					/* volume */
+      401 
+      402 	     old_vol_idx = -1;
+      403 	     old_volume_spec, new_volume_spec = "";
+      404 	     which_set = tape_archive_table.active_set;
+      405 	     args_ok = ""b;
+      406 
+      407 	     do i = i+1 to nargs;
+      408 
+      409 		value_arg = arg_array (i);
+      410 
+      411 		if substr (value_arg, 1, 1) = "-" then do; /* control argument */
+      412 		     if (value_arg = "-number" | value_arg = "-nb") then do;
+      413 			if old_vol_idx ^= -1 then call alter_err (error_table_$badopt, "Old volume specification supplied more than once.", "");
+      414 
+      415 			i = i + 1;
+      416 			value_arg = arg_array (i);
+      417 			old_vol_idx = cv_dec_check_ (value_arg, code);
+      418 			if code ^= 0 then call alter_err (0, "^a non-numeric.", value_arg);
+      419 			if old_vol_idx <= 0 then call alter_err (0, "^a negative or zero.", value_arg);
+      420 		     end;
+      421 
+      422 		     else if value_arg = "-alternate" then
+      423 			which_set = 3 - tape_archive_table.active_set;
+      424 
+      425 		     else call alter_err (error_table_$badopt, "^a", value_arg);
+      426 		end;
+      427 
+      428 		else do;				/* volume specifications */
+      429 		     if old_vol_idx = -1 then do;	/* is the first spec */
+      430 			old_volume_spec = value_arg;
+      431 			old_vol_idx = 0;
+      432 		     end;
+      433 
+      434 		     else if args_ok then
+      435 			call alter_err (error_table_$too_many_args, "for ^a.", alterspec);
+      436 
+      437 		     else do;
+      438 			args_ok = "1"b;
+      439 			new_volume_spec = value_arg;
+      440 		     end;
+      441 		end;
+      442 	     end;
+      443 
+      444                prev_retain_sw = (tape_archive_table.mount_lock = get_lock_id_());
+      445 
+      446 	     if prev_retain_sw
+      447 	     then do;
+      448 	          if ((tape_archive_table.highest_mount_type < Compact &
+      449 		     which_set = tape_archive_table.active_set) |
+      450 		    tape_archive_table.highest_mount_type = Compact)
+      451                     then call alter_err(0, "Cannot change this attribute while the volume set is retained: ^a", known_alterspecs(j));
+      452 	     end;
+      453 
+      454                if which_set = tape_archive_table.active_set
+      455 	     then do;
+      456 	          if tape_archive_table.n_component_slots > 0
+      457 	          then call ioa_("tape_archive: Warning - changing the volume set at this time may damage the archive.");
+      458 	     end;
+      459 
+      460 
+      461 	     if ^ args_ok then call alter_err (error_table_$noarg, "Not enough arguments for ^a.", alterspec);
+      462 
+      463 	     if old_vol_idx > 0 then
+      464 		if old_vol_idx > tape_archive_table.n_volumes_in_set (which_set) + 1 then
+      465 		     call alter_err (0, "Request would not result in contiguous volumes.", "");
+      466 
+      467 		else;
+      468 
+      469 	     else if old_volume_spec = "" then
+      470 		old_vol_idx = tape_archive_table.n_volumes_in_set (which_set) + 1;
+      471 
+      472 	     else do;
+      473 		do old_vol_idx = 1 to tape_archive_table.n_volumes_in_set (which_set)
+      474 			while (tape_archive_table.volume_set (which_set).volume_id (old_vol_idx) ^= old_volume_spec);
+      475 		end;
+      476 
+      477 		if old_vol_idx > tape_archive_table.n_volumes_in_set (which_set) then call alter_err (0, "^a not in volume set.", old_volume_spec);
+      478 	     end;
+      479 
+      480 	     call setup_workspace (table_ptr, 0, 0, workspace_ptr);
+      481 	     tape_info_ptr = addr (workspace.tape_info_copy);
+      482 
+      483 	     based_tape_info.volume_set (which_set).volume_id (old_vol_idx) = new_volume_spec;
+      484 	     if old_vol_idx = based_tape_info.n_volumes_in_set (which_set) + 1 then
+      485 		based_tape_info.n_volumes_in_set (which_set) = old_vol_idx;
+      486 
+      487 	     if new_volume_spec = "" then do;
+      488 
+      489 		do old_vol_idx = old_vol_idx to based_tape_info.n_volumes_in_set (which_set) - 1;
+      490 		     based_tape_info.volume_set (which_set).volume_id (old_vol_idx)
+      491 			= based_tape_info.volume_set (which_set).volume_id (old_vol_idx+1);
+      492 		end;
+      493 
+      494 		based_tape_info.n_volumes_in_set (which_set) = old_vol_idx - 1;
+      495 
+      496 	     end;
+      497 
+      498 	     call complete_table_op (table_ptr);
+      499 
+      500 	     goto alter_end;
+      501 
+      502 alter (7):					/* density */
+      503 	     which_set = tape_archive_table.active_set;
+      504 	     if i+2 <= nargs then
+      505 		if arg_array (i+2) = "-alternate" then do;
+      506 		     i = i + 1;
+      507 		     which_set = 3 - tape_archive_table.active_set;
+      508 		end;
+      509 
+      510                prev_retain_sw = (tape_archive_table.mount_lock = get_lock_id_());
+      511 
+      512 	     if prev_retain_sw
+      513 	     then do;
+      514 	          if ((tape_archive_table.highest_mount_type < Compact &
+      515 		     which_set = tape_archive_table.active_set) |
+      516 		    tape_archive_table.highest_mount_type = Compact)
+      517                     then call alter_err(0, "Cannot change this attribute while the volume set is retained: ^a", known_alterspecs(j));
+      518 	     end;
+      519 
+      520 	     fixnum = cv_dec_check_ (value_arg, code);
+      521 	     if code ^= 0 then call alter_err (0, "^a non-numeric.", value_arg);
+      522 	     do j = 1 to hbound (known_densities, 1) while (known_densities (j) ^= fixnum);
+      523 	     end;
+      524 
+      525 	     if j > hbound (known_densities, 1) then
+      526 		call ioa_ ("tape_archive: Warning-- density ^d may be unacceptable to ^a.", fixnum, tape_archive_table.io_module_name);
+      527 
+      528 	     if tape_archive_table.last_tape_file_no > 0 then
+      529 		if which_set = tape_archive_table.active_set then
+      530 		     call ioa_ ("tape_archive: Warning-- density change of current volume set may be incompatible with existing recording density for ^a.", table_name);
+      531 		else do;
+      532 		     call ioa_ ("tape_archive: ^a has been scheduled for compaction due to density change.", table_name);
+      533 		     tape_archive_table.next_mount_type = Compact;
+      534 		end;
+      535 
+      536                tape_archive_table.tape_info.density(which_set) = fixnum;
+      537 
+      538 	     goto alter_end;
+      539 
+      540 alter_end: end;
+      541 
+      542 	call unlock_table (code);
+      543 	return;
+      544 
+      545 alter_err: proc (code, reason, value);
+      546 
+      547 dcl  code fixed bin (35) parameter,
+      548     (reason, value) char (*) parameter;
+      549 
+      550 	     call com_err_ (code, "tape_archive", reason, value);
+      551 	     call unlock_table (0);
+      552 	     goto returner;
+      553 	end alter_err;
+      554 
+      555 returner:	return;
+
+
+
+
+
+      556 
+      557 compute_mount_type: proc (ignore_component, ignore_request, next_mount_type);
+      558 
+      559 dcl (ignore_component, ignore_request, next_mount_type) fixed bin parameter;
+      560 
+      561 dcl (i, k) fixed bin,
+      562     (component_ptr, request_ptr) pointer;
+      563 
+      564 	     k = None;
+      565 
+      566 	     do i = 1 to tape_archive_table.n_component_slots;
+      567 		component_ptr = addr (component_table (i));
+      568 		if ((i ^= ignore_component) & component_ptr -> component.valid) then
+      569 		     if component_ptr -> component.date_time_deleted = (36)"1"b then k = max (k, Delete);
+      570 		     else if component_ptr -> component.associated_request_index > 0 then do;
+      571 			request_ptr = addr (request_queue (component_ptr -> component.associated_request_index));
+      572 			if request_ptr -> request.extract then k = max (k, Read);
+      573 			else do;
+      574 			     k = max (k, Write);
+      575 			     i = tape_archive_table.n_component_slots; /* no need to continue */
+      576 			end;
+      577 		     end;
+      578 	     end;
+      579 
+      580 	     if k < Write then
+      581 		do i = 1 to tape_archive_table.n_request_slots;
+      582 		request_ptr = addr (request_queue (i));
+      583 		if ((i ^= ignore_request) & request_ptr -> request.valid) then
+      584 		     if request_ptr -> request.append then do;
+      585 			k = Write;
+      586 			i = tape_archive_table.n_request_slots;
+      587 		     end;
+      588 	     end;
+      589 
+      590 	     next_mount_type = k;
+      591 	end compute_mount_type;
+      592 
+      593 cancel_component: entry (table_ptr, arg_array, table_name, code);
+      594 
+      595 /* This entry implements the "cancel" key of tape_archive. */
+      596 
+      597 /* AUTOMATIC */
+      598 
+      599 dcl (i, j, k) fixed bin,
+      600      dtd_string char (24),
+      601      match bit (1) aligned,
+      602      nargs fixed bin;
+      603 
+      604 /* BUILTINS */
+      605 
+      606 dcl (addr, binary, dim, rel, size, string, unspec) builtin;
+      607 
+      608 /* EXTERNAL STATIC */
+      609 
+      610 dcl  error_table_$nomatch ext fixed bin (35) static;
+      611 
+      612 /* ENTRIES */
+      613 
+      614 dcl  check_star_name_$entry ext entry (char (*), fixed bin (35)),
+      615      date_time_$fstime ext entry (bit (36) aligned, char (*)),
+      616      command_query_ ext entry options (variable);
+      617 
+      618 /* AUTOMATIC */
+      619 
+      620 dcl  yes_or_no char (4) varying;
+      621 
+      622 	nargs = dim (arg_array, 1);
+      623 
+      624 	on cleanup call unlock_table (code);
+      625 
+      626 	call lock_table (Modify, code);
+      627 	if code ^= 0 then do;
+      628 	     call com_err_ (code, "tape_archive", "cancel request not processed.");
+      629 	     return;
+      630 	end;
+      631 
+      632 	do i = 1 to nargs;
+      633 	     call check_star_name_$entry (arg_array (i), code);
+      634 	     if code = 0 then;
+      635 	     else if code = 1 then;			/* is a discretionary starname */
+      636 	     else if code = 2 then nargs = 0;		/* user said "**" or equivalent */
+      637 	     else do;
+      638 		call com_err_ (code, "tape_archive", "^a", arg_array (i));
+      639 		call unlock_table (0);
+      640 		return;
+      641 	     end;
+      642 	end;
+      643 
+      644 	query_info.version = query_info_version_5;
+      645 	query_info.yes_or_no_sw = "1"b;
+      646 
+      647 	if nargs = 0 then do;
+      648 	     call command_query_ (addr (query_info), yes_or_no, "tape_archive",
+      649 		"Do you wish to cancel all pending requests in ^a??  ", table_name);
+      650 	     if yes_or_no = "yes" then do;
+      651 		do i = 1 to tape_archive_table.n_request_slots;
+      652 		     if request_queue (i).valid then
+      653 			call cancel_request (i);
+      654 		end;
+      655 
+      656 		do i = 1 to tape_archive_table.n_component_slots;
+      657 		     if component_table (i).valid then
+      658 			if component_table (i).date_time_deleted = (36)"1"b then
+      659 			     call cancel_deletion (i);
+      660 		end;
+      661 	     end;
+      662 
+      663 	end;
+      664 
+      665 	else begin;
+      666 
+      667 dcl  arg_used (nargs) bit (1) aligned automatic,
+      668      is_starname (nargs) bit (1) aligned automatic;
+      669 
+      670 
+      671 dcl  already_hit (0:tape_archive_table.n_component_slots) bit (1) aligned automatic;
+      672 
+      673 	     unspec (arg_used), unspec (already_hit), unspec (is_starname) = ""b;
+      674 
+      675 	     do i = 1 to nargs;
+      676 		call check_star_name_$entry (arg_array (i), code);
+      677 		is_starname (i) = (code = 1);
+      678 	     end;
+      679 
+      680 	     do j = 1 to tape_archive_table.n_request_slots;
+      681 		match = ""b;
+      682 
+      683 		request_ptr = addr (tape_archive_table.request_queue (j));
+      684 
+      685 		if request.valid then do k = 1 to nargs;
+      686 		     if is_starname (k) then do;
+      687 			call match_star_name_ (request.entry_name, arg_array (k), code);
+      688 			if code = 0 then match, arg_used (k) = "1"b;
+      689 		     end;
+      690 		     else if request.entry_name = arg_array (k) then
+      691 			match, arg_used (k) = "1"b;
+      692 		end;
+      693 
+      694 		if match then do;
+      695 		     already_hit (request.existing_reference) = "1"b;
+      696 		     call cancel_request (j);
+      697 		end;
+      698 	     end;
+      699 
+      700 	     do j = 1 to tape_archive_table.n_component_slots;
+      701 		match = ""b;
+      702 
+      703 		component_ptr = addr (tape_archive_table.component_table (j));
+      704 
+      705 		if component.valid then do k = 1 to nargs;
+      706 		     if is_starname (k) then do;
+      707 			call match_star_name_ (component.entry_name, arg_array (k), code);
+      708 			if code = 0 then match, arg_used (k) = "1"b;
+      709 		     end;
+      710 		     else if component.entry_name = arg_array (k) then
+      711 			match, arg_used = "1"b;
+      712 		end;
+      713 
+      714 		if match then
+      715 		     if ^already_hit (j) then
+      716 			call cancel_deletion (j);
+      717 	     end;
+      718 
+      719 /* Check to see if the user is trying to cancel something that has already been processed as deleted.
+      720*   If so, allow it, but warn him about what he is doing. */
+      721 
+      722 	     do i = 1 to nargs;
+      723 		if (^arg_used (i) & ^is_starname (i)) then do;
+      724 		     do j = tape_archive_table.n_component_slots to 1 by -1
+      725 			     while (tape_archive_table.component_table.entry_name (j) ^= arg_array (i));
+      726 		     end;
+      727 
+      728 		     if j > 0 then do;
+      729 			component_ptr = addr (tape_archive_table.component_table (j));
+      730 			call date_time_$fstime (component.date_time_deleted, dtd_string);
+      731 
+      732 			call command_query_ (addr (query_info), yes_or_no, "tape_archive",
+      733 			     "Component ^a was already processed as deleted on ^a.^/^-^4xDo you wish to cancel its deletion?",
+      734 			     component.entry_name, dtd_string);
+      735 
+      736 			if yes_or_no = "yes" then call cancel_deletion (j);
+      737 			arg_used (i) = "1"b;
+      738 		     end;
+      739 		end;
+      740 	     end;
+      741 
+      742 /* Complain about any we never found. */
+      743 
+      744 	     do i = 1 to nargs;
+      745 		if arg_used (i) = ""b then do;
+      746 		     if is_starname (i) then code = error_table_$nomatch;
+      747 		     else code = 0;
+      748 		     call com_err_ (code, "tape_archive", "^a^[^; not found^] in ^a", arg_array (i), is_starname (i), table_name);
+      749 		end;
+      750 	     end;
+      751 	end;
+      752 
+      753 	call unlock_table (code);
+      754 
+      755 	return;
+      756 
+      757 cancel_request_no: entry (table_ptr, request_slot, code);
+      758 
+      759 /* This entry is like cancel_component except that it is called at tape
+      760*   processing time to remove both successful extractions and unsuccessful
+      761*   operations of any type. */
+      762 
+      763 	call cancel_request (request_slot);
+      764 	code = 0;
+      765 	return;
+
+
+
+
+
+      766 
+      767 cancel_request: procedure (idx);
+      768 
+      769 dcl  idx fixed bin parameter;
+      770 
+      771 dcl (auto_request_no, auto_component_no) fixed bin;
+      772 
+      773 	     auto_request_no = idx;
+      774 	     auto_component_no = request_queue (idx).existing_reference;
+      775 
+      776 	     call setup_workspace (table_ptr, auto_component_no, auto_request_no, workspace_ptr);
+      777 
+      778 	     request_ptr = addr (workspace_ptr -> workspace.request_copy);
+      779 	     component_ptr = addr (workspace_ptr -> workspace.component_copy);
+      780 
+      781 	     if request.extract then
+      782 		if request.delete then		/* successful extract/delete resets this */
+      783 		     workspace_ptr -> workspace.dead_records = workspace_ptr -> workspace.dead_records - component.file_length;
+      784 	     if request.append | request.replace then do;
+      785 		workspace_ptr -> workspace.dead_records = workspace_ptr -> workspace.dead_records - component.file_length;
+      786 		workspace_ptr -> workspace.total_records = workspace_ptr -> workspace.total_records - request.file_length;
+      787 	     end;
+      788 
+      789 	     workspace_ptr -> workspace.n_queued_requests = workspace_ptr -> workspace.n_queued_requests - 1;
+      790 
+      791 	     workspace_ptr -> workspace.component_copy.associated_request_index = 0;
+      792 
+      793 	     if workspace_ptr -> workspace.next_mount_type ^= Compact then
+      794 		call compute_mount_type (auto_component_no, auto_request_no, workspace_ptr -> workspace.next_mount_type);
+      795 
+      796 	     unspec (request_ptr -> request) = ""b;	/* wipe out request */
+      797 
+      798 	     call complete_table_op (table_ptr);
+      799 
+      800 	     return;
+      801 
+      802 cancel_deletion: entry (idx);
+      803 
+      804 	     auto_component_no = idx;
+      805 
+      806 	     component_ptr = addr (component_table (auto_component_no));
+      807 
+      808 	     if component.date_time_deleted = ""b then do;
+      809 		call com_err_ (error_table_$action_not_performed, "tape_archive", "No requests pending for ^a.", component.entry_name);
+      810 		return;
+      811 	     end;
+      812 
+      813 	     call setup_workspace (table_ptr, auto_component_no, 0, workspace_ptr);
+      814 	     component_ptr = addr (workspace_ptr -> workspace.component_copy);
+      815 
+      816 	     workspace_ptr -> workspace.dead_records = workspace_ptr -> workspace.dead_records - component.file_length;
+      817 	     if component.valid then
+      818 		workspace_ptr -> workspace.n_queued_requests = workspace_ptr -> workspace.n_queued_requests - 1;
+      819 	     else workspace_ptr -> workspace.n_components = workspace_ptr -> workspace.n_components + 1;
+      820 
+      821 	     component.date_time_deleted = ""b;
+      822 	     component.valid = "1"b;
+      823 
+      824 	     if workspace_ptr -> workspace.next_mount_type ^= Compact then
+      825 		call compute_mount_type (auto_component_no, 0, workspace_ptr -> workspace.next_mount_type);
+      826 
+      827 	     call complete_table_op (table_ptr);
+      828 
+      829 	     return;
+      830 	end cancel_request;
+      831 
+      832 lock:	entry (table_ptr, table_name, lock_reason, code);
+      833 
+      834 dcl  lock_reason fixed bin;
+      835 
+      836 	call lock_table (lock_reason, code);
+      837 	return;
+
+
+
+
+
+      838 
+      839 unlock:	entry (table_ptr, code);
+      840 
+      841 	call unlock_table (code);
+      842 	return;
+
+
+
+
+
+      843 
+      844 lock_and_copy: entry (table_ptr, temp_table_ptr, table_name, lock_reason, code);
+      845 
+      846 /* PARAMETER */
+      847 
+      848 dcl  temp_table_ptr pointer parameter;
+      849 
+      850 /* ENTRIES */
+      851 
+      852 dcl  hcs_$get_uid_seg entry (ptr, bit (36) aligned, fixed bin (35));
+      853 
+      854 
+      855 	call lock_table (lock_reason, code);
+      856 	if code ^= 0 then return;
+      857 
+      858 	call copy_to_temp_table(table_ptr, temp_table_ptr, code);
+      859 
+      860 	return;
+
+
+
+
+
+      861 
+      862 copy_and_unlock: entry (temp_table_ptr, table_ptr, code);
+      863 
+      864           call copy_to_perm(temp_table_ptr, table_ptr, code);
+      865 	if code ^= 0 then return;
+      866 
+      867 	call unlock_table (code);
+      868 
+      869 	return;
+      870 
+      871 copy_to_temp: entry(table_ptr, temp_table_ptr, code);
+      872 
+      873           call copy_to_temp_table(table_ptr, temp_table_ptr, code);
+      874 
+      875 	return;
+      876 
+      877 
+      878 copy_to_perm: entry(temp_table_ptr, table_ptr, code);
+      879 
+      880           call copy_to_perm_table(temp_table_ptr, table_ptr, code);
+      881 
+      882 	return;
+      883 
+      884 lock_table: proc (reason_arg, code);
+      885 
+      886 dcl  reason_arg fixed bin parameter,
+      887      code fixed bin (35) parameter;
+      888 
+      889 dcl (error_table_$lock_wait_time_exceeded,
+      890      error_table_$locked_by_this_process) external fixed bin (35) static;
+      891 
+      892 	     call set_lock_$lock (tape_archive_table.lock, 10, code);
+      893 	     if code = error_table_$lock_wait_time_exceeded then do;
+      894 						/* there is contention on this lock */
+      895 		call com_err_ (code, "tape_archive", "^/^5x^a already locked by ^a for ^a.",
+      896 		     table_name, tape_archive_table.locker_id, Lock_reasons (tape_archive_table.lock_reason));
+      897 		return;
+      898 	     end;
+      899 
+      900 	     else if code = error_table_$locked_by_this_process then do;
+      901 						/* Mylock condiion shouldn't really occur unless the user */
+      902 						/* quit out of tape_archive at a lower command level previously and */
+      903 						/* never released */
+      904 		call com_err_ (code, "tape_archive",
+      905 		     "^/^5x^a still locked by a previous incomplete command invocation.",
+      906 		     table_name);
+      907 		return;
+      908 	     end;
+      909 
+      910 	     else code = 0;
+      911 
+      912 	     if ^initialized then do;
+      913 		group_id = get_group_id_ ();
+      914 		initialized = "1"b;
+      915 	     end;
+      916 
+      917 	     tape_archive_table.locker_id = group_id;
+      918 	     tape_archive_table.lock_reason = reason_arg;
+      919 	     return;
+      920 
+      921 unlock_table:  entry (code);
+      922 
+      923 	     if tape_archive_table.lock ^= ""b then
+      924 		call set_lock_$unlock (tape_archive_table.lock, code);
+      925 	     else code = 0;
+      926 	     return;
+      927 
+      928 	end lock_table;
+      929 
+      930 copy_to_temp_table: proc(table_ptr, temp_table_ptr, code);
+      931 
+      932 /* PARAMETER */
+      933 
+      934 dcl  code fixed bin(35);
+      935 dcl  table_ptr ptr;
+      936 dcl  temp_table_ptr ptr;
+      937 
+      938 /* AUTOMATIC */
+      939 
+      940 dcl  overlay_length fixed bin (18);
+      941 
+      942 /* BASED */
+      943 
+      944 dcl  overlay (overlay_length) bit (36) aligned based;
+      945 
+      946 /* ENTRIES */
+      947 
+      948 dcl  hcs_$get_uid_seg entry (ptr, bit (36) aligned, fixed bin (35));
+      949 
+      950           code = 0;
+      951 
+      952 /* Update table uid -- load_table, copy, etc. may have changed it. */
+      953 
+      954 	call hcs_$get_uid_seg (table_ptr, table_ptr->tape_archive_table.perm_table_uid, code);
+      955 	if code ^= 0 then tape_archive_table.perm_table_uid = "0"b; /* shouldn't happen -- but suppress table check */
+      956 
+      957 /* Now copy table. */
+      958 
+      959 	overlay_length = currentsize (table_ptr->tape_archive_table);
+      960 	temp_table_ptr -> overlay = table_ptr -> overlay;
+      961 
+      962 	temp_table_ptr -> tape_archive_table.lock = ""b;	/* interactive mode hates mylocks */
+      963 	temp_table_ptr -> tape_archive_table.lock_reason = 0;
+      964 
+      965      end copy_to_temp_table;
+
+
+
+
+
+      966 
+      967 copy_to_perm_table: proc(temp_table_ptr, table_ptr, code);
+      968 
+      969 /* PARAMETER */
+      970 
+      971 dcl  code fixed bin(35);
+      972 dcl  temp_table_ptr ptr;
+      973 dcl  table_ptr ptr;
+      974 
+      975 /* AUTOMATIC */
+      976 
+      977 dcl  old_mask bit (36) aligned;
+      978 dcl  overlay_length fixed bin(18);
+      979 
+      980 /* BASED */
+      981 
+      982 dcl  overlay(overlay_length) bit(36) aligned based;
+      983 
+      984 /* ENTRIES */
+      985 
+      986 dcl (hcs_$set_ips_mask, hcs_$reset_ips_mask) entry (bit (36) aligned, bit (36) aligned);
+      987 
+      988 
+      989           code = 0;
+      990 
+      991 	old_mask = ""b;
+      992 	on cleanup begin;
+      993 	     if old_mask ^= ""b then
+      994 		call hcs_$reset_ips_mask ((old_mask), old_mask);
+      995 	end;
+      996 
+      997           overlay_length = currentsize(temp_table_ptr->tape_archive_table);
+      998 
+      999 	table_ptr -> tape_archive_table.recovery_info_offset = ""b;
+     1000 						/* if we blow up during copy, too bad */
+     1001 
+     1002 	call hcs_$set_ips_mask (""b, old_mask);
+     1003 
+     1004 /* OK, now run like hell. */
+     1005 
+     1006 	table_ptr -> tape_archive_table.table_is_consistent = ""b;
+     1007 
+     1008           table_ptr->overlay = temp_table_ptr->overlay;
+     1009 
+     1010 	table_ptr->tape_archive_table.table_is_consistent = "1"b;
+     1011 
+     1012 /* Whew-- made it! */
+     1013 
+     1014 	call hcs_$set_bc_seg (table_ptr, length (unspec (table_ptr->tape_archive_table)), code);
+     1015 	call hcs_$truncate_seg (table_ptr, currentsize (table_ptr->tape_archive_table), code);
+     1016 
+     1017 	call hcs_$reset_ips_mask ((old_mask), old_mask);
+     1018 
+     1019      end copy_to_perm_table;
+     1020 
+     1021 check_compaction: entry (table_ptr, table_name, code);
+     1022 
+     1023 dcl  waste float bin;
+     1024 
+     1025 	code = 0;
+     1026 
+     1027 	if tape_archive_table.next_mount_type ^= Compact then call test_waste_thresholds ("1"b);
+     1028 	return;
+
+
+
+
+
+     1029 
+     1030 test_waste_thresholds: proc (lockit);
+     1031 
+     1032 dcl  lockit bit (1) aligned parameter;
+     1033 
+     1034 	     if tape_archive_table.total_records = 0 then waste = 0;
+     1035 	     else waste = float (tape_archive_table.dead_records) / float (tape_archive_table.total_records);
+     1036 
+     1037 	     if waste > tape_archive_table.auto_compaction_threshold then do;
+     1038 		if lockit then do;
+     1039 		     call lock_table (Modify, code);
+     1040 		     if code ^= 0 then return;
+     1041 		end;
+     1042 
+     1043 		tape_archive_table.next_mount_type = Compact;
+     1044 
+     1045 		if lockit then call unlock_table (code);
+     1046 
+     1047 		call ioa_ ("tape_archive:  ^a has been scheduled for compaction.", table_name);
+     1048 		return;
+     1049 	     end;
+     1050 
+     1051 	     if waste >= tape_archive_table.compaction_warning_threshold then
+     1052 		call ioa_ ("tape_archive: Waste factor of ^a is ^d%.", table_name, waste * 100);
+     1053 
+     1054 	     return;
+     1055 	end test_waste_thresholds;
+     1056 
+     1057 finish_requests: entry (table_ptr, code);
+     1058 
+     1059 /* This entry cleans up the table just prior to putting it out to tape.
+     1060*   This operation is always performed on a temp copy of the table in the
+     1061*   process dir-- hence no locking or IPS masking is necessary or done. */
+     1062 
+     1063 /* AUTOMATIC */
+     1064 
+     1065 dcl  compacting bit (1) aligned,
+     1066      cur_time bit (36) aligned,
+     1067      last_new_idx fixed bin,
+     1068      overlay_length fixed bin(18),
+     1069      temp_ptr pointer;
+     1070 
+     1071 /* BASED */
+     1072 
+     1073 dcl  based_temp_ptr (1) pointer based (addr (temp_ptr));
+     1074 dcl  overlay(overlay_length) bit(36) aligned based;
+     1075 
+     1076 /* ENTRIES */
+     1077 
+     1078 dcl  get_temp_segments_ ext entry (char (*), pointer dimension (*), fixed bin (35)),
+     1079      release_temp_segments_ ext entry (char (*), pointer dimension (*), fixed bin (35));
+     1080 
+     1081 	code = 0;
+     1082 	cur_time = substr (bit (clock ()), 20, 36);	/* standard file system time */
+     1083 
+     1084 	tape_archive_table.incomplete_write_op_last = ""b;
+     1085 
+     1086 	if tape_archive_table.next_mount_type = Read then do;
+     1087 	     tape_archive_table.next_mount_type = None;
+     1088 	     return;
+     1089 	end;
+     1090 
+     1091 	temp_ptr = null;
+     1092 	on cleanup begin;
+     1093 	     if temp_ptr ^= null then call release_temp_segments_ ("tape_archive", based_temp_ptr, code);
+     1094 	end;
+     1095 
+     1096 	call get_temp_segments_ ("tape_archive", based_temp_ptr, code);
+     1097 
+     1098 	last_new_idx = tape_archive_table.n_component_slots;
+     1099 
+     1100 	compacting = (tape_archive_table.next_mount_type = Compact);
+     1101 
+     1102 	if compacting then do;
+     1103 
+     1104 	     last_new_idx = 0;			/* start from beginning again */
+     1105 	     tape_archive_table.date_time_last_compacted = cur_time;
+     1106 	     tape_archive_table.total_records = 0;
+     1107 
+     1108 	     do i = 1 to tape_archive_table.n_component_slots;
+     1109 
+     1110 		component_ptr = addr (component_table (i));
+     1111 
+     1112 		if component.valid then
+     1113 		     if component.associated_request_index = 0 then do; /* extracts all removed by this point */
+     1114 			last_new_idx = last_new_idx + 1;
+     1115 			if last_new_idx ^= i then do;
+     1116 			     unspec (component_table (last_new_idx)) = unspec (component_table (i));
+     1117 			     component_table (last_new_idx).previous_instance_backchain = 0;
+     1118 			end;
+     1119 			tape_archive_table.total_records = tape_archive_table.total_records + component.file_length;
+     1120 		     end;
+     1121 	     end;
+     1122 
+     1123 	     tape_archive_table.n_components = last_new_idx;
+     1124 
+     1125 	     tape_archive_table.dead_records = 0;
+     1126 	     tape_archive_table.date_time_last_compacted = cur_time;
+     1127 	     tape_archive_table.last_table_no = 0;
+     1128 	     tape_archive_table.tape_info.active_set = 3 - tape_archive_table.tape_info.active_set;
+     1129 	end;
+     1130 
+     1131 	overlay_length = currentsize (tape_archive_table);
+     1132 	temp_ptr -> overlay = table_ptr -> overlay;	/* copy table to temp seg */
+     1133 
+     1134 	tape_archive_table.n_component_slots = last_new_idx;
+     1135 
+     1136 	call hcs_$truncate_seg (table_ptr, binary (rel (addr (tape_archive_table.request_queue))), code);
+     1137 	if code ^= 0 then goto release_and_return;
+     1138 
+     1139 	do i = 1 to tape_archive_table.n_request_slots;
+     1140 	     request_ptr = addr (temp_ptr -> tape_archive_table.request_queue (i));
+     1141 	     if request.valid then do;
+     1142 		last_new_idx = last_new_idx + 1;
+     1143 		tape_archive_table.n_component_slots = last_new_idx;
+     1144 		component_ptr = addr (tape_archive_table.component_table (last_new_idx));
+     1145 		string (request.requested_ops) = ""b;
+     1146 		unspec (component.entry_status_descriptor) = unspec (request.entry_status_descriptor);
+     1147 		component.associated_request_index = 0;
+     1148 
+     1149 		if request.existing_reference ^= 0 then /* This is a replacement, not an addition */
+     1150 		     if ^compacting then do;
+     1151 			component.previous_instance_backchain = request.existing_reference;
+     1152 			component_table (component.previous_instance_backchain).valid = ""b;
+     1153 		     end;
+     1154 		     else do;			/* compacting, old copy no longer there */
+     1155 			component.previous_instance_backchain = 0;
+     1156 			tape_archive_table.n_components = tape_archive_table.n_components + 1;
+     1157 		     end;
+     1158 		else tape_archive_table.n_components = tape_archive_table.n_components + 1;
+     1159 						/* addition, not replacement */
+     1160 	     end;
+     1161 	end;
+     1162 
+     1163 	if tape_archive_table.next_mount_type > Read then tape_archive_table.date_time_tape_modified = cur_time;
+     1164 	tape_archive_table.n_queued_requests, tape_archive_table.n_request_slots = 0;
+     1165 
+     1166 	tape_archive_table.next_mount_type = None;
+     1167 
+     1168 release_and_return:
+     1169 	call release_temp_segments_ ("tape_archive", based_temp_ptr, code);
+     1170 	return;
+     1171 
+     1172 star_list: entry (table_ptr, a_starname, selector, a_ta_component_star_ptr, code);
+     1173 
+     1174 dcl  a_starname char (32) parameter,
+     1175      selector fixed bin parameter,
+     1176      a_ta_component_star_ptr pointer;
+     1177 
+     1178 dcl  match_star_name_ ext entry (char (*), char (*), fixed bin (35));
+     1179 
+     1180 dcl  sys_info$max_seg_size ext fixed bin (35) static;
+     1181 
+     1182 dcl  system_free_area area (sys_info$max_seg_size) based (system_free_ptr);
+     1183 
+     1184 dcl  system_free_ptr pointer static initial (null);
+     1185 
+     1186 dcl  get_system_free_area_ ext entry returns (pointer);
+     1187 
+     1188 	on cleanup call unlock_table (0);
+     1189 
+     1190 	call lock_table (Examine, code);
+     1191 	if code ^= 0 then return;
+     1192 
+     1193 	call star_list (a_starname, selector, a_ta_component_star_ptr, code);
+     1194 
+     1195 	if code ^= 0 then call unlock_table (0);
+     1196 	else call unlock_table (code);
+     1197 
+     1198 	return;
+
+
+
+
+
+     1199 
+     1200 star_list: proc (starname, selector, a_ta_component_star_ptr, code);
+     1201 
+     1202 dcl (starname char (32),
+     1203      selector fixed bin,
+     1204      a_ta_component_star_ptr pointer,
+     1205      code fixed bin (35)) parameter;
+     1206 
+     1207 dcl  i fixed bin;
+     1208 
+     1209 dcl 1 select_table (tape_archive_table.n_component_slots + tape_archive_table.n_request_slots) aligned automatic like ta_component_star_info.entry;
+     1210 
+     1211 	     if system_free_ptr = null then
+     1212 		system_free_ptr = get_system_free_area_ ();
+     1213 
+     1214 	     a_ta_component_star_ptr, ta_component_star_ptr = null;
+     1215 
+     1216 	     ta_star_match_count = 0;
+     1217 
+     1218 	     if selector ^= Request then
+     1219 		do i = 1 to tape_archive_table.n_component_slots;
+     1220 
+     1221 		component_ptr = addr (tape_archive_table.component_table (i));
+     1222 
+     1223 		if component.valid then do;
+     1224 		     call match_star_name_ (component.entry_name, starname, code);
+     1225 		     if code = 0 then do;
+     1226 			ta_star_match_count = ta_star_match_count + 1;
+     1227 			select_table (ta_star_match_count).ename = component.entry_name;
+     1228 			select_table (ta_star_match_count).type = Component;
+     1229 			select_table (ta_star_match_count).table_idx = i;
+     1230 		     end;
+     1231 
+     1232 		     else if code = error_table_$nomatch then;
+     1233 
+     1234 		     else return;
+     1235 		end;
+     1236 	     end;
+     1237 
+     1238 	     if selector ^= Component then
+     1239 		do i = 1 to tape_archive_table.n_request_slots;
+     1240 
+     1241 		request_ptr = addr (tape_archive_table.request_queue (i));
+     1242 
+     1243 		if request.valid then do;
+     1244 		     call match_star_name_ (request.entry_name, starname, code);
+     1245 		     if code = 0 then do;
+     1246 			ta_star_match_count = ta_star_match_count + 1;
+     1247 			select_table (ta_star_match_count).ename = request.entry_name;
+     1248 			select_table (ta_star_match_count).type = Request;
+     1249 			select_table (ta_star_match_count).table_idx = i;
+     1250 		     end;
+     1251 
+     1252 		     else if code = error_table_$nomatch then;
+     1253 
+     1254 		     else return;
+     1255 		end;
+     1256 	     end;
+     1257 
+     1258 	     if ta_star_match_count = 0 then do;
+     1259 		code = error_table_$nomatch;
+     1260 		return;
+     1261 	     end;
+     1262 
+     1263 	     code = 0;
+     1264 
+     1265 	     on cleanup begin;
+     1266 		if ta_component_star_ptr ^= null then
+     1267 		     free ta_component_star_info in (system_free_area);
+     1268 	     end;
+     1269 
+     1270 	     allocate ta_component_star_info in (system_free_area);
+     1271 
+     1272 	     unspec (ta_component_star_info.entry) = unspec (select_table);
+     1273 	     a_ta_component_star_ptr = ta_component_star_ptr;
+     1274 
+     1275 	     return;
+     1276 
+     1277 	end star_list;
+     1278 
+     1279 setup_workspace: entry (table_ptr, arg_component_no, arg_request_no, arg_workspace_ptr);
+     1280 
+     1281 dcl (arg_component_no, arg_request_no) fixed bin parameter,
+     1282      arg_workspace_ptr pointer;
+     1283 
+     1284 	call setup_workspace (table_ptr, arg_component_no, arg_request_no, arg_workspace_ptr);
+     1285 	return;
+     1286 
+     1287 /* ------------------------------------------------------------ */
+     1288 
+     1289 setup_workspace: proc (table_ptr, arg_component_no, arg_request_no, workspace_ptr);
+     1290 
+     1291 /* This entry and entry complete_table_op implement the "indivisible" table
+     1292*   update strategy necessary to make sure that the table always remains
+     1293*   consistent.  Any tape_archive operation which has only to modify one item
+     1294*   in the table (e.g., "alter density") can do so without going through a
+     1295*   window where the table is inconsistent.  Thus it can operate on the table
+     1296*   data directly.  Any other operation, however (e.g., extract, which has to
+     1297*   set up a request queue entry and update several header variables such as
+     1298*   next_mount_type, n_queued_requests, etc.) must use these two entries.  The
+     1299*   strategy is to call setup_workspace, giving the component and request
+     1300*   number (if any) before starting the work.  All pertinent variables,
+     1301*   including the request, component, and header variables, are copied into the
+     1302*   workspace.  All changes are then made to the copies of the pertinent
+     1303*   information in the workspace.  Should the operation be aborted anywhere
+     1304*   during this time, the table remains consistent and the workspace is later
+     1305*   flushed.  When the new information is complete and consistent,
+     1306*   complete_table_op is called to put the information into place in an
+     1307*   indivisible fashion (exactly how is described in it's own header comment. */
+     1308 
+     1309 dcl (arg_component_no, arg_request_no) fixed bin parameter,
+     1310     (table_ptr, workspace_ptr) pointer parameter;
+     1311 
+     1312 dcl  temp_offset fixed bin (18) automatic;
+     1313 
+     1314 /* First, clean up any old workspaces hanging around. */
+     1315 
+     1316 	     if table_ptr -> tape_archive_table.recovery_info_offset ^= ""b then do;
+     1317 		workspace_ptr = pointer (table_ptr, table_ptr -> tape_archive_table.recovery_info_offset);
+     1318 		if workspace_ptr -> workspace.workspace_id = Magic_workspace_constant then
+     1319 		     unspec (workspace_ptr -> workspace) = ""b;
+     1320 		table_ptr -> tape_archive_table.recovery_info_offset = ""b;
+     1321 	     end;
+     1322 
+     1323 /* Calculate a safe place to put the workspace.  Put it at the end of the
+     1324*   segment, leaving enough room for extra request structures to be added on
+     1325*   to the segment without clobbering our workspace. */
+     1326 
+     1327 	     temp_offset = currentsize (table_ptr -> tape_archive_table)
+     1328 		+ 3 * size (null -> request)		/* only 1 should really be needed */
+     1329 		+ 20;				/* for good luck */
+     1330 
+     1331 	     workspace_ptr = pointer (table_ptr, bit (temp_offset));
+     1332 
+     1333 	     unspec (workspace_ptr -> workspace) = ""b;
+     1334 	     workspace_ptr -> workspace.component_no = arg_component_no;
+     1335 	     workspace_ptr -> workspace.request_no = arg_request_no;
+     1336 	     workspace_ptr -> workspace.n_queued_requests = table_ptr -> tape_archive_table.n_queued_requests;
+     1337 	     workspace_ptr -> workspace.dead_records = table_ptr -> tape_archive_table.dead_records;
+     1338 	     workspace_ptr -> workspace.total_records = table_ptr -> tape_archive_table.total_records;
+     1339 	     workspace_ptr -> workspace.n_components = table_ptr -> tape_archive_table.n_components;
+     1340 	     workspace_ptr -> workspace.n_request_slots = table_ptr -> tape_archive_table.n_request_slots;
+     1341 	     workspace_ptr -> workspace.next_mount_type = table_ptr -> tape_archive_table.next_mount_type;
+     1342 	     unspec (workspace_ptr -> workspace.tape_info_copy) = unspec (table_ptr -> tape_archive_table.tape_info);
+     1343 	     if arg_component_no ^= 0 then
+     1344 		unspec (workspace_ptr -> workspace.component_copy)
+     1345 		= unspec (table_ptr -> tape_archive_table.component_table (arg_component_no));
+     1346 	     if arg_request_no ^= 0 then
+     1347 		unspec (workspace_ptr -> workspace.request_copy)
+     1348 		= unspec (table_ptr -> tape_archive_table.request_queue (arg_request_no));
+     1349 	     workspace_ptr -> workspace.workspace_id = Magic_workspace_constant;
+     1350 
+     1351 	     table_ptr -> tape_archive_table.recovery_info_offset = rel (workspace_ptr);
+     1352 	     return;
+     1353 
+     1354 	end setup_workspace;
+     1355 
+     1356 /* ------------------------------------------------------------ */
+     1357 
+     1358 complete_table_op: entry (table_ptr);
+     1359 
+     1360 	call complete_table_op (table_ptr);
+     1361 	return;
+     1362 
+     1363 /* ------------------------------------------------------------ */
+     1364 
+     1365 complete_table_op: proc (table_ptr);
+     1366 
+     1367 /* This entry contracts to perform table updates of multiple, interdependent
+     1368*   values into the table indivisibly.  Once it turns off the bit
+     1369*   tape_archive_table.table_is_consistent, it is committed to finishing off
+     1370*   the operation described in the workspace.  Even if a fault, IPS signal, or
+     1371*   crash occurs in the middle of execution of this module, a future operation
+     1372*   on this table will see that bit off and will automatically re-attempt to
+     1373*   commit the values in the workspace back into the table.  Thus the
+     1374*   operation, while not structly "indivisible", is at least guaranteed of
+     1375*   consummation. */
+     1376 
+     1377 dcl  table_ptr pointer parameter;
+     1378 
+     1379 dcl  i fixed bin,
+     1380     (request_ptr, component_ptr, workspace_ptr) pointer;
+     1381 
+     1382 /* First, a couple of "gullibility checks". */
+     1383 
+     1384 	     if table_ptr -> tape_archive_table.recovery_info_offset = ""b then do;
+     1385 		call sub_err_ (error_table_$bad_segment, "tape_archive", "c", null, 0,
+     1386 		     "Table workspace missing-- please notify system maintenance.");
+     1387 		return;
+     1388 	     end;
+     1389 
+     1390 	     workspace_ptr = pointer (table_ptr, table_ptr -> tape_archive_table.recovery_info_offset);
+     1391 	     if workspace_ptr -> workspace.workspace_id ^= Magic_workspace_constant then do;
+     1392 		call sub_err_ (error_table_$bad_segment, "tape_archive", "c", null, 0,
+     1393 		     "Table workspace has been damaged-- please notify system maintenance.");
+     1394 		return;
+     1395 	     end;
+     1396 
+     1397 	     if workspace_ptr -> workspace.component_no ^= 0 then
+     1398 		component_ptr =
+     1399 		addr (table_ptr -> tape_archive_table.component_table (workspace_ptr -> workspace.component_no));
+     1400 	     else component_ptr = null;
+     1401 	     if workspace_ptr -> workspace.request_no ^= 0 then
+     1402 		request_ptr =
+     1403 		addr (table_ptr -> tape_archive_table.request_queue (workspace_ptr -> workspace.request_no));
+     1404 	     else request_ptr = null;
+     1405 
+     1406 /* The order of the setting of the consistent bit, clearing of the workspace,
+     1407*   etc., is highly important to ensure repeatability without interference. */
+     1408 
+     1409 	     table_ptr -> tape_archive_table.table_is_consistent = ""b;
+     1410 
+     1411 	     table_ptr -> tape_archive_table.n_queued_requests = workspace_ptr -> workspace.n_queued_requests;
+     1412 	     table_ptr -> tape_archive_table.dead_records = workspace_ptr -> workspace.dead_records;
+     1413 	     table_ptr -> tape_archive_table.total_records = workspace_ptr -> workspace.total_records;
+     1414 	     table_ptr -> tape_archive_table.n_components = workspace_ptr -> workspace.n_components;
+     1415 	     table_ptr -> tape_archive_table.n_request_slots = workspace_ptr -> workspace.n_request_slots;
+     1416 	     table_ptr -> tape_archive_table.next_mount_type = workspace_ptr -> workspace.next_mount_type;
+     1417 	     unspec (table_ptr -> tape_archive_table.tape_info) = unspec (workspace_ptr -> workspace.tape_info_copy);
+     1418 	     if workspace_ptr -> workspace.component_no ^= 0 then
+     1419 		unspec (component_ptr -> component) = unspec (workspace_ptr -> workspace.component_copy);
+     1420 	     if workspace_ptr -> workspace.request_no ^= 0 then
+     1421 		unspec (request_ptr -> request) = unspec (workspace_ptr -> workspace.request_copy);
+     1422 
+     1423 /* See if we can truncate unused request queue entries. */
+     1424 
+     1425 	     if workspace_ptr -> workspace.request_copy.valid = ""b then
+     1426 		if workspace_ptr -> workspace.request_no >= table_ptr -> tape_archive_table.n_request_slots then do;
+     1427 		     do i = workspace_ptr -> workspace.request_no - 1 to 1 by -1
+     1428 			     while (table_ptr -> request_queue (i).valid = ""b);
+     1429 			unspec (table_ptr -> request_queue (i)) = ""b;
+     1430 		     end;
+     1431 
+     1432 		     if i ^< 0 then
+     1433 			table_ptr -> tape_archive_table.n_request_slots = i;
+     1434 		end;
+     1435 
+     1436 /* All is copied.  Shut off the "must salvage" indicator */
+     1437 
+     1438 	     table_ptr -> tape_archive_table.table_is_consistent = "1"b;
+     1439 
+     1440 /* Wipe out the workspace.  The order of these lines is significant in terms
+     1441*   of the cleanup we can do later if we happen to be interrupted here. */
+     1442 
+     1443 	     call hcs_$truncate_seg
+     1444 		(table_ptr, currentsize (table_ptr -> tape_archive_table),
+     1445 		0);
+     1446 	     table_ptr -> tape_archive_table.recovery_info_offset = ""b;
+     1447 
+     1448 	     call hcs_$set_bc_seg (table_ptr, length (unspec (table_ptr -> tape_archive_table)), 0);
+     1449 	     return;
+     1450 	end complete_table_op;
+     1451 
+     1452 /* ------------------------------------------------------------ */
+     1453 
+     1454      end ta_table_mgr_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    02/16/84  1249.5  ta_table_mgr_.pl1                 >spec>on>mtape>ta_table_mgr_.pl1
+45           1    02/16/84  1230.3  tape_archive_table_dcl.incl.pl1   >spec>on>mtape>tape_archive_table_dcl.incl.pl1
+47           2    12/14/79  1519.0  tape_archive_star.incl.pl1        >ldd>include>tape_archive_star.incl.pl1
+49           3    03/11/83  1204.3  query_info_.incl.pl1              >ldd>include>query_info.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+Compact                                constant        fixed bin(17,0)          initial dcl 1-114 ref 394 448 448 514 514 533 793
+                                                                                  824 1027 1043 1100
+Component                              constant        fixed bin(17,0)          initial dcl 2-18 ref 1228 1238
+Default_density                        constant        fixed bin(17,0)          initial dcl 1-114 ref 104
+Delete                                 constant        fixed bin(17,0)          initial dcl 1-114 ref 568
+Examine                         000242 constant        fixed bin(17,0)          initial dcl 1-114 set ref 170* 1190*
+Lock_reasons                    000122 constant        char(24)                 initial array unaligned dcl 1-114 set ref 895*
+Magic_constant                  000120 constant        char(8)                  initial unaligned dcl 1-114 ref 100 146
+Magic_workspace_constant        000116 constant        char(8)                  initial unaligned dcl 1-114 ref 1318 1349 1391
+Modify                          000241 constant        fixed bin(17,0)          initial dcl 1-114 set ref 97 306* 626* 1039*
+None                                   constant        fixed bin(17,0)          initial dcl 1-114 ref 564 1087 1166
+Read                                   constant        fixed bin(17,0)          initial dcl 1-114 ref 572 1086 1163
+Request                                constant        fixed bin(17,0)          initial dcl 2-18 ref 1218 1248
+Write                                  constant        fixed bin(17,0)          initial dcl 1-114 ref 574 580 585
+a_starname                             parameter       char(32)                 unaligned dcl 1174 set ref 1172 1193*
+a_ta_component_star_ptr                parameter       pointer                  dcl 1202 in procedure "star_list" set ref 1200 1214*
+                                                                                  1273*
+a_ta_component_star_ptr                parameter       pointer                  dcl 1174 in procedure "ta_table_mgr_" set ref 1172
+                                                                                  1193*
+active_set               65            based           fixed bin(17,0)          level 4 dcl 1-14 set ref 105* 404 422 448 454 502
+                                                                                  507 514 528 1128* 1128
+addr                                                   builtin function         dcl 606 ref 212 481 567 571 582 648 648 683 703 729
+                                                                                  732 732 778 779 806 814 1093 1096 1110 1136 1136
+                                                                                  1140 1144 1168 1221 1241 1397 1401
+already_hit                     000100 automatic       bit(1)                   array dcl 671 set ref 673* 695* 714
+alter_module                    000147 automatic       bit(1)                   dcl 260 set ref 333* 336*
+alter_vol_type                  000150 automatic       bit(1)                   dcl 260 set ref 330* 339* 352 368
+alterspec                       000151 automatic       char(32)                 unaligned dcl 260 set ref 313* 314 316 320* 323*
+                                                                                  434* 461*
+answer_iocbp              6     000114 automatic       pointer                  initial level 2 dcl 3-7 set ref 3-7*
+append                  112            based           bit(1)                   level 3 packed unaligned dcl 1-60 set ref 213 583
+                                                                                  784
+arg_array                              parameter       char(168)                array unaligned dcl 256 set ref 252 297 313 326 409
+                                                                                  416 504 593 622 633* 638* 676* 687* 690 707* 710
+                                                                                  724 748*
+arg_component_no                       parameter       fixed bin(17,0)          dcl 1309 in procedure "setup_workspace" ref 1289
+                                                                                  1334 1343 1343
+arg_component_no                       parameter       fixed bin(17,0)          dcl 1281 in procedure "ta_table_mgr_" set ref 1279
+                                                                                  1284*
+arg_request_no                         parameter       fixed bin(17,0)          dcl 1281 in procedure "ta_table_mgr_" set ref 1279
+                                                                                  1284*
+arg_request_no                         parameter       fixed bin(17,0)          dcl 1309 in procedure "setup_workspace" ref 1289
+                                                                                  1335 1346 1346
+arg_used                        000100 automatic       bit(1)                   array dcl 667 set ref 673* 688* 690* 708* 710* 723
+                                                                                  737* 745
+arg_workspace_ptr                      parameter       pointer                  dcl 1281 set ref 1279 1284*
+args_ok                         000161 automatic       bit(1)                   dcl 260 set ref 405* 434 438* 461
+associated_request_index
+                         41            based           fixed bin(17,0)          level 2 in structure "component" dcl 1-53
+                                                                                  in procedure "ta_table_mgr_" set ref 570 571 1112
+                                                                                  1147*
+associated_request_index
+                       1445            based           fixed bin(17,0)          level 3 in structure "workspace" dcl 1-93
+                                                                                  in procedure "ta_table_mgr_" set ref 791*
+auto_compaction_threshold
+                          4            based           float bin(27)            level 3 dcl 1-14 set ref 102* 390* 1037
+auto_component_no               000101 automatic       fixed bin(17,0)          dcl 771 set ref 774* 776* 793* 804* 806 813* 824*
+auto_request_no                 000100 automatic       fixed bin(17,0)          dcl 771 set ref 773* 776* 793*
+based_tape_info                        based           structure                level 1 dcl 1-110
+based_temp_ptr                         based           pointer                  array dcl 1073 set ref 1093* 1096* 1168*
+binary                                                 builtin function         dcl 606 ref 1136 1136
+bit                                                    builtin function         dcl 138 ref 1082 1331
+check_star_name_$entry          000106 constant        entry                    external dcl 614 ref 633 676
+cleanup                         000132 stack reference condition                dcl 64 ref 89 168 304 624 992 1092 1188 1265
+clock                                                  builtin function         dcl 138 ref 1082
+code                                   parameter       fixed bin(35,0)          dcl 53 in procedure "ta_table_mgr_" set ref 51 83*
+                                                                                  84 85* 89* 91* 92 108* 109* 113* 116 143* 147*
+                                                                                  148* 153* 154 155* 163* 164 170* 171 176* 177* 185
+                                                                                  204* 216* 219* 232* 238* 249* 252 299* 300* 304*
+                                                                                  306* 307 308* 378* 380 386* 388 417* 418 520* 521
+                                                                                  542* 593 624* 626* 627 628* 633* 634 635 636 638*
+                                                                                  676* 677 687* 688 707* 708 746* 747* 748* 753* 757
+                                                                                  764* 832 836* 839 841* 844 855* 856 858* 862 864*
+                                                                                  865 867* 871 873* 878 880* 1021 1025* 1039* 1040
+                                                                                  1045* 1057 1081* 1093* 1096* 1136* 1137 1168* 1172
+                                                                                  1190* 1191 1193* 1195 1196*
+code                                   parameter       fixed bin(35,0)          dcl 886 in procedure "lock_table" set ref 884 892*
+                                                                                  893 895* 900 904* 910* 921 923* 925*
+code                                   parameter       fixed bin(35,0)          dcl 547 in procedure "alter_err" set ref 545 550*
+code                                   parameter       fixed bin(35,0)          dcl 934 in procedure "copy_to_temp_table" set ref
+                                                                                  930 950* 954* 955
+code                                   parameter       fixed bin(35,0)          dcl 971 in procedure "copy_to_perm_table" set ref
+                                                                                  967 989* 1014* 1015*
+code                                   parameter       fixed bin(35,0)          dcl 1202 in procedure "star_list" set ref 1200 1224*
+                                                                                  1225 1232 1244* 1245 1252 1259* 1263*
+com_err_                        000024 constant        entry                    external dcl 68 ref 85 148 155 177 219 232 238 300
+                                                                                  308 550 628 638 748 809 895 904
+com_err_$suppress_name          000026 constant        entry                    external dcl 68 ref 178
+command_query_                  000112 constant        entry                    external dcl 614 ref 648 732
+compacting                      000223 automatic       bit(1)                   dcl 1065 set ref 1100* 1102 1149
+compaction_warning_threshold
+                          3            based           float bin(27)            level 3 dcl 1-14 set ref 101* 382* 1051
+component                              based           structure                level 1 dcl 1-53 set ref 1418*
+component_copy         1404            based           structure                level 2 dcl 1-93 set ref 779 814 1343* 1418
+component_name                         parameter       char                     unaligned dcl 187 set ref 185 206 219* 225 232* 238*
+component_no              2            based           fixed bin(17,0)          level 2 dcl 1-93 set ref 1334* 1397 1397 1418
+component_ptr                   000100 automatic       pointer                  dcl 1-112 in procedure "ta_table_mgr_" set ref 703*
+                                                                                  705 707 710 729* 730 732 779* 781 785 806* 808 809
+                                                                                  814* 816 817 821 822 1110* 1112 1112 1119 1144*
+                                                                                  1146 1147 1151 1152 1155 1221* 1223 1224 1227
+component_ptr                   000104 automatic       pointer                  dcl 1379 in procedure "complete_table_op" set ref
+                                                                                  1397* 1400* 1418
+component_ptr                   000102 automatic       pointer                  dcl 561 in procedure "compute_mount_type" set ref
+                                                                                  567* 568 568 570 571
+component_slot                         parameter       fixed bin(17,0)          dcl 187 set ref 185 225* 225 225* 230 237
+component_table        1330            based           structure                array level 3 dcl 1-14 set ref 567 703 729 806 1110
+                                                                                  1116* 1116 1144 1221 1343 1397
+cp_escape_control         1(02) 000114 automatic       bit(2)                   initial level 3 packed unaligned dcl 3-7 set ref
+                                                                                  3-7*
+cur_time                        000224 automatic       bit(36)                  dcl 1065 set ref 1082* 1105 1126 1163
+currentsize                                            builtin function         dcl 138 ref 959 997 1015 1015 1131 1327 1443 1443
+cv_dec_check_                   000076 constant        entry                    external dcl 293 ref 417 520
+cv_float_                       000100 constant        entry                    external dcl 293 ref 378 386
+date_time_$fstime               000110 constant        entry                    external dcl 614 ref 730
+date_time_deleted        42            based           bit(36)                  level 2 in structure "component" dcl 1-53
+                                                                                  in procedure "ta_table_mgr_" set ref 568 730* 808
+                                                                                  821*
+date_time_deleted      1372            based           bit(36)                  array level 4 in structure "tape_archive_table"
+                                                                                  dcl 1-14 in procedure "ta_table_mgr_" set ref 237
+                                                                                  657
+date_time_last_compacted
+                         46            based           bit(36)                  level 3 dcl 1-14 set ref 1105* 1126*
+date_time_tape_modified
+                         45            based           bit(36)                  level 3 dcl 1-14 set ref 1163*
+dead_records             50            based           fixed bin(35,0)          level 3 in structure "tape_archive_table" dcl 1-14
+                                                                                  in procedure "ta_table_mgr_" set ref 1035 1125*
+                                                                                  1337 1412*
+dead_records              5            based           fixed bin(17,0)          level 2 in structure "workspace" dcl 1-93
+                                                                                  in procedure "ta_table_mgr_" set ref 781* 781 785*
+                                                                                  785 816* 816 1337* 1412
+delete                  112(03)        based           bit(1)                   level 3 packed unaligned dcl 1-60 set ref 781
+density                  64            based           fixed bin(17,0)          array level 4 packed unaligned dcl 1-14 set ref 104*
+                                                                                  536*
+dim                                                    builtin function         dcl 606 ref 297 622
+dtd_string                      000207 automatic       char(24)                 unaligned dcl 599 set ref 730* 732*
+ename                           000101 automatic       char(32)                 array level 2 packed unaligned dcl 1209 set ref
+                                                                                  1227* 1247*
+entry                     1            based           structure                array level 2 dcl 2-7 set ref 1272*
+entry_name                             based           char(32)                 array level 6 in structure "tape_archive_table"
+                                                                                  packed unaligned dcl 1-14 in procedure
+                                                                                  "ta_table_mgr_" set ref 206
+entry_name                6            based           char(32)                 level 4 in structure "component" packed unaligned
+                                                                                  dcl 1-53 in procedure "ta_table_mgr_" set ref 707*
+                                                                                  710 732* 809* 1224* 1227
+entry_name             1336            based           char(32)                 array level 6 in structure "tape_archive_table"
+                                                                                  packed unaligned dcl 1-14 in procedure
+                                                                                  "ta_table_mgr_" set ref 225 724
+entry_name                6            based           char(32)                 level 4 in structure "request" packed unaligned
+                                                                                  dcl 1-60 in procedure "ta_table_mgr_" set ref 687*
+                                                                                  690 1244* 1247
+entry_status_descriptor                based           structure                level 1 dcl 1-74 in procedure "ta_table_mgr_"
+entry_status_descriptor                based           structure                array level 4 in structure "tape_archive_table"
+                                                                                  dcl 1-14 in procedure "ta_table_mgr_"
+entry_status_descriptor
+                       1330            based           structure                array level 4 in structure "tape_archive_table"
+                                                                                  dcl 1-14 in procedure "ta_table_mgr_"
+entry_status_descriptor                based           structure                level 2 in structure "component" dcl 1-53
+                                                                                  in procedure "ta_table_mgr_" set ref 1146*
+entry_status_descriptor
+                       1474            based           structure                level 3 in structure "workspace" dcl 1-93
+                                                                                  in procedure "ta_table_mgr_"
+entry_status_descriptor                based           structure                level 2 in structure "request" dcl 1-60 in procedure
+                                                                                  "ta_table_mgr_" set ref 1146
+error_table_$action_not_performed
+                                000066 external static fixed bin(35,0)          dcl 194 set ref 204 809*
+error_table_$bad_segment        000056 external static fixed bin(35,0)          dcl 131 set ref 176 1385* 1392*
+error_table_$badopt             000074 external static fixed bin(35,0)          dcl 274 set ref 320* 348* 357* 364* 397* 413* 425*
+error_table_$improper_data_format
+                                000060 external static fixed bin(35,0)          dcl 131 ref 147
+error_table_$lock_wait_time_exceeded
+                                000124 external static fixed bin(35,0)          dcl 889 ref 893
+error_table_$locked_by_this_process
+                                000126 external static fixed bin(35,0)          dcl 889 ref 900
+error_table_$moderr             000062 external static fixed bin(35,0)          dcl 131 set ref 178*
+error_table_$noarg              000072 external static fixed bin(35,0)          dcl 274 set ref 299 323* 461*
+error_table_$nomatch            000104 external static fixed bin(35,0)          dcl 610 ref 746 1232 1252 1259
+error_table_$too_many_args      000064 external static fixed bin(35,0)          dcl 131 set ref 434*
+existing_reference                     based           fixed bin(17,0)          array level 4 in structure "tape_archive_table"
+                                                                                  dcl 1-14 in procedure "ta_table_mgr_" set ref 774
+existing_reference      113            based           fixed bin(17,0)          level 2 in structure "request" dcl 1-60 in procedure
+                                                                                  "ta_table_mgr_" set ref 695 1149 1151
+explanation_len          14     000114 automatic       fixed bin(21,0)          initial level 2 dcl 3-7 set ref 3-7*
+explanation_ptr          12     000114 automatic       pointer                  initial level 2 dcl 3-7 set ref 3-7*
+extract                 112(02)        based           bit(1)                   level 3 packed unaligned dcl 1-60 set ref 215 572
+                                                                                  781
+file_info              1331            based           structure                array level 5 in structure "tape_archive_table"
+                                                                                  dcl 1-14 in procedure "ta_table_mgr_"
+file_info                 1            based           structure                level 3 in structure "component" dcl 1-53
+                                                                                  in procedure "ta_table_mgr_"
+file_info                 1            based           structure                level 3 in structure "request" dcl 1-60 in procedure
+                                                                                  "ta_table_mgr_"
+file_info                              based           structure                array level 5 in structure "tape_archive_table"
+                                                                                  dcl 1-14 in procedure "ta_table_mgr_"
+file_length              33            based           fixed bin(35,0)          level 4 in structure "component" dcl 1-53
+                                                                                  in procedure "ta_table_mgr_" set ref 781 785 816
+                                                                                  1119
+file_length              33            based           fixed bin(35,0)          level 4 in structure "request" dcl 1-60 in procedure
+                                                                                  "ta_table_mgr_" set ref 786
+fixnum                          000163 automatic       fixed bin(17,0)          dcl 260 set ref 520* 522 525* 536
+float                                                  builtin function         dcl 138 ref 1035 1035
+floatnum                        000164 automatic       float bin(27)            dcl 260 set ref 378* 381 381 382 386* 389 389 390
+get_group_id_                   000030 constant        entry                    external dcl 68 ref 94 913
+get_lock_id_                    000102 constant        entry                    external dcl 293 ref 341 444 510
+get_system_free_area_           000122 constant        entry                    external dcl 1186 ref 1211
+get_temp_segments_              000114 constant        entry                    external dcl 1078 ref 1096
+group_id                        000010 internal static char(32)                 initial unaligned dcl 59 set ref 94* 96 913* 917
+hbound                                                 builtin function         dcl 138 ref 316 320 354 357 361 364 522 525
+hcs_$fs_get_mode                000052 constant        entry                    external dcl 122 ref 153
+hcs_$get_uid_seg                000130 constant        entry                    external dcl 948 ref 954
+hcs_$initiate                   000054 constant        entry                    external dcl 122 ref 143
+hcs_$make_seg                   000040 constant        entry                    external dcl 68 ref 83
+hcs_$reset_ips_mask             000134 constant        entry                    external dcl 986 ref 993 1017
+hcs_$set_bc_seg                 000034 constant        entry                    external dcl 68 ref 108 1014 1448
+hcs_$set_ips_mask               000132 constant        entry                    external dcl 986 ref 1002
+hcs_$set_safety_sw_seg          000036 constant        entry                    external dcl 68 ref 109
+hcs_$truncate_seg               000032 constant        entry                    external dcl 68 ref 1015 1136 1443
+highest_mount_type       55            based           fixed bin(17,0)          level 3 dcl 1-14 ref 448 448 514 514
+i                               000100 automatic       fixed bin(17,0)          dcl 1379 in procedure "complete_table_op" set ref
+                                                                                  1427* 1427* 1429* 1432 1432
+i                               000100 automatic       fixed bin(17,0)          dcl 561 in procedure "compute_mount_type" set ref
+                                                                                  566* 567 568 575* 580* 582 583 586*
+i                               000100 automatic       fixed bin(17,0)          dcl 1207 in procedure "star_list" set ref 1218* 1221
+                                                                                  1229* 1238* 1241 1249*
+i                               000204 automatic       fixed bin(17,0)          dcl 599 in procedure "ta_table_mgr_" set ref 312*
+                                                                                  313 323 326 407* 407* 409 415* 415 416* 504 504
+                                                                                  506* 506* 632* 633 638* 651* 652 652* 656* 657 657
+                                                                                  657* 675* 676 677* 722* 723 723 724 737* 744* 745
+                                                                                  746 748 748* 1108* 1110 1115 1116* 1139* 1140*
+idx                                    parameter       fixed bin(17,0)          dcl 769 ref 767 773 774 802 804
+ignore_component                       parameter       fixed bin(17,0)          dcl 559 ref 557 568
+ignore_request                         parameter       fixed bin(17,0)          dcl 559 ref 557 583
+incomplete_write_op_last
+                         51            based           bit(1)                   level 3 dcl 1-14 set ref 1084*
+initialized                     000020 internal static bit(1)                   initial dcl 59 set ref 95* 912 914*
+io_module_name           20            based           char(32)                 level 3 dcl 1-14 set ref 103* 370* 372* 374* 525*
+ioa_                            000042 constant        entry                    external dcl 68 ref 81 456 525 528 532 1047 1051
+is_starname                     000100 automatic       bit(1)                   array dcl 667 set ref 673* 677* 686 706 723 746 748*
+j                               000205 automatic       fixed bin(17,0)          dcl 599 set ref 316* 316* 320 328 345 348 354* 354*
+                                                                                  357 361* 361* 364 448 514 522* 522* 525 680* 683
+                                                                                  696* 700* 703 714 714* 724* 724* 728 729 736*
+k                               000206 automatic       fixed bin(17,0)          dcl 599 in procedure "ta_table_mgr_" set ref 685*
+                                                                                  686 687 688 690 690* 705* 706 707 708 710*
+k                               000101 automatic       fixed bin(17,0)          dcl 561 in procedure "compute_mount_type" set ref
+                                                                                  564* 568* 568 572* 572 574* 574 580 585* 590
+known_alterspecs                000026 constant        char(32)                 initial array unaligned dcl 279 set ref 316 316 316
+                                                                                  320 345* 348* 448* 514*
+known_densities                 000023 constant        fixed bin(17,0)          initial array dcl 282 ref 522 522 525
+known_io_modules                000007 constant        varying char(10)         initial array dcl 288 ref 361 361 361 364 370 372
+known_vol_types                 000017 constant        varying char(4)          initial array dcl 285 ref 354 354 354 357 370
+last_new_idx                    000225 automatic       fixed bin(17,0)          dcl 1065 set ref 1098* 1104* 1114* 1114 1115 1116
+                                                                                  1117 1123 1134 1142* 1142 1143 1144
+last_table_no            53            based           fixed bin(17,0)          level 3 dcl 1-14 set ref 1127*
+last_tape_file_no        52            based           fixed bin(17,0)          level 3 dcl 1-14 ref 528
+lbound                                                 builtin function         dcl 138 ref 316 354 361
+length                                                 builtin function         dcl 138 ref 1014 1014 1448 1448
+literal_sw                1(05) 000114 automatic       bit(1)                   initial level 3 packed unaligned dcl 3-7 set ref
+                                                                                  3-7*
+lock                      6            based           bit(36)                  level 3 dcl 1-14 set ref 91* 113* 892* 923 923* 962*
+lock_reason                            parameter       fixed bin(17,0)          dcl 834 in procedure "ta_table_mgr_" set ref 832
+                                                                                  836* 844 855*
+lock_reason               7            based           fixed bin(17,0)          level 3 in structure "tape_archive_table" dcl 1-14
+                                                                                  in procedure "ta_table_mgr_" set ref 97* 895 918*
+                                                                                  963*
+locker_id                10            based           char(32)                 level 3 dcl 1-14 set ref 96* 895* 917*
+lockit                                 parameter       bit(1)                   dcl 1032 ref 1030 1038 1045
+magic_constant            1            based           char(8)                  level 3 dcl 1-14 set ref 100* 146
+match                           000215 automatic       bit(1)                   dcl 599 set ref 681* 688* 690* 694 701* 708* 710*
+                                                                                  714
+match_star_name_                000120 constant        entry                    external dcl 1178 ref 687 707 1224 1244
+max                                                    builtin function         dcl 138 ref 568 572 574
+mod                                                    builtin function         dcl 138 ref 159
+mode                            000140 automatic       fixed bin(17,0)          dcl 127 set ref 153* 159
+mount_lock               54            based           bit(36)                  level 3 dcl 1-14 ref 341 444 510
+must_be_there                          parameter       bit(1)                   dcl 187 ref 185 230
+n_component_slots        41            based           fixed bin(17,0)          level 3 dcl 1-14 set ref 206 206 212 225 245 348 456
+                                                                                  566 571 575 582 652 656 671 683 700 724 774 959
+                                                                                  997 1014 1014 1015 1015 1098 1108 1131 1134* 1136
+                                                                                  1136 1140 1143* 1209 1218 1241 1327 1346 1401 1427
+                                                                                  1429 1443 1443 1448 1448
+n_components             40            based           fixed bin(17,0)          level 3 in structure "tape_archive_table" dcl 1-14
+                                                                                  in procedure "ta_table_mgr_" set ref 1123* 1156*
+                                                                                  1156 1158* 1158 1339 1414*
+n_components              7            based           fixed bin(17,0)          level 2 in structure "workspace" dcl 1-93
+                                                                                  in procedure "ta_table_mgr_" set ref 819* 819
+                                                                                  1339* 1414
+n_entries                              based           fixed bin(17,0)          level 2 dcl 2-7 set ref 1266 1270* 1272
+n_queued_requests        42            based           fixed bin(17,0)          level 3 in structure "tape_archive_table" dcl 1-14
+                                                                                  in procedure "ta_table_mgr_" set ref 1164* 1336
+                                                                                  1411*
+n_queued_requests         4            based           fixed bin(17,0)          level 2 in structure "workspace" dcl 1-93
+                                                                                  in procedure "ta_table_mgr_" set ref 789* 789 817*
+                                                                                  817 1336* 1411
+n_request_slots          10            based           fixed bin(17,0)          level 2 in structure "workspace" dcl 1-93
+                                                                                  in procedure "ta_table_mgr_" set ref 1340* 1415
+n_request_slots          43            based           fixed bin(17,0)          level 3 in structure "tape_archive_table" dcl 1-14
+                                                                                  in procedure "ta_table_mgr_" set ref 206 211 245
+                                                                                  580 586 651 680 959 997 1014 1014 1015 1015 1131
+                                                                                  1139 1164* 1209 1238 1327 1340 1415* 1425 1432*
+                                                                                  1443 1443 1448 1448
+n_volumes_in_set         66            based           fixed bin(17,0)          array level 4 in structure "tape_archive_table"
+                                                                                  dcl 1-14 in procedure "ta_table_mgr_" set ref 463
+                                                                                  469 473 477
+n_volumes_in_set          2            based           fixed bin(17,0)          array level 2 in structure "based_tape_info"
+                                                                                  dcl 1-110 in procedure "ta_table_mgr_" set ref 484
+                                                                                  484* 489 494*
+nargs                           000216 automatic       fixed bin(17,0)          dcl 599 set ref 297* 298 312 323 407 504 622* 632
+                                                                                  636* 647 667 667 675 685 705 722 744
+new_volume_spec                 000170 automatic       char(8)                  unaligned dcl 260 set ref 403* 439* 483 487
+next_mount_type                        parameter       fixed bin(17,0)          dcl 559 in procedure "compute_mount_type" set ref
+                                                                                  557 590*
+next_mount_type          44            based           fixed bin(17,0)          level 3 in structure "tape_archive_table" dcl 1-14
+                                                                                  in procedure "ta_table_mgr_" set ref 394* 396*
+                                                                                  533* 1027 1043* 1086 1087* 1100 1163 1166* 1341
+                                                                                  1416*
+next_mount_type          11            based           fixed bin(17,0)          level 2 in structure "workspace" dcl 1-93
+                                                                                  in procedure "ta_table_mgr_" set ref 793 793* 824
+                                                                                  824* 1341* 1416
+nonvolatile_part                       based           structure                level 2 dcl 1-14
+null                                                   builtin function         dcl 138 ref 144 216 216 1091 3-7 3-7 3-7 1093 1211
+                                                                                  1214 1266 1327 1385 1385 1392 1392 1400 1404
+old_mask                        000100 automatic       bit(36)                  dcl 977 set ref 991* 993 993 993* 1002* 1017 1017*
+old_vol_idx                     000162 automatic       fixed bin(17,0)          dcl 260 set ref 400* 413 417* 419 429 431* 463 463
+                                                                                  469* 473* 473* 477 483 484 484 489* 489* 490 490*
+                                                                                  494
+old_volume_spec                 000166 automatic       char(8)                  unaligned dcl 260 set ref 403* 430* 469 473 477*
+overlay                                based           bit(36)                  array dcl 944 in procedure "copy_to_temp_table" set
+                                                                                  ref 960* 960
+overlay                                based           bit(36)                  array dcl 982 in procedure "copy_to_perm_table" set
+                                                                                  ref 1008* 1008
+overlay                                based           bit(36)                  array dcl 1074 in procedure "ta_table_mgr_" set ref
+                                                                                  1132* 1132
+overlay_length                  000302 automatic       fixed bin(18,0)          dcl 940 in procedure "copy_to_temp_table" set ref
+                                                                                  959* 960
+overlay_length                  000226 automatic       fixed bin(18,0)          dcl 1065 in procedure "ta_table_mgr_" set ref 1131*
+                                                                                  1132
+overlay_length                  000101 automatic       fixed bin(18,0)          dcl 978 in procedure "copy_to_perm_table" set ref
+                                                                                  997* 1008
+padding                   1(07) 000114 automatic       bit(29)                  initial level 3 packed unaligned dcl 3-7 set ref
+                                                                                  3-7*
+perm_table_uid           31            based           bit(36)                  level 3 dcl 1-14 set ref 954* 955*
+pointer                                                builtin function         dcl 138 ref 1317 1331 1390
+prev_retain_sw                  000172 automatic       bit(1)                   dcl 260 set ref 341* 345 444* 446 510* 512
+previous_instance_backchain
+                       1370            based           fixed bin(17,0)          array level 4 in structure "tape_archive_table"
+                                                                                  dcl 1-14 in procedure "ta_table_mgr_" set ref
+                                                                                  1117*
+previous_instance_backchain
+                         40            based           fixed bin(17,0)          level 2 in structure "component" dcl 1-53
+                                                                                  in procedure "ta_table_mgr_" set ref 1151* 1152
+                                                                                  1155*
+prompt_after_explanation
+                          1(06) 000114 automatic       bit(1)                   initial level 3 packed unaligned dcl 3-7 set ref
+                                                                                  3-7*
+query_code                3     000114 automatic       fixed bin(35,0)          initial level 2 dcl 3-7 set ref 3-7*
+query_info                      000114 automatic       structure                level 1 dcl 3-7 set ref 648 648 732 732
+query_info_version_5                   constant        fixed bin(17,0)          initial dcl 3-35 ref 644
+question_iocbp            4     000114 automatic       pointer                  initial level 2 dcl 3-7 set ref 3-7*
+reason                                 parameter       char                     unaligned dcl 547 set ref 545 550*
+reason_arg                             parameter       fixed bin(17,0)          dcl 886 ref 884 918
+recovery_info_offset     30            based           bit(18)                  level 3 dcl 1-14 set ref 999* 1316 1317 1320* 1351*
+                                                                                  1384 1390 1446*
+rel                                                    builtin function         dcl 606 ref 1136 1136 1351
+release_temp_segments_          000116 constant        entry                    external dcl 1078 ref 1093 1168
+repeat_time              10     000114 automatic       fixed bin(71,0)          initial level 2 dcl 3-7 set ref 3-7*
+replace                 112(01)        based           bit(1)                   level 3 packed unaligned dcl 1-60 set ref 214 784
+request                                based           structure                level 1 dcl 1-60 set ref 796* 1327 1420*
+request_copy           1474            based           structure                level 2 dcl 1-93 set ref 778 1346* 1420
+request_no                3            based           fixed bin(17,0)          level 2 dcl 1-93 set ref 1335* 1401 1401 1420 1425
+                                                                                  1427
+request_ptr                     000102 automatic       pointer                  dcl 1379 in procedure "complete_table_op" set ref
+                                                                                  1401* 1404* 1420
+request_ptr                     000104 automatic       pointer                  dcl 561 in procedure "compute_mount_type" set ref
+                                                                                  571* 572 582* 583 583
+request_ptr                     000102 automatic       pointer                  dcl 1-112 in procedure "ta_table_mgr_" set ref 212*
+                                                                                  213 214 215 683* 685 687 690 695 778* 781 781 784
+                                                                                  784 786 796 1140* 1141 1145 1146 1149 1151 1241*
+                                                                                  1243 1244 1247
+request_queue                          based           structure                array level 3 dcl 1-14 set ref 212 571 582 683 1136
+                                                                                  1136 1140 1241 1346 1401 1429*
+request_slot                           parameter       fixed bin(17,0)          dcl 187 set ref 185 206* 206 206* 211 212 245* 245*
+                                                                                  757 763*
+requested_ops           112            based           structure                level 2 packed unaligned dcl 1-60 set ref 1145*
+select_table                    000101 automatic       structure                array level 1 dcl 1209 set ref 1272
+selector                               parameter       fixed bin(17,0)          dcl 1202 in procedure "star_list" ref 1200 1218 1238
+selector                               parameter       fixed bin(17,0)          dcl 1174 in procedure "ta_table_mgr_" set ref 1172
+                                                                                  1193*
+set_lock_$lock                  000044 constant        entry                    external dcl 68 ref 91 892
+set_lock_$unlock                000046 constant        entry                    external dcl 68 ref 113 923
+size                                                   builtin function         dcl 606 ref 108 1327
+starname                               parameter       char(32)                 unaligned dcl 1202 set ref 1200 1224* 1244*
+status_code               2     000114 automatic       fixed bin(35,0)          initial level 2 dcl 3-7 set ref 3-7*
+string                                                 builtin function         dcl 606 set ref 1145*
+sub_err_                        000070 constant        entry                    external dcl 198 ref 216 1385 1392
+substr                                                 builtin function         dcl 138 ref 411 1082
+suppress_name_sw          1(01) 000114 automatic       bit(1)                   initial level 3 packed unaligned dcl 3-7 set ref
+                                                                                  3-7*
+suppress_spacing          1(04) 000114 automatic       bit(1)                   initial level 3 packed unaligned dcl 3-7 set ref
+                                                                                  3-7*
+switches                  1     000114 automatic       structure                level 2 dcl 3-7
+system_free_area                       based           area                     dcl 1182 ref 1266 1270
+system_free_ptr                 000022 internal static pointer                  initial dcl 1184 set ref 1211 1211* 1266 1270
+ta_component_star_info                 based           structure                level 1 dcl 2-7 set ref 1266 1270
+ta_component_star_ptr           000112 automatic       pointer                  dcl 2-14 set ref 1214* 1266 1266 1270* 1272 1273
+ta_star_match_count             000110 automatic       fixed bin(17,0)          dcl 2-14 set ref 1216* 1226* 1226 1227 1228 1229
+                                                                                  1246* 1246 1247 1248 1249 1258 1270 1270
+ta_upgrade_version_             000050 constant        entry                    external dcl 78 ref 163
+table_dir                              parameter       char                     unaligned dcl 53 set ref 51 81* 83* 85* 116 143*
+                                                                                  148* 155* 163* 177*
+table_idx                11     000101 automatic       fixed bin(17,0)          array level 2 dcl 1209 set ref 1229* 1249*
+table_is_consistent       5            based           bit(1)                   level 3 packed unaligned dcl 1-14 set ref 111* 174
+                                                                                  1006* 1010* 1409* 1438*
+table_name                             parameter       char                     unaligned dcl 53 set ref 51 81* 83* 85* 116 143*
+                                                                                  148* 155* 163* 177* 185 232* 252 528* 532* 593
+                                                                                  648* 748* 832 844 895* 904* 1021 1047* 1051*
+table_ptr                              parameter       pointer                  dcl 973 in procedure "copy_to_perm_table" set ref
+                                                                                  967 999 1006 1008 1010 1014* 1014 1014 1015* 1015
+                                                                                  1015
+table_ptr                              parameter       pointer                  dcl 1377 in procedure "complete_table_op" set ref
+                                                                                  1365 1384 1390 1390 1397 1401 1409 1411 1412 1413
+                                                                                  1414 1415 1416 1417 1425 1427 1429 1432 1438 1443*
+                                                                                  1443 1443 1446 1448* 1448 1448
+table_ptr                              parameter       pointer                  dcl 1-112 in procedure "ta_table_mgr_" set ref 51
+                                                                                  83* 91 96 97 99 100 101 102 103 104 105 106 108*
+                                                                                  108 109* 111 113 116 143* 144 146 153* 161 163*
+                                                                                  174 180* 185 206 206 206 211 212 225 225 225 237
+                                                                                  245 245 252 341 348 370 372 374 382 390 394 396
+                                                                                  404 422 444 448 448 448 454 456 463 469 473 473
+                                                                                  477 480* 498* 502 507 510 514 514 514 525 528 528
+                                                                                  533 536 566 567 571 575 580 582 586 593 651 652
+                                                                                  656 657 657 671 680 683 700 703 724 724 729 757
+                                                                                  774 776* 798* 806 813* 827* 832 839 844 858* 862
+                                                                                  864* 871 873* 878 880* 892 895 895 917 918 923 923
+                                                                                  955 1021 1027 1034 1035 1035 1037 1043 1051 1057
+                                                                                  1084 1086 1087 1098 1100 1105 1106 1108 1110 1116
+                                                                                  1116 1117 1119 1119 1123 1125 1126 1127 1128 1128
+                                                                                  1131 1132 1134 1136* 1136 1136 1139 1143 1144 1152
+                                                                                  1156 1156 1158 1158 1163 1163 1164 1164 1166 1172
+                                                                                  1209 1209 1218 1221 1238 1241 1279 1284* 1358
+                                                                                  1360*
+table_ptr                              parameter       pointer                  dcl 935 in procedure "copy_to_temp_table" set ref
+                                                                                  930 954* 954 959 960
+table_ptr                              parameter       pointer                  dcl 1309 in procedure "setup_workspace" ref 1289
+                                                                                  1316 1317 1317 1320 1327 1331 1336 1337 1338 1339
+                                                                                  1340 1341 1342 1343 1346 1351
+tape_archive_table                     based           structure                level 1 dcl 1-14 set ref 108 959 997 1014 1014 1015
+                                                                                  1015 1131 1327 1443 1443 1448 1448
+tape_archive_version_4                 constant        fixed bin(17,0)          initial dcl 1-114 ref 99 161
+tape_info                64            based           structure                level 3 dcl 1-14 set ref 1342 1417*
+tape_info_copy          120            based           structure                level 2 dcl 1-93 set ref 481 1342* 1417
+tape_info_ptr                   000106 automatic       pointer                  dcl 1-112 set ref 481* 483 484 484 489 490 490 494
+temp_offset                     000100 automatic       fixed bin(18,0)          dcl 1312 set ref 1327* 1331
+temp_ptr                        000230 automatic       pointer                  dcl 1065 set ref 1091* 1093 1093 1096 1132 1140 1168
+temp_table_ptr                         parameter       pointer                  dcl 972 in procedure "copy_to_perm_table" ref 967
+                                                                                  997 1008
+temp_table_ptr                         parameter       pointer                  dcl 848 in procedure "ta_table_mgr_" set ref 844
+                                                                                  858* 862 864* 871 873* 878 880*
+temp_table_ptr                         parameter       pointer                  dcl 936 in procedure "copy_to_temp_table" ref 930
+                                                                                  960 962 963
+total_records            47            based           fixed bin(35,0)          level 3 in structure "tape_archive_table" dcl 1-14
+                                                                                  in procedure "ta_table_mgr_" set ref 1034 1035
+                                                                                  1106* 1119* 1119 1338 1413*
+total_records             6            based           fixed bin(17,0)          level 2 in structure "workspace" dcl 1-93
+                                                                                  in procedure "ta_table_mgr_" set ref 786* 786
+                                                                                  1338* 1413
+type                     10     000101 automatic       fixed bin(17,0)          array level 2 dcl 1209 set ref 1228* 1248*
+unspec                                                 builtin function         dcl 606 set ref 673* 673* 673* 796* 1014 1014 1116*
+                                                                                  1116 1146* 1146 1272* 1272 1318* 1333* 1342* 1342
+                                                                                  1343* 1343 1346* 1346 1417* 1417 1418* 1418 1420*
+                                                                                  1420 1429* 1448 1448
+valid                                  based           bit(1)                   array level 5 in structure "tape_archive_table"
+                                                                                  packed unaligned dcl 1-14 in procedure
+                                                                                  "ta_table_mgr_" set ref 206 245 652 1427
+valid                  1330            based           bit(1)                   array level 5 in structure "tape_archive_table"
+                                                                                  packed unaligned dcl 1-14 in procedure
+                                                                                  "ta_table_mgr_" set ref 225 657 1152*
+valid                                  based           bit(1)                   level 3 in structure "request" packed unaligned
+                                                                                  dcl 1-60 in procedure "ta_table_mgr_" set ref 583
+                                                                                  685 1141 1243
+valid                  1474            based           bit(1)                   level 4 in structure "workspace" packed unaligned
+                                                                                  dcl 1-93 in procedure "ta_table_mgr_" set ref 1425
+valid                                  based           bit(1)                   level 3 in structure "component" packed unaligned
+                                                                                  dcl 1-53 in procedure "ta_table_mgr_" set ref 568
+                                                                                  705 817 822* 1112 1223
+value                                  parameter       char                     unaligned dcl 547 set ref 545 550*
+value_arg                       000173 automatic       char(32)                 unaligned dcl 260 set ref 314* 326* 354 357* 361
+                                                                                  364* 370 374 378* 380* 381* 386* 388* 389* 394 396
+                                                                                  397* 409* 411 412 412 416* 417* 418* 419* 422 425*
+                                                                                  430 439 520* 521*
+version                         000114 automatic       fixed bin(17,0)          level 2 dcl 3-7 set ref 644*
+version_number                         based           fixed bin(17,0)          level 3 dcl 1-14 set ref 99* 161
+volatile_part            40            based           structure                level 2 dcl 1-14
+volume_id                70            based           char(168)                array level 5 in structure "tape_archive_table"
+                                                                                  dcl 1-14 in procedure "ta_table_mgr_" set ref 106*
+                                                                                  473
+volume_id                 4            based           char(168)                array level 3 in structure "based_tape_info"
+                                                                                  dcl 1-110 in procedure "ta_table_mgr_" set ref
+                                                                                  483* 490* 490
+volume_set               70            based           structure                array level 4 in structure "tape_archive_table"
+                                                                                  dcl 1-14 in procedure "ta_table_mgr_"
+volume_set                4            based           structure                array level 2 in structure "based_tape_info"
+                                                                                  dcl 1-110 in procedure "ta_table_mgr_"
+w_permit                               parameter       bit(1)                   dcl 118 set ref 116 141* 159* 163* 167 174 182
+waste                           000222 automatic       float bin(27)            dcl 1023 set ref 1034* 1035* 1037 1051 1051
+which_set                       000203 automatic       fixed bin(17,0)          dcl 260 set ref 404* 422* 448 454 463 469 473 473
+                                                                                  477 483 484 484 489 490 490 494 502* 507* 514 528
+                                                                                  536
+words                           000141 automatic       char(24)                 unaligned dcl 202 set ref 213* 214* 215* 219*
+workspace                              based           structure                level 1 dcl 1-93 set ref 1318* 1333*
+workspace_id                           based           char(8)                  level 2 dcl 1-93 set ref 1318 1349* 1391
+workspace_ptr                          parameter       pointer                  dcl 1309 in procedure "setup_workspace" set ref 1289
+                                                                                  1317* 1318 1318 1331* 1333 1334 1335 1336 1337
+                                                                                  1338 1339 1340 1341 1342 1343 1346 1349 1351
+workspace_ptr                   000106 automatic       pointer                  dcl 1379 in procedure "complete_table_op" set ref
+                                                                                  1390* 1391 1397 1397 1401 1401 1411 1412 1413 1414
+                                                                                  1415 1416 1417 1418 1418 1420 1420 1425 1425 1427
+workspace_ptr                   000104 automatic       pointer                  dcl 1-112 in procedure "ta_table_mgr_" set ref 480*
+                                                                                  481 776* 778 779 781 781 785 785 786 786 789 789
+                                                                                  791 793 793 813* 814 816 816 817 817 819 819 824
+                                                                                  824
+yes_or_no                       000220 automatic       varying char(4)          dcl 620 set ref 648* 650 732* 736
+yes_or_no_sw              1     000114 automatic       bit(1)                   initial level 3 packed unaligned dcl 3-7 set ref
+                                                                                  645* 3-7*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+Cancellation                           internal static fixed bin(17,0)          initial dcl 1-114
+Deletion                               internal static fixed bin(17,0)          initial dcl 1-114
+Deletion_cancellation                  internal static fixed bin(17,0)          initial dcl 1-114
+Extraction                             internal static fixed bin(17,0)          initial dcl 1-114
+Process_tape                           internal static fixed bin(17,0)          initial dcl 1-114
+Replacement                            internal static fixed bin(17,0)          initial dcl 1-114
+TAPE_ARCHIVE_IO_MODULE                 internal static char(6)                  initial unaligned dcl 1-114
+Table_copy                             internal static fixed bin(17,0)          initial dcl 1-114
+Table_creation                         internal static fixed bin(17,0)          initial dcl 1-114
+Volume_alteration                      internal static fixed bin(17,0)          initial dcl 1-114
+divide                                                 builtin function         dcl 138
+hcs_$get_uid_seg                000000 constant        entry                    external dcl 852
+query_info_version_3                   internal static fixed bin(17,0)          initial dcl 3-33
+query_info_version_4                   internal static fixed bin(17,0)          initial dcl 3-34
+query_info_version_6                   internal static fixed bin(17,0)          initial dcl 3-36
+sys_info$max_seg_size                  external static fixed bin(35,0)          dcl 1180
+ta_filesys_star_info                   based           structure                level 1 dcl 2-3
+ta_filesys_star_ptr                    automatic       pointer                  dcl 2-14
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+ALTER_MOD_VOL                   003423 constant        label                    dcl 341 set ref 334
+alter                           000000 constant        label                    array(7) dcl 330 ref 328
+alter_attributes                003071 constant        entry                    external dcl 252
+alter_end                       005255 constant        label                    dcl 540 ref 376 384 392 398 500 538
+alter_err                       010155 constant        entry                    internal dcl 545 ref 320 323 345 348 357 364 380 381
+                                                                                  388 389 397 413 418 419 425 434 448 461 463 477
+                                                                                  514 521
+cancel_component                005272 constant        entry                    external dcl 593
+cancel_deletion                 010562 constant        entry                    internal dcl 802 ref 657 714 736
+cancel_request                  010421 constant        entry                    internal dcl 767 ref 652 696 763
+cancel_request_no               006757 constant        entry                    external dcl 757
+check_compaction                007304 constant        entry                    external dcl 1021
+complete_table_op               012272 constant        entry                    internal dcl 1365 in procedure "ta_table_mgr_" ref
+                                                                                  180 498 798 827 1360
+complete_table_op               010135 constant        entry                    external dcl 1358
+compute_mount_type              010240 constant        entry                    internal dcl 557 ref 396 793 824
+copy_and_unlock                 007154 constant        entry                    external dcl 862
+copy_to_perm                    007250 constant        entry                    external dcl 878 ref 864
+copy_to_perm_table              011236 constant        entry                    internal dcl 967 ref 880
+copy_to_temp                    007216 constant        entry                    external dcl 871
+copy_to_temp_table              011162 constant        entry                    internal dcl 930 ref 858 873
+create_err                      001367 constant        label                    dcl 85 ref 92
+create_table                    001251 constant        entry                    external dcl 51
+find_and_verify                 001702 constant        entry                    external dcl 116
+find_component                  002405 constant        entry                    external dcl 185
+finish_requests                 007341 constant        entry                    external dcl 1057
+lock                            007011 constant        entry                    external dcl 832
+lock_and_copy                   007077 constant        entry                    external dcl 844
+lock_table                      010735 constant        entry                    internal dcl 884 ref 170 306 626 836 855 1039 1190
+release_and_return              007732 constant        label                    dcl 1168 ref 1137
+returner                        005267 constant        label                    dcl 555 ref 552
+setup_workspace                 010103 constant        entry                    external dcl 1279
+setup_workspace                 012134 constant        entry                    internal dcl 1289 in procedure "ta_table_mgr_" ref
+                                                                                  480 776 813 1284
+star_list                       011566 constant        entry                    internal dcl 1200 in procedure "ta_table_mgr_" ref
+                                                                                  1193
+star_list                       007766 constant        entry                    external dcl 1172
+ta_table_mgr_                   001235 constant        entry                    external dcl 18
+test_waste_thresholds           011436 constant        entry                    internal dcl 1030 ref 383 391 1027
+unlock                          007050 constant        entry                    external dcl 839
+unlock_table                    011131 constant        entry                    internal dcl 921 ref 89 168 182 304 542 551 624 639
+                                                                                  753 841 867 1045 1188 1195 1196
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0     14022       14160   13035       14032
+Length     14636   13035       136         441     765          14
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+ta_table_mgr_                       372 external procedure  is an external procedure.  
+on unit on line 89                   70 on unit               
+on unit on line 168                  72 on unit               
+on unit on line 304                  70 on unit               
+alter_err                               internal procedure  shares stack frame of external procedure ta_table_mgr_.  
+compute_mount_type                   73 internal procedure  is called by several nonquick procedures.  
+on unit on line 624                  70 on unit               
+begin block on line 665             164 begin block         uses auto adjustable storage.  
+cancel_request                      106 internal procedure  is called by several nonquick procedures.  
+lock_table                          130 internal procedure  is called by several nonquick procedures.  
+copy_to_temp_table                      internal procedure  shares stack frame of external procedure ta_table_mgr_.  
+copy_to_perm_table                   88 internal procedure  enables or reverts conditions.  
+on unit on line 992                  72 on unit               
+test_waste_thresholds                   internal procedure  shares stack frame of external procedure ta_table_mgr_.  
+on unit on line 1092                 82 on unit               
+on unit on line 1188                 72 on unit               
+star_list                            98 internal procedure  uses auto adjustable storage, and enables or reverts conditions.  
+on unit on line 1265                 64 on unit               
+setup_workspace                      67 internal procedure  is called by several nonquick procedures.  
+complete_table_op                   148 internal procedure  is called by several nonquick procedures.  
+
+STORAGE FOR INTERNAL STATIC VARIABLES.
+
+   LOC IDENTIFIER                  BLOCK NAME
+000010 group_id                    ta_table_mgr_
+000020 initialized                 ta_table_mgr_
+000022 system_free_ptr             ta_table_mgr_
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+begin block on line 665  000100 already_hit                 begin block on line 665
+                         000100 arg_used                    begin block on line 665
+                         000100 is_starname                 begin block on line 665
+cancel_request           000100 auto_request_no             cancel_request
+                         000101 auto_component_no           cancel_request
+complete_table_op        000100 i                           complete_table_op
+                         000102 request_ptr                 complete_table_op
+                         000104 component_ptr               complete_table_op
+                         000106 workspace_ptr               complete_table_op
+compute_mount_type       000100 i                           compute_mount_type
+                         000101 k                           compute_mount_type
+                         000102 component_ptr               compute_mount_type
+                         000104 request_ptr                 compute_mount_type
+copy_to_perm_table       000100 old_mask                    copy_to_perm_table
+                         000101 overlay_length              copy_to_perm_table
+setup_workspace          000100 temp_offset                 setup_workspace
+star_list                000100 i                           star_list
+                         000101 select_table                star_list
+ta_table_mgr_            000100 component_ptr               ta_table_mgr_
+                         000102 request_ptr                 ta_table_mgr_
+                         000104 workspace_ptr               ta_table_mgr_
+                         000106 tape_info_ptr               ta_table_mgr_
+                         000110 ta_star_match_count         ta_table_mgr_
+                         000112 ta_component_star_ptr       ta_table_mgr_
+                         000114 query_info                  ta_table_mgr_
+                         000140 mode                        ta_table_mgr_
+                         000141 words                       ta_table_mgr_
+                         000147 alter_module                ta_table_mgr_
+                         000150 alter_vol_type              ta_table_mgr_
+                         000151 alterspec                   ta_table_mgr_
+                         000161 args_ok                     ta_table_mgr_
+                         000162 old_vol_idx                 ta_table_mgr_
+                         000163 fixnum                      ta_table_mgr_
+                         000164 floatnum                    ta_table_mgr_
+                         000166 old_volume_spec             ta_table_mgr_
+                         000170 new_volume_spec             ta_table_mgr_
+                         000172 prev_retain_sw              ta_table_mgr_
+                         000173 value_arg                   ta_table_mgr_
+                         000203 which_set                   ta_table_mgr_
+                         000204 i                           ta_table_mgr_
+                         000205 j                           ta_table_mgr_
+                         000206 k                           ta_table_mgr_
+                         000207 dtd_string                  ta_table_mgr_
+                         000215 match                       ta_table_mgr_
+                         000216 nargs                       ta_table_mgr_
+                         000220 yes_or_no                   ta_table_mgr_
+                         000222 waste                       ta_table_mgr_
+                         000223 compacting                  ta_table_mgr_
+                         000224 cur_time                    ta_table_mgr_
+                         000225 last_new_idx                ta_table_mgr_
+                         000226 overlay_length              ta_table_mgr_
+                         000230 temp_ptr                    ta_table_mgr_
+                         000302 overlay_length              copy_to_temp_table
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+fx1_to_fl2          r_e_as              enter_begin         leave_begin         call_ext_in         call_ext_out_desc
+call_ext_out        call_int_this       call_int_other      return              alloc_auto_adj      mod_fx1
+enable              ext_entry           ext_entry_desc      int_entry           alloc_based         free_based
+clock
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+check_star_name_$entry        com_err_                      com_err_$suppress_name        command_query_
+cv_dec_check_                 cv_float_                     date_time_$fstime             get_group_id_
+get_lock_id_                  get_system_free_area_         get_temp_segments_            hcs_$fs_get_mode
+hcs_$get_uid_seg              hcs_$initiate                 hcs_$make_seg                 hcs_$reset_ips_mask
+hcs_$set_bc_seg               hcs_$set_ips_mask             hcs_$set_safety_sw_seg        hcs_$truncate_seg
+ioa_                          match_star_name_              release_temp_segments_        set_lock_$lock
+set_lock_$unlock              sub_err_                      ta_upgrade_version_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$action_not_performed                           error_table_$bad_segment      error_table_$badopt
+error_table_$improper_data_format                           error_table_$lock_wait_time_exceeded
+error_table_$locked_by_this_process                         error_table_$moderr           error_table_$noarg
+error_table_$nomatch          error_table_$too_many_args
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+ 3    7 001202        18 001234        19 001243        51 001244        81 001276        83 001324        84 001365
+     85 001367        86 001435        89 001436        91 001463        92 001501        94 001503        95 001512
+     96 001515        97 001522        99 001524       100 001526       101 001531       102 001533       103 001535
+    104 001540       105 001563       106 001567       108 001620       109 001642       111 001657       113 001663
+    114 001674       116 001675       141 001727       143 001732       144 001775       146 002001       147 002007
+    148 002012       150 002054       153 002055       154 002070       155 002072       156 002134       159 002135
+    161 002144       163 002150       164 002203       167 002205       168 002211       170 002236       171 002246
+    174 002250       176 002260       177 002263       178 002323       179 002354       180 002355       182 002363
+    183 002376       185 002377       204 002434       206 002437       209 002500       211 002502       212 002507
+    213 002517       214 002526       215 002535       216 002544       219 002616       222 002661       225 002662
+    228 002710       230 002713       232 002720       233 002765       235 002766       237 002767       238 002774
+    242 003032       245 003033       247 003060       249 003062       250 003063       252 003064       297 003111
+    298 003121       299 003122       300 003125       301 003155       304 003156       306 003203       307 003213
+    308 003215       309 003246       312 003247       313 003257       314 003275       316 003300       318 003313
+    320 003315       323 003343       326 003373       328 003412       330 003414       333 003416       334 003417
+    336 003420       339 003422       341 003423       345 003440       348 003467       352 003521       354 003523
+    355 003540       357 003542       359 003571       361 003572       362 003606       364 003610       368 003637
+    370 003641       372 003655       373 003663       374 003664       376 003671       378 003672       380 003713
+    381 003727       382 003743       383 003746       384 003752       386 003753       388 003774       389 004010
+    390 004024       391 004027       392 004033       394 004034       396 004045       397 004071       398 004115
+    400 004116       403 004120       404 004123       405 004127       407 004130       409 004137       411 004155
+    412 004161       413 004171       415 004220       416 004221       417 004237       418 004260       419 004274
+    420 004305       422 004306       425 004320       426 004343       429 004344       430 004347       431 004352
+    432 004353       434 004354       438 004402       439 004404       442 004407       444 004411       446 004426
+    448 004427       454 004470       456 004475       461 004513       463 004541       467 004561       469 004562
+    473 004575       475 004624       477 004626       480 004643       481 004661       483 004664       484 004676
+    487 004705       489 004711       490 004721       492 004743       494 004745       498 004751       500 004757
+    502 004760       504 004764       506 005001       507 005002       510 005005       512 005022       514 005023
+    520 005064       521 005105       522 005121       523 005132       525 005134       528 005165       532 005215
+    533 005235       536 005241       538 005254       540 005255       542 005260       543 005266       555 005267
+    593 005270       622 005312       624 005322       626 005347       627 005357       628 005361       629 005412
+    632 005413       633 005423       634 005455       635 005460       636 005463       638 005467       639 005540
+    640 005547       642 005550       644 005552       645 005554       647 005556       648 005560       650 005623
+    651 005630       652 005641       654 005662       656 005664       657 005675       660 005714       663 005716
+    665 005717       667 005722       671 005733       748 005743       673 005745       675 005775       676 006006
+    677 006040       678 006047       680 006051       681 006064       683 006065       685 006077       686 006112
+    687 006116       688 006155       689 006165       690 006166       692 006213       694 006215       695 006217
+    696 006223       698 006232       700 006235       701 006250       703 006251       705 006256       706 006272
+    707 006276       708 006335       709 006345       710 006346       712 006402       714 006405       717 006422
+    722 006425       723 006436       724 006446       726 006502       728 006505       729 006507       730 006514
+    732 006531       736 006603       737 006620       740 006625       744 006627       745 006640       746 006644
+    747 006654       748 006655       750 006740       751 006743       753 006744       755 006752       757 006753
+    763 006774       764 007002       765 007003       832 007004       836 007033       837 007043       839 007044
+    841 007063       842 007071       844 007072       855 007123       856 007133       858 007135       860 007147
+    862 007150       864 007171       865 007203       867 007205       869 007213       871 007214       873 007233
+    875 007245       878 007246       880 007265       882 007277      1021 007300      1025 007324      1027 007325
+   1028 007336      1057 007337      1081 007354      1082 007355      1084 007364      1086 007367      1087 007372
+   1088 007374      1091 007375      1092 007377      1093 007413      1094 007445      1096 007446      1098 007474
+   1100 007500      1102 007504      1104 007505      1105 007506      1106 007510      1108 007511      1110 007521
+   1112 007526      1114 007534      1115 007535      1116 007540      1117 007547      1119 007550      1121 007554
+   1123 007556      1125 007562      1126 007563      1127 007565      1128 007566      1131 007570      1132 007603
+   1134 007610      1136 007612      1137 007633      1139 007635      1140 007647      1141 007660      1142 007663
+   1143 007664      1144 007670      1145 007673      1146 007674      1147 007677      1149 007700      1151 007704
+   1152 007705      1153 007710      1155 007711      1156 007712      1157 007713      1158 007714      1161 007715
+   1163 007717      1164 007726      1166 007730      1168 007732      1170 007760      1172 007761      1188 010001
+   1190 010026      1191 010036      1193 010040      1195 010055      1196 010067      1198 010075      1279 010076
+   1284 010114      1285 010131      1358 010132      1360 010146      1361 010154       545 010155       550 010173
+    551 010227       552 010236       557 010237       564 010245       566 010247       567 010261       568 010267
+    570 010307       571 010311       572 010321       574 010332       575 010337       578 010341       580 010343
+    582 010361       583 010374       585 010406       586 010410       588 010412       590 010414       591 010417
+    767 010420       773 010426       774 010431       776 010444       778 010461       779 010466       781 010470
+    784 010504       785 010507       786 010515       789 010523       791 010525       793 010526       796 010544
+    798 010551       800 010560       802 010561       804 010567       806 010572       808 010601       809 010603
+    810 010640       813 010641       814 010657       816 010664       817 010672       819 010700       821 010701
+    822 010702       824 010704       827 010723       829 010733       884 010734       892 010745       893 010764
+    895 010770       897 011041       900 011042       904 011044       907 011101       910 011102       912 011103
+    913 011105       914 011113       917 011116       918 011124       919 011127       921 011130       923 011141
+    925 011160       926 011161       930 011162       950 011164       954 011165       955 011203       959 011211
+    960 011224       962 011232       963 011233       965 011234       967 011235       989 011243       991 011245
+    992 011246       993 011262       995 011276       997 011277       999 011313      1002 011316      1006 011331
+   1008 011335      1010 011344      1014 011346      1015 011373      1017 011422      1019 011435      1030 011436
+   1034 011440      1035 011447      1037 011455      1038 011457      1039 011462      1040 011472      1043 011475
+   1045 011501      1047 011513      1048 011533      1051 011534      1054 011564      1200 011565      1209 011573
+   1211 011604      1214 011616      1216 011623      1218 011624      1221 011641      1223 011650      1224 011653
+   1225 011674      1226 011677      1227 011701      1228 011711      1229 011715      1230 011717      1232 011720
+   1234 011724      1236 011725      1238 011727      1241 011745      1243 011760      1244 011763      1245 012004
+   1246 012007      1247 012011      1248 012021      1249 012025      1250 012027      1252 012030      1254 012034
+   1256 012035      1258 012037      1259 012042      1260 012046      1263 012047      1265 012051      1266 012065
+   1268 012100      1270 012101      1272 012115      1273 012130      1275 012132      1289 012133      1316 012141
+   1317 012146      1318 012150      1320 012157      1327 012162      1331 012201      1333 012210      1334 012213
+   1335 012215      1336 012217      1337 012223      1338 012225      1339 012227      1340 012231      1341 012233
+   1342 012235      1343 012240      1346 012247      1349 012263      1351 012266      1352 012270      1365 012271
+   1384 012277      1385 012304      1387 012355      1390 012356      1391 012361      1392 012365      1394 012436
+   1397 012437      1400 012445      1401 012447      1404 012462      1409 012464      1411 012465      1412 012467
+   1413 012471      1414 012473      1415 012475      1416 012477      1417 012501      1418 012504      1420 012512
+   1425 012520      1427 012525      1429 012547      1430 012553      1432 012556      1438 012564      1443 012571
+   1446 012616      1448 012622      1449 012650
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

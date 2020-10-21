@@ -1,0 +1,779 @@
+	COMPILATION LISTING OF SEGMENT g115_io_
+	Compiled by: Multics PL/I Compiler, Release 25b, of November 27, 1979
+	Compiled at: Honeywell LISD Phoenix, System M
+	Compiled on: 02/06/80  1133.4 mst Wed
+	    Options: optimize map
+
+        1 /* ******************************************************
+        2*   *                                                    *
+        3*   *                                                    *
+        4*   * Copyright (c) 1972 by Massachusetts Institute of   *
+        5*   * Technology and Honeywell Information Systems, Inc. *
+        6*   *                                                    *
+        7*   *                                                    *
+        8*   ****************************************************** */
+        9 
+       10 g115_io_$write: proc (a_ddp, a_msgp, a_code);
+       11 
+       12 /* this procedure handles the actual read and writing of the
+       13*   data to the L6-RBF via hcs_$tty calls. */
+       14 
+       15 /* Coded 4/30/74 by Mike Grady */
+       16 
+       17 /* Modified 06/10/75 by Bob Adsit to move line_status to MCS/355 */
+       18 
+       19 /* Modified 04/10/77 by Bob Franklin to fix many bugs. Now multiple
+       20*   blocks must be unpacked on input in g115_message, special control
+       21*   records must be ignored, etc. Ignore Quit error on Writes. */
+       22 
+       23 /* Modified to handle multiple buffers, line control orders and
+       24*   fit into the iox_ based total g115 package June 1978 by D. Vinograd */
+       25 
+       26 /* Modified by J. Nicholls 7/78 to count records instead of characters */
+       27 
+       28 /*   Modified by J. Nicholls Sept 78 to buffer input in ring 4, since the fnp dia channel may
+       29*   become clogged if the input sets in ring 0.  Thus if output is pending and input is available,
+       30*   we will read a record and buffer it, and keep trying until output is not pending and input is completed.
+       31*   If no more input, we'll go blocked; if no output pending, task is accomplished and we'll continue. */
+       32 
+       33 /* Modified by J. C. Whitmore, 9/79, renamed g115_message_ to g115_io_ and restructured completely */
+       34 
+       35 dcl  a_ddp ptr parameter;
+       36 dcl  a_msgp ptr parameter;
+       37 dcl  a_infop ptr parameter;
+       38 dcl  a_code fixed bin (35) parameter;
+       39 
+       40 dcl  msg_block_ptr ptr;
+       41 dcl  nelemt fixed bin;
+       42 dcl  nelem fixed bin;
+       43 dcl  offset fixed bin;
+       44 dcl  idx fixed bin;
+       45 dcl  state fixed bin;
+       46 dcl  code fixed bin (35);
+       47 dcl  ec fixed bin (35);
+       48 dcl  send_wakeup bit (1) init ("0"b);			/* set if we should send a wakeup to previous (if any) invocation */
+       49 dcl  read_status_entry bit (1);
+       50 
+       51 
+       52 dcl  quit_code fixed bin (35) int static init (3000005) options (constant); /* quit occurred */
+       53 
+       54 
+       55 dcl 1 line_status aligned,
+       56    (2 value,
+       57     2 mbz1,
+       58     2 mbz2,
+       59     2 mbz3) fixed bin unal;
+       60 
+       61 dcl 1 info aligned based,
+       62     2 pad fixed bin (71),
+       63     2 input_available bit (1);
+       64 
+       65 dcl 1 io_status aligned,
+       66     2 pad fixed bin (71),
+       67     2 io_pending bit (1);
+       68 
+       69 dcl 1 event_info aligned,				/* wakeup information */
+       70     2 channel_id fixed bin (71) aligned,		/* channel over which to send wakeup */
+       71     2 message char (8) aligned,			/* event message */
+       72     2 sender bit (36) aligned,			/* process id of sending process */
+       73     2 origin,
+       74       3 dev_signal bit (18) unaligned,			/* ON if event occurred as result of i/o interrupt */
+       75       3 ring bit (18) unaligned,			/* sender's validation level */
+       76     2 wait_list_index fixed bin aligned;
+       77 
+       78 dcl  convert_ipc_code_ entry (fixed bin (35));
+       79 dcl  ipc_$drain_chn entry (fixed bin (71), fixed bin (35));
+       80 dcl  ipc_$block entry (ptr, ptr, fixed bin (35));
+       81 dcl  hcs_$tty_write entry (fixed bin, ptr, fixed bin, fixed bin, fixed bin, fixed bin, fixed bin (35));
+       82 dcl  hphcs_$tty_write_force entry (fixed bin, ptr, fixed bin, fixed bin, fixed bin, fixed bin, fixed bin (35));
+       83 dcl  hcs_$tty_get_line entry (fixed bin, ptr, fixed bin, fixed bin, fixed bin, bit (1), fixed bin, fixed bin (35));
+       84 dcl  hcs_$tty_order entry (fixed bin, char (*), ptr, fixed bin, fixed bin (35));
+       85 dcl  hcs_$tty_event entry (fixed bin, fixed bin (71), fixed bin, fixed bin (35));
+       86 dcl  hcs_$wakeup entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+       87 dcl  ipc_$mask_ev_calls entry (fixed bin (35));
+       88 dcl  ipc_$unmask_ev_calls entry (fixed bin (35));
+       89 dcl  timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2), fixed bin (71));
+       90 dcl  timer_manager_$reset_alarm_wakeup entry (fixed bin (71));
+       91 
+       92 dcl  error_table_$net_timeout ext fixed bin (35);
+       93 dcl  error_table_$line_status_pending ext fixed bin (35);
+       94 dcl  error_table_$io_no_permission ext fixed bin (35);
+       95 dcl  error_table_$improper_data_format ext fixed bin (35);
+       96 
+       97 
+       98 dcl (addr, null, unspec) builtin;
+       99 
+  1     1 /* BEGIN INCLUDE FILE ...  g115_device_data.incl.pl1 ... 9-7-79 */
+  1     2 
+  1     3 
+  1     4 /* This structure describes all the data specific to a tty channel used for the G115 protocol.
+  1     5*   There is one device data block per channel chained together in a list.  Chaining and allocation
+  1     6*   of each data block is managed by g115_.pl1
+  1     7**/
+  1     8 
+  1     9 dcl  device_data_p ptr init (null);
+  1    10 
+  1    11 dcl 1 g115_device_data aligned based (device_data_p),
+  1    12     2 fwd_ptr ptr,					/* forward pointer in chain of these structures */
+  1    13     2 back_ptr ptr,					/* backward pointer   "      "    "      "	*/
+  1    14     2 tty_name char (32),				/* name of the device channel for devx */
+  1    15     2 devx fixed bin,				/* Ring 0 device index for the device */
+  1    16     2 attach_count fixed bin,				/* number of switches currently active */
+  1    17     2 dial_mgr_ev_chan fixed bin (71),			/* IPC channel for dial manager */
+  1    18     2 as_ev_chan fixed bin (71),			/* IPC event channel from answering service */
+  1    19     2 wait_list,					/* IPC wait list to block on for hardcore tty dim */
+  1    20       3 nchan fixed bin,				/* this must be 2 and must be on an even word */
+  1    21       3 dummy_word fixed bin,
+  1    22       3 tty_ev_channel fixed bin (71),			/* because the compiler wants this on even word */
+  1    23       3 timeout_ev_channel fixed bin (71),
+  1    24     2 control_bits,
+  1    25       3 as_priv_no_block bit (1) unal,			/* ON for answering service reads and writes */
+  1    26       3 write_split bit (1) unal,			/* ON if split records are to be sent to device */
+  1    27       3 write_compress bit (1) unal,			/* ON if compressed records are to be sent */
+  1    28       3 hangup_signalled bit (1) unal,			/* ON if a hangup control is sent */
+  1    29     2 delay fixed bin (35),				/* runout delay for L6 bug */
+  1    30     2 fmt_code,					/* the current data and operator msg format codes */
+  1    31       3 data bit (9) unal,				/* format code for data transfer to remote terminal */
+  1    32       3 control bit (9) unal,				/* format code for operator messages (teleprinter) */
+  1    33     2 process_id bit (36),				/* process id for sending wakeups to ourselves */
+  1    34     2 padding (14) fixed bin,				/* for the future */
+  1    35     2 buffer_areap ptr,				/* ptr to area for buffer allocation */
+  1    36     2 first_bp ptr,					/* ptr to first input buffer of chain */
+  1    37     2 last_bp ptr,					/* ptr to last  input buffer of chain */
+  1    38     2 template_ptr ptr,				/* ptr to template output buffer */
+  1    39     2 level fixed bin,				/* write recursion (or quit) level index */
+  1    40     2 outp (100) ptr;				/* pointers to output buffers in buffer area
+  1    41*						   indexed by level */
+  1    42 
+  1    43 dcl  buffer_area based (g115_device_data.buffer_areap) area (262144); /* area for input and output buffers */
+  1    44 
+  1    45 /* END INCLUDE FILE ... g115_device_data.incl.pl1 */
+      100 
+      101 
+  2     1 /* BEGIN include file ...  g115_message.incl.pl1 */
+  2     2 
+  2     3 /* This structure describes the format of any message which may be sent by the
+  2     4*   g115_dim to the G115 data terminal or received by the dim from that terminal.
+  2     5*   The structure includes some state information associated with the processing
+  2     6*   of the message block.
+  2     7**/
+  2     8 
+  2     9 /* Modified 04/10/77 by Bob Franklin to unpack input blocks */
+  2    10 /* Modified by J. Nicholls 7/78 to allow for remaing_record_count instead of character */
+  2    11 /* Modified by J. Whitmore, 8/79, to remove null char field, count and garbage variables, and to improve comments */
+  2    12 
+  2    13 dcl  msgp ptr init (null);				/* pointer to message structure */
+  2    14 
+  2    15 dcl 1 g115_message aligned based (msgp),		/* message and related state variables */
+  2    16     2 next_bp ptr,					/* forward thread when buffers are chained */
+  2    17 
+  2    18     2 text_char_count fixed bin,			/* character count of text */
+  2    19     2 rec_count fixed bin,				/* remaining text records to be processed (input only) */
+  2    20     2 last_char_read fixed bin,			/* index of last processed input char (Record Separator) */
+  2    21     2 being_changed bit (1),				/* message or state is being modified */
+  2    22 
+  2    23     2 g115_msg_block,				/* chars forming the message to/from ring 0 */
+  2    24 
+  2    25       3 soh bit (9) unal,				/* start of header character */
+  2    26       3 fmt_code bit (9) unal,			/* format code */
+  2    27       3 seq_code bit (9) unal,			/* sequence code */
+  2    28       3 addr_code bit (9) unal,			/* address code */
+  2    29       3 op_code unal,				/* operations code */
+  2    30         4 ascii_pad bit (2) unal,			/* -- */
+  2    31         4 use bit (1) unal,				/* should = "1"b */
+  2    32         4 ack bit (3) unal,				/* acknowledgement field */
+  2    33         4 cmd bit (3) unal,				/* instruction field */
+  2    34       3 id_code bit (9) unal,				/* identification code */
+  2    35       3 stx bit (9) unal,				/* start of text character */
+  2    36       3 text (324 refer (text_char_count)) char (1) unal,	/* text of message: <mc><data_record><rs> ...  */
+  2    37       3 etx bit (9) unal;				/* end of text character */
+  2    38 
+  2    39 
+  2    40 /* END include file ...  g115_message.incl.pl1 */
+      102 
+      103 
+  3     1 /* BEGIN include file G115.incl.pl1 */
+  3     2 
+  3     3 /* This include file defines several special character codes used by the Ring 4 portion of the
+  3     4*   Multics support for G115 (GRTS/NPS) protocol */
+  3     5 
+  3     6 /* JCW, 8/79 */
+  3     7 
+  3     8 dcl 1 G115 aligned internal static options (constant),
+  3     9 
+  3    10 /* This group defines input/output media codes associated with records within the text of a message block */
+  3    11 
+  3    12     2 media_codes unal,
+  3    13       3 bcd_input_mc char (1) init ("H"),		/* Input media code for BCD data - 110 octal */
+  3    14       3 bin_input_mc char (1) init ("P"),		/* Input media code for Binary data - 120 octal */
+  3    15 
+  3    16       3 printer_mc char (1) init ("L"),			/* printer output media code - 114 octal */
+  3    17       3 punch_bcd_mc char (1) init ("O"),		/* punch output media code (BCD data)  - 117 octal */
+  3    18       3 punch_bin_mc char (1) init ("W"),		/* punch output media code (Binary data)  - 127 octal */
+  3    19       3 teleprinter_mc char (1) init ("N"),		/* teleprinter output media code - 116 octal */
+  3    20 
+  3    21 /* This group defines the message format codes which apply to all records in a single message block */
+  3    22 
+  3    23     2 format_codes unal,
+  3    24       3 info_ns_nc bit (9) init ("110"b3),		/* information message, no split, no compression */
+  3    25       3 info_ns_c bit (9) init ("111"b3),		/* information message, no split, compression */
+  3    26       3 info_s_nc bit (9) init ("112"b3),		/* information message, split, no compression */
+  3    27       3 info_s_c bit (9) init ("113"b3),		/* information message, split, compression */
+  3    28       3 special_nc bit (9) init ("104"b3),		/* Special control record, no compression */
+  3    29       3 special_c bit (9) init ("105"b3),		/* Special control record, compression */
+  3    30 
+  3    31 /* This group defines reserved characters which appear in the message block */
+  3    32 
+  3    33     2 char_codes unal,
+  3    34       3 stx_char bit (9) init ("002"b3),		/* start-of-text (STX) char */
+  3    35       3 etx_char bit (9) init ("003"b3),		/* end-of-text (ETX) char */
+  3    36       3 soh_char bit (9) init ("001"b3),		/* start-of-header (SOH) char */
+  3    37       3 addr_code_char bit (9) init ("100"b3),		/* address code character */
+  3    38       3 id_code_char bit (9) init ("100"b3),		/* identification code character */
+  3    39       3 RS char (1) init (""),			/* record separator - 036 octal */
+  3    40       3 CC char (1) init (""),			/* compression character code - 037 octal */
+  3    41 
+  3    42 /* The maximum size of a single g115 message from SOH to ETX */
+  3    43 
+  3    44     2 max_msg_len fixed bin init (324);			/* max data in a message */
+  3    45 
+  3    46 
+  3    47 /* END include file G115.incl.pl1 */
+      104 
+      105 
+      106 /* g115_io_$write:	proc (a_ddp, a_msgp, a_code);	*/
+      107 
+      108 /* This procedure writes messages to the L6-RBF and will read input if output is still pending. */
+      109 
+      110 	read_status_entry = "0"b;			/* this is not the read_status entry */
+      111 	a_code, code = 0;				/* set error code to 0 */
+      112 	msgp = a_msgp;
+      113 	device_data_p = a_ddp;
+      114 
+      115 	if g115_message.text_char_count = 0 | g115_message.being_changed then do;
+      116 	     a_code = error_table_$improper_data_format;
+      117 	     return;
+      118 	end;
+      119 
+      120 	nelem = g115_message.text_char_count + 8;	/* add in header-trailer to get actual length of message */
+      121 	msg_block_ptr = addr (msgp -> g115_msg_block);	/* get addr for tty_write */
+      122 	offset = 0;
+      123 
+      124 	if g115_device_data.as_priv_no_block then go to ANS_SERVICE; /* special section for answering service */
+      125 
+      126 check_write_completion:
+      127 
+      128 	call check_write_status (code);		/* set the io_status structure */
+      129 	if code ^= 0 then go to RETURN;
+      130 
+      131 	do while (io_status.io_pending);		/* if output is still in Ring 0, check for input */
+      132 	     call hcs_$tty_order (g115_device_data.devx, "read_status", addr (io_status), state, code);
+      133 	     if state ^= 5 then code = error_table_$io_no_permission;
+      134 	     if line_status_pending (code) then go to check_write_completion;
+      135 	     if code ^= 0 then go to RETURN;
+      136 
+      137 	     if io_status.io_pending then do;		/* if we have input, get it out of Ring 0 */
+      138 		allocate g115_message in (buffer_area) set (msgp);
+      139 		unspec (g115_message) = "0"b;		/* be sure it is clear */
+      140 		g115_message.next_bp = null;
+      141 		g115_device_data.last_bp -> g115_message.next_bp = msgp; /* add to chain */
+      142 		g115_device_data.last_bp = msgp;
+      143 
+      144 		send_wakeup = "1"b;			/* tell reader about input */
+      145 
+      146 		call read_message (msgp, code);	/* read one message and verify it */
+      147 		if code ^= 0 then go to RETURN;
+      148 	     end;
+      149 	     else do;				/* output pending and no input, so just wait */
+      150 
+      151 		call block (code);
+      152 		if code ^= 0 then go to RETURN;;
+      153 	     end;
+      154 
+      155 	     call check_write_status (code);		/* check for output pending and loop back */
+      156 	     if code ^= 0 then go to RETURN;
+      157 	end;
+      158 
+      159 try_write:
+      160 	nelemt, state = 0;
+      161 	call hcs_$tty_write (g115_device_data.devx, msg_block_ptr, offset, nelem, nelemt, state, code);
+      162 	if state ^= 5 then code = error_table_$io_no_permission;
+      163 	if code = quit_code then go to try_write;	/* ignore quit error its been reset */
+      164 	if line_status_pending (code) then go to try_write;
+      165 	if code ^= 0 then go to RETURN;
+      166 
+      167 	if nelem = nelemt then go to RETURN;		/* all data was accepted by ring 0 */
+      168 
+      169 	nelem = nelem - nelemt;			/* only a portion was sent, try to send remainder */
+      170 	offset = offset + nelemt;
+      171 	go to check_write_completion;
+      172 
+      173 
+      174 
+      175 /* ===== SPECIAL SECTION FOR THE ANSWERING SERVICE ===== */
+      176 
+      177 ANS_SERVICE:
+      178 
+      179 /* We cannot allow the answering service to block on output indefinitely. So we use a timeout of 3 seconds
+      180*   if there is already output pending.  The event channel we block on must be different from
+      181*   the normal answering service channel so we change it each time. */
+      182 
+      183 	call hcs_$tty_event (g115_device_data.devx, g115_device_data.tty_ev_channel, state, code);
+      184 	if state ^= 5 then code = error_table_$io_no_permission;
+      185 	if line_status_pending (code) then go to ANS_SERVICE; /* try all over */
+      186 	if code ^= 0 then go to RETURN;
+      187 
+      188 	call check_write_status (code);		/* Check for output pending */
+      189 	if code ^= 0 then go to ANS_RETURN;		/* really screwed up, will have to be dropped */
+      190 
+      191 	do while (io_status.io_pending);		/* if told to wait */
+      192 	     call ipc_$mask_ev_calls (ec);		/* stop answering service for a second */
+      193 
+      194 	     call ipc_$drain_chn (g115_device_data.timeout_ev_channel, ec); /* be sure it is clear */
+      195 
+      196 	     call timer_manager_$alarm_wakeup (3, "11"b, g115_device_data.timeout_ev_channel); /* 3 seconds max */
+      197 
+      198 	     call block (code);			/* wait for completion or timeout */
+      199 
+      200 	     call ipc_$unmask_ev_calls (ec);		/* ALWAYS reset the event call mask */
+      201 
+      202 	     if code ^= 0 then go to ANS_RETURN;	/* check code from block, timeout is fatal */
+      203 
+      204 	     call timer_manager_$reset_alarm_wakeup (g115_device_data.timeout_ev_channel); /* made it */
+      205 
+      206 	     call check_write_status (code);
+      207 	     if code ^= 0 then go to ANS_RETURN;
+      208 	end;
+      209 
+      210 	call hphcs_$tty_write_force (g115_device_data.devx, msg_block_ptr, offset, nelem, nelemt, state, code);
+      211 	if state ^= 5 then code = error_table_$io_no_permission;
+      212 	if line_status_pending (code) then go to ANS_SERVICE; /* start all over */
+      213 
+      214 ANS_RETURN:
+      215 
+      216 /* ALWAYS attempt to return the normal event channel to Ring 0 - error or not */
+      217 
+      218 	call hcs_$tty_event (g115_device_data.devx, g115_device_data.as_ev_chan, state, ec);
+      219 
+      220 	if code = 0 then code = ec;			/* give other errors priority */
+      221 	go to RETURN;				/* common return code (See read entry) */
+      222 
+      223 check_write_status: proc (code);
+      224 
+      225 dcl  code fixed bin (35);
+      226 
+      227 	     call ipc_$drain_chn (g115_device_data.tty_ev_channel, code); /* clear wakeups? */
+      228 
+      229 
+      230 retry_ws:	     call hcs_$tty_order (g115_device_data.devx, "write_status", addr (io_status), state, code);
+      231 	     if state ^= 5 then code = error_table_$io_no_permission;
+      232 
+      233 	     if line_status_pending (code) then go to retry_ws;
+      234 
+      235 	     return;
+      236 
+      237 	end check_write_status;
+      238 
+      239 
+      240 
+      241 line_status_pending: proc (code) returns (bit (1));
+      242 
+      243 /* this procedure simply clears any pending line status and throws it away */
+      244 
+      245 dcl  code fixed bin (35);
+      246 
+      247 	     if code = 0 then return ("0"b);		/* avoid a loop for normal case */
+      248 
+      249 	     do while (code = error_table_$line_status_pending);
+      250 		call hcs_$tty_order (g115_device_data.devx, "line_status", addr (line_status), state, code);
+      251 		if state ^= 5 then code = error_table_$io_no_permission;
+      252 	     end;
+      253 
+      254 	     if code = 0 then return ("1"b);		/* OK to retry the operation */
+      255 
+      256 	     return ("0"b);				/* do not attempt a retry */
+      257 
+      258 	end line_status_pending;
+      259 
+      260 
+      261 
+      262 block:	proc (code);
+      263 
+      264 /* this procedure blocks on the pre-defined wait list for the device and waits for a wakeup from ring 0 */
+      265 
+      266 dcl  code fixed bin (35);
+      267 
+      268 	     event_info.wait_list_index = 0;		/* initialize test value */
+      269 
+      270 	     call ipc_$block (addr (g115_device_data.wait_list), addr (event_info), code);
+      271 
+      272 	     if event_info.wait_list_index = 2 then code = error_table_$net_timeout;
+      273 
+      274 	     else if code ^= 0 then call convert_ipc_code_ (code);
+      275 
+      276 	     send_wakeup = "1"b;			/* we may have stolen a wakeup, so give it back */
+      277 
+      278 	     return;
+      279 
+      280 	end block;
+      281 
+      282 read:	entry (a_ddp, a_msgp, a_code);
+      283 
+      284 /* This entry reads a message from ring 0 and puts it into the message buffer defined by a_msgp */
+      285 
+      286 	device_data_p = a_ddp;			/* define the g115_device_data for this invocation */
+      287 	msgp = a_msgp;
+      288 	read_status_entry = "0"b;			/* this is not the read_status entry */
+      289 
+      290 	go to READ_COMMON;
+      291 
+      292 
+      293 read_status: entry (a_ddp, a_infop, a_code);
+      294 
+      295 /* This entry tries to read a message from ring zero (if available) and saves it in the last input buffer of the chain.
+      296*   It sets the input_available flag in the structure a_infop -> info if there is a valid record
+      297*   count in the message read.
+      298**/
+      299 
+      300 	device_data_p = a_ddp;			/* define the g115_device_data for this invocation */
+      301 
+      302 	msgp = g115_device_data.last_bp;		/* get ptr to tail buffer of chain */
+      303 	if g115_message.rec_count > 0 then do;		/* something there? */
+      304 	     a_infop -> info.input_available = "1"b;	/* tell caller */
+      305 	     a_code = 0;
+      306 	     return;
+      307 	end;
+      308 
+      309 	read_status_entry = "1"b;			/* this is the read_status entry */
+      310 
+      311 
+      312 READ_COMMON:
+      313 
+      314 	a_code, code = 0;
+      315 
+      316 
+      317 	call read_message (msgp, code);
+      318 	if code ^= 0 then go to RETURN;
+      319 
+      320 	if read_status_entry then			/* see if the message was good */
+      321 	     if g115_message.rec_count > 0 then
+      322 		a_infop -> info.input_available = "1"b; /* OK to read */
+      323 
+      324 RETURN:						/* this is the common exit point for this external procedure */
+      325 
+      326 	a_code = code;				/* copy back any status */
+      327 
+      328 /*	If we went blocked, we may have taken a wakeup from a read_status then block sequence. */
+      329 /*	So we will send back a wakeup unconditionally if we went blocked at all, just in case.		*/
+      330 
+      331 	if send_wakeup then call hcs_$wakeup (g115_device_data.process_id, g115_device_data.tty_ev_channel, 0, code);
+      332 
+      333 	return;
+      334 
+      335 read_message: proc (msgp, code);
+      336 
+      337 dcl  msgp ptr;
+      338 dcl  code fixed bin (35);
+      339 dcl  msg_len fixed bin;
+      340 dcl  offset fixed bin;
+      341 dcl  read_ptr ptr;
+      342 dcl  max_len fixed bin;
+      343 dcl  etx_found bit (1);
+      344 
+      345 	     msgp -> g115_message.last_char_read = 0;	/* reset state variables */
+      346 	     msgp -> g115_message.text_char_count = 0;
+      347 	     msgp -> g115_message.rec_count = 0;
+      348 
+      349 	     offset = 0;				/* hardcore read offset */
+      350 	     max_len = G115.max_msg_len + 8;		/* SOH -> STX = 7, ETX = 1, total = 8 chars */
+      351 	     read_ptr = addr (msgp -> g115_message.g115_msg_block); /* where ring 0 should put the message */
+      352 try_read:
+      353 	     etx_found = "0"b;
+      354 	     msg_len, state = 0;
+      355 
+      356 	     call hcs_$tty_get_line (g115_device_data.devx, read_ptr, offset, max_len - offset, msg_len,
+      357 		etx_found, state, code);
+      358 	     if state ^= 5 then code = error_table_$io_no_permission;
+      359 	     if line_status_pending (code) then go to try_read;
+      360 	     if code ^= 0 then return;
+      361 
+      362 	     if msg_len < 1 then do;			/* no meat to the message */
+      363 		if g115_message.text_char_count = 0 then /* on partial read wait for complete msg */
+      364 		     if read_status_entry | g115_device_data.as_priv_no_block then return;
+      365 						/* for these cases, don't wait for a message */
+      366 
+      367 		call block (code);			/* wait for the message (or remainder) to arrive */
+      368 		if code ^= 0 then return;
+      369 		go to try_read;			/* should get it this time */
+      370 	     end;
+      371 
+      372 	     if msgp -> g115_message.text_char_count = 0 then /* allow for message header? (SOH -> STX = 7 chars) */
+      373 		msgp -> g115_message.text_char_count = msg_len - 7;
+      374 	     else msgp -> g115_message.text_char_count = msgp -> g115_message.text_char_count + msg_len;
+      375 
+      376 	     if etx_found then			/* when complete, take the ETX char out of the count */
+      377 		msgp -> g115_message.text_char_count = msgp -> g115_message.text_char_count - 1;
+      378 	     else do;
+      379 		offset = msgp -> g115_message.text_char_count + 7; /* next read follows last char read */
+      380 		go to try_read;
+      381 	     end;
+      382 
+      383 /* count the records in the message */
+      384 
+      385 	     do idx = 1 to g115_message.text_char_count;
+      386 		if g115_message.text (idx) = G115.RS then /* look for record separators (RS) */
+      387 		     g115_message.rec_count = g115_message.rec_count + 1; /* add up full records */
+      388 	     end;
+      389 	     if g115_message.text (g115_message.text_char_count) ^= G115.RS then
+      390 						/* if last char is not RS, record is split */
+      391 		g115_message.rec_count = g115_message.rec_count + 1; /* add partial record to count */
+      392 
+      393 	     return;
+      394 
+      395 	end read_message;
+      396 
+      397 
+      398 
+      399      end g115_io_$write;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    02/06/80  1131.0  g115_io_.pl1                      >spec>on>spec020680>g115_io_.pl1
+100          1    02/06/80  1130.0  g115_device_data.incl.pl1         >spec>on>spec020680>g115_device_data.incl.pl1
+102          2    02/06/80  1129.3  g115_message.incl.pl1             >spec>on>spec020680>g115_message.incl.pl1
+104          3    02/06/80  1129.3  G115.incl.pl1                     >spec>on>spec020680>G115.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+G115                            000000 constant        structure                level 1 dcl 3-8
+RS                        4(09) 000000 constant        char(1)                  initial level 3 packed unaligned dcl 3-8 ref 386 389
+a_code                                 parameter       fixed bin(35,0)          dcl 38 set ref 10 111* 116* 282 293 305* 312* 324*
+a_ddp                                  parameter       pointer                  dcl 35 ref 10 113 282 286 293 300
+a_infop                                parameter       pointer                  dcl 37 ref 293 304 320
+a_msgp                                 parameter       pointer                  dcl 36 ref 10 112 282 287
+addr                                                   builtin function         dcl 98 ref 121 132 132 230 230 250 250 270 270 270
+                                                                                  270 351
+as_ev_chan               20            based           fixed bin(71,0)          level 2 dcl 1-11 set ref 214*
+as_priv_no_block         30            based           bit(1)                   level 3 packed unaligned dcl 1-11 ref 124 363
+being_changed             5            based           bit(1)                   level 2 dcl 2-15 set ref 115
+buffer_area                            based           area(262144)             dcl 1-43 ref 138
+buffer_areap             52            based           pointer                  level 2 dcl 1-11 ref 138
+char_codes                3     000000 constant        structure                level 2 packed unaligned dcl 3-8
+code                                   parameter       fixed bin(35,0)          dcl 338 in procedure "read_message" set ref 335 356*
+                                                                                  358* 359* 360 367* 368
+code                                   parameter       fixed bin(35,0)          dcl 266 in procedure "block" set ref 262 270* 272*
+                                                                                  274 274*
+code                            000107 automatic       fixed bin(35,0)          dcl 46 in procedure "g115_io_$write" set ref 111*
+                                                                                  126* 129 132* 133* 134* 135 146* 147 151* 152 155*
+                                                                                  156 161* 162* 163 164* 165 177* 184* 185* 186 188*
+                                                                                  189 198* 202 206* 207 210* 211* 212* 220 220* 312*
+                                                                                  317* 318 324 331*
+code                                   parameter       fixed bin(35,0)          dcl 225 in procedure "check_write_status" set ref
+                                                                                  223 227* 230* 231* 233*
+code                                   parameter       fixed bin(35,0)          dcl 245 in procedure "line_status_pending" set ref
+                                                                                  241 247 249 250* 251* 254
+control_bits             30            based           structure                level 2 dcl 1-11
+convert_ipc_code_               000010 constant        entry                    external dcl 78 ref 274
+device_data_p                   000132 automatic       pointer                  initial dcl 1-9 set ref 113* 124 132 138 141 142 161
+                                                                                  177 177 194 196 204 210 214 214 286* 300* 302 331
+                                                                                  331 1-9* 227 230 250 270 270 356 363
+devx                     14            based           fixed bin(17,0)          level 2 dcl 1-11 set ref 132* 161* 177* 210* 214*
+                                                                                  230* 250* 356*
+ec                              000110 automatic       fixed bin(35,0)          dcl 47 set ref 192* 194* 200* 214* 220
+error_table_$improper_data_format
+                                000050 external static fixed bin(35,0)          dcl 95 ref 116
+error_table_$io_no_permission   000046 external static fixed bin(35,0)          dcl 94 ref 133 162 184 211 231 251 358
+error_table_$line_status_pending
+                                000044 external static fixed bin(35,0)          dcl 93 ref 249
+error_table_$net_timeout        000042 external static fixed bin(35,0)          dcl 92 ref 272
+etx_found                       000173 automatic       bit(1)                   unaligned dcl 343 set ref 352* 356* 376
+event_info                      000122 automatic       structure                level 1 dcl 69 set ref 270 270
+g115_device_data                       based           structure                level 1 dcl 1-11
+g115_message                           based           structure                level 1 dcl 2-15 set ref 138 139*
+g115_msg_block            6            based           structure                level 2 dcl 2-15 set ref 121 351
+hcs_$tty_event                  000026 constant        entry                    external dcl 85 ref 177 214
+hcs_$tty_get_line               000022 constant        entry                    external dcl 83 ref 356
+hcs_$tty_order                  000024 constant        entry                    external dcl 84 ref 132 230 250
+hcs_$tty_write                  000016 constant        entry                    external dcl 81 ref 161
+hcs_$wakeup                     000030 constant        entry                    external dcl 86 ref 331
+hphcs_$tty_write_force          000020 constant        entry                    external dcl 82 ref 210
+idx                             000105 automatic       fixed bin(17,0)          dcl 44 set ref 385* 386*
+info                                   based           structure                level 1 dcl 61
+input_available           2            based           bit(1)                   level 2 dcl 61 set ref 304* 320*
+io_pending                2     000116 automatic       bit(1)                   level 2 dcl 65 set ref 131 137 191
+io_status                       000116 automatic       structure                level 1 dcl 65 set ref 132 132 230 230
+ipc_$block                      000014 constant        entry                    external dcl 80 ref 270
+ipc_$drain_chn                  000012 constant        entry                    external dcl 79 ref 194 227
+ipc_$mask_ev_calls              000032 constant        entry                    external dcl 87 ref 192
+ipc_$unmask_ev_calls            000034 constant        entry                    external dcl 88 ref 200
+last_bp                  56            based           pointer                  level 2 dcl 1-11 set ref 141 142* 302
+last_char_read            4            based           fixed bin(17,0)          level 2 dcl 2-15 set ref 345*
+line_status                     000114 automatic       structure                level 1 dcl 55 set ref 250 250
+max_len                         000172 automatic       fixed bin(17,0)          dcl 342 set ref 350* 356
+max_msg_len               5     000000 constant        fixed bin(17,0)          initial level 2 dcl 3-8 ref 350
+msg_block_ptr                   000100 automatic       pointer                  dcl 40 set ref 121* 161* 210*
+msg_len                         000166 automatic       fixed bin(17,0)          dcl 339 set ref 354* 356* 362 372 374
+msgp                            000134 automatic       pointer                  initial dcl 2-13 in procedure "g115_io_$write" set
+                                                                                  ref 112* 115 115 120 121 138* 139 140 141 142 146*
+                                                                                  287* 302* 303 317* 320 2-13* 363 385 386 386 386
+                                                                                  389 389 389 389
+msgp                                   parameter       pointer                  dcl 337 in procedure "read_message" ref 335 345 346
+                                                                                  347 351 372 372 374 374 376 376 379
+nelem                           000103 automatic       fixed bin(17,0)          dcl 42 set ref 120* 161* 167 169* 169 210*
+nelemt                          000102 automatic       fixed bin(17,0)          dcl 41 set ref 159* 161* 167 169 170 210*
+next_bp                                based           pointer                  level 2 dcl 2-15 set ref 140* 141*
+null                                                   builtin function         dcl 98 ref 140 1-9 2-13
+offset                          000104 automatic       fixed bin(17,0)          dcl 43 in procedure "g115_io_$write" set ref 122*
+                                                                                  161* 170* 170 210*
+offset                          000167 automatic       fixed bin(17,0)          dcl 340 in procedure "read_message" set ref 349*
+                                                                                  356* 356 379*
+process_id               33            based           bit(36)                  level 2 dcl 1-11 set ref 331*
+quit_code                       000006 constant        fixed bin(35,0)          initial dcl 52 ref 163
+read_ptr                        000170 automatic       pointer                  dcl 341 set ref 351* 356*
+read_status_entry               000112 automatic       bit(1)                   unaligned dcl 49 set ref 110* 288* 309* 320 363
+rec_count                 3            based           fixed bin(17,0)          level 2 dcl 2-15 set ref 303 320 347* 386* 386 389*
+                                                                                  389
+send_wakeup                     000111 automatic       bit(1)                   initial unaligned dcl 48 set ref 48* 144* 276* 331
+state                           000106 automatic       fixed bin(17,0)          dcl 45 set ref 132* 133 159* 161* 162 177* 184 210*
+                                                                                  211 214* 230* 231 250* 251 354* 356* 358
+text                      7(27)        based           char(1)                  array level 3 packed unaligned dcl 2-15 set ref 386
+                                                                                  389
+text_char_count           2            based           fixed bin(17,0)          level 2 dcl 2-15 set ref 115 120 138* 139 346* 363
+                                                                                  372 372* 374* 374 376* 376 379 385 389
+timeout_ev_channel       26            based           fixed bin(71,0)          level 3 dcl 1-11 set ref 194* 196* 204*
+timer_manager_$alarm_wakeup     000036 constant        entry                    external dcl 89 ref 196
+timer_manager_$reset_alarm_wakeup
+                                000040 constant        entry                    external dcl 90 ref 204
+tty_ev_channel           24            based           fixed bin(71,0)          level 3 dcl 1-11 set ref 177* 227* 331*
+unspec                                                 builtin function         dcl 98 set ref 139*
+wait_list                22            based           structure                level 2 dcl 1-11 set ref 270 270
+wait_list_index           6     000122 automatic       fixed bin(17,0)          level 2 dcl 69 set ref 268* 272
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+ANS_RETURN                      000515 constant        label                    dcl 214 ref 189 202 207
+ANS_SERVICE                     000324 constant        label                    dcl 177 ref 124 185 212
+READ_COMMON                     000611 constant        label                    dcl 312 ref 290
+RETURN                          000631 constant        label                    dcl 324 ref 129 135 147 152 156 165 167 186 221 318
+block                           001061 constant        entry                    internal dcl 262 ref 151 198 367
+check_write_completion          000110 constant        label                    dcl 126 ref 134 171
+check_write_status              000657 constant        entry                    internal dcl 223 ref 126 155 188 206
+g115_io_$write                  000050 constant        entry                    external dcl 10
+line_status_pending             000761 constant        entry                    internal dcl 241 ref 134 164 185 212 233 359
+read                            000542 constant        entry                    external dcl 282
+read_message                    001132 constant        entry                    internal dcl 335 ref 146 317
+read_status                     000563 constant        entry                    external dcl 293
+retry_ws                        000674 constant        label                    dcl 230 ref 233
+try_read                        001146 constant        label                    dcl 352 ref 359 369 380
+try_write                       000246 constant        label                    dcl 159 ref 163 164
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      1632        1704    1360        1642
+Length      2164    1360        52         243     252           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+g115_io_$write                      246 external procedure  is an external procedure.  
+check_write_status                      internal procedure  shares stack frame of external procedure g115_io_$write.  
+line_status_pending                     internal procedure  shares stack frame of external procedure g115_io_$write.  
+block                                   internal procedure  shares stack frame of external procedure g115_io_$write.  
+read_message                            internal procedure  shares stack frame of external procedure g115_io_$write.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+g115_io_$write           000100 msg_block_ptr               g115_io_$write
+                         000102 nelemt                      g115_io_$write
+                         000103 nelem                       g115_io_$write
+                         000104 offset                      g115_io_$write
+                         000105 idx                         g115_io_$write
+                         000106 state                       g115_io_$write
+                         000107 code                        g115_io_$write
+                         000110 ec                          g115_io_$write
+                         000111 send_wakeup                 g115_io_$write
+                         000112 read_status_entry           g115_io_$write
+                         000114 line_status                 g115_io_$write
+                         000116 io_status                   g115_io_$write
+                         000122 event_info                  g115_io_$write
+                         000132 device_data_p               g115_io_$write
+                         000134 msgp                        g115_io_$write
+                         000166 msg_len                     read_message
+                         000167 offset                      read_message
+                         000170 read_ptr                    read_message
+                         000172 max_len                     read_message
+                         000173 etx_found                   read_message
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+call_ext_out_desc   call_ext_out        return              ext_entry           alloc_based
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+convert_ipc_code_             hcs_$tty_event                hcs_$tty_get_line             hcs_$tty_order
+hcs_$tty_write                hcs_$wakeup                   hphcs_$tty_write_force        ipc_$block
+ipc_$drain_chn                ipc_$mask_ev_calls            ipc_$unmask_ev_calls          timer_manager_$alarm_wakeup
+timer_manager_$reset_alarm_wakeup
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$improper_data_format                           error_table_$io_no_permission
+error_table_$line_status_pending                            error_table_$net_timeout
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     48 000036    1    9 000037    2   13 000041        10 000044       110 000056       111 000057       112 000062
+    113 000065       115 000070       116 000074       117 000077       120 000100       121 000102       122 000104
+    124 000105       126 000110       129 000112       131 000114       132 000116       133 000155       134 000163
+    135 000170       137 000172       138 000174       139 000207       140 000221       141 000223       142 000225
+    144 000226       146 000230       147 000232       148 000234       151 000235       152 000237       155 000241
+    156 000243       157 000245       159 000246       161 000250       162 000274       163 000302       164 000305
+    165 000312       167 000314       169 000317       170 000321       171 000323       177 000324       184 000342
+    185 000350       186 000355       188 000357       189 000361       191 000363       192 000365       194 000374
+    196 000406       198 000426       200 000430       202 000437       204 000441       206 000451       207 000453
+    208 000455       210 000456       211 000502       212 000510       214 000515       220 000533       221 000537
+    282 000540       286 000550       287 000554       288 000557       290 000560       293 000561       300 000571
+    302 000575       303 000577       304 000601       305 000605       306 000606       309 000607       312 000611
+    317 000613       318 000615       320 000617       324 000631       331 000634       333 000656       223 000657
+    227 000661       230 000674       231 000735       233 000744       235 000760       241 000761       247 000763
+    249 000772       250 000777       251 001035       252 001044       254 001045       256 001054       262 001061
+    268 001063       270 001064       272 001105       274 001115       276 001127       278 001131       335 001132
+    345 001134       346 001137       347 001140       349 001141       350 001142       351 001144       352 001146
+    354 001150       356 001152       358 001204       359 001213       360 001227       362 001233       363 001236
+    367 001250       368 001256       369 001262       372 001263       374 001273       376 001275       379 001303
+    380 001306       385 001307       386 001317       388 001325       389 001327       393 001336
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

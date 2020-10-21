@@ -1,0 +1,806 @@
+	COMPILATION LISTING OF SEGMENT bj_close_oid
+	Compiled by: Multics PL/I Compiler, Release 28e, of February 14, 1985
+	Compiled at: Honeywell Multics Op. - System M
+	Compiled on: 05/17/85  1456.5 mst Fri
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        4*   *                                                         *
+        5*   *********************************************************** */
+        6 
+        7 /* DESCRIPTION
+        8*
+        9*   bj_close_oid - implements the before journal manager close primitive.
+       10*
+       11*   This procedure decrements the n_opened count of the before journal
+       12*   specified by the first parameter.  It then checks the count to see if
+       13*   it is zero, indicating that the before journal is not referenced by
+       14*   any program in this process.  This being the case, the before journal
+       15*   can be closed.  If not, an appropriate code is returned.  If being
+       16*   closed, then the pste for this before journal must be adjusted to
+       17*   reflect that one less process is using it.  This is done with the pst 
+       18*   locked (as required by bj_pst_register$check_out).  The closing may
+       19*   effect the default before journal status.  This procedure makes sure
+       20*   that there is a valid default before journal reflected in dm_data_.
+       21*
+       22*   Design consideration: the PST must be locked before this program is
+       23*   called.  bj_close_oid cannot know of the environment from which it
+       24*   was called, hence the requirement of locking the PST.
+       25**/
+       26 
+       27 /* HISTORY:
+       28*Written by Mike Pandolf, 07/06/82.
+       29*Modified:
+       30*08/24/82 by Mike Pandolf:  To be bjm support procedure
+       31*10/04/82 by Lee A. Newcomb:  To understand that there are two default_bj
+       32*	  OID cells as per the write_begin_mark BJ selection protocol.
+       33*10/15/82 by M. Pandolf:  to use file_manager_ for manipulation of data
+       34*	  management files.
+       35*11/03/82 by M. Pandolf:  to remove PSTE if journal is used by no one after
+       36*	  it is closed in this process.
+       37*11/23/82 by A. Bensoussan:  to call dm_hcs_$free_journal.
+       38*12/21/82 by M. Pandolf:  to remove call to bj_pst_lock.  see notes above.
+       39*03/10/83 by M. Pandolf:  to log calls to dm_send_request_.
+       40*03/15/83 by M. Pandolf:  to get rid of call to
+       41*	  dm_send_request_$adjust_process_id because this leads to an
+       42*	  endless wakeup loop if the adjustment fails; to not allow journal
+       43*	  checkout from system table if the journal has a non zero
+       44*	  transaction count.
+       45*03/29/83 by A. Bensoussan:  to call bj_pste_delete which centralizes the
+       46*	  freeing of pste's.
+       47*05/06/83 by A.Bensoussan:  to add the entry point $after_recovery.
+       48*12/06/83 by L. A. Newcomb:  Renamed before_journal_manager_static_ to
+       49*            bjm_data_ and moved some cells from dm_data_ to bjm_data_.
+       50*11/30/84 by Maggie Sharpe:  to set/reset validation level around the call to
+       51*            file_manager_.
+       52*04/05/85 by Lee A. Newcomb:  Fixed to not call dm_pste_register$check_out_dead
+       53*            during recovery.
+       54*05/10/85 by R. Michael Tague:  Removed dm_journal_seg_.incl.pl1 - unreferenced.
+       55**/
+       56 
+       57 /* format: style4,^indcomtxt,^ifthen,indattr,^inddcls,idind40 */
+       58 
+       59 bj_close_oid:
+       60      procedure (p_bj_oid);
+       61 
+       62 
+       63 /* DECLARATIONS */
+       64 
+       65 /* Parameter */
+       66 
+       67 dcl  p_bj_oid			     bit (36) aligned parameter; /* OID of before journal to be closed */
+       68 
+       69 /* Automatic */
+       70 
+       71 dcl  fm_oid			     bit (36) aligned; /* local aligned copy of fm_oid for call to file_manager_ */
+       72 dcl  code				     fixed bin (35);/* standard system status code */
+       73 dcl  bj_uid			     bit (36) aligned;
+       74 dcl  bj_oid			     bit (36) aligned; /* copy of the parameter */
+       75 dcl  close_after_recovery		     bit (1);
+       76 dcl  saved_level			     fixed bin;
+       77 
+       78 /* Builtin */
+       79 
+       80 dcl  addr				     builtin;
+       81 
+       82 /* Condition */
+       83 
+       84 dcl  cleanup			     condition;
+       85 
+       86 /* Constant */
+       87 
+       88 dcl  ME				     char (32) internal static options (constant) init ("bj_close_oid");
+       89 
+       90 
+       91 /* Entry */
+       92 
+       93 dcl  bj_oid_util$get_ptr		     entry (bit (36) aligned) returns (pointer);
+       94 dcl  bj_oid_util$get_latest_oid	     entry () returns (bit (36) aligned);
+       95 dcl  bj_pste_register$check_out	     entry (pointer);
+       96 dcl  bj_pste_register$check_out_dead	     entry (ptr, bit (36) aligned);
+       97 dcl  bj_pste_delete			     entry (ptr);
+       98 dcl  bj_pste_delete$after_recovery	     entry (ptr);
+       99 dcl  bj_report_err			     entry (fixed bin (35), char (*));
+      100 dcl  cu_$level_get			     entry (fixed bin);
+      101 dcl  cu_$level_set			     entry (fixed bin);
+      102 dcl  file_manager_$close		     entry (bit (36) aligned, fixed bin (35));
+      103 dcl  get_ring_			     entry () returns (fixed bin (3));
+      104 dcl  hcs_$validate_processid		     entry (bit (36) aligned, fixed bin (35));
+      105 
+      106 
+      107 
+      108 
+      109 /* External Static */
+      110 
+      111 dcl  bjm_data_$bj_ppt_ptr		     pointer external static;
+      112 dcl  bjm_data_$bj_pst_ptr		     pointer external static;
+      113 dcl  dm_data_$bj_txt_ptr		     pointer external static;
+      114 dcl  dm_data_$current_txn_id		     bit (36) external static;
+      115 dcl  dm_data_$current_txn_index	     fixed bin external static;
+      116 dcl  dm_error_$bj_journal_in_use	     fixed bin (35) external static;
+      117 
+      118 
+      119 
+      120 /* Standard entrypoint */
+      121 
+      122 	close_after_recovery = "0"b;
+      123 	goto COMMON;
+      124 
+      125 after_recovery: entry (p_bj_oid);
+      126 
+      127 	close_after_recovery = "1"b;
+      128 	goto COMMON;
+      129 
+      130 
+      131 
+      132 COMMON:	bj_oid = p_bj_oid;
+      133 	code = 0;
+      134 	call cu_$level_get (saved_level);
+      135 
+      136 	on cleanup begin;
+      137 	     call cu_$level_set (saved_level);
+      138 	end;
+      139 
+      140 /* get pointer to ppte referenced by OID */
+      141 
+      142 	bj_ppte_ptr = bj_oid_util$get_ptr (bj_oid);
+      143 
+      144 
+      145 /* if we are trying to close a journal which we are currently using, give up */
+      146 
+      147 	if dm_data_$current_txn_id ^= (36)"0"b then
+      148 	     if bj_ppte.bj_uid = addr (dm_data_$bj_txt_ptr -> bj_txt.entry (dm_data_$current_txn_index)) -> bj_txte.bj_uid
+      149 	     then do;
+      150 		code = dm_error_$bj_journal_in_use;
+      151 		goto local_error_exit;
+      152 	     end;
+      153 
+      154 
+      155 /* decrement number of openings this process by one */
+      156 
+      157 	if close_after_recovery = "0"b
+      158 	then bj_ppte.n_opening = bj_ppte.n_opening - 1;
+      159 	else bj_ppte.n_opening = 0;
+      160 
+      161 
+      162 /* if openings > 0, then we can do no more */
+      163 
+      164 	if bj_ppte.n_opening > 0
+      165 	then goto exit;
+      166 
+      167 
+      168 /* begin the big close... */
+      169 
+      170 	bjm_data_$bj_ppt_ptr -> bj_ppt.n_entries_used = bjm_data_$bj_ppt_ptr -> bj_ppt.n_entries_used - 1;
+      171 
+      172 
+      173 /* get the file manager opening ID for later use */
+      174 
+      175 	fm_oid = bj_ppte.pf_oid;
+      176 
+      177 
+      178 /* openings = 0, so we can actually close the before journal at the system level */
+      179 
+      180 	bj_pste_ptr = bj_ppte.bj_pste_ptr;
+      181 
+      182 	call bj_pste_register$check_out (bj_pste_ptr);	/* Check me out */
+      183 
+      184 	if close_after_recovery = "0"b
+      185 	then do;
+      186 	     call bj_pste_register$check_out_dead (bj_pste_ptr, (36)"0"b); /* Check all dead out */
+      187 	     if bj_pste.n_processes = 0 & bj_pste.n_txn = 0
+      188 	     then call bj_pste_delete (bj_pste_ptr);
+      189 	end;
+      190 	else
+      191 	     call bj_pste_delete$after_recovery (bj_pste_ptr);
+      192 
+      193 /* mark the PPTE as unused */
+      194 
+      195 	bj_ppte.version = 0;
+      196 
+      197 /* open a window where there is no known default before journal */
+      198 
+      199 	bj_ppt_ptr = bjm_data_$bj_ppt_ptr;		/* get bj_ppt loc. in auto. storage */
+      200 
+      201 	if bj_ppt.default_bj.user_set_oid = bj_oid then	/* lost our explicit default BJ */
+      202 	     bj_ppt.default_bj.user_set_oid = ""b;
+      203 
+      204 	if bj_ppt.default_bj.last_opened_oid = bj_oid then/* lost our 1st implicit BJ */
+      205 	     bj_ppt.default_bj.last_opened_oid = ""b;
+      206 
+      207 
+      208 /* close the before journal in its capacity as a dms file */
+      209 
+      210 	call cu_$level_set (get_ring_ ());
+      211 	call file_manager_$close (fm_oid, code);
+      212 	call cu_$level_set (saved_level);
+      213 
+      214 /* close the window where there is no known default before journal */
+      215 /* note we only get an implicit default if the user set one has been closed */
+      216 
+      217 	if bj_ppt.default_bj.last_opened_oid = ""b then
+      218 	     bj_ppt.default_bj.last_opened_oid = bj_oid_util$get_latest_oid ();
+      219 
+      220 /* check the code we got last call, during the default journal window */
+      221 
+      222 	if code ^= 0
+      223 	then goto local_error_exit;
+      224 
+      225 
+      226 /* the close operation is now completed */
+      227 
+      228 exit:
+      229 	return;
+      230 
+      231 local_error_exit:
+      232 	call bj_report_err (code, ME);
+      233 	goto exit;
+      234 
+      235 
+      236 /* Include Files */
+      237 
+      238 
+  1     1 	/* BEGIN dm_bj_static.incl.pl1 */
+  1     2 /*
+  1     3*Modified: 
+  1     4*10/04/82 by Lee A. Newcomb:  To change from internal static to external
+  1     5*	  static.
+  1     6**/
+  1     7 
+  1     8 dcl dm_system_data_$bj_max_n_journals		fixed bin ext static;
+  1     9 dcl dm_system_data_$bj_max_n_processes		fixed bin ext static;
+  1    10 dcl dm_system_data_$max_n_transactions     fixed bin ext static;
+  1    11 
+  1    12 	/* END dm_bj_static.incl.pl1 */
+  1    13 
+      239 
+      240 
+  2     1 /*  BEGIN INCLUDE FILE:	dm_bj_ppt.incl.pl1	*/
+  2     2 /*
+  2     3*Layout of the per-process before journal table and entries.
+  2     4*
+  2     5*Written by Andre Bensoussan June/July 1982
+  2     6*Modified:
+  2     7*09/29/82 by Lee A. Newcomb:  To make two default oid cells, pad ppte's
+  2     8*	  to account for all used space, and use dm_system_data_ for
+  2     9*	  determining dimension of bj_ppt.e.
+  2    10**/
+  2    11 /* format: style4,indattr,idind33,^indcomtxt */
+  2    12 
+  2    13 dcl  BJ_PPT_VERSION_1	        fixed bin int static options (constant) init (1);
+  2    14 dcl  BJ_PPTE_VERSION_1	        fixed bin int static options (constant) init (1);
+  2    15 
+  2    16 dcl  bj_ppt_ptr		        ptr;
+  2    17 
+  2    18 dcl  1 bj_ppt		        based (bj_ppt_ptr) aligned,
+  2    19        2 version		        fixed bin,
+  2    20        2 max_n_entries	        fixed bin,		/* should be = dm_system_data_$bj_max_n_journals */
+  2    21        2 n_entries_used	        fixed bin,		/* # of BJs open in this process */
+  2    22        2 highest_ix_used	        fixed bin,		/* max. # of BJs ever opened in this process */
+  2    23        2 default_bj,				/* for selecting a txn def. BJ by write_before_mark protocol */
+  2    24          3 user_set_oid	        bit (36),		/* explicit user setting via $set_default_bj */
+  2    25          3 last_opened_oid	        bit (36),		/* implicit if no user setting, set by open and close */
+  2    26 						/* if both zero, use system default BJ */
+  2    27        2 process_id		        bit (36),		/* so we don't have to keep calling for it. */
+  2    28        2 process_ix		        fixed bin,		/* index into bj_check_in_table */
+  2    29        2 mod_list_area	        (100) fixed bin (35), /* for keeping track of ppt mods, not curr. used */
+  2    30 
+  2    31        2 e		        dim (dm_system_data_$bj_max_n_journals refer (bj_ppt.max_n_entries))
+  2    32 			        like bj_ppte;	/* an entry for each BJ open in this process */
+  2    33 						/* always make sure bj_ppt.e is on a even word boundary */
+  2    34 
+  2    35 /* now specify the format of each per-process BJ table entry */
+  2    36 
+  2    37 dcl  bj_ppte_ptr		        ptr;
+  2    38 
+  2    39 dcl  1 bj_ppte		        based (bj_ppte_ptr) aligned,
+  2    40        2 version		        fixed bin,		/* better be the same for all entries in a bj_ppt */
+  2    41        2 bj_uid		        bit (36),		/* UID of the BJ page file */
+  2    42        2 pf_oid		        bit (36),		/* OID of the BJ page file */
+  2    43        2 n_opening		        fixed bin,		/* how many openings this process has done for this BJ */
+  2    44        2 bj_pste_ptr	        ptr,		/* "link" to per-system BJ table entry */
+  2    45        2 open_time		        fixed bin (71);	/* used to fill in bj_ppt.default_bj.last_opened_oid */
+  2    46 						/* if the last opened BJ is closed */
+  2    47 
+  2    48 /* END INCLUDE FILE:	bj_ppt.incl.pl1	*/
+      241 
+      242 
+  3     1 /*  BEGIN INCLUDE FILE:	dm_bj_pst.incl.pl1	*/
+  3     2 /*
+  3     3*Layout of the before journal per-system table header and BJ table entries.
+  3     4*
+  3     5*Written by Andre Bensoussan 06-15-1982
+  3     6*Modified:
+  3     7*09/29/82 by Lee A. Newcomb:  To use dm_system_data_ for determining
+  3     8*	  dimension of bj_pst.e and force bj_pst.mod_list_area and
+  3     9*	  bj_pst.e to even word boundaries.
+  3    10*04/27/82 by M. Pandolf:  To add meter space by cutting away from mod_list_area.
+  3    11**/
+  3    12 /* format: style4,indattr,idind33,^indcomtxt */
+  3    13 
+  3    14 dcl  BJ_PST_VERSION_1	        fixed bin internal static options (constant) init (1);
+  3    15 
+  3    16 dcl  bj_pst_ptr		        ptr;
+  3    17 
+  3    18 dcl  1 bj_pst		        based (bj_pst_ptr) aligned,
+  3    19        2 version		        fixed bin,
+  3    20        2 pad1		        bit (36),
+  3    21        2 lock,
+  3    22          3 pid		        bit (36),		/* process_id holding lock */
+  3    23          3 event		        bit (36),
+  3    24        2 time_of_bootload	        fixed bin (71),	/* for ease of access */
+  3    25        2 max_n_entries	        fixed bin,		/* as determined from dm_system_data_$bj_max_n_journals */
+  3    26        2 n_entries_used	        fixed bin,		/* current # of BJs open on the system */
+  3    27        2 highest_ix_used	        fixed bin,		/* max. # of BJs that has ever been open of the system */
+  3    28        2 pn_table_offset	        fixed bin (18) uns,	/* relative offset of bj_pn_table in bj_pst seg. */
+  3    29        2 check_in_table_offset        fixed bin (18) uns,	/* ditto for bj_check_in_table */
+  3    30        2 buffer_table_offset	        fixed bin (18) uns,	/* ditto for where our BJ buffers are located */
+  3    31        2 max_n_buffers	        fixed bin,		/* must be <= to max_n_entries */
+  3    32        2 pad2		        bit (36),		/* force next on even word boundary */
+  3    33        2 meters,					/* dim (50) fixed bin (71), */
+  3    34          3 n_calls_begin_txn          fixed bin (71),	/* meter (1) */
+  3    35          3 n_calls_before_image       fixed bin (71),	/* meter (2) */
+  3    36          3 n_calls_abort              fixed bin (71),	/* meter (3) */
+  3    37          3 n_calls_commit             fixed bin (71),	/* meter (4) */
+  3    38          3 n_calls_rb_mark            fixed bin (71),	/* meter (5) */
+  3    39          3 n_calls_fm_pc_mark         fixed bin (71),	/* meter (6) */
+  3    40          3 n_calls_fm_rbh             fixed bin (71),	/* meter (7) */
+  3    41          3 n_calls_rollback           fixed bin (71),	/* meter (8) */
+  3    42          3 meter dim (9:50)           fixed bin (71),	/* meter (9) - meter (50) */
+  3    43        2 mod_list_area	        (100) fixed bin (35), /* for keeping track of pst mods */
+  3    44 
+  3    45        2 e		        dim (dm_system_data_$bj_max_n_journals refer (bj_pst.max_n_entries))
+  3    46 			        like bj_pste;	/* per system BJ table entries */
+  3    47 
+  3    48 
+  3    49 /* END INCLUDE FILE:	dm_bj_pst.incl.pl1	*/
+      243 
+      244 
+  4     1 /* BEGIN INCLUDE FILE:	dm_bj_pste.incl.pl1	*/
+  4     2 
+  4     3 /* DESCRIPTION
+  4     4*
+  4     5*	Layout of the per-system before journal table
+  4     6*     entries.  This structure is used to contain information
+  4     7*     about a before journal active in a running DMS.  It is
+  4     8*     currently also used as the header of a before journal
+  4     9*     (see dm_bj_header.incl.pl1).  Version changes to this
+  4    10*     structure require either automatic conversion to be set
+  4    11*     up, or users to be told to re-create their journals.
+  4    12*
+  4    13*	Currently, a bj_pste must be 64 words long;  any
+  4    14*     future changes must at least make sure a bj_pste is an
+  4    15*     even # of words for the alignment of some of its
+  4    16*     elements.
+  4    17**/
+  4    18 
+  4    19 /*  HISTORY:
+  4    20*
+  4    21*Written by Andre Bensoussan, 06/15/82.
+  4    22*Modified:
+  4    23*08/16/82 by Andre Bensoussan: to add stamp_for_last_ci_put.
+  4    24*09/29/82 by Lee A. Newcomb: to fix BJ_PSTE_VERSION_1 and fix some
+  4    25*	  alignments.
+  4    26*11/01/82 by Andre Bensoussan: to add "stamp_for_last_ci_on_disk",
+  4    27*	  "n_bi_still_unsafe", and "n_bi_being_saved".
+  4    28*02/08/83 by M. Pandolf: to add append_state structure.
+  4    29*03/19/83 by L. A. Newcomb: to fix up some alignments and spelling problems.
+  4    30*04/27/83 by M. Pandolf: to add meter structure at end.
+  4    31*02/11/85 by Lee A. Newcomb:  Fixed version constant name to agree with its
+  4    32*            value of 2; fixed references to page files or PF's; fixed format
+  4    33*            of description and history sections.
+  4    34*03/07/85 by Lee A. Newcomb:  Changed a pad word to be txn_storage_limit and
+  4    35*            expanded on the description for future generations (no
+  4    36*            version was made).
+  4    37*03/27/85 by Lee A. Newcomb:  Changed one of the unused meters to
+  4    38*            n_txn_storage_limit_hits (again without a version change).
+  4    39**/
+  4    40 /* format: style2,ll79,ind3,^indprocbody,ifthendo,ifthen,^indnoniterdo,^inddcls,dclind5,idind35,linecom */
+  4    41 
+  4    42 dcl  BJ_PSTE_VERSION_2		fixed bin internal static
+  4    43 				options (constant) init (2);
+  4    44 
+  4    45 dcl  bj_pste_ptr			ptr;
+  4    46 
+  4    47 /* MUST HAVE EVEN NUMBER OR WORDS */
+  4    48 dcl  1 bj_pste			based (bj_pste_ptr) aligned,
+  4    49        2 version			fixed bin,
+  4    50        2 bj_ix			fixed bin,	/* Index of this entry in bj_pst table */
+  4    51        2 lock			aligned,
+  4    52          3 pid			bit (36),		/* process ID of lock owner */
+  4    53          3 event			bit (36),
+  4    54        2 bj_uid			bit (36),		/* UID of BJ file */
+  4    55        2 ci_size			fixed bin,	/* In number of bytes */
+  4    56        2 max_size			fixed bin,	/* In number of ci's */
+  4    57        2 active			bit (1) aligned,	/* 0 means journal not being used */
+  4    58        2 time_header_updated		fixed bin (71),
+  4    59        2 earliest_meaningful_time	fixed bin (71),	/* time stamp on first valid control interval */
+  4    60        2 update_frequency		fixed bin,	/* Not used yet, probably will be how many CIs */
+  4    61        2 last_rec_id		bit (36),		/* rec id of the last logical record in journal */
+  4    62        2 n_processes		fixed bin,	/* Number of processes using this BJ */
+  4    63        2 n_txn			fixed bin,	/* Number of txn in progress using this BJ */
+  4    64        2 last_ci_info		aligned,
+  4    65          3 last_ci_buffered		fixed bin (24) uns, /* Last ci encached in the buffer */
+  4    66          3 last_ci_put		fixed bin (24) uns, /* Last ci put in the BJ */
+  4    67          3 last_ci_flushed		fixed bin (24) uns, /* Last ci for which flush initiated */
+  4    68          3 last_ci_on_disk		fixed bin (24) uns, /* Last ci of that portion of the BJ known to be ... */
+  4    69 						/* .. completely on disk */
+  4    70          3 stamp_for_last_ci_put	fixed bin (71),	/* Time stamp associated with the last ci put in the BJ */
+  4    71          3 stamp_for_last_ci_on_disk	fixed bin (71),	/* Time stamp associated with the last ci on disk in the BJ */
+  4    72        2 n_bi_still_unsafe		fixed bin,	/* number of bi's still not on disk */
+  4    73        2 n_bi_being_saved		fixed bin,	/* number of bi's for which flush initiated */
+  4    74        2 buffer_offset		fixed bin (18) uns, /* Now allocated in the bj_pst segment */
+  4    75        2 txn_storage_limit		fixed bin (35),	/* # of bytes a single txn may write */
+  4    76        2 cl			aligned,		/* Circular List */
+  4    77          3 origin_ci		fixed bin (24) uns,
+  4    78          3 lowest_ci		fixed bin (24) uns,
+  4    79          3 highest_ci		fixed bin (24) uns,
+  4    80          3 number_ci		fixed bin (24) uns,
+  4    81        2 append_state		aligned,
+  4    82          3 current_operation		char (4),		/* equal to "appe" when append in progress */
+  4    83          3 pending_n_txn		fixed bin,	/* n_txn value when append done */
+  4    84          3 pending_last_rec_id	bit (36),		/* last_rec_id value after append done */
+  4    85          3 pending_last_element_id	bit (36),		/* last element id after append done */
+  4    86          3 txte_rec_id_relp		bit (18),		/* rel ptr into seg containing TXT for txte.pending_bj_rec_id */
+  4    87        2 pad_to_even_word1		bit (36) aligned,
+  4    88        2 meters			aligned,		/* dim (10) fixed bin (71), */
+  4    89          3 n_bi_written		fixed bin (71),	/* meter (1) */
+  4    90          3 n_bi_bytes_written		fixed bin (71),	/* meter (2) */
+  4    91          3 n_journal_full		fixed bin (71),	/* meter (3) */
+  4    92          3 n_successful_recycles	fixed bin (71),	/* meter (4) */
+  4    93          3 n_ci_recycled		fixed bin (71),	/* meter (5) */
+  4    94          3 n_txn_started		fixed bin (71),	/* meter (6) */
+  4    95          3 n_non_null_txn		fixed bin (71),	/* meter (7) */
+  4    96          3 n_txn_storage_limit_hits	fixed bin (71),	/* meter (8) */
+  4    97          3 meter			(9:10) fixed bin (71),
+  4    98 						/* meter (9) - meter (10) */
+  4    99        2 pad_to_64_words		(6) bit (36);	/* 64 is even (see below) */
+  4   100 
+  4   101 
+  4   102 /*  END INCLUDE FILE:	dm_bj_pste.incl.pl1	*/
+      245 
+      246 
+  5     1 /* BEGIN INCLUDE FILE:	dm_bj_check_in_table.incl.pl1	*/
+  5     2 /*
+  5     3*Table for fast checking of who's got what BJ open
+  5     4*
+  5     5*Written by Andre Bensoussan June/July 1982
+  5     6*Modified:
+  5     7*08/30/82 by Lee A. Newcomb:  To use dm_system_data_ for max length of
+  5     8*	  vector and array bounds.
+  5     9**/
+  5    10 /* format: style4,indattr,idind33,^indcomtxt */
+  5    11 
+  5    12 dcl  bj_check_in_table_ptr	        ptr;
+  5    13 
+  5    14 dcl  1 bj_check_in_table	        based (bj_check_in_table_ptr) aligned,
+  5    15        2 max_n_processes	        fixed bin,
+  5    16        2 max_n_journals	        fixed bin,
+  5    17        2 process_id		        dim (dm_system_data_$bj_max_n_processes refer
+  5    18 			        (bj_check_in_table.max_n_processes)) bit (36),
+  5    19        2 cross_proc_bj	        dim (dm_system_data_$bj_max_n_processes refer
+  5    20 			        (bj_check_in_table.max_n_processes),
+  5    21 			        dm_system_data_$bj_max_n_journals refer (bj_check_in_table.max_n_journals))
+  5    22 			        bit (1) unaligned;
+  5    23 
+  5    24 /* END INCLUDE FILE:	dm_bj_check_in_table.incl.pl1	*/
+      247 
+      248 
+  6     1 /* BEGIN INCLUDE FILE:	dm_bj_pn_table.incl.pl1	*/
+  6     2 /*
+  6     3*This vector relates a BJ UID to its pathname.
+  6     4*
+  6     5*Written by Andre Bensoussan June/July 1982
+  6     6*Modified:
+  6     7*09/29/82 by Lee A. Newcomb:  To make word aligned, convert to use
+  6     8*	  dm_system_data_$bj_max_n_journals, and store max_n_entries
+  6     9*	  for use with crash recovery.
+  6    10**/
+  6    11 /* format: style4,indattr,idind33,^indcomtxt */
+  6    12 
+  6    13 dcl  bj_pn_table_ptr	        ptr;
+  6    14 
+  6    15 dcl  1 bj_pn_table		        based (bj_pn_table_ptr) aligned,
+  6    16        2 max_n_entries	        fixed bin,		/* know how long the table is for crash recovery */
+  6    17        2 bj_path_to_uid_relation      dim (dm_system_data_$bj_max_n_journals refer (bj_pn_table.max_n_entries)),
+  6    18          3 dir		        char (168),
+  6    19          3 entry		        char (32),
+  6    20          3 bj_uid		        bit (36);
+  6    21 
+  6    22 /* END INCLUDE FILE:	dm_bj_pn_table.incl.pl1	*/
+      249 
+      250 
+  7     1 /* BEGIN INCLUDE FILE:	dm_bj_txt.incl.pl1	*/
+  7     2 /* 
+  7     3*dm_bj_txt - before journal per-system transaction table.
+  7     4*
+  7     5*Designed by A. Bensoussan
+  7     6*Written  by M. Pandolf 06/02/82
+  7     7*Modified:
+  7     8*10/01/82 by Lee A. Newcomb:  To use dm_system_data_ for dimension attributes
+  7     9*	  and specify alignment on level one.
+  7    10*08feb83  by M. Pandolf:      To restructure the TXT and TXTE.
+  7    11*30mar83  by M. Pandolf:      To add last_completed_operation and ok_to_write.
+  7    12**/
+  7    13 /* format: style4,indattr,idind33,^indcomtxt */
+  7    14 
+  7    15 dcl  BJ_TXT_VERSION_1	        fixed bin int static options (constant) init (1);
+  7    16 
+  7    17 dcl  bj_txt_ptr		        ptr;		/* pointer to transaction table */
+  7    18 dcl  bj_txte_ptr		        ptr;		/* pointer to transaction table element */
+  7    19 
+  7    20 dcl  1 bj_txt		        aligned based (bj_txt_ptr), /* transaction table */
+  7    21        2 version		        fixed bin,		/* should be BJ_TXT_VERSION_1 */
+  7    22        2 max_n_entries	        fixed bin,
+  7    23        2 n_entries_used	        fixed bin,		/* assumed contiguous */
+  7    24        2 pad_header_to_32_words       bit (36) dim (29),	/* to mod32 align bj_txt.entry */
+  7    25        2 entry		        dim (dm_system_data_$max_n_transactions refer (bj_txt.max_n_entries))
+  7    26 			        like bj_txte;
+  7    27 
+  7    28 dcl  1 bj_txte		        based (bj_txte_ptr) aligned, /* single entry, must be mod32 word aligned */
+  7    29        2 tid		        bit (36),		/* transaction id if this or last txn */
+  7    30        2 bj_uid		        bit (36),		/* UID of before journal chosen at begin mark */
+  7    31        2 entry_state aligned,
+  7    32          3 last_completed_operation   char (4),		/* to prevent multiple abort and commit */
+  7    33          3 ok_to_write                bit (1),		/* basically validates using this entry */
+  7    34        2 owner_info aligned,				/* info about creation of txte */
+  7    35          3 process_id	        bit (36),		/* of process that wrote begin mark */
+  7    36        2 operator_info aligned,			/* of process that is currently using this txte */
+  7    37          3 process_id	        bit (36),		/* of process that shall write subsequent marks */
+  7    38          3 ppte_ptr		        ptr,		/* pointer to PPTE for this transaction */
+  7    39          3 bj_oid		        bit (36),		/* before journal opening ID for operator */
+  7    40        2 records_info aligned,			/* grouped to be saved and restored as one unit */
+  7    41          3 curr_checkpoint_rec_id     bit (36),		/* ident of checkpoint record if doing a rollback, */
+  7    42 						/* else, this value must be zero. */
+  7    43          3 first_bj_rec_id	        bit (36),		/* ident of first mark for this transaction */
+  7    44          3 last_bj_rec_id	        bit (36),		/* ident of current mark for this transaction */
+  7    45          3 n_rec_written	        fixed bin (35),	/* count of marks written for this transaction */
+  7    46          3 n_bytes_written	        fixed bin (35),	/* count of total bytes written to journal */
+  7    47          3 last_fm_postcommit_handler_rec_id
+  7    48 			        bit (36),		/* ident of last special handler in list */
+  7    49        2 append_state aligned,			/* the first two members define the state of this */
+  7    50          3 current_operation	        char (4),		/* transaction and its interaction with bj_storage: */
+  7    51          3 pending_bj_rec_id	        bit (36),		/* operation  rec_id  state */
+  7    52 						/*   *null*    XXX    quiesed */
+  7    53 						/*   ^null     "0"b   write pending */
+  7    54 						/*   ^null     ^"0"b  write completed, needs flushing */
+  7    55 						/* */
+  7    56          3 pending_n_rec_written      fixed bin (35),	/* copy to n_rec_written before flush */
+  7    57          3 pending_n_bytes_written    fixed bin (35),	/* copy to n_bytes_written before flush */
+  7    58        2 pad_entry_to_32_words        bit (36) dim (13);	/* make any part of table 32 words long */
+  7    59 
+  7    60 /* END INCLUDE FILE:	dm_bj_txt_ptr	*/
+      251 
+      252 
+  8     1 /* BEGIN INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+  8     2 
+  8     3 /* format: ^indcom */
+  8     4 
+  8     5 /* DESCRIPTION:
+  8     6*   These are the severity codes used by the dms daemon when calling its logger.
+  8     7*   The severity is ranked thusly:
+  8     8*
+  8     9*   severity log write situation
+  8    10*   -------- --- ----- ---------
+  8    11*          0 no  yes   standard output, query, etc.
+  8    12*          1 yes yes   fatal error, terminate dms daemon.
+  8    13*          2 yes yes   nonfatal error.
+  8    14*          3 yes yes   informative message.
+  8    15*          4 yes no    log information only.
+  8    16**/
+  8    17 
+  8    18 /* HISTORY:
+  8    19*
+  8    20*Written by M. Pandolf, 10/06/82.
+  8    21*Modified:
+  8    22*12/10/84 by R. Michael Tague: Rename and reformat description/history.
+  8    23*01/13/85 by Lee A. Newcomb:  Renamed to dm_log_sv_codes from
+  8    24*            dm_daemon_sv_codes as the severity codes for the DM log are not
+  8    25*            restrained to the DM Daemon's use.
+  8    26*01/24/85 by Lee A. Newcomb:  Fixed to say dm_log_sv_codes.incl.pl1 in the
+  8    27*            BEGIN and END INCLUDE comments, instead of dm_daemon_sv_codes.==.
+  8    28**/
+  8    29 
+  8    30 /* format: style5 */
+  8    31 
+  8    32      dcl	   (PRINT_SV, QUERY_SV)    fixed bin internal static
+  8    33 			       options (constant) init (0);
+  8    34      dcl	   (CRASH_SV, FATAL_SV)    fixed bin internal static
+  8    35 			       options (constant) init (1);
+  8    36      dcl	   ERROR_SV	       fixed bin internal static
+  8    37 			       options (constant) init (2);
+  8    38      dcl	   INFORM_SV	       fixed bin internal static
+  8    39 			       options (constant) init (3);
+  8    40      dcl	   LOG_SV		       fixed bin internal static
+  8    41 			       options (constant) init (4);
+  8    42 
+  8    43 /* END INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+      253 
+      254 
+      255 
+      256      end bj_close_oid;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    05/17/85  1328.6  bj_close_oid.pl1                  >spec>online>pbf-05/17/85>bj_close_oid.pl1
+239          1    01/07/85  0857.8  dm_bj_static.incl.pl1             >ldd>include>dm_bj_static.incl.pl1
+241          2    01/07/85  0857.6  dm_bj_ppt.incl.pl1                >ldd>include>dm_bj_ppt.incl.pl1
+243          3    01/07/85  0857.7  dm_bj_pst.incl.pl1                >ldd>include>dm_bj_pst.incl.pl1
+245          4    04/05/85  0924.4  dm_bj_pste.incl.pl1               >ldd>include>dm_bj_pste.incl.pl1
+247          5    01/07/85  0857.3  dm_bj_check_in_table.incl.pl1     >ldd>include>dm_bj_check_in_table.incl.pl1
+249          6    01/07/85  0857.4  dm_bj_pn_table.incl.pl1           >ldd>include>dm_bj_pn_table.incl.pl1
+251          7    01/07/85  0858.0  dm_bj_txt.incl.pl1                >ldd>include>dm_bj_txt.incl.pl1
+253          8    03/06/85  1031.1  dm_log_sv_codes.incl.pl1          >ldd>include>dm_log_sv_codes.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+ME                              000000 constant        char(32)                 initial unaligned dcl 88 set ref 231*
+addr                                                   builtin function         dcl 80 ref 147
+bj_oid                          000102 automatic       bit(36)                  dcl 74 set ref 132* 142* 201 204
+bj_oid_util$get_latest_oid      000012 constant        entry                    external dcl 94 ref 217
+bj_oid_util$get_ptr             000010 constant        entry                    external dcl 93 ref 142
+bj_ppt                                 based           structure                level 1 dcl 2-18
+bj_ppt_ptr                      000114 automatic       pointer                  dcl 2-16 set ref 199* 201 201 204 204 217 217
+bj_ppte                                based           structure                level 1 dcl 2-39
+bj_ppte_ptr                     000116 automatic       pointer                  dcl 2-37 set ref 142* 147 157 157 159 164 175 180
+                                                                                  195
+bj_pste                                based           structure                level 1 dcl 4-48
+bj_pste_delete                  000020 constant        entry                    external dcl 97 ref 187
+bj_pste_delete$after_recovery   000022 constant        entry                    external dcl 98 ref 190
+bj_pste_ptr                     000120 automatic       pointer                  dcl 4-45 in procedure "bj_close_oid" set ref 180*
+                                                                                  182* 186* 187 187 187* 190*
+bj_pste_ptr               4            based           pointer                  level 2 in structure "bj_ppte" dcl 2-39 in procedure
+                                                                                  "bj_close_oid" ref 180
+bj_pste_register$check_out      000014 constant        entry                    external dcl 95 ref 182
+bj_pste_register$check_out_dead 000016 constant        entry                    external dcl 96 ref 186
+bj_report_err                   000024 constant        entry                    external dcl 99 ref 231
+bj_txt                                 based           structure                level 1 dcl 7-20
+bj_txte                                based           structure                level 1 dcl 7-28
+bj_uid                    1            based           bit(36)                  level 2 in structure "bj_txte" dcl 7-28 in procedure
+                                                                                  "bj_close_oid" ref 147
+bj_uid                    1            based           bit(36)                  level 2 in structure "bj_ppte" dcl 2-39 in procedure
+                                                                                  "bj_close_oid" ref 147
+bjm_data_$bj_ppt_ptr            000036 external static pointer                  dcl 111 ref 170 170 199
+cleanup                         000106 stack reference condition                dcl 84 ref 136
+close_after_recovery            000103 automatic       bit(1)                   unaligned dcl 75 set ref 122* 127* 157 184
+code                            000101 automatic       fixed bin(35,0)          dcl 72 set ref 133* 150* 211* 222 231*
+cu_$level_get                   000026 constant        entry                    external dcl 100 ref 134
+cu_$level_set                   000030 constant        entry                    external dcl 101 ref 137 210 212
+default_bj                4            based           structure                level 2 dcl 2-18
+dm_data_$bj_txt_ptr             000040 external static pointer                  dcl 113 ref 147
+dm_data_$current_txn_id         000042 external static bit(36)                  unaligned dcl 114 ref 147
+dm_data_$current_txn_index      000044 external static fixed bin(17,0)          dcl 115 ref 147
+dm_error_$bj_journal_in_use     000046 external static fixed bin(35,0)          dcl 116 ref 150
+entry                    40            based           structure                array level 2 dcl 7-20 set ref 147
+file_manager_$close             000032 constant        entry                    external dcl 102 ref 211
+fm_oid                          000100 automatic       bit(36)                  dcl 71 set ref 175* 211*
+get_ring_                       000034 constant        entry                    external dcl 103 ref 210 210
+last_opened_oid           5            based           bit(36)                  level 3 dcl 2-18 set ref 204 204* 217 217*
+n_entries_used            2            based           fixed bin(17,0)          level 2 dcl 2-18 set ref 170* 170
+n_opening                 3            based           fixed bin(17,0)          level 2 dcl 2-39 set ref 157* 157 159* 164
+n_processes              16            based           fixed bin(17,0)          level 2 dcl 4-48 ref 187
+n_txn                    17            based           fixed bin(17,0)          level 2 dcl 4-48 ref 187
+p_bj_oid                               parameter       bit(36)                  dcl 67 ref 59 125 132
+pf_oid                    2            based           bit(36)                  level 2 dcl 2-39 ref 175
+saved_level                     000104 automatic       fixed bin(17,0)          dcl 76 set ref 134* 137* 212*
+user_set_oid              4            based           bit(36)                  level 3 dcl 2-18 set ref 201 201*
+version                                based           fixed bin(17,0)          level 2 dcl 2-39 set ref 195*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+BJ_PPTE_VERSION_1                      internal static fixed bin(17,0)          initial dcl 2-14
+BJ_PPT_VERSION_1                       internal static fixed bin(17,0)          initial dcl 2-13
+BJ_PSTE_VERSION_2                      internal static fixed bin(17,0)          initial dcl 4-42
+BJ_PST_VERSION_1                       internal static fixed bin(17,0)          initial dcl 3-14
+BJ_TXT_VERSION_1                       internal static fixed bin(17,0)          initial dcl 7-15
+CRASH_SV                               internal static fixed bin(17,0)          initial dcl 8-34
+ERROR_SV                               internal static fixed bin(17,0)          initial dcl 8-36
+FATAL_SV                               internal static fixed bin(17,0)          initial dcl 8-34
+INFORM_SV                              internal static fixed bin(17,0)          initial dcl 8-38
+LOG_SV                                 internal static fixed bin(17,0)          initial dcl 8-40
+PRINT_SV                               internal static fixed bin(17,0)          initial dcl 8-32
+QUERY_SV                               internal static fixed bin(17,0)          initial dcl 8-32
+bj_check_in_table                      based           structure                level 1 dcl 5-14
+bj_check_in_table_ptr                  automatic       pointer                  dcl 5-12
+bj_pn_table                            based           structure                level 1 dcl 6-15
+bj_pn_table_ptr                        automatic       pointer                  dcl 6-13
+bj_pst                                 based           structure                level 1 dcl 3-18
+bj_pst_ptr                             automatic       pointer                  dcl 3-16
+bj_txt_ptr                             automatic       pointer                  dcl 7-17
+bj_txte_ptr                            automatic       pointer                  dcl 7-18
+bj_uid                                 automatic       bit(36)                  dcl 73
+bjm_data_$bj_pst_ptr                   external static pointer                  dcl 112
+dm_system_data_$bj_max_n_journals      external static fixed bin(17,0)          dcl 1-8
+dm_system_data_$bj_max_n_processes     external static fixed bin(17,0)          dcl 1-9
+dm_system_data_$max_n_transactions     external static fixed bin(17,0)          dcl 1-10
+hcs_$validate_processid         000000 constant        entry                    external dcl 104
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+COMMON                          000044 constant        label                    dcl 132 ref 123 128
+after_recovery                  000034 constant        entry                    external dcl 125
+bj_close_oid                    000023 constant        entry                    external dcl 59
+exit                            000315 constant        label                    dcl 228 ref 164 233
+local_error_exit                000316 constant        label                    dcl 231 ref 151 222
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0       570         640     334         600
+Length      1206     334        50         331     234           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+bj_close_oid                        106 external procedure  is an external procedure.  
+on unit on line 136                  68 on unit               
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+bj_close_oid             000100 fm_oid                      bj_close_oid
+                         000101 code                        bj_close_oid
+                         000102 bj_oid                      bj_close_oid
+                         000103 close_after_recovery        bj_close_oid
+                         000104 saved_level                 bj_close_oid
+                         000114 bj_ppt_ptr                  bj_close_oid
+                         000116 bj_ppte_ptr                 bj_close_oid
+                         000120 bj_pste_ptr                 bj_close_oid
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+call_ext_out_desc   call_ext_out        return              enable              ext_entry           int_entry
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+bj_oid_util$get_latest_oid    bj_oid_util$get_ptr           bj_pste_delete                bj_pste_delete$after_recovery
+bj_pste_register$check_out    bj_pste_register$check_out_dead                             bj_report_err
+cu_$level_get                 cu_$level_set                 file_manager_$close           get_ring_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+bjm_data_$bj_ppt_ptr          dm_data_$bj_txt_ptr           dm_data_$current_txn_id       dm_data_$current_txn_index
+dm_error_$bj_journal_in_use
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     59 000020       122 000030       123 000031       125 000032       127 000041       128 000043       132 000044
+    133 000047       134 000050       136 000057       137 000073       138 000102       142 000103       147 000114
+    150 000130       151 000132       157 000133       159 000141       164 000143       170 000145       175 000151
+    180 000153       182 000155       184 000163       186 000165       187 000200       189 000214       190 000215
+    195 000224       199 000225       201 000231       204 000236       210 000242       211 000261       212 000272
+    217 000301       222 000313       228 000315       231 000316       233 000333
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

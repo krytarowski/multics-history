@@ -1,0 +1,901 @@
+	COMPILATION LISTING OF SEGMENT bjm_attribute_fref_
+	Compiled by: Multics PL/I Compiler, Release 28e, of February 14, 1985
+	Compiled at: Honeywell Multics Op. - System M
+	Compiled on: 04/24/85  0835.1 mst Wed
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        4*   *                                                         *
+        5*   *********************************************************** */
+        6 
+        7 /* DESCRIPTION:
+        8*
+        9*		bjm_attribute_fref_
+       10*	This module maintains or gets before journal attributes which
+       11*     require a running DM system.  It is different from bjm_attribute_ in
+       12*     that it sets of the the DM firstref trap and does not rely on
+       13*     file_manager_ for all support.
+       14*
+       15*	Currently, only setting the per-transaction storage limit is
+       16*     supported.  The general scenario is open the journal, set the limit,
+       17*     and close the journal.  Due to the current bjm error handling
+       18*     mechanism, the setup for BJM error handling is left until the open
+       19*     call has returned.  If it was setup immediately, a BJM recursion error
+       20*     would occur.
+       21**/
+       22 
+       23 /* HISTORY:
+       24*
+       25*Written by Lee A. Newcomb, 03/18/85.
+       26*Modified:
+       27*03/22/85 by Lee A. Newcomb:  Fixed to use error_table_$item_too_big instead of
+       28*            =$bigarg.
+       29*03/25/85 by Lee A. Newcomb:  Fixed to make sure user has at least "m"
+       30*            access to a BJ's containing dir before setting txn storage limit.
+       31*04/08/85 by Lee A. Newcomb:  Fixed to have FINISH only call ERROR_RETURN if
+       32*            bjm_data_$bj_code is non-zero, instead of any time it is called in
+       33*            normal return; added several explainatory comments; renamed and
+       34*            added several comments for readability.
+       35**/
+       36 
+       37 /* format: style2,ll79,ind3,^indprocbody,ifthendo,ifthen,^indnoniterdo,^inddcls,dclind5,idind35,linecom */
+       38 
+       39 bjm_attribute_fref_$set_transaction_storage_limit:
+       40    proc (p_dir_path, p_entry_name, p_transaction_storage_limit, p_code);
+       41 
+       42 
+       43 /* START OF DECLARATIONS */
+       44 
+       45 /* Parameter */
+       46 dcl  (
+       47      p_dir_path			char (*),		/* dir containing BJ (Input) */
+       48      p_entry_name			char (*),		/* BJ name (Input) */
+       49      p_transaction_storage_limit	fixed bin (35),	/* new txn storage limit (Input) */
+       50      p_code			fixed bin (35)	/* status code (Output) */
+       51      )				parameter;
+       52 
+       53 /* Automatic */
+       54 dcl  (
+       55      bj_oid			bit (36) aligned init (NULL_BJ_OID),
+       56      bjm_clean_up_needed		bit (1) aligned init (NO),
+       57 						/* for cleanup handler */
+       58      code				fixed bin (35) init (0),
+       59      containing_dir_path		char (168) init (""),
+       60 						/* dir containing dir containing BJ */
+       61      dir_name			char (32) init (""),/* entry name portion of dir_path */
+       62      dir_path			char (168) init (""),
+       63 						/* copy of parameter */
+       64      dir_path_effective_access	bit (36) aligned init (N_ACCESS),
+       65      dir_path_from_bjm		char (168) init (""),
+       66 						/* dir_path as recorded in BJM tables */
+       67 						/* used so links won't bypass access check */
+       68      entry_name			char (32) init (""),/* copy of parameter */
+       69      transaction_storage_limit	fixed bin (35) init (-1)
+       70 						/* copy of parameter */
+       71      )				automatic;
+       72 
+       73 /* Based */
+       74 /* Builtin */
+       75 dcl  (length, reverse, rtrim, substr)	builtin;
+       76 
+       77 /* Condition */
+       78 dcl  cleanup			condition;
+       79 
+       80 /* Constant */
+       81 dcl  (
+       82      CHECK_FOR_BJM_RECURSION		bit (1) aligned init ("1"b),
+       83      DONT_CHECK_FOR_BJM_RECURSION	bit (1) aligned init (""b),
+       84      FINISH_MUST_IGNORE_ERRORS	bit (1) aligned init (""b),
+       85      FINISH_MUST_NOT_IGNORE_ERRORS	bit (1) aligned init ("1"b),
+       86      MYNAME			char (32) init ("bjm_attribute_fref_"),
+       87      NO				bit (1) aligned init (""b),
+       88      NULL_BJ_OID			bit (36) aligned init (""b),
+       89      YES				bit (1) aligned init ("1"b)
+       90      )				internal static options (constant);
+       91 
+       92 /* Entry */
+       93 dcl  (
+       94      before_journal_manager_$get_bj_path_from_oid
+       95 				entry (bit (36) aligned, char (*),
+       96 				char (*), fixed bin (35)),
+       97      before_journal_manager_$open_bj	entry (char (*), char (*),
+       98 				bit (36) aligned, fixed bin (35)),
+       99      bj_ci_zero$put_header		entry (bit (36) aligned, ptr,
+      100 				fixed bin),
+      101      bj_cleanup_tables$handler	entry (fixed bin (35)),
+      102      bj_close_oid			entry (bit (36) aligned),
+      103      bj_oid_util$get_ptr		entry (bit (36) aligned) returns (ptr),
+      104      bj_max_txn_storage_limit		entry (ptr) returns (fixed bin (35)),
+      105      bj_pste_lock$lock		entry (ptr, bit (36) aligned),
+      106      bj_pste_lock$unlock		entry (ptr),
+      107      expand_pathname_		entry (char (*), char (*), char (*),
+      108 				fixed bin (35)),
+      109      get_group_id_			entry () returns (char (32)),
+      110      get_ring_			entry () returns (fixed bin (3)),
+      111      hcs_$get_user_access_modes	entry (char (*), char (*), char (*),
+      112 				fixed bin, bit (36) aligned,
+      113 				bit (36) aligned, fixed bin (35))
+      114      )				external;
+      115 
+      116 /* External */
+      117 dcl  (
+      118      (
+      119      dm_error_$bj_bad_ppte_version,
+      120      dm_error_$bj_bad_pste_version,
+      121      dm_error_$bj_invalid_name,
+      122      dm_error_$bj_recursive_invoc,
+      123      error_table_$incorrect_access,
+      124      error_table_$item_too_big,
+      125      error_table_$smallarg
+      126      )				fixed bin (35)
+      127      )				external static;
+      128 
+      129 /* END OF DECLARATIONS */
+      130 
+      131 /*			repeat for reader's convenience	*/
+      132 /* bjm_attribute_fref_$set_transaction_storage_limit:		*/
+      133 /*     proc (p_dir_path, p_entry_name,			*/
+      134 /*		p_stransaction_storage_limit, p_code);		*/
+      135 
+      136 COPY_AND_INIT_PARAMETERS:
+      137    do;
+      138       dir_path = p_dir_path;
+      139       entry_name = p_entry_name;
+      140       transaction_storage_limit = p_transaction_storage_limit;
+      141       p_code = 0;
+      142    end COPY_AND_INIT_PARAMETERS;
+      143 
+      144 PARTIALLY_VALIDATE_INPUT_PARAMETERS:
+      145    do;
+      146       if ^IS_VALID_BJ_NAME (entry_name) then
+      147          call ERROR_RETURN (dm_error_$bj_invalid_name);
+      148       if transaction_storage_limit < 0 then
+      149          call ERROR_RETURN (error_table_$smallarg);
+      150    end PARTIALLY_VALIDATE_INPUT_PARAMETERS;
+      151 
+      152 SETUP_FOR_NON_STANDARD_EXIT:
+      153    on cleanup call CLEAN_UP ();
+      154 
+      155 OPEN_JOURNAL:					/* to get the BJ's header */
+      156    do;
+      157       call before_journal_manager_$open_bj (dir_path, entry_name, bj_oid, code)
+      158 	 ;
+      159       if bj_oid = NULL_BJ_OID then
+      160          call ERROR_RETURN (code);
+      161    end OPEN_JOURNAL;
+      162 
+      163 VALIDATE_CONTAINING_DIR_MODIFY_ACCESS:
+      164    do;
+      165       call before_journal_manager_$get_bj_path_from_oid (bj_oid,
+      166 	 dir_path_from_bjm, (32)"" /* already have BJ name */, code);
+      167       if code ^= 0 then
+      168          call ERROR_RETURN (code);
+      169       call expand_pathname_ (dir_path_from_bjm, containing_dir_path, dir_name,
+      170 	 code);
+      171       if code ^= 0 then
+      172          call ERROR_RETURN (code);
+      173       call hcs_$get_user_access_modes (containing_dir_path, dir_name,
+      174 	 get_group_id_ (), get_ring_ (), dir_path_effective_access,
+      175 	 (""b) /* ignore xmodes */, code);
+      176       if code ^= 0 then
+      177          call ERROR_RETURN (code);
+      178       if (dir_path_effective_access & M_ACCESS) ^= M_ACCESS then
+      179          call ERROR_RETURN (error_table_$incorrect_access);
+      180    end VALIDATE_CONTAINING_DIR_MODIFY_ACCESS;
+      181 
+      182 /* Now we can set the bjm_data_ error handling values to indicate we	*/
+      183 /* are in control.  The only way this should be able to fail is if	*/
+      184 /* the DM ring is the login ring.				*/
+      185    call SET_BJM_DATA_ERROR_HANDLING_VALUES (NONLOCAL_ERROR_EXIT, MYNAME,
+      186         CHECK_FOR_BJM_RECURSION);
+      187 
+      188 FIND_BJ_PST_ENTRY:
+      189    do;
+      190       bj_ppte_ptr = bj_oid_util$get_ptr (bj_oid);
+      191       call CHECK_VERSION_NUMERIC (bj_ppte.version, BJ_PPTE_VERSION_1,
+      192 	 dm_error_$bj_bad_ppte_version);
+      193       bj_pste_ptr = bj_ppte.bj_pste_ptr;
+      194       call CHECK_VERSION_NUMERIC (bj_pste.version, BJ_PSTE_VERSION_2,
+      195 	 dm_error_$bj_bad_pste_version);
+      196       call bj_pste_lock$lock (bj_pste_ptr, bj_ppte.bj_uid);
+      197    end FIND_BJ_PST_ENTRY;
+      198 
+      199    if transaction_storage_limit = 0 then
+      200 SET_LIMIT_TO_MAXIMUM:
+      201       transaction_storage_limit = bj_max_txn_storage_limit (bj_pste_ptr);
+      202    else
+      203 VALIDATE_TRANSACTION_STORAGE_LIMIT:
+      204         if transaction_storage_limit > bj_max_txn_storage_limit (bj_pste_ptr)
+      205         then
+      206       call ERROR_RETURN (error_table_$item_too_big);
+      207 
+      208 SET_NEW_TRANSACTION_STORAGE_LIMIT:
+      209    do;
+      210       bj_pste.txn_storage_limit = transaction_storage_limit;
+      211       call bj_ci_zero$put_header (bj_ppte.pf_oid, bj_pste_ptr, size (bj_pste));
+      212    end SET_NEW_TRANSACTION_STORAGE_LIMIT;
+      213 
+      214 
+      215    call RETURN ();
+      216 
+      217 /* end bjm_attribute_fref_$set_transaction_storage_limit; */
+      218 
+      219 MAIN_RETURN:
+      220    return;
+
+
+
+
+      221 
+      222 NONLOCAL_ERROR_EXIT:
+      223    call ERROR_RETURN (bjm_data_$bj_code);
+
+
+
+
+      224 
+      225 CHECK_VERSION_NUMERIC:
+      226    proc (cvn_p_given_version, cvn_p_correct_version, cvn_p_error_to_use);
+      227 
+      228 /* The error code to use is passed as this is really a template proc	*/
+      229 /* used in several modules to check structure versions.  It is hoped	*/
+      230 /* newer versions of these structures will be changed to use	*/
+      231 /* char (8) versions.					*/
+      232 
+      233 dcl  (
+      234      cvn_p_given_version		fixed bin,
+      235      cvn_p_correct_version		fixed bin,
+      236      cvn_p_error_to_use		fixed bin (35)
+      237      )				parameter;
+      238 
+      239    if cvn_p_given_version ^= cvn_p_correct_version then
+      240       call ERROR_RETURN (cvn_p_error_to_use);
+      241 
+      242    end CHECK_VERSION_NUMERIC;
+
+
+
+
+      243 
+      244 CLEAN_UP:
+      245    proc ();
+      246 
+      247 /* CLEAN_UP doubles as a cleanup handler and ERROR_FINISH procedure.	*/
+      248 /* We will call the FINISH proc as it is a subset of the work we must	*/
+      249 /* do, passing an argument telling it to not report any errors.	*/
+      250 
+      251    if bjm_clean_up_needed = YES then
+      252       call bj_cleanup_tables$handler (0);
+      253 
+      254    call FINISH (FINISH_MUST_IGNORE_ERRORS);
+      255 
+      256    return;
+      257 
+      258    end CLEAN_UP;
+      259 
+      260 ERROR_RETURN:
+      261    proc (er_p_code);
+      262 
+      263 dcl  er_p_code			fixed bin (35) parameter;
+      264 
+      265    p_code = er_p_code;
+      266    call CLEAN_UP ();				/* our ERROR_FINISH proc */
+      267    goto MAIN_RETURN;
+      268 
+      269    end ERROR_RETURN;
+
+
+
+
+      270 
+      271 FINISH:
+      272    proc (f_p_ignore_errors);
+      273 
+      274 /* FINISH is used to undo anything done which should be reset.  An	*/
+      275 /* example is closing a before journal we may have opened.  Note some	*/
+      276 /* of this work must be done whether we are returning from an error,	*/
+      277 /* while cleaning up, or in the normal course of work.  Rather than	*/
+      278 /* duplicate this code in CLEAN_UP, CLEAN_UP informs us we may not	*/
+      279 /* call ERROR_RETURN.  However, if we want to return normally, RETURN	*/
+      280 /* also calls, but passes a parameter indicating we must report any	*/
+      281 /* errors encountered.					*/
+      282 
+      283 dcl  f_p_ignore_errors		bit (1) aligned parameter;
+      284 dcl  f_bj_oid			bit (36) aligned
+      285 				init (NULL_BJ_OID) automatic;
+      286 
+      287    if bj_oid ^= NULL_BJ_OID then
+      288 CLOSE_THIS_BJ_OPENING:
+      289       do;
+      290       bjm_data_$bj_exit_err = FINISH_ERROR_LABEL;
+      291       f_bj_oid = bj_oid;
+      292       bj_oid = NULL_BJ_OID;				/* so we can't close >1 times */
+      293       call bj_close_oid (f_bj_oid);
+      294    end CLOSE_THIS_BJ_OPENING;
+      295 
+      296 FINISH_ERROR_LABEL:
+      297    if (f_p_ignore_errors = FINISH_MUST_NOT_IGNORE_ERRORS)
+      298         & (bjm_data_$bj_code ^= 0) then
+      299       call ERROR_RETURN (bjm_data_$bj_code);		/* won't return */
+      300 
+      301    call SET_BJM_DATA_ERROR_HANDLING_VALUES (bjm_data_$bj_default_error_label,
+      302         "", DONT_CHECK_FOR_BJM_RECURSION);
+      303 
+      304    return;
+      305 
+      306    end FINISH;
+      307 
+      308 IS_VALID_BJ_NAME:
+      309    proc (ivbn_p_bj_name) reducible returns (bit (1) aligned);
+      310 
+      311 dcl  ivbn_p_bj_name			char (*) parameter;
+      312 
+      313    return ((length (rtrim (ivbn_p_bj_name)) < 33)
+      314         & (substr (reverse (rtrim (ivbn_p_bj_name)), 1, 3) = "jb."));
+      315 
+      316    end IS_VALID_BJ_NAME;
+
+
+
+
+      317 
+      318 RETURN:
+      319    proc ();
+      320 
+      321    call bj_pste_lock$unlock (bj_pste_ptr);
+      322    call FINISH (FINISH_MUST_NOT_IGNORE_ERRORS);
+      323    go to MAIN_RETURN;
+      324 
+      325    end RETURN;
+      326 
+      327 SET_BJM_DATA_ERROR_HANDLING_VALUES:
+      328    proc (sbdehv_p_error_exit, sbdehv_p_operation,
+      329         sbdehv_p_check_for_recursive_invocation);
+      330 
+      331 /* This internal procedure centralizes the setting of the BJM global	*/
+      332 /* error values in bjm_data_.  It is called near the beginning of	*/
+      333 /* this module, and in the FINISH internal procedure.  ONLY THE FIRST	*/
+      334 /* OF THESE CALLS SHOULD ASK FOR DETECTION OF A RECURSIVE INVOCATION	*/
+      335 /* OF THE BEFORE JOURNAL MANAGER, if the other calls did, we could	*/
+      336 /* end up getting a recursive call ERROR_RETURN, CLEAN_UP, FINISH,	*/
+      337 /* this proc, etc.						*/
+      338 /*							*/
+      339 /* Note: if sbdehv_p_check_for_recursive_invocation and		*/
+      340 /* bjm_clean_up_needed both have negative meanings, we do not set any	*/
+      341 /* values.  This may happen if we call ERROR_RETURN before calling	*/
+      342 /* this proc (e.g., a failure in partial argument validation).	*/
+      343 
+      344 dcl  (
+      345      sbdehv_p_error_exit		label variable,
+      346      sbdehv_p_operation		char (*),
+      347      sbdehv_p_check_for_recursive_invocation
+      348 				bit (1) aligned
+      349      )				parameter;
+      350 
+      351    if sbdehv_p_check_for_recursive_invocation = CHECK_FOR_BJM_RECURSION then
+      352       if bjm_data_$bj_operation ^= "" then
+      353          call ERROR_RETURN (dm_error_$bj_recursive_invoc);
+      354 
+      355    if (bjm_clean_up_needed = NO)
+      356         & (sbdehv_p_check_for_recursive_invocation
+      357         = DONT_CHECK_FOR_BJM_RECURSION) then
+      358       ;
+      359    else
+      360 SET_BJM_DATA_ERROR_VALUES:
+      361       do;
+      362       bjm_clean_up_needed = YES;
+      363       bjm_data_$bj_operation = sbdehv_p_operation;
+      364       bjm_data_$bj_exit_err = sbdehv_p_error_exit;
+      365       bjm_data_$bj_code = 0;
+      366    end SET_BJM_DATA_ERROR_VALUES;
+      367 
+      368    return;
+      369 
+      370    end SET_BJM_DATA_ERROR_HANDLING_VALUES;
+      371 
+  1     1 /* BEGIN INCLUDE FILE dm_bj_global_error_info.incl.pl1 */
+  1     2 
+  1     3 /* Originally found in before journal primitives written by */
+  1     4 /* A. Bensoussan.  Gathered into an include file for ease of use. */
+  1     5 /* See the bjm_data_.alm source for details of use. */
+  1     6 
+  1     7 /* HISTORY:
+  1     8*Written by Mike Pandolf, 07/14/82.
+  1     9*Modified:
+  1    10*12/06/83 by L. A. Newcomb:  Renamed before_journal_manager_static_ to
+  1    11*            bjm_data_ and moved some cells from dm_data_ to bjm_data_.
+  1    12**/
+  1    13 
+  1    14 /* format: style4,indattr,ifthenstmt,ifthen,^indcomtxt,idind33 */
+  1    15 dcl  bjm_data_$bj_operation	        char (32) external static;
+  1    16 
+  1    17 dcl  bjm_data_$bj_exit_err	        label variable external;
+  1    18 
+  1    19 dcl  bjm_data_$bj_code	        fixed bin (35) external;
+  1    20 
+  1    21 dcl  bjm_data_$bj_default_error_label label external static;
+  1    22 
+  1    23 
+  1    24 /* END INCLUDE FILE dm_bj_global_error_info.incl.pl1 */
+      372 
+      373 
+  2     1 /*  BEGIN INCLUDE FILE:	dm_bj_ppt.incl.pl1	*/
+  2     2 /*
+  2     3*Layout of the per-process before journal table and entries.
+  2     4*
+  2     5*Written by Andre Bensoussan June/July 1982
+  2     6*Modified:
+  2     7*09/29/82 by Lee A. Newcomb:  To make two default oid cells, pad ppte's
+  2     8*	  to account for all used space, and use dm_system_data_ for
+  2     9*	  determining dimension of bj_ppt.e.
+  2    10**/
+  2    11 /* format: style4,indattr,idind33,^indcomtxt */
+  2    12 
+  2    13 dcl  BJ_PPT_VERSION_1	        fixed bin int static options (constant) init (1);
+  2    14 dcl  BJ_PPTE_VERSION_1	        fixed bin int static options (constant) init (1);
+  2    15 
+  2    16 dcl  bj_ppt_ptr		        ptr;
+  2    17 
+  2    18 dcl  1 bj_ppt		        based (bj_ppt_ptr) aligned,
+  2    19        2 version		        fixed bin,
+  2    20        2 max_n_entries	        fixed bin,		/* should be = dm_system_data_$bj_max_n_journals */
+  2    21        2 n_entries_used	        fixed bin,		/* # of BJs open in this process */
+  2    22        2 highest_ix_used	        fixed bin,		/* max. # of BJs ever opened in this process */
+  2    23        2 default_bj,				/* for selecting a txn def. BJ by write_before_mark protocol */
+  2    24          3 user_set_oid	        bit (36),		/* explicit user setting via $set_default_bj */
+  2    25          3 last_opened_oid	        bit (36),		/* implicit if no user setting, set by open and close */
+  2    26 						/* if both zero, use system default BJ */
+  2    27        2 process_id		        bit (36),		/* so we don't have to keep calling for it. */
+  2    28        2 process_ix		        fixed bin,		/* index into bj_check_in_table */
+  2    29        2 mod_list_area	        (100) fixed bin (35), /* for keeping track of ppt mods, not curr. used */
+  2    30 
+  2    31        2 e		        dim (dm_system_data_$bj_max_n_journals refer (bj_ppt.max_n_entries))
+  2    32 			        like bj_ppte;	/* an entry for each BJ open in this process */
+  2    33 						/* always make sure bj_ppt.e is on a even word boundary */
+  2    34 
+  2    35 /* now specify the format of each per-process BJ table entry */
+  2    36 
+  2    37 dcl  bj_ppte_ptr		        ptr;
+  2    38 
+  2    39 dcl  1 bj_ppte		        based (bj_ppte_ptr) aligned,
+  2    40        2 version		        fixed bin,		/* better be the same for all entries in a bj_ppt */
+  2    41        2 bj_uid		        bit (36),		/* UID of the BJ page file */
+  2    42        2 pf_oid		        bit (36),		/* OID of the BJ page file */
+  2    43        2 n_opening		        fixed bin,		/* how many openings this process has done for this BJ */
+  2    44        2 bj_pste_ptr	        ptr,		/* "link" to per-system BJ table entry */
+  2    45        2 open_time		        fixed bin (71);	/* used to fill in bj_ppt.default_bj.last_opened_oid */
+  2    46 						/* if the last opened BJ is closed */
+  2    47 
+  2    48 /* END INCLUDE FILE:	bj_ppt.incl.pl1	*/
+      374 
+      375 
+  3     1 /* BEGIN INCLUDE FILE:	dm_bj_pste.incl.pl1	*/
+  3     2 
+  3     3 /* DESCRIPTION
+  3     4*
+  3     5*	Layout of the per-system before journal table
+  3     6*     entries.  This structure is used to contain information
+  3     7*     about a before journal active in a running DMS.  It is
+  3     8*     currently also used as the header of a before journal
+  3     9*     (see dm_bj_header.incl.pl1).  Version changes to this
+  3    10*     structure require either automatic conversion to be set
+  3    11*     up, or users to be told to re-create their journals.
+  3    12*
+  3    13*	Currently, a bj_pste must be 64 words long;  any
+  3    14*     future changes must at least make sure a bj_pste is an
+  3    15*     even # of words for the alignment of some of its
+  3    16*     elements.
+  3    17**/
+  3    18 
+  3    19 /*  HISTORY:
+  3    20*
+  3    21*Written by Andre Bensoussan, 06/15/82.
+  3    22*Modified:
+  3    23*08/16/82 by Andre Bensoussan: to add stamp_for_last_ci_put.
+  3    24*09/29/82 by Lee A. Newcomb: to fix BJ_PSTE_VERSION_1 and fix some
+  3    25*	  alignments.
+  3    26*11/01/82 by Andre Bensoussan: to add "stamp_for_last_ci_on_disk",
+  3    27*	  "n_bi_still_unsafe", and "n_bi_being_saved".
+  3    28*02/08/83 by M. Pandolf: to add append_state structure.
+  3    29*03/19/83 by L. A. Newcomb: to fix up some alignments and spelling problems.
+  3    30*04/27/83 by M. Pandolf: to add meter structure at end.
+  3    31*02/11/85 by Lee A. Newcomb:  Fixed version constant name to agree with its
+  3    32*            value of 2; fixed references to page files or PF's; fixed format
+  3    33*            of description and history sections.
+  3    34*03/07/85 by Lee A. Newcomb:  Changed a pad word to be txn_storage_limit and
+  3    35*            expanded on the description for future generations (no
+  3    36*            version was made).
+  3    37*03/27/85 by Lee A. Newcomb:  Changed one of the unused meters to
+  3    38*            n_txn_storage_limit_hits (again without a version change).
+  3    39**/
+  3    40 /* format: style2,ll79,ind3,^indprocbody,ifthendo,ifthen,^indnoniterdo,^inddcls,dclind5,idind35,linecom */
+  3    41 
+  3    42 dcl  BJ_PSTE_VERSION_2		fixed bin internal static
+  3    43 				options (constant) init (2);
+  3    44 
+  3    45 dcl  bj_pste_ptr			ptr;
+  3    46 
+  3    47 /* MUST HAVE EVEN NUMBER OR WORDS */
+  3    48 dcl  1 bj_pste			based (bj_pste_ptr) aligned,
+  3    49        2 version			fixed bin,
+  3    50        2 bj_ix			fixed bin,	/* Index of this entry in bj_pst table */
+  3    51        2 lock			aligned,
+  3    52          3 pid			bit (36),		/* process ID of lock owner */
+  3    53          3 event			bit (36),
+  3    54        2 bj_uid			bit (36),		/* UID of BJ file */
+  3    55        2 ci_size			fixed bin,	/* In number of bytes */
+  3    56        2 max_size			fixed bin,	/* In number of ci's */
+  3    57        2 active			bit (1) aligned,	/* 0 means journal not being used */
+  3    58        2 time_header_updated		fixed bin (71),
+  3    59        2 earliest_meaningful_time	fixed bin (71),	/* time stamp on first valid control interval */
+  3    60        2 update_frequency		fixed bin,	/* Not used yet, probably will be how many CIs */
+  3    61        2 last_rec_id		bit (36),		/* rec id of the last logical record in journal */
+  3    62        2 n_processes		fixed bin,	/* Number of processes using this BJ */
+  3    63        2 n_txn			fixed bin,	/* Number of txn in progress using this BJ */
+  3    64        2 last_ci_info		aligned,
+  3    65          3 last_ci_buffered		fixed bin (24) uns, /* Last ci encached in the buffer */
+  3    66          3 last_ci_put		fixed bin (24) uns, /* Last ci put in the BJ */
+  3    67          3 last_ci_flushed		fixed bin (24) uns, /* Last ci for which flush initiated */
+  3    68          3 last_ci_on_disk		fixed bin (24) uns, /* Last ci of that portion of the BJ known to be ... */
+  3    69 						/* .. completely on disk */
+  3    70          3 stamp_for_last_ci_put	fixed bin (71),	/* Time stamp associated with the last ci put in the BJ */
+  3    71          3 stamp_for_last_ci_on_disk	fixed bin (71),	/* Time stamp associated with the last ci on disk in the BJ */
+  3    72        2 n_bi_still_unsafe		fixed bin,	/* number of bi's still not on disk */
+  3    73        2 n_bi_being_saved		fixed bin,	/* number of bi's for which flush initiated */
+  3    74        2 buffer_offset		fixed bin (18) uns, /* Now allocated in the bj_pst segment */
+  3    75        2 txn_storage_limit		fixed bin (35),	/* # of bytes a single txn may write */
+  3    76        2 cl			aligned,		/* Circular List */
+  3    77          3 origin_ci		fixed bin (24) uns,
+  3    78          3 lowest_ci		fixed bin (24) uns,
+  3    79          3 highest_ci		fixed bin (24) uns,
+  3    80          3 number_ci		fixed bin (24) uns,
+  3    81        2 append_state		aligned,
+  3    82          3 current_operation		char (4),		/* equal to "appe" when append in progress */
+  3    83          3 pending_n_txn		fixed bin,	/* n_txn value when append done */
+  3    84          3 pending_last_rec_id	bit (36),		/* last_rec_id value after append done */
+  3    85          3 pending_last_element_id	bit (36),		/* last element id after append done */
+  3    86          3 txte_rec_id_relp		bit (18),		/* rel ptr into seg containing TXT for txte.pending_bj_rec_id */
+  3    87        2 pad_to_even_word1		bit (36) aligned,
+  3    88        2 meters			aligned,		/* dim (10) fixed bin (71), */
+  3    89          3 n_bi_written		fixed bin (71),	/* meter (1) */
+  3    90          3 n_bi_bytes_written		fixed bin (71),	/* meter (2) */
+  3    91          3 n_journal_full		fixed bin (71),	/* meter (3) */
+  3    92          3 n_successful_recycles	fixed bin (71),	/* meter (4) */
+  3    93          3 n_ci_recycled		fixed bin (71),	/* meter (5) */
+  3    94          3 n_txn_started		fixed bin (71),	/* meter (6) */
+  3    95          3 n_non_null_txn		fixed bin (71),	/* meter (7) */
+  3    96          3 n_txn_storage_limit_hits	fixed bin (71),	/* meter (8) */
+  3    97          3 meter			(9:10) fixed bin (71),
+  3    98 						/* meter (9) - meter (10) */
+  3    99        2 pad_to_64_words		(6) bit (36);	/* 64 is even (see below) */
+  3   100 
+  3   101 
+  3   102 /*  END INCLUDE FILE:	dm_bj_pste.incl.pl1	*/
+      376 
+      377 
+  4     1 /* BEGIN INCLUDE FILE ... access_mode_values.incl.pl1
+  4     2*
+  4     3*   Values for the "access mode" argument so often used in hardcore
+  4     4*   James R. Davis 26 Jan 81  MCR 4844
+  4     5*   Added constants for SM access 4/28/82 Jay Pattin
+  4     6*   Added text strings 03/19/85 Chris Jones
+  4     7**/
+  4     8 
+  4     9 
+  4    10 /* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+  4    11 dcl	(
+  4    12 	N_ACCESS		   init ("000"b),
+  4    13 	R_ACCESS		   init ("100"b),
+  4    14 	E_ACCESS		   init ("010"b),
+  4    15 	W_ACCESS		   init ("001"b),
+  4    16 	RE_ACCESS		   init ("110"b),
+  4    17 	REW_ACCESS	   init ("111"b),
+  4    18 	RW_ACCESS		   init ("101"b),
+  4    19 	S_ACCESS		   init ("100"b),
+  4    20 	M_ACCESS		   init ("010"b),
+  4    21 	A_ACCESS		   init ("001"b),
+  4    22 	SA_ACCESS		   init ("101"b),
+  4    23 	SM_ACCESS		   init ("110"b),
+  4    24 	SMA_ACCESS	   init ("111"b)
+  4    25 	)		   bit (3) internal static options (constant);
+  4    26 
+  4    27 /* The following arrays are meant to be accessed by doing either 1) bin (bit_value) or
+  4    28*   2) divide (bin_value, 2) to come up with an index into the array. */
+  4    29 
+  4    30 dcl	SEG_ACCESS_MODE_NAMES  (0:7) init ("null", "W", "E", "EW", "R", "RW", "RE", "REW") char (4) internal
+  4    31 			   static options (constant);
+  4    32 
+  4    33 dcl	DIR_ACCESS_MODE_NAMES  (0:7) init ("null", "A", "M", "MA", "S", "SA", "SM", "SMA") char (4) internal
+  4    34 			   static options (constant);
+  4    35 
+  4    36 dcl	(
+  4    37 	N_ACCESS_BIN	   init (00000b),
+  4    38 	R_ACCESS_BIN	   init (01000b),
+  4    39 	E_ACCESS_BIN	   init (00100b),
+  4    40 	W_ACCESS_BIN	   init (00010b),
+  4    41 	RW_ACCESS_BIN	   init (01010b),
+  4    42 	RE_ACCESS_BIN	   init (01100b),
+  4    43 	REW_ACCESS_BIN	   init (01110b),
+  4    44 	S_ACCESS_BIN	   init (01000b),
+  4    45 	M_ACCESS_BIN	   init (00010b),
+  4    46 	A_ACCESS_BIN	   init (00001b),
+  4    47 	SA_ACCESS_BIN	   init (01001b),
+  4    48 	SM_ACCESS_BIN	   init (01010b),
+  4    49 	SMA_ACCESS_BIN	   init (01011b)
+  4    50 	)		   fixed bin (5) internal static options (constant);
+  4    51 
+  4    52 /* END INCLUDE FILE ... access_mode_values.incl.pl1 */
+      378 
+      379 
+      380 
+      381    end bjm_attribute_fref_$set_transaction_storage_limit;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/24/85  0803.8  bjm_attribute_fref_.pl1           >spec>on>41-21>bjm_attribute_fref_.pl1
+372          1    01/07/85  0857.3  dm_bj_global_error_info.incl.pl1  >ldd>include>dm_bj_global_error_info.incl.pl1
+374          2    01/07/85  0857.6  dm_bj_ppt.incl.pl1                >ldd>include>dm_bj_ppt.incl.pl1
+376          3    04/05/85  0924.4  dm_bj_pste.incl.pl1               >ldd>include>dm_bj_pste.incl.pl1
+378          4    04/11/85  1452.6  access_mode_values.incl.pl1       >ldd>include>access_mode_values.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+BJ_PPTE_VERSION_1               000030 constant        fixed bin(17,0)          initial dcl 2-14 set ref 191*
+BJ_PSTE_VERSION_2               000026 constant        fixed bin(17,0)          initial dcl 3-42 set ref 194*
+CHECK_FOR_BJM_RECURSION         000010 constant        bit(1)                   initial dcl 81 set ref 185* 351
+DONT_CHECK_FOR_BJM_RECURSION    000020 constant        bit(1)                   initial dcl 81 set ref 301* 355
+FINISH_MUST_IGNORE_ERRORS       000020 constant        bit(1)                   initial dcl 81 set ref 254*
+FINISH_MUST_NOT_IGNORE_ERRORS   000010 constant        bit(1)                   initial dcl 81 set ref 296 322*
+MYNAME                          000000 constant        char(32)                 initial unaligned dcl 81 set ref 185*
+M_ACCESS                               constant        bit(3)                   initial unaligned dcl 4-11 ref 178 178
+NO                                     constant        bit(1)                   initial dcl 81 ref 54 355
+NULL_BJ_OID                            constant        bit(36)                  initial dcl 81 ref 54 159 284 287 292
+N_ACCESS                               constant        bit(3)                   initial unaligned dcl 4-11 ref 54
+YES                                    constant        bit(1)                   initial dcl 81 ref 251 362
+before_journal_manager_$get_bj_path_from_oid
+                                000010 constant        entry                    external dcl 93 ref 165
+before_journal_manager_$open_bj 000012 constant        entry                    external dcl 93 ref 157
+bj_ci_zero$put_header           000014 constant        entry                    external dcl 93 ref 211
+bj_cleanup_tables$handler       000016 constant        entry                    external dcl 93 ref 251
+bj_close_oid                    000020 constant        entry                    external dcl 93 ref 293
+bj_max_txn_storage_limit        000024 constant        entry                    external dcl 93 ref 199 202
+bj_oid                          000100 automatic       bit(36)                  initial dcl 54 set ref 54* 157* 159 165* 190* 287
+                                                                                  291 292*
+bj_oid_util$get_ptr             000022 constant        entry                    external dcl 93 ref 190
+bj_ppte                                based           structure                level 1 dcl 2-39
+bj_ppte_ptr                     000332 automatic       pointer                  dcl 2-37 set ref 190* 191 193 196 211
+bj_pste                                based           structure                level 1 dcl 3-48 set ref 211 211
+bj_pste_lock$lock               000026 constant        entry                    external dcl 93 ref 196
+bj_pste_lock$unlock             000030 constant        entry                    external dcl 93 ref 321
+bj_pste_ptr                     000334 automatic       pointer                  dcl 3-45 in procedure
+                                                                                  "bjm_attribute_fref_$set_transaction_storage_limit"
+                                                                                  set ref 193* 194 196* 199* 202* 210 211* 211 211
+                                                                                  321*
+bj_pste_ptr               4            based           pointer                  level 2 in structure "bj_ppte" dcl 2-39 in procedure
+                                                                                  "bjm_attribute_fref_$set_transaction_storage_limit"
+                                                                                  ref 193
+bj_uid                    1            based           bit(36)                  level 2 dcl 2-39 set ref 196*
+bjm_clean_up_needed             000101 automatic       bit(1)                   initial dcl 54 set ref 54* 251 355 362*
+bjm_data_$bj_code               000064 external static fixed bin(35,0)          dcl 1-19 set ref 222* 296 296* 365*
+bjm_data_$bj_default_error_label
+                                000066 external static label variable           dcl 1-21 set ref 301*
+bjm_data_$bj_exit_err           000062 external static label variable           dcl 1-17 set ref 290* 364*
+bjm_data_$bj_operation          000060 external static char(32)                 unaligned dcl 1-15 set ref 351 363*
+cleanup                         000324 stack reference condition                dcl 78 ref 152
+code                            000102 automatic       fixed bin(35,0)          initial dcl 54 set ref 54* 157* 159* 165* 167 167*
+                                                                                  169* 171 171* 173* 176 176*
+containing_dir_path             000103 automatic       char(168)                initial unaligned dcl 54 set ref 54* 169* 173*
+cvn_p_correct_version                  parameter       fixed bin(17,0)          dcl 233 ref 225 239
+cvn_p_error_to_use                     parameter       fixed bin(35,0)          dcl 233 set ref 225 239*
+cvn_p_given_version                    parameter       fixed bin(17,0)          dcl 233 ref 225 239
+dir_name                        000155 automatic       char(32)                 initial unaligned dcl 54 set ref 54* 169* 173*
+dir_path                        000165 automatic       char(168)                initial unaligned dcl 54 set ref 54* 138* 157*
+dir_path_effective_access       000237 automatic       bit(36)                  initial dcl 54 set ref 54* 173* 178
+dir_path_from_bjm               000240 automatic       char(168)                initial unaligned dcl 54 set ref 54* 165* 169*
+dm_error_$bj_bad_ppte_version   000042 external static fixed bin(35,0)          dcl 117 set ref 191*
+dm_error_$bj_bad_pste_version   000044 external static fixed bin(35,0)          dcl 117 set ref 194*
+dm_error_$bj_invalid_name       000046 external static fixed bin(35,0)          dcl 117 set ref 146*
+dm_error_$bj_recursive_invoc    000050 external static fixed bin(35,0)          dcl 117 set ref 351*
+entry_name                      000312 automatic       char(32)                 initial unaligned dcl 54 set ref 54* 139* 146* 157*
+er_p_code                              parameter       fixed bin(35,0)          dcl 263 ref 260 265
+error_table_$incorrect_access   000052 external static fixed bin(35,0)          dcl 117 set ref 178*
+error_table_$item_too_big       000054 external static fixed bin(35,0)          dcl 117 set ref 202*
+error_table_$smallarg           000056 external static fixed bin(35,0)          dcl 117 set ref 148*
+expand_pathname_                000032 constant        entry                    external dcl 93 ref 169
+f_bj_oid                        000100 automatic       bit(36)                  initial dcl 284 set ref 284* 291* 293*
+f_p_ignore_errors                      parameter       bit(1)                   dcl 283 ref 271 296
+get_group_id_                   000034 constant        entry                    external dcl 93 ref 173 173
+get_ring_                       000036 constant        entry                    external dcl 93 ref 173 173
+hcs_$get_user_access_modes      000040 constant        entry                    external dcl 93 ref 173
+ivbn_p_bj_name                         parameter       char                     unaligned dcl 311 ref 308 313 313
+length                                                 builtin function         dcl 75 ref 313
+p_code                                 parameter       fixed bin(35,0)          dcl 46 set ref 39 141* 265*
+p_dir_path                             parameter       char                     unaligned dcl 46 ref 39 138
+p_entry_name                           parameter       char                     unaligned dcl 46 ref 39 139
+p_transaction_storage_limit            parameter       fixed bin(35,0)          dcl 46 ref 39 140
+pf_oid                    2            based           bit(36)                  level 2 dcl 2-39 set ref 211*
+reverse                                                builtin function         dcl 75 ref 313
+rtrim                                                  builtin function         dcl 75 ref 313 313
+sbdehv_p_check_for_recursive_invocation
+                                       parameter       bit(1)                   dcl 344 ref 327 351 355
+sbdehv_p_error_exit                    parameter       label variable           dcl 344 ref 327 364
+sbdehv_p_operation                     parameter       char                     unaligned dcl 344 ref 327 363
+substr                                                 builtin function         dcl 75 ref 313
+transaction_storage_limit       000322 automatic       fixed bin(35,0)          initial dcl 54 set ref 54* 140* 148 199 199* 202 210
+txn_storage_limit        33            based           fixed bin(35,0)          level 2 dcl 3-48 set ref 210*
+version                                based           fixed bin(17,0)          level 2 in structure "bj_pste" dcl 3-48 in procedure
+                                                                                  "bjm_attribute_fref_$set_transaction_storage_limit"
+                                                                                  set ref 194*
+version                                based           fixed bin(17,0)          level 2 in structure "bj_ppte" dcl 2-39 in procedure
+                                                                                  "bjm_attribute_fref_$set_transaction_storage_limit"
+                                                                                  set ref 191*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+A_ACCESS                               internal static bit(3)                   initial unaligned dcl 4-11
+A_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 4-36
+BJ_PPT_VERSION_1                       internal static fixed bin(17,0)          initial dcl 2-13
+DIR_ACCESS_MODE_NAMES                  internal static char(4)                  initial array unaligned dcl 4-33
+E_ACCESS                               internal static bit(3)                   initial unaligned dcl 4-11
+E_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 4-36
+M_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 4-36
+N_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 4-36
+REW_ACCESS                             internal static bit(3)                   initial unaligned dcl 4-11
+REW_ACCESS_BIN                         internal static fixed bin(5,0)           initial dcl 4-36
+RE_ACCESS                              internal static bit(3)                   initial unaligned dcl 4-11
+RE_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 4-36
+RW_ACCESS                              internal static bit(3)                   initial unaligned dcl 4-11
+RW_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 4-36
+R_ACCESS                               internal static bit(3)                   initial unaligned dcl 4-11
+R_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 4-36
+SA_ACCESS                              internal static bit(3)                   initial unaligned dcl 4-11
+SA_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 4-36
+SEG_ACCESS_MODE_NAMES                  internal static char(4)                  initial array unaligned dcl 4-30
+SMA_ACCESS                             internal static bit(3)                   initial unaligned dcl 4-11
+SMA_ACCESS_BIN                         internal static fixed bin(5,0)           initial dcl 4-36
+SM_ACCESS                              internal static bit(3)                   initial unaligned dcl 4-11
+SM_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 4-36
+S_ACCESS                               internal static bit(3)                   initial unaligned dcl 4-11
+S_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 4-36
+W_ACCESS                               internal static bit(3)                   initial unaligned dcl 4-11
+W_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 4-36
+bj_ppt                                 based           structure                level 1 dcl 2-18
+bj_ppt_ptr                             automatic       pointer                  dcl 2-16
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+CHECK_VERSION_NUMERIC           000620 constant        entry                    internal dcl 225 ref 191 194
+CLEAN_UP                        000635 constant        entry                    internal dcl 244 ref 152 266
+CLOSE_THIS_BJ_OPENING           000722 constant        label                    dcl 287
+COPY_AND_INIT_PARAMETERS        000106 constant        label                    dcl 136
+ERROR_RETURN                    000666 constant        entry                    internal dcl 260 ref 146 148 159 167 171 176 178 202
+                                                                                  222 239 296 351
+FIND_BJ_PST_ENTRY               000452 constant        label                    dcl 188
+FINISH                          000711 constant        entry                    internal dcl 271 ref 254 322
+FINISH_ERROR_LABEL              000736 constant        label                    dcl 296 ref 290
+IS_VALID_BJ_NAME                001000 constant        entry                    internal dcl 308 ref 146
+MAIN_RETURN                     000607 constant        label                    dcl 219 set ref 267 323
+NONLOCAL_ERROR_EXIT             000610 constant        label                    dcl 222 set ref 185 185
+OPEN_JOURNAL                    000174 constant        label                    dcl 155
+PARTIALLY_VALIDATE_INPUT_PARAMETERS
+                                000124 constant        label                    dcl 144
+RETURN                          001046 constant        entry                    internal dcl 318 ref 215
+SETUP_FOR_NON_STANDARD_EXIT     000152 constant        label                    dcl 152
+SET_BJM_DATA_ERROR_HANDLING_VALUES
+                                001066 constant        entry                    internal dcl 327 ref 185 301
+SET_BJM_DATA_ERROR_VALUES       001132 constant        label                    dcl 359
+SET_LIMIT_TO_MAXIMUM            000530 constant        label                    dcl 199
+SET_NEW_TRANSACTION_STORAGE_LIMIT
+                                000565 constant        label                    dcl 208
+VALIDATE_CONTAINING_DIR_MODIFY_ACCESS
+                                000231 constant        label                    dcl 163
+VALIDATE_TRANSACTION_STORAGE_LIMIT
+                                000542 constant        label                    dcl 202
+bjm_attribute_fref_$set_transaction_storage_limit
+                                000041 constant        entry                    external dcl 39
+
+NAME DECLARED BY CONTEXT OR IMPLICATION.
+size                                                   builtin function         ref 211 211
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      1620        1710    1166        1630
+Length      2224    1166        70         300     431           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+bjm_attribute_fref_$set_transaction_storage_limit
+                                    320 external procedure  is an external procedure.  
+on unit on line 152                  64 on unit               
+CHECK_VERSION_NUMERIC                   internal procedure  shares stack frame of external procedure bjm_attribute_fref_$set_trans                      
+CLEAN_UP                             76 internal procedure  is called by several nonquick procedures.  
+ERROR_RETURN                         64 internal procedure  is called by several nonquick procedures.  
+FINISH                               92 internal procedure  is called by several nonquick procedures.  
+IS_VALID_BJ_NAME                        internal procedure  shares stack frame of external procedure bjm_attribute_fref_$set_trans                      
+RETURN                                  internal procedure  shares stack frame of external procedure bjm_attribute_fref_$set_trans                      
+SET_BJM_DATA_ERROR_HANDLING_VALUES
+                                     72 internal procedure  is called by several nonquick procedures.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+FINISH                   000100 f_bj_oid                    FINISH
+bjm_attribute_fref_$set_transaction_storage_limit
+                         000100 bj_oid                      bjm_attribute_fref_$set_transaction_storage_limit
+                         000101 bjm_clean_up_needed         bjm_attribute_fref_$set_transaction_storage_limit
+                         000102 code                        bjm_attribute_fref_$set_transaction_storage_limit
+                         000103 containing_dir_path         bjm_attribute_fref_$set_transaction_storage_limit
+                         000155 dir_name                    bjm_attribute_fref_$set_transaction_storage_limit
+                         000165 dir_path                    bjm_attribute_fref_$set_transaction_storage_limit
+                         000237 dir_path_effective_access   bjm_attribute_fref_$set_transaction_storage_limit
+                         000240 dir_path_from_bjm           bjm_attribute_fref_$set_transaction_storage_limit
+                         000312 entry_name                  bjm_attribute_fref_$set_transaction_storage_limit
+                         000322 transaction_storage_limit   bjm_attribute_fref_$set_transaction_storage_limit
+                         000332 bj_ppte_ptr                 bjm_attribute_fref_$set_transaction_storage_limit
+                         000334 bj_pste_ptr                 bjm_attribute_fref_$set_transaction_storage_limit
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+r_l_a               r_e_as              call_ext_out_desc   call_ext_out        call_int_this_desc  call_int_this
+call_int_other_desc call_int_other      return              tra_ext             enable              shorten_stack
+ext_entry_desc      int_entry           int_entry_desc      reverse_cs          set_cs_eis
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+before_journal_manager_$get_bj_path_from_oid                before_journal_manager_$open_bj
+bj_ci_zero$put_header         bj_cleanup_tables$handler     bj_close_oid                  bj_max_txn_storage_limit
+bj_oid_util$get_ptr           bj_pste_lock$lock             bj_pste_lock$unlock           expand_pathname_
+get_group_id_                 get_ring_                     hcs_$get_user_access_modes
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+bjm_data_$bj_code             bjm_data_$bj_default_error_label                            bjm_data_$bj_exit_err
+bjm_data_$bj_operation        dm_error_$bj_bad_ppte_version dm_error_$bj_bad_pste_version dm_error_$bj_invalid_name
+dm_error_$bj_recursive_invoc  error_table_$incorrect_access error_table_$item_too_big     error_table_$smallarg
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     39 000034        54 000061       138 000106       139 000114       140 000121       141 000123       146 000124
+    148 000141       152 000152       157 000174       159 000221       165 000231       167 000256       169 000266
+    171 000312       173 000322       176 000404       178 000414       185 000427       190 000452       191 000463
+    193 000476       194 000501       196 000514       199 000526       202 000542       210 000565       211 000570
+    215 000606       219 000607       222 000610       381 000617       225 000620       239 000622       242 000633
+    244 000634       251 000642       254 000655       256 000664       260 000665       265 000673       266 000700
+    267 000705       271 000710       284 000716       287 000717       290 000722       291 000726       292 000727
+    293 000730       296 000736       301 000755       304 000777       308 001000       313 001011       318 001046
+    321 001047       322 001056       323 001064       327 001065       351 001101       355 001122       362 001132
+    363 001134       364 001144       365 001152       368 001153
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

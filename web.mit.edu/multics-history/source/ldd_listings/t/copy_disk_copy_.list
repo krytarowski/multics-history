@@ -1,0 +1,441 @@
+	COMPILATION LISTING OF SEGMENT copy_disk_copy_
+	Compiled by: Multics PL/I Compiler, Release 33e, of October 6, 1992
+	Compiled at: CGI                             
+	Compiled on: 2000-04-17_1922.09_Mon_mdt
+	    Options: optimize map
+
+        1 /****^  ********************************************
+        2*        *                                          *
+        3*        * Copyright, (C) Honeywell Bull Inc., 1987 *
+        4*        *                                          *
+        5*        ******************************************** */
+        6 
+        7 
+        8 /****^  HISTORY COMMENTS:
+        9*  1) change(87-03-31,Blair), approve(87-03-31,MCR7666),
+       10*     audit(87-06-25,Fawcett), install(87-07-15,MR12.1-1040):
+       11*     Install as part of bound_copy_disk_.  This program is the I/O driver.
+       12*     The asynchronous i/o scheme has been eliminated becuase rdisk_ goes
+       13*     blocked, so setting up event channels only leads to confusion.
+       14*                                                   END HISTORY COMMENTS */
+       15 
+       16 copy_disk_copy_:
+       17      procedure (P_source_info_ptr, P_target_info_ptr, 
+       18 	P_brief_sw, P_query_sw, P_trace_sw, P_retry_sw, P_cylinder, P_code);
+       19 
+       20 /* This procedure implements the double-buffered disk copying mechanism. It
+       21*   loops through the entire disk, doing the largest I/O's it can, reading 
+       22*   and writing from alternate buffers.  The boundaries are detected by having
+       23*   the lengths for read and write only be greater than zero when there is
+       24*   I/O to be done.  If an error occurs on a read in the middle of a buffer, 
+       25*   the entire buffer is read and written a record at a time before control
+       26*   returns to this module.
+       27*   */
+       28 
+       29 dcl  P_source_info_ptr pointer parameter;
+       30 dcl  P_target_info_ptr pointer parameter;
+       31 dcl  P_brief_sw bit (1) aligned parameter;
+       32 dcl  P_query_sw bit (1) aligned parameter;
+       33 dcl  P_trace_sw bit (1) aligned parameter;
+       34 dcl  P_retry_sw bit (1) aligned parameter;
+       35 dcl  P_cylinder fixed bin parameter;
+       36 dcl  P_code fixed bin (35) parameter;
+       37 
+       38 dcl 1 source aligned like copy_disk_info based (P_source_info_ptr);
+       39 dcl 1 target aligned like copy_disk_info based (P_target_info_ptr);
+       40 
+       41 dcl  code fixed bin (35);
+       42 dcl  cylinder_idx fixed bin;
+       43 dcl  buffer_ptrs (2) pointer;
+       44 dcl  read_channel fixed bin (71);
+       45 dcl  start_clock_time fixed bin (71);
+       46 dcl  last_event_time fixed bin (71);
+       47 
+       48 dcl (read_address, write_address) fixed bin (35);
+       49 dcl (read_length, write_length) fixed bin;
+       50 dcl (read_buf_ptr, write_buf_ptr) pointer;
+       51 dcl  temp_ptr pointer;
+       52 dcl  last_cylinder_announced fixed bin;
+       53 dcl  first_time bit (1) aligned;
+       54 
+       55 dcl  copy_disk_io_$read entry (pointer, bit (1) aligned, bit (1) aligned,
+       56      pointer, fixed bin (35), fixed bin, bit (1) aligned, fixed bin (35));
+       57 dcl  copy_disk_io_$write entry (pointer, bit (1) aligned, bit (1) aligned,
+       58      pointer, fixed bin (35), fixed bin, bit (1) aligned, fixed bin (35));
+       59 dcl  copy_disk_io_$record_to_sector  entry (ptr, fixed bin (18)) returns (fixed bin (35));
+       60 
+       61 dcl  com_err_ entry options (variable);
+       62 dcl  get_temp_segments_ entry (char (*), (*) pointer, fixed bin (35));
+       63 dcl  ioa_ entry options (variable);
+       64 dcl  ioa_$nnl entry options (variable);
+       65 dcl  release_temp_segments_ entry (char (*), (*) pointer, fixed bin (35));
+       66 
+       67 dcl cleanup condition;
+       68 
+       69 dcl (addr, clock, divide, float, min, mod, null) builtin;
+       70 
+       71 /*  */
+       72 
+       73 	read_channel = 0;
+       74 	buffer_ptrs (*) = null ();
+       75 	on condition (cleanup) call clean_up ();
+       76 
+       77 	call get_temp_segments_ (WHOAMI, buffer_ptrs, code);
+       78 	if (code ^= 0) then do;
+       79 	     call com_err_ (code, WHOAMI, "Cannot get temp segments for I/O.");
+       80 	     goto MAIN_RETURN;
+       81 	     end;
+       82 
+       83 	read_address = source.low_bound;
+       84 	write_address = read_address - source.sectors_per_io;
+       85 	read_length = source.sectors_per_io;
+       86 	write_length = 0;
+       87 	read_buf_ptr = buffer_ptrs (1);
+       88 	write_buf_ptr = buffer_ptrs (2);
+       89 	last_cylinder_announced = 0;
+       90 	first_time = "1"b;
+       91 
+       92 	start_clock_time = clock ();
+       93 	last_event_time = start_clock_time;
+       94 
+       95 	cylinder_idx = 0;				/* for reporting */
+       96 
+       97 	do while (write_address <= source.high_bound );
+       98 	     if (write_length > 0) then do;		/* all but last */
+       99 
+      100 		call read_write (addr (target), WRITE,
+      101 		     write_buf_ptr, write_address, write_length);
+      102 		end;
+      103 		
+      104 	     if (read_length > 0 & read_address <= source.high_bound) then    /* first, synchronous, read */
+      105 		call read_write (addr (source), READ, 
+      106 		     read_buf_ptr, read_address, read_length);
+      107 
+      108 	     cylinder_idx = divide (write_address, target.sectors_per_cylinder, 17, 0);
+      109 	     if (mod (cylinder_idx, 100) = 0) | first_time then
+      110 		if (cylinder_idx ^= last_cylinder_announced) then
+      111 		     if ^P_brief_sw then do;
+      112 			if write_address > copy_disk_io_$record_to_sector (addr (source), source.n_records) then; 
+      113 
+      114 			else call ioa_$nnl ("^/^d cylinder^[ ^;s ^]processed ...", cylinder_idx, first_time);
+      115 			last_cylinder_announced = cylinder_idx;
+      116 			first_time = "0"b;
+      117 			end;
+      118 	      
+      119 /* After a retry, where the buffer was processed by reading and writing one record at a time,
+      120*   the length of the read buffer is set to zero so that we can resynchronize the next read.
+      121*   We'll do this by 1) set write_length to zero (like when we started)
+      122* 	          2) increment read_buffer past the portion we just finished reading
+      123*	          3) figure out new read_length				          */
+      124 	     if read_length = 0 then do;
+      125 		write_length = 0;
+      126 		read_address = read_address + source.sectors_per_io;
+      127 		read_length = min (source.sectors_per_io, (1 + source.high_bound - read_address));
+      128 		goto RESYNCHRONIZE;
+      129 		end;
+      130 	     temp_ptr = write_buf_ptr;		/* swap buffers */
+      131 	     write_buf_ptr = read_buf_ptr;
+      132 	     read_buf_ptr = temp_ptr;
+      133 		
+      134 	     write_address = read_address;
+      135 	     read_address = read_address + source.sectors_per_io;
+      136 
+      137 	     write_length = read_length;
+      138 	     read_length = min (source.sectors_per_io, (1 + source.high_bound - read_address));
+      139 	     source.trace_count = source.trace_count + 1;
+      140 RESYNCHRONIZE: 
+      141 	     end;
+      142 
+      143 	code = 0;
+      144 
+      145 MAIN_RETURN:
+      146 	call clean_up ();
+      147 
+      148 	P_cylinder = cylinder_idx;
+      149 	P_code = code;
+      150 	return;
+      151 
+      152 /*  */
+      153 
+      154 read_write:
+      155      procedure (P_info_ptr, P_operation, P_buffer_ptr, P_sector, P_n_sectors);
+      156 
+      157 dcl  P_info_ptr pointer parameter;
+      158 dcl 1 P_info aligned like copy_disk_info based (P_info_ptr);
+      159 dcl  P_operation fixed bin parameter;     
+      160 dcl  P_buffer_ptr pointer parameter;
+      161 dcl  P_sector fixed bin (35);
+      162 dcl  P_n_sectors fixed bin;
+      163 
+      164 dcl  interval fixed bin (71);
+      165 
+      166 
+      167 	if P_trace_sw then  
+      168             if mod(source.trace_count, source.trace_parm)= 0 then do; /* only show the trace every N I/Os */
+      169 	     interval = clock () - last_event_time;
+      170 	     last_event_time = last_event_time + interval;
+      171 	     call ioa_ (
+      172 		"^/^9.4f (^7.1f): ^[Read^x^;Write^] ^7a: ^4d sectors at sector ^8d",
+      173 		(float (last_event_time - start_clock_time) / 1.0e6), 
+      174 		(float (interval) / 1.0e3), P_operation,
+      175 		P_info.device, P_n_sectors, P_sector);
+      176 	     end;
+      177 
+      178 	if (P_operation = READ) then
+      179 	     call copy_disk_io_$read (P_info_ptr, P_brief_sw, P_query_sw,
+      180 	          P_buffer_ptr, P_sector, P_n_sectors, P_retry_sw, code);
+      181 	else call copy_disk_io_$write (P_info_ptr, P_brief_sw, P_query_sw,
+      182 	          P_buffer_ptr, P_sector, P_n_sectors, ("0"b), code);
+      183 
+      184 	if (code ^= 0) then goto MAIN_RETURN;		/* message already printed */
+      185 
+      186 	return;
+      187 	end read_write;
+      188 
+      189 /*  */
+      190 
+      191 clean_up:
+      192      procedure ();
+      193 
+      194 
+      195 	if (buffer_ptrs (1) ^= null ()) then 
+      196 	     call release_temp_segments_ (WHOAMI, buffer_ptrs, (0));
+      197 
+      198 	return;
+      199 	end clean_up;
+      200 
+      201  /* BEGIN INCLUDE FILE ... copy_disk_info.incl.pl1 ... 83-04-25 ... W. Olin Sibert */
+  1     2 
+  1     3 
+  1     4 /****^  HISTORY COMMENTS:
+  1     5*  1) change(87-03-31,Blair), approve(87-03-31,MCR7666),
+  1     6*     audit(87-07-08,Fawcett), install(87-07-15,MR12.1-1040):
+  1     7*     Install as part of the copy_disk command.  This is the info structure used
+  1     8*     to pass around information about the source and target disks.
+  1     9*  2) change(87-07-08,Blair), approve(87-07-08,MCR7731),
+  1    10*     audit(87-07-08,Fawcett), install(87-07-15,MR12.1-1040):
+  1    11*     Change the copy_disk command to copy_disk_volume.
+  1    12*                                                   END HISTORY COMMENTS */
+  1    13 
+  1    14 dcl 1 copy_disk_info aligned based,
+  1    15     2 device char (32) unaligned,
+  1    16     2 device_type fixed bin,
+  1    17     2 mode fixed bin,
+  1    18     2 attached bit (1) aligned,
+  1    19     2 opened bit (1) aligned,
+  1    20     2 iocb_name char (32) unaligned,
+  1    21     2 iocb pointer,
+  1    22     2 target_info_ptr pointer,
+  1    23     2 bounds, 
+  1    24       3 low_bound fixed bin (35),
+  1    25       3 high_bound fixed bin (35),
+  1    26     2 disk_parameters,
+  1    27       3 words_per_sector fixed bin,
+  1    28       3 chars_per_sector fixed bin,
+  1    29       3 sectors_per_cylinder fixed bin,
+  1    30       3 sectors_per_record fixed bin,
+  1    31       3 records_per_cylinder fixed bin,
+  1    32       3 sectors_per_io fixed bin,
+  1    33       3 n_records fixed bin (18),
+  1    34       3 n_vtoces fixed bin,
+  1    35     2 errors fixed bin,
+  1    36     2 threshold fixed bin,
+  1    37     2 trace_parm fixed bin,
+  1    38     2 trace_count fixed bin,
+  1    39     2 desc char (200) varying;
+  1    40     	
+  1    41 dcl  WHOAMI char (32) internal static options (constant) init ("copy_disk_volume");
+  1    42 
+  1    43 dcl  READ fixed bin internal static options (constant) init (1);
+  1    44 dcl  WRITE fixed bin internal static options (constant) init (2);
+  1    45 
+  1    46 dcl  POSITION_BEGINNING fixed bin internal static options (constant) init (-1);
+  1    47 dcl  POSITION_RELATIVE fixed bin internal static options (constant) init (0);
+  1    48 dcl  POSITION_ABSOLUTE fixed bin internal static options (constant) init (2);
+  1    49 
+  1    50 /* END INCLUDE FILE ... copy_disk_info.incl.pl1 */
+      201 
+      202 
+      203 	end copy_disk_copy_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/17/00  1922.0  copy_disk_copy_.pl1               >udd>sm>ds>w>ml>copy_disk_copy_.pl1
+201          1    07/16/87  1855.4  copy_disk_info.incl.pl1           >ldd>incl>copy_disk_info.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+P_brief_sw                             parameter       bit(1)                   dcl 31 set ref 16 109 178* 181*
+P_buffer_ptr                           parameter       pointer                  dcl 160 set ref 154 178* 181*
+P_code                                 parameter       fixed bin(35,0)          dcl 36 set ref 16 149*
+P_cylinder                             parameter       fixed bin(17,0)          dcl 35 set ref 16 148*
+P_info                                 based           structure                level 1 dcl 158
+P_info_ptr                             parameter       pointer                  dcl 157 set ref 154 171 178* 181*
+P_n_sectors                            parameter       fixed bin(17,0)          dcl 162 set ref 154 171* 178* 181*
+P_operation                            parameter       fixed bin(17,0)          dcl 159 set ref 154 171* 178
+P_query_sw                             parameter       bit(1)                   dcl 32 set ref 16 178* 181*
+P_retry_sw                             parameter       bit(1)                   dcl 34 set ref 16 178*
+P_sector                               parameter       fixed bin(35,0)          dcl 161 set ref 154 171* 178* 181*
+P_source_info_ptr                      parameter       pointer                  dcl 29 ref 16 83 84 85 97 104 104 104 112 112 112
+                                                                                  126 127 127 135 138 138 139 139 167 167
+P_target_info_ptr                      parameter       pointer                  dcl 30 ref 16 100 100 108
+P_trace_sw                             parameter       bit(1)                   dcl 33 ref 16 167
+READ                                   constant        fixed bin(17,0)          initial dcl 1-43 set ref 104* 178
+WHOAMI                          000000 constant        char(32)                 initial packed unaligned dcl 1-41 set ref 77* 79*
+                                                                                  195*
+WRITE                                  constant        fixed bin(17,0)          initial dcl 1-44 set ref 100*
+addr                                                   builtin function         dcl 69 ref 100 100 104 104 112 112
+bounds                   30            based           structure                level 2 dcl 38
+buffer_ptrs                     000102 automatic       pointer                  array dcl 43 set ref 74* 77* 87 88 195 195*
+cleanup                         000130 stack reference condition                dcl 67 ref 75
+clock                                                  builtin function         dcl 69 ref 92 169
+code                            000100 automatic       fixed bin(35,0)          dcl 41 set ref 77* 78 79* 143* 149 178* 181* 184
+com_err_                        000016 constant        entry                    external dcl 61 ref 79
+copy_disk_info                         based           structure                level 1 dcl 1-14
+copy_disk_io_$read              000010 constant        entry                    external dcl 55 ref 178
+copy_disk_io_$record_to_sector  000014 constant        entry                    external dcl 59 ref 112
+copy_disk_io_$write             000012 constant        entry                    external dcl 57 ref 181
+cylinder_idx                    000101 automatic       fixed bin(17,0)          dcl 42 set ref 95* 108* 109 109 114* 115 148
+device                                 based           char(32)                 level 2 packed packed unaligned dcl 158 set ref 171*
+disk_parameters          32            based           structure                level 2 in structure "source" dcl 38 in procedure
+                                                                                  "copy_disk_copy_"
+disk_parameters          32            based           structure                level 2 in structure "target" dcl 39 in procedure
+                                                                                  "copy_disk_copy_"
+divide                                                 builtin function         dcl 69 ref 108
+first_time                      000127 automatic       bit(1)                   dcl 53 set ref 90* 109 114* 116*
+float                                                  builtin function         dcl 69 ref 171 171
+get_temp_segments_              000020 constant        entry                    external dcl 62 ref 77
+high_bound               31            based           fixed bin(35,0)          level 3 dcl 38 set ref 97 104 127 138
+interval                        000146 automatic       fixed bin(71,0)          dcl 164 set ref 169* 170 171
+ioa_                            000022 constant        entry                    external dcl 63 ref 171
+ioa_$nnl                        000024 constant        entry                    external dcl 64 ref 114
+last_cylinder_announced         000126 automatic       fixed bin(17,0)          dcl 52 set ref 89* 109 115*
+last_event_time                 000112 automatic       fixed bin(71,0)          dcl 46 set ref 93* 169 170* 170 171
+low_bound                30            based           fixed bin(35,0)          level 3 dcl 38 set ref 83
+min                                                    builtin function         dcl 69 ref 127 138
+mod                                                    builtin function         dcl 69 ref 109 167
+n_records                40            based           fixed bin(18,0)          level 3 dcl 38 set ref 112*
+null                                                   builtin function         dcl 69 ref 74 195
+read_address                    000114 automatic       fixed bin(35,0)          dcl 48 set ref 83* 84 104 104* 126* 126 127 134 135*
+                                                                                  135 138
+read_buf_ptr                    000120 automatic       pointer                  dcl 50 set ref 87* 104* 131 132*
+read_channel                    000106 automatic       fixed bin(71,0)          dcl 44 set ref 73*
+read_length                     000116 automatic       fixed bin(17,0)          dcl 49 set ref 85* 104 104* 124 127* 137 138*
+release_temp_segments_          000026 constant        entry                    external dcl 65 ref 195
+sectors_per_cylinder     34            based           fixed bin(17,0)          level 3 dcl 39 set ref 108
+sectors_per_io           37            based           fixed bin(17,0)          level 3 dcl 38 set ref 84 85 126 127 135 138
+source                                 based           structure                level 1 dcl 38 set ref 104 104 112 112
+start_clock_time                000110 automatic       fixed bin(71,0)          dcl 45 set ref 92* 93 171
+target                                 based           structure                level 1 dcl 39 set ref 100 100
+temp_ptr                        000124 automatic       pointer                  dcl 51 set ref 130* 132
+trace_count              45            based           fixed bin(17,0)          level 2 dcl 38 set ref 139* 139 167
+trace_parm               44            based           fixed bin(17,0)          level 2 dcl 38 set ref 167
+write_address                   000115 automatic       fixed bin(35,0)          dcl 48 set ref 84* 97 100* 108 112 134*
+write_buf_ptr                   000122 automatic       pointer                  dcl 50 set ref 88* 100* 130 131*
+write_length                    000117 automatic       fixed bin(17,0)          dcl 49 set ref 86* 98 100* 125* 137*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+POSITION_ABSOLUTE                      internal static fixed bin(17,0)          initial dcl 1-48
+POSITION_BEGINNING                     internal static fixed bin(17,0)          initial dcl 1-46
+POSITION_RELATIVE                      internal static fixed bin(17,0)          initial dcl 1-47
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+MAIN_RETURN                     000474 constant        label                    dcl 145 ref 80 184
+RESYNCHRONIZE                   000472 constant        label                    dcl 140 ref 128
+clean_up                        000701 constant        entry                    internal dcl 191 ref 75 145
+copy_disk_copy_                 000110 constant        entry                    external dcl 16
+read_write                      000506 constant        entry                    internal dcl 154 ref 100 104
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      1116        1146     767        1126
+Length      1346     767        30         163     127           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+copy_disk_copy_                     188 external procedure  is an external procedure.  
+on unit on line 75                   64 on unit               
+read_write                              internal procedure  shares stack frame of external procedure copy_disk_copy_.  
+clean_up                             80 internal procedure  is called by several nonquick procedures.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+copy_disk_copy_          000100 code                        copy_disk_copy_
+                         000101 cylinder_idx                copy_disk_copy_
+                         000102 buffer_ptrs                 copy_disk_copy_
+                         000106 read_channel                copy_disk_copy_
+                         000110 start_clock_time            copy_disk_copy_
+                         000112 last_event_time             copy_disk_copy_
+                         000114 read_address                copy_disk_copy_
+                         000115 write_address               copy_disk_copy_
+                         000116 read_length                 copy_disk_copy_
+                         000117 write_length                copy_disk_copy_
+                         000120 read_buf_ptr                copy_disk_copy_
+                         000122 write_buf_ptr               copy_disk_copy_
+                         000124 temp_ptr                    copy_disk_copy_
+                         000126 last_cylinder_announced     copy_disk_copy_
+                         000127 first_time                  copy_disk_copy_
+                         000146 interval                    read_write
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+call_ext_out_desc   call_ext_out        call_int_this       call_int_other      return_mac          mdfx1
+enable_op           ext_entry           int_entry           clock_mac
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+com_err_                      copy_disk_io_$read            copy_disk_io_$record_to_sector
+copy_disk_io_$write           get_temp_segments_            ioa_                          ioa_$nnl
+release_temp_segments_
+
+NO EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     16 000101        73 000115        74 000117        75 000133        77 000155        78 000176        79 000200
+     80 000224        83 000225        84 000232        85 000240        86 000242        87 000243        88 000245
+     89 000247        90 000250        92 000252        93 000254        95 000255        97 000256        98 000264
+    100 000266       104 000273       108 000307       109 000315       112 000331       114 000354       115 000400
+    116 000402       124 000403       125 000405       126 000406       127 000415       128 000432       130 000433
+    131 000435       132 000437       134 000441       135 000443       137 000452       138 000454       139 000471
+    140 000472       143 000473       145 000474       148 000500       149 000503       150 000505       154 000506
+    167 000510       169 000522       170 000525       171 000527       178 000612       181 000645       184 000675
+    186 000677       191 000700       195 000706       198 000734
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

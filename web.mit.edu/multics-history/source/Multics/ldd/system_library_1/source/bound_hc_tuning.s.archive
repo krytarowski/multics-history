@@ -1,0 +1,2937 @@
+
+
+
+
+		    force_write.pl1                 10/23/92  1027.5rew 10/23/92  1026.2       98631
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1992   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(92-09-16,WAAnderson), approve(92-09-16,MCR8261),
+     audit(92-09-24,Vu), install(92-10-23,MR12.5-1040):
+     The values sst$fw_none and sst$force_pwrites were not being updated
+     correctly due to the uninitialized variable num_writ in WRITE_ONE_SEGMENT.
+     It was possible to use the value to determine the actions taken by a
+     conditional statement and used in a calculation before it was ever set.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style3 */
+force_write:
+     proc (Segp, Fwf, Code);
+
+/* Force_write-- procedure to force I/O on a segment from user ring.
+
+   Bernard Greenberg  2/3/77 */
+/* Bob Mullen made this program a lot better, several times in '77, '78 */
+/* pds limit, BSG 8/18/78 */
+/* Modified for ADP PTWs, SDWs, 03/21/81, W. Olin Sibert */
+/* Modified for consecutive, list entries, November 1982, J. Bongiovanni */
+/* Modified to work on segments which are currently not connected to the caller's process, 30mar83, M.Pandolf */
+
+/* Note: we do not use search_ast$check, to avoid the expense of deriving the
+   pvid and vtocx for the segment.  If there is actually a double-uid conflict,
+   we are either going to write the correct segment, or harrass some other segment.
+   In either case, we end up with the pages of the 'correct' segment on disk,
+   if at all possible. */
+
+/*  Parameter  */
+
+dcl	Code		fixed bin (35) parameter;	/* Standard error code */
+dcl	Flush_Consecp	ptr parameter;		/* -> structure describing segments to be flushed */
+dcl	Flushp		ptr parameter;		/* -> structure describing pages to be flushed */
+dcl	Fwf		bit (36) unaligned parameter; /* Flags - see force_write_flags.incl.pl1 */
+dcl	Segp		pointer parameter;		/* -> segment to be written */
+dcl	Write_Limit	fixed bin parameter;	/* Maximum outstanding I/Os for this val level on force-write */
+
+/*  Automatic  */
+
+dcl	code		fixed bin (35);
+dcl	done_list		bit (1) aligned;
+dcl	done_seg		bit (1) aligned;
+dcl	first_page	fixed bin;
+dcl	1 fwf		like force_write_flags aligned;
+dcl	have_list		bit (1) aligned;
+dcl	n_pages		fixed bin;
+dcl	page_list		(0:255) fixed bin;
+dcl	page_no		fixed bin;
+dcl	pagex		fixed bin;
+dcl	seg_no		fixed bin;
+dcl	seg_pagex		fixed bin;
+dcl	segp		ptr;
+dcl	segx		fixed bin;
+dcl	write_limit	fixed bin;
+
+/*  Based  */
+
+dcl	1 Flush_Consec	aligned like flush_consec based (Flush_Consecp);
+dcl	1 Flush		aligned like flush based (Flushp);
+
+/*  External  */
+
+dcl	error_table_$argerr fixed bin (35) external static;
+dcl	error_table_$dirseg fixed bin (35) external static;
+dcl	error_table_$invalidsegno
+			fixed bin (35) external static;
+dcl	error_table_$unimplemented_version
+			fixed bin (35) external static;
+dcl	pds$force_write_limit
+			(0:7) fixed bin external static;
+dcl	pds$validation_level
+			fixed bin external static;
+dcl	sst$astsize	fixed bin external static;
+dcl	sst$force_pwrites	fixed bin (35) external static;
+dcl	sst$force_swrites	fixed bin (35) external static;
+dcl	sst$force_updatevs	fixed bin (35) external static;
+dcl	sst$fw_none	fixed bin (35) external static;
+dcl	sst$fw_retries	fixed bin (35) external static;
+
+/*  Entry  */
+
+dcl	get_ptrs_$given_segno
+			entry (fixed bin (17)) returns (ptr);
+dcl	lock$lock_ast	entry ();
+dcl	lock$unlock_ast	entry ();
+dcl	pc_wired$write_wait_uid
+			entry (ptr, fixed bin, fixed bin, bit (36) aligned);
+dcl	pc_wired$write_wait_uid_list
+			entry (ptr, ptr, fixed bin, fixed bin, bit (36) aligned);
+dcl	ptw_util_$get_phm	entry (pointer, bit (1) aligned);
+dcl	search_ast	entry (bit (36) aligned) returns (ptr);
+dcl	update_vtoce	entry (ptr);
+
+/*  Builtin  */
+
+dcl	addr		builtin;
+dcl	addrel		builtin;
+dcl	baseno		builtin;
+dcl	baseptr		builtin;
+dcl	fixed		builtin;
+dcl	hbound		builtin;
+dcl	min		builtin;
+dcl	null		builtin;
+dcl	string		builtin;
+dcl	unspec		builtin;
+
+%page;
+
+	segp = Segp;
+	string (fwf) = Fwf;
+	have_list = "0"b;
+	n_pages = -1;
+
+	call WRITE_ONE_SEGMENT (code);
+
+	Code = code;
+	return;
+%page;
+consecutive:
+     entry (Flush_Consecp, Code);
+
+	Code = 0;
+	unspec (fwf) = ""b;
+	have_list = "1"b;
+
+	if Flush_Consec.version ^= FLUSH_CONSEC_VERSION_1
+	then do;
+		Code = error_table_$unimplemented_version;
+		return;
+	     end;
+
+	do segx = 1 to Flush_Consec.n_segs;
+	     segp = baseptr (Flush_Consec.seg (segx).segno);
+	     first_page = Flush_Consec.seg (segx).first_page;
+	     n_pages = Flush_Consec.seg (segx).n_pages;
+	     if first_page < 0 | (first_page + n_pages) > 255
+	     then do;
+		     Code = error_table_$argerr;
+		     return;
+		end;
+	     unspec (page_list) = ""b;
+	     do pagex = 0 to n_pages - 1;
+		page_list (pagex) = first_page + pagex;
+	     end;
+
+	     call WRITE_ONE_SEGMENT (Code);
+	     if Code ^= 0
+	     then return;
+	end;
+
+	return;
+%page;
+list:
+     entry (Flushp, Code);
+
+	Code = 0;
+	unspec (fwf) = ""b;
+	have_list = "1"b;
+
+	if Flush.version ^= FLUSH_VERSION_1
+	then do;
+		Code = error_table_$unimplemented_version;
+		return;
+	     end;
+
+	done_list = "0"b;
+	seg_pagex = 1;
+	do while (^done_list);
+	     if seg_pagex > Flush.n_pages
+	     then done_list = "1"b;
+	     else do;
+		     seg_no = Flush.seg_page (seg_pagex).seg_no;
+		     segp = baseptr (seg_no);
+		     pagex = 0;
+		     done_seg = "0"b;
+		     do while (^done_seg);
+			if seg_pagex > Flush.n_pages
+			then done_seg = "1"b;
+			else if Flush.seg_page (seg_pagex).seg_no ^= seg_no
+			then done_seg = "1"b;
+			else do;
+				page_no = Flush.seg_page (seg_pagex).page_no;
+				if page_no < 0 | page_no > 255
+				then do;
+ARGERR:
+					Code = error_table_$argerr;
+					return;
+				     end;
+				if pagex > hbound (page_list, 1)
+				then goto ARGERR;
+				page_list (pagex) = page_no;
+				pagex = pagex + 1;
+				seg_pagex = seg_pagex + 1;
+			     end;
+		     end;
+		     n_pages = pagex;
+		     call WRITE_ONE_SEGMENT (Code);
+		     if Code ^= 0
+		     then return;
+		end;
+	end;
+
+	return;
+
+
+%page;
+
+set_force_write_limit:
+     entry (Write_Limit, Code);
+
+
+	write_limit = Write_Limit;
+
+	if write_limit < 1 | write_limit > 256
+	then code = error_table_$argerr;
+	else do;
+		pds$force_write_limit (pds$validation_level) = write_limit;
+		code = 0;
+	     end;
+
+	Code = code;
+	return;
+
+%page;
+/*  Internal Procedure to do the work for one segment  */
+
+WRITE_ONE_SEGMENT:
+     proc (Code);
+
+dcl	Code		fixed bin (35) parameter;
+
+dcl	first_page	fixed bin;
+dcl	force_write_limit	fixed bin;
+dcl	i		fixed bin;
+dcl	increment		fixed bin;
+dcl	last_page		fixed bin;
+dcl	lp		fixed bin;
+dcl	num_writ		fixed bin;
+dcl	page_no		fixed bin;
+dcl	phm_bit		bit (1) aligned;
+dcl	ptp		pointer;
+dcl	segno		fixed bin (17);
+dcl	tuid		bit (36) aligned;
+
+
+
+	Code = 0;
+	num_writ = 0;
+	segno = fixed (baseno (segp));		/* Get segno */
+	kstp = pds$kstp;
+	force_write_limit = pds$force_write_limit (pds$validation_level);
+
+	if segno < kst.lowseg | segno > kst.highest_used_segno
+	then do;					/* Validate segno range */
+segno_is_bad:
+		Code = error_table_$invalidsegno;
+		return;
+	     end;
+
+	sst$force_swrites = sst$force_swrites + 1;	/* Meter */
+
+	kstep = addr (kst.kst_entry (segno));
+	if unspec (kste.entryp) = ""b
+	then goto segno_is_bad;			/* Verify that seg is initiated */
+	if kste.dirsw
+	then do;					/* Don't force write dirs */
+		Code = error_table_$dirseg;
+		return;
+	     end;
+
+	tuid = kste.uid;
+	astep = get_ptrs_$given_segno (segno);		/* Get astep via dseg */
+
+	if astep = null
+	then do;					/* Segment is not connected */
+
+		call lock$lock_ast;
+		astep = search_ast (tuid);
+		call lock$unlock_ast;
+
+		if astep = null			/* Segment is not active */
+		then goto ret;
+
+	     end;
+
+	if aste.uid = ""b
+	then do;
+		Code = error_table_$invalidsegno;
+		goto ret;				/* No soap on hc segs */
+	     end;
+
+RETRY:
+	ptp = addrel (astep, sst$astsize);
+
+	num_writ = 0;				/* nothing written yet */
+	first_page = -1;
+	if force_write_limit < 2
+	then fwf.serial_write = "1"b;
+
+	if have_list
+	then lp = n_pages - 1;
+	else lp = fixed (aste.csl, 9) - 1;
+	do i = 0 to lp;
+	     if have_list
+	     then page_no = page_list (i);
+	     else page_no = i;
+	     call ptw_util_$get_phm (addrel (ptp, page_no), phm_bit);
+						/* Modified anytime? */
+	     if phm_bit				/* See if page needs writing, */
+	     then do;				/* and do so if we are to write serially */
+		     last_page = i;
+		     if first_page = -1
+		     then first_page = i;
+		     num_writ = num_writ + 1;
+		     if fwf.serial_write
+		     then call pc_wired$write_wait_uid (astep, page_no, 1, tuid);
+		end;
+	end;
+
+
+	if ^fwf.serial_write & num_writ ^= 0		/* If parallel write and we have pages */
+	then do;					/* then write the lot out */
+		if num_writ <= force_write_limit
+		then increment = last_page - first_page + 1;
+		else increment = force_write_limit;
+		do i = first_page to last_page by increment;
+		     if have_list
+		     then call pc_wired$write_wait_uid_list (astep, addr (page_list), i,
+			     min ((last_page - i + 1), increment), tuid);
+		     else call pc_wired$write_wait_uid (astep, i, min ((last_page - i + 1), increment), tuid);
+		end;
+	     end;
+
+	if aste.uid ^= tuid
+	then do;					/* check race with segmove */
+		call lock$lock_ast;
+		astep = search_ast (tuid);
+		call lock$unlock_ast;
+		if astep ^= null ()
+		then do;
+			sst$fw_retries = sst$fw_retries + 1;
+			goto RETRY;
+		     end;
+		else goto ret;			/* deactivated seg means all done */
+	     end;
+
+/* if here then valid astep and aste.uid = tuid */
+
+	if ^aste.fmchanged				/* no change in aste? */
+	then if aste.uid = tuid			/* and still same aste? */
+	     then goto ret;				/* then this is the EZ case */
+
+	call lock$lock_ast;				/* If here then looks like vtoce needs updating */
+
+	if aste.uid ^= tuid				/* Has aste moved? */
+	then astep = search_ast (tuid);		/* If so then find it */
+	if astep ^= null
+	then if aste.fmchanged			/* no one else did update */
+	     then do;
+		     sst$force_updatevs = sst$force_updatevs + 1;
+		     call update_vtoce (astep);
+		end;
+
+	call lock$unlock_ast;
+
+ret:
+	if num_writ = 0
+	then sst$fw_none = sst$fw_none + 1;
+	else sst$force_pwrites = sst$force_pwrites + num_writ;
+
+	return;
+
+     end WRITE_ONE_SEGMENT;
+
+
+/* format: off */
+%page; %include aste;
+%page; %include flush_structures;
+%page; %include force_write_flags;
+%page; %include kst;
+
+	end force_write;
+ 
+
+
+
+		    hc_tune.pl1.pmac                11/11/89  1136.0rew 11/11/89  0800.0      236997
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+        /* use: pl1_macro hc_tune.pl1.pmac */
+
+hc_tune: proc ();
+
+/* *	HC_TUNE
+   *
+   *	This procedure manages the getting and setting of system tuning parameters.
+   *	It is organized in a somewhat unusual fashion for a PL/I program, in order to
+   *	make the addition of new tuning parameters as simple as possible. All the tuning
+   *	parameters appear in a section of code at the very end of this program. A complex
+   *	mechanism of gotos and label variables is used to minize the size of the program,
+   *	and, more importantly, to make the description of individual tuning parameters
+   *	as simple and straightforward as possible. Each tuning parameter must be a single
+   *	word quantity at some known address in the supervisor, and is described by a
+   *	block of code like this:
+   *
+   *	dcl  tc_data$post_purge_switch fixed bin (35) external static;
+   *	%set NUM to NUM + 1;
+   *	TP (NUM):	call tp_init (addr (tc_data$post_purge_switch),
+   *		     "post_purge", "pp", TP_ON_OFF);
+   *
+   *		call on_or_off ();
+   *		goto RETURN;
+   *
+   *	The parameters to tp_init are:
+   *	   1) The location of the value in the supervisor address space.
+   *	   2) The long name of the tuning parameter.
+   *	   3) The short name. If the short name is "", it will be the same as the long name.
+   *	   4) The type, as defined in tuning_parameter_info.incl.pl1
+   *
+   *	Additionally, the value tp_special may be set to "1"b to indicate that this parameter
+   *	is not to be listed by a normal listing operation. It is intended for internal system
+   *	parameters, solely in order to make them easy to set by other than patching.
+   *
+   *	There are two procedures available to insure that an input value is acceptable. The
+   *	range procedure is called with two limits, and aborts an attempt to set if the value
+   *	falls outside the limits of the specified range. The on_or_off procedure aborts if
+   *	an attempt is made to set an on/off parameter to an invalid value. Additionally, the
+   *	procedure abort may be called if it is necessary to invalid a n attempt to set a
+   *	tuning parameter for some other, more complex, reason.
+   *
+   *	The existing examples in this program should be used as guidelines for how to add
+   *	and name new tuning parameters.
+   *
+   *	04/21/81, W. Olin Sibert
+   *	Modified 10/24/81, J. Bongiovanni, to fix bug in maxabs
+   *	Modified February 1982, BIM, for stack truncation parameters
+   *	Modified March 1982, J. Bongiovanni, for trap_invalid_masked, wsf bug fix
+   *	Modified April 1982, J. Bongiovanni, gv_integration
+   *	Modified July 1982, J. Bongiovanni, meter_ast_locking
+   *	Modified August 1982, J. Bongiovanni, realtime_io parameters
+   *	Modified October 1982, J. Bongiovanni, checksum_filemap
+   *	Modified February 1983, E. N. Kittlitz, default_256K_enable
+   *	Modified October 1984, M. Pandolf, dirlock_writebehind
+   */
+
+/*  */
+
+dcl  P_input_name char (32) parameter;			/* Name of parameter to get or set */
+dcl  P_old_value bit (36) aligned parameter;		/* Current value for parameter */
+dcl  P_new_value bit (36) aligned parameter;		/* New value, for setting */
+dcl  P_tp_ptr pointer parameter;			/* Its address (in ring zero) */
+dcl  P_long_name char (*) parameter;			/* Long name, for output */
+dcl  P_short_name char (*) parameter;			/* Short name, for output */
+dcl  P_error char (*) parameter;			/* Description of error while setting, if any */
+dcl  P_tp_type fixed bin parameter;			/* Its type */
+dcl  P_area_ptr pointer parameter;			/* Pointer to area for parameter list allocation */
+dcl  P_special_flag bit (1) aligned parameter;		/* Whether to return "special" values, in a listing */
+dcl  P_tp_count fixed bin parameter;			/* Number of defined tuning parameters */
+dcl  P_tp_list_ptr pointer parameter;			/* Pointer to returned array of info */
+dcl  P_code fixed bin (35) parameter;			/* Error code */
+
+dcl  input_name char (32);
+dcl  function fixed bin;				/* What we are supposed to do */
+dcl  return_label label variable internal local;		/* Used for our pseudo-subroutine call mechanism */
+dcl  lookup_return_label variable label internal local;
+dcl  severity fixed bin;				/* Severity code for syserr call */
+dcl  code fixed bin (35);
+dcl  return_special bit (1) aligned;			/* Whether to list "special" parameters */
+dcl  error_reason char (128);				/* Description of error encountered in setting */
+
+dcl  based_value bit (36) aligned based;		/* For parameter assignment */
+
+dcl  list_area area based (list_area_ptr);
+dcl  list_area_ptr pointer;
+
+dcl 1 tp_list (tp_list_size) based (tp_list_ptr) like tp_info;
+dcl  tp_list_ptr pointer;
+dcl  tp_list_size fixed bin;
+dcl  list_idx fixed bin;
+
+dcl  tp_ptr pointer;				/* Pointer to tuning parameter currently of interest */
+dcl  tp_type fixed bin;				/* Type of this tuning parameter */
+dcl  tp_idx fixed bin;				/* Its index */
+dcl  tp_short_name char (16); 			/* Short and long names */
+dcl  tp_long_name char (32);
+dcl  tp_special bit (1) aligned;			/* Whether it is "special" */
+
+dcl  tp_value bit (36) aligned;			/* Current value, as bits */
+dcl  binary_value fixed bin (35) aligned;		/* unspec equivalent of tp_value */
+dcl  scaled_value fixed bin (35, 18) aligned;		/* unspec equivalent of tp_value */
+dcl  char_value char (4) aligned;			/* unspec equivalent of tp_value */
+dcl  float_value float bin (27) aligned;		/* unspec equivalent of tp_value */
+
+dcl  new_value bit (36) aligned;			/* New value, as above */
+dcl  new_binary_value fixed bin (35) aligned;
+dcl  new_scaled_value fixed bin (35, 18) aligned;
+dcl  new_char_value char (4) aligned;
+dcl  new_float_value float bin (27) aligned;
+
+dcl  pds$process_group_id char (32) aligned external static;
+
+dcl  error_table_$unknown_tp fixed bin (35) external static;
+dcl  error_table_$invalid_tp_value fixed bin (35) external static;
+
+dcl  syserr entry options (variable);
+
+dcl  ONE_SECOND fixed bin (35) internal static options (constant) init (1000000); /* Assorted limits in microseconds */
+dcl  ONE_MINUTE fixed bin (35) internal static options (constant) init (60000000);
+dcl  TEN_MINUTES fixed bin (35) internal static options (constant) init (600000000);
+dcl  FIVE_HOURS fixed bin (35) internal static options (constant) init (18000000000);
+
+dcl  SCALE fixed bin (35) internal static options (constant) init (262144); /* Converts fixed bin (35) to (35,18) */
+
+dcl  LIST init (1) fixed bin internal static options (constant);
+dcl  GET init (2) fixed bin internal static options (constant);
+dcl  SET init (3) fixed bin internal static options (constant);
+
+dcl (addr, decimal, divide, float, hbound, round, trunc, unspec) builtin;
+
+/*  */
+
+hc_tune$get: entry (P_input_name, P_tp_type, P_old_value, P_tp_ptr, P_long_name, P_short_name, P_code);
+
+/* This entrypoint returns the address and present value of the named tuning parameter.
+   It will return an error code if the tuning parameter does not exist. It is accessed
+   via metering_gate_$get_tuning_parameter */
+
+	input_name = P_input_name;			/* Copy input parameter */
+	function = GET;				/* Say what we're doing */
+	code = 0;
+
+	return_label = GET_LOOKUP_RETURNS;
+	goto LOOKUP;				/* Find it, set idx & code */
+
+GET_LOOKUP_RETURNS:
+	if code ^= 0 then do;			/* Couldn't find it */
+	     P_code = code;
+	     return;
+	     end;
+
+	P_old_value = tp_value;			/* Return value and address */
+	P_tp_ptr = tp_ptr;
+	P_tp_type = tp_type;
+	P_long_name = tp_long_name;
+	P_short_name = tp_short_name;
+
+	P_code = 0;
+	return;					/* End of hc_tune$get */
+
+/*  */
+
+hc_tune$set: entry (P_input_name, P_new_value, P_old_value, P_tp_ptr, P_error, P_code);
+
+/* This entry sets a tuning parameter, also returning its old value and address. The change
+   is announced on the BOS console. It is accessed via hphcs_$set_tuning_parameter */
+
+	severity = ANNOUNCE;
+	goto SET_COMMON;
+
+
+hc_tune$set_silent: entry (P_input_name, P_new_value, P_old_value, P_tp_ptr, P_error, P_code);
+
+/* This entry sets a tuning parameter, as above, but logs the change without typing it out.
+   Used only by the Initializer, it is accessed via initializer_gate_$set_tuning_parameter */
+
+	severity = LOG;
+	goto SET_COMMON;
+
+
+SET_COMMON:
+	code = 0;
+	input_name = P_input_name;			/* Copy input parameter */
+	new_value = P_new_value;
+	unspec (new_binary_value) = new_value;		/* Make it available in all its forms */
+	unspec (new_scaled_value) = new_value;
+	unspec (new_char_value) = new_value;
+	unspec (new_float_value) = new_value;
+	
+	function = GET;				/* First, find it */
+	return_label = SET_LOOKUP_RETURNS;
+	goto LOOKUP;				/* Find it, set idx & code */
+
+SET_LOOKUP_RETURNS:
+	if code ^= 0 then do;			/* Can't set it */
+	     P_code = code;
+	     P_error = error_reason;
+	     return;
+	     end;
+
+	P_old_value = tp_value;			/* Return value and address */
+	P_tp_ptr = tp_ptr;
+
+	function = SET;				/* Next, check whether the new value is valid */
+	return_label = SET_CHECK_RETURNS;
+	goto TP (tp_idx);
+
+SET_CHECK_RETURNS:
+	if code ^= 0 then do;			/* Can't set it */
+	     P_code = code;
+	     P_error = error_reason;
+	     return;
+	     end;
+
+/*  */
+
+	if tp_type = TP_CHAR then			/* Call syserr to announce the change */
+	     call syserr (severity, "hc_tune: Changing ^a from ""^4a"" to ""^4a"" for ^a",
+		tp_long_name, char_value, new_char_value, pds$process_group_id);
+
+	else if tp_type = TP_INTEGER then
+	     call syserr (severity, "hc_tune: Changing ^a from ^d to ^d for ^a",
+		tp_long_name, binary_value, new_binary_value, pds$process_group_id);
+
+	else if tp_type = TP_SCALED_INTEGER then
+	     call syserr (severity, "hc_tune: Changing ^a from ^f to ^f for ^a",
+		tp_long_name, round (decimal (scaled_value), 4),
+		round (decimal (new_scaled_value), 4), pds$process_group_id);
+
+	else if tp_type = TP_MICROSECONDS then
+	     call syserr (severity, "hc_tune: Changing ^a from ^f to ^f seconds for ^a",
+		tp_long_name, (float (binary_value) / 1.0e6),
+		(float (new_binary_value) / 1.0e6), pds$process_group_id);
+
+	else if tp_type = TP_ON_OFF then
+	     call syserr (severity, "hc_tune: Changing ^a from ^[on^;off^] to ^[on^;off^] for ^a",
+		tp_long_name, (binary_value ^= 0), (new_binary_value ^= 0), pds$process_group_id);
+
+	else if tp_type = TP_FLOAT
+	then call syserr (severity, "hc_tune: Changing ^a from ^f to ^f for ^a.",
+	          tp_long_name, float_value, new_float_value, pds$process_group_id);
+
+	else call syserr (severity, "hc_tune: Changing ^a from ^w to ^w for ^a",
+		tp_long_name, tp_value, new_value, pds$process_group_id);
+
+
+	tp_ptr -> based_value = new_value;		/* Do it */
+
+	P_code = 0;
+	P_error = "";
+	return;					/* End of hc_tune$get */
+
+/*  */
+
+hc_tune$list: entry (P_area_ptr, P_special_flag, P_tp_count, P_tp_list_ptr);
+
+/* This entrypoint returns a list of all the defined tuning parameters, and their current
+   values. If P_special_flag is set, it returns all parameters, including special ones.
+   It is accessed via metering_gate_$list_tuning_parameters. */
+
+	input_name = "";
+	code = 0;
+
+	list_area_ptr = P_area_ptr;
+	return_special = P_special_flag;
+
+	function = LIST;
+
+	return_label = LIST_COUNT_RETURNS;		/* "return" to our label, below */
+	tp_list_size = 0;				/* start out empty */
+	do tp_idx = 1 to hbound (TP, 1); 		/* First, count them */
+	     goto TP (tp_idx); 			/* "call" */
+LIST_COUNT_RETURNS:
+	     if return_special | (^tp_special) then tp_list_size = tp_list_size + 1;
+	     end;
+
+	allocate tp_list in (list_area) set (tp_list_ptr); /* Make room to return to our caller */
+
+	return_label = LIST_LISTING_RETURNS;		/* "return" to our label, below */
+	list_idx = 1;				/* start out with the first one */
+	do tp_idx = 1 to hbound (TP, 1);		/* Get info for each parameter, again */
+	     goto TP (tp_idx); 			/* "call" to get info on this parameter */
+LIST_LISTING_RETURNS:				/* and "return" here */
+	     if tp_special & (^return_special) then goto LIST_NOT_RETURN_THIS_ONE;
+
+	     tp_list (list_idx).type = tp_type;
+	     tp_list (list_idx).long_name = tp_long_name;
+	     tp_list (list_idx).short_name = tp_short_name;
+	     tp_list (list_idx).ptr = tp_ptr;
+	     tp_list (list_idx).value = tp_value;
+	     tp_list (list_idx).special = tp_special;
+	     list_idx = list_idx + 1;
+
+LIST_NOT_RETURN_THIS_ONE:
+	     end;
+
+	P_tp_count = tp_list_size;			/* Return info */
+	P_tp_list_ptr = tp_list_ptr;
+
+	return;					/* End of hc_tune$list */
+
+/*  */
+
+tp_init: proc (P_tp_ptr, P_long_name, P_short_name, P_type);
+
+dcl  P_tp_ptr pointer parameter;
+dcl  P_long_name char (*) parameter;
+dcl  P_short_name char (*) parameter;
+dcl  P_type fixed bin;
+
+/* This procedure initializes values for a single tuning parameter */
+
+	tp_ptr = P_tp_ptr;
+	tp_long_name = P_long_name;
+	tp_short_name = P_short_name;
+	tp_type = P_type;
+	if tp_short_name = "" then tp_short_name = tp_long_name;
+
+	tp_special = "0"b;
+	code = 0;
+
+	tp_value = tp_ptr -> based_value;		/* Get the value from ring zero */
+
+	unspec (binary_value) = tp_value;
+	unspec (scaled_value) = tp_value;
+	unspec (char_value) = tp_value;
+	unspec (float_value) = tp_value;
+
+	return;
+	end tp_init;
+
+/*  */
+
+/* This portion of the program decides whether a particular tuning parameter exists, and
+   sets code and tp_idx appropriately. */
+
+LOOKUP:	lookup_return_label = return_label;		/* Save return label, for "recursion" */
+
+	return_label = LOOKUP_INTERNAL_RETURN;
+	do tp_idx = 1 to hbound (TP, 1); 		/* Try each one in its turn */
+	     goto TP (tp_idx); 			/* "call" */
+LOOKUP_INTERNAL_RETURN:
+	     if tp_long_name = input_name then goto lookup_return_label; /* This is the one we want */
+	     if tp_short_name = input_name then goto lookup_return_label;
+	     end;
+
+	code = error_table_$unknown_tp;		/* Sorry, no sale */
+	error_reason = "";
+	tp_idx = -1;
+	goto lookup_return_label;			/* "return" */
+
+
+
+/* This part of the program finishes off the lookup/checking of each individual tuning parameter */
+
+RETURN:	goto return_label;				/* Set all values, etc. */
+
+
+
+
+/* This label is used to indicate that a parameter cannot be set to the requested value
+   for some reason. No attempt is made to describe the reason, however. */
+
+ABORT_SETTING:
+	code = error_table_$invalid_tp_value;
+
+	goto return_label;
+
+/*  */
+
+range: proc (P_lower, P_upper, P_range_description);
+
+/* This procedure insures that, for set attempts only, the specified value is within range */
+
+dcl  P_lower fixed bin (35) parameter;
+dcl  P_upper fixed bin (35) parameter;
+dcl  P_range_description char (*) parameter;
+
+
+	if function ^= SET then return;		/* Not setting, ignore it */
+
+	if new_binary_value < P_lower then call abort (P_range_description);
+	if new_binary_value > P_upper then call abort (P_range_description);
+
+	return;					/* All OK */
+	end range;
+
+
+
+need_integer: proc ();
+
+/* This procedure aborts if a scaled "integer" is not actually an integral value */
+
+	if function ^= SET then return;
+
+	if trunc (new_scaled_value) ^= new_scaled_value then
+	     call abort ("an integer value");
+
+	return;
+	end need_integer;
+
+
+
+on_or_off: proc ();
+
+/* This procedure rejects attempts to set on/off parameters to invalid values */
+
+	if function ^= SET then return;		/* Not setting, ignore it */
+
+	if new_binary_value ^= 0 then
+	     if new_binary_value ^= 1 then
+		call abort ("Not ""on"" or ""off""");
+
+	return;					/* All OK */
+	end on_or_off;
+
+
+/* COMMENT THIS IN WHEN A FLOATING POINT PARM IS DEFINED */
+
+
+/* float_range:
+/* 	procedure (P_lower, P_upper, P_range_description);
+/*
+/*	declare (P_lower, P_upper) float bin (27) aligned;
+/*	declare P_range_description character (*);
+
+/*	if function ^= SET then return;
+
+/*	if new_float_value < P_lower | new_float_value > P_upper
+/*	then call abort (P_range_description);
+
+/*	return;
+/*	end float_range;
+*/
+scaled_range:
+          procedure (P_lower, P_upper, P_range_description);
+
+	declare (P_lower, P_upper) fixed bin (35, 18);
+	declare P_range_description character (*);
+
+	if function ^= SET
+	then return;
+
+	if new_scaled_value < P_lower | new_scaled_value > P_upper
+	then call abort (P_range_description);
+
+	return;
+	end scaled_range;
+
+
+abort: proc (P_reason);
+
+/* This procedure just performs an abort -- it would be used anywhere the
+   valid values cannot be tested by either of the above procedures. It is a
+   procedure only in order to retain the general procedural structure of this
+   program. */
+
+dcl  P_reason char (*);
+
+
+	error_reason = P_reason;
+
+	goto ABORT_SETTING;
+
+	end abort;
+
+/*  */
+
+/* At last, the tuning parameters themselves: */
+
+%set NUM to 0;
+
+dcl  tc_data$tefirst fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$tefirst),
+	     "tefirst", "", TP_MICROSECONDS);
+
+	call range (500, ONE_MINUTE, "between 500 us. and one minute");
+	goto RETURN;
+
+
+
+dcl  tc_data$telast fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$telast),
+	     "telast", "", TP_MICROSECONDS);
+
+	call range (500, ONE_MINUTE, "between 500 us. and one minute");
+	if function = SET
+	     then if ^tc_data$gv_integration_set
+	          then tc_data$gv_integration = 4 * new_binary_value;
+	goto RETURN;
+
+
+
+dcl  tc_data$timax fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$timax),
+	     "timax", "", TP_MICROSECONDS);
+
+	call range (500, ONE_MINUTE, "between 500 us. and one minute");
+	goto RETURN;
+
+
+
+dcl  tc_data$priority_sched_inc fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$priority_sched_inc),
+	     "priority_sched_inc", "psi", TP_MICROSECONDS);
+
+	call range (100000, FIVE_HOURS, "between 100 ms. and five hours");
+	goto RETURN;
+
+
+
+dcl  tc_data$ncpu fixed bin (35) external static;
+dcl  tc_data$max_max_eligible fixed bin (35) external static;
+dcl  tc_data$min_eligible fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$min_eligible),
+	     "min_eligible", "mine", TP_SCALED_INTEGER);
+
+	call need_integer ();
+	call range ((tc_data$ncpu * SCALE), (tc_data$max_eligible), "at least as large as the number of cpus");
+	call range (0, (tc_data$max_eligible), "not greater than max_eligible");
+	goto RETURN;				/* up to the maximum allowed */
+
+
+
+dcl  tc_data$max_eligible fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$max_eligible),
+	     "max_eligible", "maxe", TP_SCALED_INTEGER);
+
+	call need_integer ();
+	call range ((tc_data$min_eligible), (tc_data$max_max_eligible), "between min_eligible and max_max_eligible");
+	goto RETURN;				/* up to the maximum allowed */
+
+
+
+dcl  tc_data$max_batch_elig fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$max_batch_elig),
+	     "max_batch_elig", "maxabs", TP_INTEGER);
+
+	call range (0, (tc_data$max_eligible), "between 0 and max_eligible");
+	goto RETURN;
+
+
+
+dcl  tc_data$working_set_factor fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$working_set_factor),
+	     "working_set_factor", "wsf", TP_SCALED_INTEGER);
+
+	call range (0, (2 * SCALE), "between 0 and 2");
+	goto RETURN;
+
+
+
+dcl  tc_data$working_set_addend fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$working_set_addend),
+	     "working_set_addend", "wsa", TP_INTEGER);
+
+	call range (-1000, 1000, "between -1000 and 1000");
+	goto RETURN;
+
+
+
+dcl  tc_data$deadline_mode fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$deadline_mode),
+	     "deadline_mode", "dmode", TP_ON_OFF);
+
+	call on_or_off ();				/* only two possible values */
+	goto RETURN;
+
+
+
+dcl  tc_data$int_q_enabled fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$int_q_enabled),
+	     "int_q_enabled", "intq", TP_ON_OFF);
+
+	call on_or_off ();				/* only two possible values */
+	goto RETURN;
+
+
+
+dcl  tc_data$post_purge_switch fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$post_purge_switch),
+	     "post_purge", "pp", TP_ON_OFF);
+
+	call on_or_off ();				/* only two possible values */
+	goto RETURN;
+
+
+
+dcl  tc_data$pre_empt_sample_time fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$pre_empt_sample_time),
+	     "pre_empt_sample_time", "pest", TP_MICROSECONDS);
+
+	call range (500, ONE_SECOND, "between 500 us. and one second");
+	goto RETURN;
+
+
+
+dcl  tc_data$gp_at_notify fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$gp_at_notify),
+	     "gp_at_notify", "gpn", TP_ON_OFF);
+
+	call on_or_off ();				/* only two possible values */
+	goto RETURN;
+
+
+
+dcl  tc_data$gp_at_ptlnotify fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$gp_at_ptlnotify),
+	     "gp_at_ptlnotify", "gpp", TP_ON_OFF);
+
+	call on_or_off ();				/* only two possible values */
+	goto RETURN;
+
+
+
+dcl  tc_data$process_initial_quantum fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$process_initial_quantum),
+	     "process_initial_quantum", "piq", TP_MICROSECONDS);
+
+	call range (100000, (30 * ONE_SECOND), "between 100 ms. and 30 seconds");
+	goto RETURN;
+
+
+
+dcl  tc_data$quit_priority fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$quit_priority),
+	     "quit_priority", "qp", TP_SCALED_INTEGER);
+
+	call range (0, (2 * SCALE), "between zero and two");
+	goto RETURN;
+
+
+
+dcl  tc_data$nto_delta fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$nto_delta),
+	     "notify_timeout_interval", "nto_delta", TP_MICROSECONDS);
+
+	call range (ONE_SECOND, TEN_MINUTES, "between one second and ten minutes");
+	goto RETURN;
+
+
+
+dcl  tc_data$time_out_severity fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (tc_data$time_out_severity),
+	     "notify_timeout_severity", "nto_severity", TP_INTEGER);
+
+	call range (-1, 5, "any of -1, 0, 1, 3, 4, or 5");	/* Disallow 2 */
+	if new_binary_value = 2 then call abort ("any of -1, 0, 1, 3, 4, or 5");
+	goto RETURN;
+
+
+
+dcl  sst$nused fixed bin (35) external static;
+dcl  sst$write_limit fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (sst$write_limit),
+	     "write_limit", "wlim", TP_INTEGER);
+
+	call range (30, divide (sst$nused, 2, 35, 0), "between 30 pages and half of memory");
+	goto RETURN;
+
+%set NUM to NUM + 1;
+declare tc_data$stk_truncate bit (1) ext static;
+TP (NUM): call tp_init (addr (tc_data$stk_truncate),
+   "stack_truncation", "stkt", TP_ON_OFF);
+
+	tp_special = "1"b;
+	call on_or_off ();
+	goto RETURN;
+
+declare tc_data$stk_truncate_always bit (1) aligned ext;
+
+%set NUM to NUM + 1;
+TP (NUM): call tp_init (addr (tc_data$stk_truncate_always),
+       "stack_truncation_always", "stta", TP_ON_OFF);
+
+	tp_special = "1"b;
+	call on_or_off;
+	goto RETURN;
+
+%set NUM to NUM + 1;
+declare tc_data$stk_trunc_avg_f1 aligned fixed bin (35, 18) ext static;
+declare tc_data$stk_trunc_avg_f2 aligned fixed bin (35, 18) ext static;
+
+TP (NUM): call tp_init (addr (tc_data$stk_trunc_avg_f1),
+	     "stk_trunc_block_avg_factor", "stk_baf",
+              TP_SCALED_INTEGER);
+
+           tp_special = "1"b;
+	 call scaled_range (0b, 1b, "between zero and one.");
+
+	if function = SET
+	then tc_data$stk_trunc_avg_f2 = 1b - tc_data$stk_trunc_avg_f1;
+
+	 goto RETURN;
+
+
+%set NUM to NUM + 1;
+declare wired_hardcore_data$trap_invalid_masked bit (1) aligned ext static;
+TP (NUM): call tp_init (addr (wired_hardcore_data$trap_invalid_masked),
+   "trap_invalid_masked", "", TP_ON_OFF);
+
+          tp_special = "1"b;
+          call on_or_off ();
+	goto RETURN;
+
+%set NUM to NUM + 1;
+declare tc_data$gv_integration fixed bin (35) external static;
+declare tc_data$gv_integration_set bit (1) aligned external static;
+
+TP (NUM): call tp_init (addr (tc_data$gv_integration),
+   "gv_integration", "", TP_MICROSECONDS);
+
+          call range ((tc_data$telast), FIVE_HOURS, "between telast and 5 hours");
+
+	if function = SET
+	     then tc_data$gv_integration_set = "1"b;
+	goto RETURN;
+	
+
+dcl  sst$meter_ast_locking fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM): call tp_init (addr (sst$meter_ast_locking),
+               "meter_ast_locking", "", TP_ON_OFF);
+
+	tp_special = "1"b;
+	call on_or_off ();
+	goto RETURN;
+
+
+dcl  tc_data$realtime_io_priority_switch fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM): call tp_init (addr (tc_data$realtime_io_priority_switch),
+	     "realtime_io_priority", "io_prior", TP_ON_OFF);
+
+          call on_or_off ();
+	goto RETURN;
+
+
+dcl  tc_data$realtime_io_deadline fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM): call tp_init (addr (tc_data$realtime_io_deadline),
+	     "realtime_io_deadline", "io_deadline", TP_MICROSECONDS);
+
+          call range (500, ONE_MINUTE, "between 500 us. and one minute");
+	goto RETURN;
+
+
+dcl  tc_data$realtime_io_quantum fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM): call tp_init (addr (tc_data$realtime_io_quantum),
+	     "realtime_io_quantum", "io_quantum", TP_MICROSECONDS);
+
+          call range (500, ONE_MINUTE, "between 500 us. and one minute");
+	goto RETURN;
+
+dcl  sst$checksum_filemap fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM): call tp_init (addr (sst$checksum_filemap),
+	     "checksum_filemap", "", TP_ON_OFF);
+
+	tp_special = "1"b;
+	call on_or_off ();
+	goto RETURN;
+
+dcl  sys_info$default_256K_enable bit (1) aligned ext static;
+%set NUM to NUM + 1;
+TP (NUM): call tp_init (addr (sys_info$default_256K_enable),
+   	     "default_256K_enable", "", TP_ON_OFF);
+	tp_special = "1"b;
+	call on_or_off ();
+	go to RETURN;
+
+dcl  sst$dirlock_writebehind fixed bin (35) external static;
+%set NUM to NUM + 1;
+TP (NUM):	call tp_init (addr (sst$dirlock_writebehind),
+	     "dirlock_writebehind", "dirw", TP_ON_OFF);
+	call on_or_off ();
+	goto RETURN;
+
+%page; %include tuning_parameter_info;
+%page; %include syserr_constants;
+
+	end hc_tune;
+   
+
+
+
+		    history_reg_save.pl1            11/11/89  1136.0r w 11/11/89  0800.9       20772
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+history_reg_save: proc;
+
+/* history_reg_save - hardcore primitives for turning  on  or  off  the  ability  to  save
+   history  regs,  either  per  process  (with  the  per_proc  entry) or per-system (with the
+   per_system entry).
+
+   Written 9/16/80 by J. A. Bush for the DPS8/70M CPU
+*/
+
+dcl (pp_state, ps_state) bit (1) aligned;		/* entry parameters */
+dcl  pds$save_history_regs bit (1) aligned ext;
+dcl  wired_hardcore_data$global_hregs bit (1) aligned ext;
+
+/* entry to return the state of a process's ability to save history regs, called from hcs_$history_regs_get */
+
+per_proc_get: entry (pp_state);			/* per-process get entry */
+
+	pp_state = pds$save_history_regs;		/* return switch state */
+
+	return;					/* thats it, return to caller */
+
+/* entry to save a process's history regs, called from hcs_$history_regs_set */
+
+per_proc_set: entry (pp_state);			/* per-process set entry */
+
+	pds$save_history_regs = pp_state;		/* set the desired switch state */
+
+	return;					/* thats it, return to caller */
+
+/* entry to return the state of the systems ability to save history regs, called from hphcs_$history_regs_get */
+
+per_system_get: entry (ps_state);			/* per-system get  entry */
+
+	ps_state = wired_hardcore_data$global_hregs;	/* return switch state */
+
+	     return;				/* thats it, return to caller */
+
+/* entry to save everybodies history regs_set called from hphcs_$history_regs_set */
+
+per_system_set: entry (ps_state);			/* per-system set  entry */
+
+	wired_hardcore_data$global_hregs = ps_state;	/* set the desired switch state */
+
+	return;					/* thats it, return to caller */
+
+     end history_reg_save;
+
+
+
+
+		    set_procs_required.pl1          11/11/89  1136.0rew 11/11/89  0800.9      132615
+
+
+
+/****^  ******************************************************
+        *                                                    *
+        * Copyright, (C) Honeywell Bull Inc., 1987           *
+        *                                                    *
+        * Copyright (c) 1986 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        * Copyright (c) 1972 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        ****************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(81-09-01,Bongiovanni), approve(), audit(), install():
+      Written by J. Bongiovanni.
+  2) change(83-08-01,Bongiovanni), approve(), audit(), install():
+      Modified to initialize variables in given_processid.
+  3) change(86-06-02,Lippard), approve(87-02-09,MCR7616),
+     audit(87-06-03,Farley), install(87-08-06,MR12.1-1063):
+      Modified to fix coding error which sometimes allowed sprq'ing an
+      offline cpu.
+  4) change(87-01-12,Lippard), approve(87-02-09,MCR7616),
+     audit(87-06-03,Farley), install(87-08-06,MR12.1-1063):
+      Modified to check ACS before allowing sprq. Removed the obsolete
+      single_cpu entry point and associated code.
+  5) change(87-08-07,Lippard), approve(87-02-09,PBF7616),
+     audit(87-08-11,Farley), install(87-08-18,MR12.1-1090):
+      Added entry points get_procs_required and get_system_procs_required.
+  6) change(87-08-27,Lippard), approve(87-02-09,PBF7616),
+     audit(87-08-28,Farley), install(87-09-01,MR12.1-1095):
+      Always allow Initializer access.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style3 */
+set_procs_required:
+     proc (a_procs_required, a_code);
+
+/*  Ring-0 routine to allow suitably a privileged process to
+    set per-process or system default CPUs required.  Access
+    is controlled by gates to this procedure.  Although this
+    routine locks the Global APT Lock, it is normally unwired,
+    as it is called infrequently.
+
+    Entries:
+
+    set_procs_required - sets per-process CPUs required
+
+    given_processid    - sets per-process CPUs required for
+		     another process
+
+    system_default     - sets the system default group of CPUs
+		     required (this default applies to processes
+		     which have not requested specific CPUs)
+
+    get_procs_required - gets per-process CPUs required
+
+    get_system_procs_required - gets system default group of CPUs
+                         required */
+
+/*  Parameter */
+
+dcl	a_code		fixed bin (35) parameter;	/* standard error code */
+dcl	a_default_flag	bit (1) aligned parameter;	/* on if set of CPUs is default */
+dcl	a_processid	bit (36) aligned parameter;	/* target processid */
+dcl	a_procs_required	bit (8) aligned parameter;	/* mask of CPUs required */
+
+/*  Automatic */
+
+dcl	apteap		ptr;			/* pointer to APTE array */
+dcl	aptex		fixed bin;		/* index into APTE array */
+dcl	bad_processid	bit (1);			/* ON => invalid target processid */
+dcl	code		fixed bin (35);		/* error code (standard or otherwise) */
+dcl	cpu_num		fixed bin;		/* CPU number (0-7) */
+dcl	1 event_flags	like audit_event_flags;	/* audit flags for access_audit_ */
+dcl	is_default	bit (1);			/* ON => setting to system default */
+dcl	local_apte_ptr	ptr;			/* pointer to user's APT entry */
+dcl	mode		bit (36) aligned;		/* ACS access mode */
+dcl	n_aptes		fixed bin;		/* number of APTEs */
+dcl	no_cpus_online	bit (1);			/* ON => requested set of CPUs had none online */
+dcl	old_procs_required	bit (8) aligned;		/* previous value of system default */
+dcl	old_procs_required_tags
+			char (8);			/* CPU tags of previous system default */
+dcl	processid		bit (36) aligned;		/* target processid */
+dcl	procs_required	bit (8) aligned;		/* mask of CPUs required */
+dcl	procs_required_tags char (8);			/* CPU tags of new system default */
+dcl	ptwp		ptr;			/* saved pointer to stack page table for pmut */
+dcl	saved_mask	fixed bin (71);		/* saved interrupt mask for pmut */
+
+/*  Static */
+
+dcl	CPUS		char (8) init ("ABCDEFGH") int static options (constant);
+dcl	INITIALIZER	char (23) init ("Initializer.SysDaemon.z") int static options (constant);
+dcl	MAX_CPU_TAG	fixed bin init (7) int static options (constant);
+dcl	SPRQ_ACS_DIR	char (14) init (">sc1>admin_acs") int static options (constant);
+dcl	SPRQ_ACS_SEG	char (21) init ("set_proc_required.acs") int static options (constant);
+
+/*  Based */
+
+dcl	1 aptea		(n_aptes) aligned based (apteap) like apte;
+dcl	1 local_apte	aligned based (local_apte_ptr) like apte;
+
+/* Entry */
+
+dcl	access_audit_$log_general
+			entry options (variable);
+dcl	level$get		entry returns (fixed bin);
+dcl	pmut$wire_and_mask	entry (fixed bin (71), ptr);
+dcl	pmut$unwire_unmask	entry (fixed bin (71), ptr);
+dcl	pxss$lock_apt	entry;
+dcl	pxss$lock_apte	entry (bit (36) aligned, ptr, fixed bin (35));
+dcl	pxss$set_procs_required
+			entry (bit (8) aligned, fixed bin (35));
+dcl	pxss$unlock_apt	entry;
+dcl	pxss$unlock_apte	entry (ptr);
+dcl	status_$get_user_raw_mode
+			entry (char (*), char (*), char (*), bit (36) aligned, fixed bin (35));
+dcl	syserr		entry options (variable);
+dcl	syserr$error_code	entry options (variable);
+dcl	wire_proc$wire_me	entry;
+dcl	wire_proc$unwire_me entry;
+
+/* External */
+
+dcl	access_operations_$get_procs_required
+			bit (36) aligned external;
+dcl	access_operations_$set_procs_required
+			bit (36) aligned external;
+dcl	error_table_$bad_arg
+			fixed bin (35) external;
+dcl	error_table_$insufficient_access
+			fixed bin (35) ext static;
+dcl	error_table_$no_cpus_online
+			fixed bin (35) external;
+dcl	error_table_$process_unknown
+			fixed bin (35) external;
+dcl	pds$apt_ptr	ptr external;
+dcl	pds$process_group_id
+			char (32) aligned external;
+dcl	scs$processor	bit (8) aligned external;
+dcl	tc_data$apt	bit (36) aligned external;
+dcl	tc_data$apt_size	fixed bin external;
+dcl	tc_data$default_procs_required
+			bit (8) aligned external;
+
+
+/*  Builtin  */
+
+dcl	addr		builtin;
+dcl	null		builtin;
+dcl	rtrim		builtin;
+dcl	string		builtin;
+dcl	substr		builtin;
+
+%page;
+/* SET_PROCS_REQUIRED - set CPUs required for this process
+
+   takes a bit mask specifying CPUs required ("0"b means current
+                        system default)
+
+   return code = 0    - this process running on some CPU in the group
+
+	       error_table_$no_cpus_online - the set requested had
+	              no CPUs online
+*/
+
+	procs_required = a_procs_required;		/* copy to stack which will be wired */
+	if ^CHECK_ACCESS (access_operations_$set_procs_required)
+	then do;
+		a_code = error_table_$insufficient_access;
+		return;
+	     end;
+
+	call SET_MY_PROCS_REQUIRED (procs_required, code);
+
+	a_code = code;
+	return;
+
+%page;
+/* GIVEN_PROCESSID     - sets per-process CPUs required for another
+                         process
+
+   takes a bit mask specifying CPUs required ("0"b means current
+   system default) and a processid.
+
+   return code = 0    - proc_required mask set for target process
+                        (will take effect on next trip thru getwork)
+
+                 error_table_$no_cpus_online - the set requested had
+                        no CPUs online
+
+                 error_table_$process_unknown - the target processid
+                        is invalid
+*/
+
+given_processid:
+     entry (a_procs_required, a_processid, a_code);
+
+	procs_required = a_procs_required;		/* copy arguments to stack to be wired */
+	processid = a_processid;
+
+	call WIRE_LOCK_APT;
+
+/* ---------- WIRED, MASKED, GLOBAL APT LOCK HELD ---------- */
+
+	if procs_required = "0"b
+	then do;					/* system default */
+		is_default = "1"b;
+		procs_required = tc_data$default_procs_required;
+	     end;
+	else is_default = "0"b;
+
+
+	bad_processid = "0"b;			/* Steve Harris says this is useful */
+	if (scs$processor & procs_required) = "0"b
+	then no_cpus_online = "1"b;			/* No online CPUs in requested set */
+	else do;
+		no_cpus_online = "0"b;		/* Steve was correct */
+		call pxss$lock_apte (processid, aptep, code);
+						/* Check processid, lock APTE, set aptep */
+		if code ^= 0
+		then bad_processid = "1"b;		/* Could not lock - processid not found */
+		else if apte.flags.idle		/* Don't allow idle process to change */
+		then do;
+			bad_processid = "1"b;
+			call pxss$unlock_apte (aptep);
+		     end;
+		else do;
+			apte.procs_required = procs_required;
+			apte.flags.default_procs_required = is_default;
+			call pxss$unlock_apte (aptep);/* Unlock APTE */
+		     end;
+	     end;
+
+	call UNLOCK_APT_UNWIRE;
+
+/* ---------- UNMASKED, UNWIRED, NO LOCKS HELD ---------- */
+
+	if no_cpus_online
+	then a_code = error_table_$no_cpus_online;
+	else if bad_processid
+	then a_code = error_table_$process_unknown;
+	else a_code = 0;
+
+	return;
+%page;
+/* SYSTEM_DEFAULT     - sets the system default group of CPUs required
+
+   takes a bit mask specifying the CPUs required
+
+   walks the APTE array and changes procs_required for all processes
+   with current default to new default
+
+   return code = 0    - default set as requested
+
+	       error_table_$no_cpus_online - the set requested had
+                        no CPUs online
+
+                 error_table_$bad_arg - a mask of "0"b was specified
+                        (no CPUs)
+*/
+
+system_default:
+     entry (a_procs_required, a_code);
+
+	procs_required = a_procs_required;		/* copy to stack to be wired */
+
+	if procs_required = "0"b
+	then do;					/* no CPUs in set */
+		a_code = error_table_$bad_arg;
+		return;
+	     end;
+
+	no_cpus_online = "0"b;
+
+	call WIRE_LOCK_APT;
+
+/* ---------- WIRED, MASKED, GLOBAL APT LOCK HELD ---------- */
+
+	if (scs$processor & procs_required) = "0"b
+	then no_cpus_online = "1"b;			/* No online CPUs in set requested */
+	else do;
+		old_procs_required = tc_data$default_procs_required;
+		tc_data$default_procs_required = procs_required;
+		apteap = addr (tc_data$apt);
+		n_aptes = tc_data$apt_size;
+		do aptex = 1 to n_aptes;
+		     if aptea (aptex).flags.default_procs_required
+						/* This process has system default */
+		     then aptea (aptex).procs_required = procs_required;
+		end;
+	     end;
+
+	call UNLOCK_APT_UNWIRE;
+
+
+/* ---------- UNMASKED, UNWIRED, NO LOCKS HELD ---------- */
+
+	if no_cpus_online
+	then a_code = error_table_$no_cpus_online;
+	else do;
+		a_code = 0;
+		procs_required_tags, old_procs_required_tags = "";
+						/* Build syserr message */
+		do cpu_num = 0 to MAX_CPU_TAG;
+		     if substr (procs_required, cpu_num + 1, 1) = "1"b
+		     then procs_required_tags = rtrim (procs_required_tags) || substr (CPUS, cpu_num + 1, 1);
+		     if substr (old_procs_required, cpu_num + 1, 1) = "1"b
+		     then old_procs_required_tags = rtrim (old_procs_required_tags) || substr (CPUS, cpu_num + 1, 1);
+		end;
+		call syserr (SYSERR_PRINT_ON_CONSOLE,
+		     "set_procs_required: Changing system default CPUs required from ^a to ^a for ^a",
+		     old_procs_required_tags, procs_required_tags, pds$process_group_id);
+	     end;
+
+	return;
+%page;
+/* GET_PROCS_REQUIRED - gets the per-process CPUs required
+
+   returns a bit mask specifying CPUs required, a bit indicating
+   whether the CPUs required is the default, and an error code. */
+
+get_procs_required:
+     entry (a_procs_required, a_default_flag, a_code);
+
+	if ^CHECK_ACCESS (access_operations_$get_procs_required)
+	then do;
+		a_code = error_table_$insufficient_access;
+		return;
+	     end;
+
+	local_apte_ptr = pds$apt_ptr;
+	a_procs_required = local_apte.procs_required;
+	a_default_flag = local_apte.flags.default_procs_required;
+	a_code = 0;
+	return;
+%page;
+/* GET_SYSTEM_PROCS_REQUIRED - gets system default group of CPUs required
+   returns a bit mask specifying CPUs required by the system */
+
+get_system_procs_required:
+     entry (a_procs_required);
+
+	a_procs_required = tc_data$default_procs_required;
+	return;
+
+%page;
+/* Internal Procedure to check ACS segment for access */
+CHECK_ACCESS:
+     proc (a_access_op) returns (bit (1) aligned);
+
+dcl	a_access_op	bit (36) aligned parm;
+dcl	access_op		bit (36) aligned;
+dcl	have_access	bit (1) aligned;
+dcl	return_code	fixed bin (35);
+
+	access_op = a_access_op;
+	have_access = "0"b;
+	return_code = 0;
+
+	if pds$process_group_id = INITIALIZER then return ("1"b);
+
+	call status_$get_user_raw_mode (SPRQ_ACS_DIR, SPRQ_ACS_SEG, "", mode, code);
+	if code ^= 0
+	then do;
+		call syserr$error_code (SYSERR_LOG_OR_PRINT, code,
+		     "set_procs_required: Failed to check access for ^a.", pds$process_group_id);
+		return ("0"b);
+	     end;
+
+	if (mode & RW_ACCESS) = RW_ACCESS
+	then have_access = "1"b;
+	else return_code = error_table_$insufficient_access;
+
+	string (event_flags) = ""b;
+	event_flags.priv_op = "1"b;
+	event_flags.grant = have_access;
+
+	call access_audit_$log_general ("set_procs_required", level$get (), string (event_flags), access_op, "",
+	     return_code, null (), 0);
+	return (have_access);
+
+     end CHECK_ACCESS;
+
+%page;
+/* Internal Procedure to set the CPUs required for this process */
+
+SET_MY_PROCS_REQUIRED:
+     proc (procs, code);
+
+dcl	procs		bit (8) aligned;		/* Mask for CPUs required */
+dcl	code		fixed bin (35);		/* Standard error code */
+
+dcl	pxss_code		fixed bin (35);		/* Non-standard error code from pxss */
+
+
+	call pxss$set_procs_required (procs, pxss_code);
+	if pxss_code = 0
+	then code = 0;
+	else code = error_table_$no_cpus_online;
+	return;
+
+
+     end SET_MY_PROCS_REQUIRED;
+
+%page;
+/* Internal Procedure to wire this procedure (text and linkage), wire
+   stack, mask to system level, and lock the Global APT Lock */
+
+WIRE_LOCK_APT:
+     proc;
+
+	call wire_proc$wire_me;
+	call pmut$wire_and_mask (saved_mask, ptwp);
+	call pxss$lock_apt;
+
+
+     end WIRE_LOCK_APT;
+
+
+
+
+
+
+
+
+/* Internal Procedure to Unlock Global APT Lock, Reset mask to previous,
+   Unwire Stack, Unwire text and linkage */
+
+UNLOCK_APT_UNWIRE:
+     proc;
+
+
+	call pxss$unlock_apt;
+	call pmut$unwire_unmask (saved_mask, ptwp);
+	call wire_proc$unwire_me;
+
+
+     end UNLOCK_APT_UNWIRE;
+
+
+%page;
+%include access_audit_eventflags;
+%include access_mode_values;
+%include apte;
+%include syserr_constants;
+
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   set_procs_required: Changing system default CPUs required from XXXX to YYYY for PERSON.PROJECT.TAG
+
+   S: $info
+
+   T: $run
+
+   M: The default set of CPUs has been changed from XXXX (CPU tags) to YYYY
+   (CPU tags) by PERSON.PROJECT.TAG.  These are the only CPUs on which
+   processes will run which have not requested to be run on specific CPUs.
+
+   A: $ignore
+
+
+   Message:
+   set_procs_required: Failed to check access for USER.
+
+   S: $log
+
+   T: $run
+
+   M: Access on >sc1>admin_acs>set_proc_required.acs could not be checked.
+
+   A: Verify that the ACS seg exists.
+
+   END MESSAGE DOCUMENTATION */
+
+     end set_procs_required;
+
+ 
+
+
+
+		    tc.pl1                          11/11/89  1136.0r w 11/11/89  0801.0       89964
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+tc:  proc;
+
+/* This program includes those scheduler functions which
+   are used infrequently enough that the code is appropriately
+   written in pl1 and not permanently wired-down */
+
+/* Coded May 1975 by RE Mullen for priority scheduler */
+/* tune_work_class entry added RE Mullen for deadline scheduler */
+/* Modified 29 October by M. Pierret for pin_weight and io_priority */
+/* Modified June 1981 by J. Bongiovanni for governed work classes */
+/* Modified May 1982 by J. Bongiovanni for interactive_q */
+/* Modified November 1984 by M. Pandolf to include hc_lock. */
+
+% include tcm;
+% include hc_lock;
+% include apte;
+
+dcl 1 wci aligned like work_class_info;
+
+% include work_class_info;
+dcl (i, max_wc, wct_base) fixed bin;
+dcl  hundth_of_credits fixed bin;
+dcl  hundth_of_scatter fixed bin;
+dcl (apte_count, sum, wcnum, size_of_wct_entry) fixed bin (35);
+dcl  ptwp ptr;
+dcl  oldmask fixed bin (71);
+dcl  code fixed bin (35);
+
+dcl  tc_data$ external;
+
+dcl (
+     error_table_$action_not_performed,
+     error_table_$obsolete_function,
+     error_table_$bad_work_class,
+     error_table_$bad_arg)
+     external static fixed bin (35);
+
+dcl  clock_ entry returns (fixed bin (71));
+dcl (pxss$lock_apt, pxss$unlock_apt) entry ();		/* only way to touch apt lock */
+
+dcl  pmut$wire_and_mask entry (fixed bin (71), ptr);
+dcl  pmut$unwire_unmask entry (fixed bin (71), ptr);
+dcl  wire_proc$wire_me entry ();
+dcl  wire_proc$unwire_me entry ();
+
+dcl (addr, addrel, bin, divide, fixed, rel, size) builtin;
+
+/* END DCLS */
+
+/*  */
+
+
+tune_work_class: entry (a_wctup, a_code);
+
+dcl  a_wctup ptr;
+dcl  wctup ptr;
+
+dcl 1 wctu_info aligned like work_class_tune_info;
+
+	wctup = a_wctup;
+	code = 0;
+	tcmp = addr (tc_data$);
+	wctu_info = wctup -> work_class_tune_info;
+	if wctu_info.version < WCTI_version_3 then do;
+	     code = error_table_$obsolete_function;
+	     go to TWC_RETURN;
+	end;
+	i = wctu_info.wc_number;
+	if (i<0) | (i>16) then do;
+	     code = error_table_$bad_work_class;
+	     go to TWC_RETURN;
+	end;
+	if ^tcm.wcte (i).defined then do;
+	     code = error_table_$bad_work_class;
+	     go to TWC_RETURN;
+	end;
+
+	if wctu_info.set.governed then
+	     if wctu_info.max_percent < 0 | wctu_info.max_percent > 100
+	     then do;
+		code = error_table_$bad_arg;
+		goto TWC_RETURN;
+	     end;
+	     
+
+/* Now set the new parameters for this work_class. */
+
+	call WIRE_LOCK;				/* TRAFFIC CONTROLLER LOCKED */
+
+	if wctu_info.set.resp1 then
+	     tcm.wcte (i).resp1 = wctu_info.resp1;
+	if wctu_info.set.resp2 then
+	     tcm.wcte (i).resp2 = wctu_info.resp2;
+	if wctu_info.set.quantum1 then
+	     tcm.wcte (i).quantum1 = wctu_info.quantum1;
+	if wctu_info.set.quantum2 then
+	     tcm.wcte (i).quantum2 = wctu_info.quantum2;
+	if wctu_info.set.purging then
+	     if wctu_info.flags.purging then tcm.wcte (i).purging = 1;
+	     else tcm.wcte (i).purging = 0;
+	if wctu_info.set.realtime then
+	     if wctu_info.flags.realtime then tcm.wcte (i).realtime = 1;
+	     else tcm.wcte (i).realtime = 0;
+	if wctu_info.set.maxel then
+	     tcm.wcte (i).maxel = wctu_info.maxel;
+	if wctu_info.set.pin_weight then
+	     tcm.wcte (i).pin_weight = wctu_info.pin_weight;
+	if wctu_info.set.io_priority then
+	     tcm.wcte (i).io_priority = wctu_info.flags.io_priority;
+	if wctu_info.set.governed then do;
+	     if wctu_info.max_percent = 0 then
+	          tcm.wcte (i).flags.governed = "0"b;
+	     else do;
+		hundth_of_scatter = divide (tcm.credits_per_scatter, 100, 17);
+		tcm.wcte (i).maxf = hundth_of_scatter * wctu_info.max_percent;
+		tcm.wcte (i).governing_credits = 0;
+		tcm.wcte (i).flags.governed = "1"b;
+		end;
+	     if ^wctu_info.set.interactive_q		/* Use default */
+		then tcm.wcte (i).flags.interactive_q = ^tcm.wcte (i).flags.governed;
+	     end;
+	     if wctu_info.set.interactive_q
+		then tcm.wcte (i).flags.interactive_q = wctu_info.flags.interactive_q;
+	     
+
+	call UNLOCK_UNWIRE;				/* TRAFFIC CONTROLLER LOCKED */
+
+TWC_RETURN:
+	a_code = code;
+	return;
+
+
+
+define_work_classes: entry (a_wcip, a_code);
+
+dcl  a_wcip ptr;
+dcl  a_code fixed bin (35);
+
+
+/* First copy args */
+
+	wcip = a_wcip;
+
+	wci = work_class_info;
+	wci.error_process_id = ""b;
+	wci.error_work_class = 0;
+	code = 0;
+
+/* If setting user workclasses then compute sum and max_wc */
+/* In any case validate arguments */
+
+	if wci.set_user_wc then do;
+	     sum = 0;				/* Compute the sum of the "percents" */
+	     max_wc = 0;				/* Assume only  zeroth exists */
+
+	     do i = 1 to 16;
+		if wci.user_wc_defined (i) then do;
+		     if wci.user_wc_min_pct (i) <= 0
+			| (wci.governed (i) 
+			     & (wci.user_wc_max_pct (i) <= 0 | wci.user_wc_max_pct (i) > 100))
+		     then do;
+			code = error_table_$bad_arg;
+			go to DWC_RETURN;
+		     end;
+		     sum = sum + wci.user_wc_min_pct (i);
+		     max_wc = i;
+		end;
+	     end;
+	end;
+
+	if wci.set_system_wc then do;
+	     if wci.system_wc_min_pct <= 0 then do;
+		code = error_table_$bad_arg;
+		go to DWC_RETURN;
+	     end;
+	end;
+
+	call WIRE_LOCK;				/* TRAFFIC CONTROLLER LOCKED */
+
+
+/* Verify that existing processes will belong to defined work classes */
+
+	aptep = addr (tcm.apt);
+	apte_count = tcm.apt_size;
+	size_of_wct_entry = size (wct_entry);
+	wct_base = fixed (rel (addr (tcm.wcte (0))), 18);
+
+	if wci.set_user_wc then do;
+	     do i = 1 to apte_count;
+		if ^ apte.flags.idle then		/* Idle processes are not in wc's */
+		     if bin (apte.flags.state, 18) ^= 0 then /* Dont worry about empties */
+			if bin (apte.flags.state, 18) ^= 5 then do; /* Dont worry about stopped */
+			     wcnum = divide (fixed (apte.wct_index, 18) - wct_base, size_of_wct_entry, 17, 0);
+			     if wcnum > 0 then do;
+				if ^ wci.user_wc_defined (wcnum) then do;
+				     wci.error_process_id = apte.processid;
+				     wci.error_work_class = wcnum;
+				     go to DWC_UU_RETURN;
+				end;
+			     end;
+			end;
+		aptep = addrel (aptep, tcm.apt_entry_size); /* Move to next APTE */
+	     end;
+
+	     tcm.max_wct_index = rel (addr (tcm.wcte (max_wc)));
+
+	     if sum ^= 0 then			/* Scheduler algorithm requires normalization to 100% */
+		hundth_of_credits = divide (tcm.credits_per_scatter, sum, 17, 0);
+	     else hundth_of_credits = 0;		/* no user_work_classes defined */
+	     hundth_of_scatter = divide (tcm.credits_per_scatter, 100, 17, 0);
+	     
+
+/* Set per-work_class parameters as specified */
+
+	     do i = 1 to 16;
+		if wci.user_wc_defined (i) then do;
+		     tcm.wcte (i).flags.defined = "1"b;
+		     tcm.wcte (i).minf = fixed (wci.user_wc_min_pct (i), 7) * hundth_of_credits;
+						/* Set credits to a modest amount. */
+		     tcm.wcte (i).credits = tcm.wcte (i).minf + tcm.telast;
+		end;
+		else do;
+		     tcm.wcte (i).flags.defined = "0"b;
+		     tcm.wcte (i).credits,
+			tcm.wcte (i).minf = 0;
+		end;
+		tcm.wcte (i).purging = 1;
+		tcm.wcte (i).maxel = 0;
+		if wci.version >= 2 & wci.user_wc_defined (i) then do;
+		     if wci.realtime (i) then tcm.wcte.realtime (i) = 1;
+		     else tcm.wcte (i).realtime = 0;
+		     tcm.wcte (i).resp1 = wci.resp1 (i);
+		     tcm.wcte (i).quantum1 = wci.quantum1 (i);
+		     tcm.wcte (i).resp2 = wci.resp2 (i);
+		     tcm.wcte (i).quantum2 = wci.quantum2 (i);
+		end;
+		else do;				/* set default parms for this wc */
+		     tcm.wcte (i).resp1 = 4000000;	/* 4sec */
+		     tcm.wcte (i).quantum1 = 500000;	/* half sec */
+		     tcm.wcte (i).resp2 = 32000000;	/* 32 sec */
+		     tcm.wcte (i).quantum2 = 1000000;	/* one sec */
+		     tcm.wcte (i).realtime = 0;
+		end;
+		if wci.version >= 3 & wci.user_wc_defined (i) 
+		     & wci.governed (i) then do;
+		     tcm.wcte (i).flags.governed = "1"b;
+		     tcm.wcte (i).maxf = hundth_of_scatter * wci.user_wc_max_pct (i);
+		end;
+		else tcm.wcte (i).flags.governed = "0"b;
+		tcm.wcte (i).flags.interactive_q = ^tcm.wcte (i).flags.governed;
+		tcm.wcte (i).governing_credits = 0;
+	     end;
+	end;
+
+/* Set global parameters if requested. */
+
+
+	if wci.set_sked_mode then tcm.deadline_mode = bin (wci.deadline_mode, 1);
+	if wci.set_max_batch_elig then tcm.max_batch_elig = wci.max_batch_elig;
+
+	if wci.set_system_wc then do;
+	     tcm.wcte (0).minf = fixed (wci.system_wc_min_pct, 7)
+		* divide (tcm.credits_per_scatter, 100, 17, 0);
+	     tcm.wcte (0).credits = tcm.wcte (0).minf + tcm.telast;
+	end;
+
+
+/* Re-initialize metering data */
+	if wci.set_user_wc | wci.set_system_wc then do;
+	     do i = 0 to 16;
+		tcm.wcte (i).cpu_sum,
+		     tcm.wcte (i).eligibilities = 0;
+	     end;
+	     tcm.define_wc_time = clock_ ();
+	     tcm.processor_time_at_define_wc = tcm.processor_time;
+	end;
+
+DWC_UU_RETURN:
+	call UNLOCK_UNWIRE;				/* TRAFFIC CONTROLLER UNLOCKED */
+
+
+DWC_RETURN:
+	work_class_info = wci;
+	if code = 0 then
+	     if (wci.error_work_class ^= 0) | (wci.error_process_id ^= ""b)
+	     then code = error_table_$action_not_performed;
+	a_code = code;
+	return;
+
+
+/*  */
+
+/* -------------------------------------------------------------------- */
+
+WIRE_LOCK: proc;
+
+	     call wire_proc$wire_me ();
+	     call pmut$wire_and_mask (oldmask, ptwp);
+	     tcmp = addr (tc_data$);
+	     call pxss$lock_apt ();			/* TRAFFIC CONTROLLER LOCKED HERE */
+
+	end WIRE_LOCK;
+
+/* -------------------------------------------------------------------- */
+
+UNLOCK_UNWIRE: proc;
+
+	     call pxss$unlock_apt ();			/* TRAFFIC CONTROLLER UNLOCKED HERE */
+	     call pmut$unwire_unmask (oldmask, ptwp);
+	     call wire_proc$unwire_me ();
+
+	end UNLOCK_UNWIRE;
+
+
+     end tc;
+
+
+
+
+		    tc_util.pl1                     11/11/89  1136.0rew 11/11/89  0801.0      138501
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* format: style3 */
+
+tc_util:
+     proc;
+
+/* DESCRIPTION:
+   Various traffic control utility functions which used to live in pxss.
+   They need to run wired and masked, with various traffic control locks,
+   but are called infrequently.
+
+   Entries:
+
+   check_abort         - returns non-zero code if a quit or trm_ IPS signal,
+		     or a stop is pending for the process. Can be used
+		     by long-running ring-0 procedures to simulate quits.
+
+   get_aptep	   - validates a processid and returns the apte pointer.
+
+   get_ipc_operands    - returns to the caller the values of apte.ipc_r_offset
+                         and apte.ipc_r_factor.  These are used by user-ring
+                         (and hardcore) IPC event channel validation and
+                         decoding.  It is the target of hcs_$get_ipc_operands.
+
+   get_ipc_operands_priv
+                       - returns to the caller the values of apte.ipc_r_offset
+		     and apte.ipc_r_factor for a specified process.  This
+		     is a highly privileged entrypoint and intended only
+		     to be used by hardcore IPC (hc_ipc) and the
+		     Initializer process (dialup_).  It is the target
+		     of the gate hphcs_$get_ipc_operands_priv.
+
+   ips_wakeup	   - send a given named IPS signal to a given process.
+
+   process_status      - return information about a process.
+
+   resume_tc	   - unfreeze traffic control scheduling (see suspend_tc
+		     described below).
+
+   set_cpu_monitor     - establishes a wakeup call to the term processid
+		     after a given amount of virtual CPU time has
+		     been used by a specified process.
+
+   set_timax           - sets timax for a process
+
+   suspend_tc	   - freeze traffic control's running of processes, with
+		     the exception of all idles and the calling process.
+
+   validate_processid  - determines whether a processid coresponds to an
+		     active process.
+
+   Moved from pxss and converted to PL1 by J. Bongiovanni, September 1981
+   Modified June 1982, J. Bongiovanni, to add validate_processid
+   Modified September 1982, J. Bongiovanni, to add check_abort
+   Modififed February 1983, E. N. Kittlitz, to clear cpu timer if arg < 0.
+   Modified 831111 for validate_processid_all entry -E. A. Ranzenbach
+   Modified 831213, E. N. Kittlitz, to remove validate_processid_all and 
+      several intermediate changes.
+   Modified: 07/15/84 by R. Michael Tague:  Added ips_wakeup.
+   Modified October 1984 by M. Pandolf to add suspend_tc and resume_tc
+   Modified 1984-11-11 by E. Swenson for IPC event channel validation
+      support of hcs_$get_ipc_operands.  Also added highly privileged
+      entrypoint get_ipc_operands_priv which is used in ring-0 and as
+      the garget of the gate hphcs_$get_ipc_operands_priv.      
+*/
+
+/*  Parameter  */
+
+dcl	a_allow_special_procs
+			bit (1) aligned;		/* allow special processes in get_apte search */
+dcl	a_code		fixed bin (35) parameter;	/* standard error code */
+dcl	a_delta_vcpu	fixed bin (71) parameter;	/* increment to current VCPU for wakeup */
+dcl	a_info_ptr	ptr;			/* pointer to structure of process information */
+dcl	a_ips_signal_name	char (*);			/* name of the ips signal to be sent */
+dcl	a_processid	bit (36) aligned parameter;	/* target process ID */
+dcl	a_timax		fixed bin (35) parameter;	/* value to set timax to */
+dcl	P_ipc_r_offset	fixed bin (18) parameter;	/* IPC validation operand */
+dcl	P_ipc_r_factor	fixed bin (35) parameter;	/* IPC validation operand */
+
+/*  Automatic  */
+
+dcl	arg_list_ptr	ptr;			/* argument list pointer for ips_wakeup */
+dcl	code		fixed bin (35);		/* return code */
+dcl	delta_vcpu	fixed bin (71);		/* copy of increment to VCPU */
+dcl	ipc_r_offset	fixed bin (18);		/* automatic copy for wiring */
+dcl	ipc_r_factor	fixed bin (35);		/* automatic copy for wiring */
+dcl	ips_mask_index	fixed bin;		/* do loop index */
+dcl	ips_signal_name	char (32);		/* copy of ips signal name */
+dcl	oldmask		fixed bin (71);		/* value of interrupt mask at wire_mask */
+dcl	process_mp_state	fixed bin;		/* loaded (ON=1) + eligible (ON=2) */
+dcl	process_state	fixed bin;		/* traffic control state */
+dcl	process_timax	fixed bin (35);		/* copy of value to set timax for process */
+dcl	processid		bit (36) aligned;		/* copy of process ID */
+dcl	ptwp		ptr;			/* pointer to page table for stack */
+
+/*  Based  */
+
+dcl	1 a_process_status	aligned based (a_info_ptr) like process_status_return;
+dcl	1 my_arg_list	aligned based (arg_list_ptr) like arg_list;
+
+/*  Entry  */
+
+dcl	cu_$arg_list_ptr	entry (ptr);
+dcl	lock$lock_fast	entry (ptr);
+dcl	lock$unlock_fast	entry (ptr);
+dcl	pmut$wire_and_mask	entry (fixed bin (71), ptr);
+dcl	pmut$unwire_unmask	entry (fixed bin (71), ptr);
+dcl	pxss$lock_apte	entry (bit (36) aligned, ptr, fixed bin (35));
+dcl	pxss$ips_wakeup	entry (bit (36) aligned, bit (36) aligned);
+dcl	pxss$suspend_getwork
+			entry ();
+dcl	pxss$unlock_apte	entry (ptr);
+dcl	signal_		entry options (variable);
+dcl	wire_proc$unwire_me entry;
+dcl	wire_proc$wire_me	entry;
+
+/*  External  */
+
+dcl	error_table_$quit_term_abort
+			fixed bin (35) external;
+dcl	error_table_$process_unknown
+			fixed bin (35) external;
+dcl	pds$apt_ptr	ptr external;
+dcl	tc_data$		external;
+dcl	tc_data$abort_ips_mask
+			bit (36) aligned external;
+dcl	tc_data$apt	bit (36) aligned external;
+dcl	tc_data$apt_size	fixed bin external;
+dcl	tc_data$tc_suspend_lock
+			bit (36) aligned external;
+dcl	tc_data$timax	fixed bin (35) external;
+
+
+/*  Builtin  */
+
+dcl	addr		builtin;
+dcl	bin		builtin;
+dcl	divide		builtin;
+dcl	mod		builtin;
+dcl	null		builtin;
+dcl	ptr		builtin;
+dcl	rel		builtin;
+dcl	size		builtin;
+dcl	unspec		builtin;
+
+	return;					/* no tc_util entry */
+						/* END OF DECLARATIONS */
+%page;
+
+/* CHECK_ABORT - checks for quit or term IPS signal pending, or stop pending. */
+
+check_abort:
+     entry (a_code);
+
+	a_code = 0;
+
+	aptep = pds$apt_ptr;
+	if apte.flags.stop_pending | ((apte.ips_message & tc_data$abort_ips_mask) ^= ""b)
+	then a_code = error_table_$quit_term_abort;
+
+	return;
+%page;
+
+/* GET_APTEP	    - validates that a processid corresponds to an active
+		      process and returns the apte pointer.
+*/
+
+get_aptep:
+     entry (a_processid, a_allow_special_procs) returns (ptr);
+
+	aptep = PROCESSID_TO_APTE ((a_processid), (a_allow_special_procs));
+	return (aptep);
+%page;
+
+/* IPS_WAKEUP            - Look up the given ips signal name in sys_info and
+		       send the corresponding ips signal bit string to
+		       pxss$ips_wakeup.
+*/
+
+ips_wakeup:
+     entry (a_processid, a_ips_signal_name);
+
+/* For release MR11, this entry will check its calling arguments
+   to see if the old calling sequence of (bit (36), char (4)) was
+   used.  If so a gate_error signal is raised.  This should be taken
+   out by the next release.
+*/
+	call cu_$arg_list_ptr (arg_list_ptr);
+	if my_arg_list.header.desc_count = 0
+	then call signal_ ("gate_err");
+	else do;
+		processid = a_processid;
+		ips_signal_name = a_ips_signal_name;
+		do ips_mask_index = 1 to sys_info$ips_mask_data.count
+		     while (ips_signal_name ^= sys_info$ips_mask_data.mask (ips_mask_index).name);
+		end;
+		if ips_mask_index <= sys_info$ips_mask_data.count
+		then call pxss$ips_wakeup (processid, sys_info$ips_mask_data.mask (ips_mask_index).mask);
+	     end;
+	return;
+%page;
+
+/* PROCESS_STATUS      - return information about a process.
+
+		     fills in info structure like process_status_return.
+		     If processid not found, aptptr in structure is null.
+
+*/
+
+process_status:
+     entry (a_info_ptr);
+
+	processid = a_process_status.target_proc;	/* copy to stack to be wired */
+	a_process_status.up_exec = 0;
+	a_process_status.up_mp = 0;
+	a_process_status.aptptr = null ();
+
+	process_mp_state = 1;
+
+	aptep = PROCESSID_TO_APTE (processid, "0"b);
+	if aptep ^= null ()
+	then do;
+		process_state = bin (apte.state, 17);
+		if apte.flags.loaded
+		then process_mp_state = process_mp_state + 2;
+		if apte.flags.eligible
+		then process_mp_state = process_mp_state + 1;
+						/* fill in structure */
+		a_process_status.total_page_faults = apte.page_faults;
+		a_process_status.aptptr = aptep;
+		a_process_status.up_exec = process_state;
+		a_process_status.up_mp = process_mp_state;
+		a_process_status.up_block = apte.state_change_time;
+						/* mis-named */
+		a_process_status.up_cpu = apte.time_used_clock;
+		a_process_status.up_page = apte.paging_measure;
+		a_process_status.virtual_cpu = apte.virtual_cpu_time;
+		a_process_status.extra2 = 0;
+	     end;
+
+	return;
+%page;
+/* SET_CPU_MONITOR     - establishes a wakeup call to the term processid
+		     after a given amount of virtual CPU time has
+		     been used by a specified process.
+
+   return code = 0     - wakeup established
+   = error_table_$process_unknown  - no such process
+
+*/
+
+set_cpu_monitor:
+     entry (a_processid, a_delta_vcpu, a_code);
+
+	processid = a_processid;			/* copy to stack to be wired */
+	delta_vcpu = a_delta_vcpu;
+
+	call WIRE_MASK;
+
+/* ---------- WIRED AND MASKED ---------- */
+
+	call pxss$lock_apte (processid, aptep, code);	/* try to lock target APTE */
+	if code = 0
+	then do;
+		if delta_vcpu < 0
+		then apte.cpu_monitor = 0;
+		else apte.cpu_monitor = divide (apte.virtual_cpu_time + delta_vcpu, 1024, 35);
+		call pxss$unlock_apte (aptep);
+	     end;
+
+	call UNWIRE_UNMASK;
+
+/* ---------- UNWIRED AND and UNMASKED ---------- */
+
+	if code ^= 0
+	then a_code = error_table_$process_unknown;
+	else a_code = 0;
+
+	return;
+%page;
+/* SET_TIMAX           - sets timax for a process
+
+   If the value is 0, it is reset to the system default
+*/
+
+set_timax:
+     entry (a_processid, a_timax);
+
+	processid = a_processid;			/* copy to stack to be wired */
+	process_timax = a_timax;
+	if process_timax <= 0
+	then process_timax = tc_data$timax;
+
+	call WIRE_MASK;
+
+/* ---------- WIRED AND MASKED ---------- */
+
+	call pxss$lock_apte (processid, aptep, code);	/* Try to lock target APTE */
+	if code = 0
+	then do;					/* Process exists and is locked */
+		apte.timax = process_timax;
+		call pxss$unlock_apte (aptep);
+	     end;
+
+	call UNWIRE_UNMASK;
+
+/* ---------- UNWIRED AND UNMASKED ---------- */
+
+	return;
+%page;
+/* VALIDATE_PROCESSID  - validates that a processid corresponds to an active
+		     process.
+
+   return code = 0     - process exists
+   = error_table_$process_unknown - no such process
+
+*/
+
+validate_processid:
+     entry (a_processid, a_code);
+
+	a_code = 0;
+
+	aptep = PROCESSID_TO_APTE ((a_processid), "0"b);
+	if aptep = null ()
+	then a_code = error_table_$process_unknown;
+
+	return;
+%page;
+/* SUSPEND_TC	   - turn on the mechanism in getwork (of pxss fame) that
+		     suspends the running of processes, leaving only the
+		     idles and the caller available for running.  this
+		     state occurs only when tc_data$tc_suspend_lock is
+		     locked.  there are no parameters to this routine; its
+		     caller is guarenteed to be the only one running upon
+		     its return.
+*/
+
+suspend_tc:
+     entry ();
+
+	call lock$lock_fast (addr (tc_data$tc_suspend_lock));
+						/* get the lock, possibly */
+						/* entering the WAIT state */
+
+	call pxss$suspend_getwork ();			/* connect all processors */
+						/* and loop until only we remain */
+
+	return;
+
+%page;
+/* RESUME_TC	   - disable the suspension mechanism in getwork. */
+
+resume_tc:
+     entry ();
+
+	call lock$unlock_fast (addr (tc_data$tc_suspend_lock));
+						/* possibly wake others */
+						/* who want the suspend service */
+
+	return;
+%page;
+get_ipc_operands:
+     entry (P_ipc_r_offset, P_ipc_r_factor);
+
+/**** This entry, target of hcs_$get_ipc_operands, allows a process
+      to determine the operands used for IPC validation.  It returns
+      only the operands for the calling process.  These values are
+      retrieved from the apte by the user-ring IPC at Event Channel
+      Table initialization time. */
+
+	aptep = pds$apt_ptr;
+	P_ipc_r_offset = apte.ipc_r_offset;
+	P_ipc_r_factor = apte.ipc_r_factor;
+	return;
+%page;
+get_ipc_operands_priv:
+     entry (a_processid, P_ipc_r_offset, P_ipc_r_factor, a_code);
+
+/**** This entry is a highly priviledged entry to determine the operands
+      used for IPC validation for a specified process.  It is used by
+      ring-0 IPC (hc_ipc) and by the Initializer process through the
+      gate hphcs_$get_ipc_operands_priv. */
+
+	processid = a_processid;
+
+	call WIRE_MASK ();
+
+/***** WIRED AND MASKED *****/
+
+	call pxss$lock_apte (processid, aptep, code);
+	if code = 0
+	then do;
+		ipc_r_offset = apte.ipc_r_offset;	/* copy to wired stack frame */
+		ipc_r_factor = apte.ipc_r_factor;	/* copy to wired stack frame */
+		call pxss$unlock_apte (aptep);
+	     end;
+	call UNWIRE_UNMASK ();
+
+/***** UNWIRED AND UNMASKED *****/
+
+	if code ^= 0
+	then a_code = error_table_$process_unknown;
+	else do;
+		P_ipc_r_offset = ipc_r_offset;
+		P_ipc_r_factor = ipc_r_factor;
+		a_code = 0;
+	     end;
+	return;
+%page;
+/*  Internal procedure to validate that a process ID corresponds to
+    an active process. We're not concerned with races here, since they
+    can happen anyway (between now and when the process ID is used). */
+
+PROCESSID_TO_APTE:
+     proc (processid, allow_special_procs) returns (ptr);
+
+dcl	processid		bit (36) aligned;
+dcl	allow_special_procs bit (1) aligned;
+
+
+dcl	apte_offset	fixed bin (18);		/* Offset of APTE in tc_data */
+dcl	first_apte_offset	fixed bin (18);		/* offset of first APTE in tc_data */
+dcl	1 pid		aligned,			/* decomposition of process ID */
+	  2 offset	bit (18) unaligned,		/* offset of APTE */
+	  2 unique	bit (18) unaligned;		/* unique number assigned by AS */
+dcl	taptep		ptr;
+dcl	1 tapte		aligned like apte based (taptep);
+
+
+	unspec (pid) = processid;
+	apte_offset = bin (pid.offset, 18);
+	taptep = ptr (addr (tc_data$), pid.offset);
+	first_apte_offset = bin (rel (addr (tc_data$apt)), 18);
+
+	if apte_offset < first_apte_offset
+	then return (null ());
+	else if apte_offset >= first_apte_offset + tc_data$apt_size * size (apte)
+	then return (null ());
+	else if mod ((apte_offset - first_apte_offset), size (apte)) ^= 0
+	then return (null ());
+	else if tapte.processid ^= processid
+	then return (null ());
+	else if (^allow_special_procs & (tapte.flags.hproc | tapte.flags.idle))
+	then return (null ());
+	else return (taptep);
+
+     end PROCESSID_TO_APTE;
+%page;
+/* Internal Procedure to wire this procedure (text and linkage), wire
+   stack, and mask to system level */
+
+WIRE_MASK:
+     proc;
+
+	call wire_proc$wire_me;
+	call pmut$wire_and_mask (oldmask, ptwp);
+
+     end WIRE_MASK;
+
+
+
+
+
+
+
+
+/* Internal Procedure to reset mask to previous, unwire stack, unwire
+   text and linkage */
+
+UNWIRE_UNMASK:
+     proc;
+
+	call pmut$unwire_unmask (oldmask, ptwp);
+	call wire_proc$unwire_me;
+
+
+     end UNWIRE_UNMASK;
+
+/* format: off */
+%page; %include apte;
+%page; %include process_status_return;
+%page; %include ips_mask_data;
+%page; %include arg_list;
+/* format: on */
+
+     end tc_util;
+   
+
+
+
+		    trace_mc.pl1                    11/11/89  1136.0r w 11/11/89  0801.0       57132
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+trace_mc: proc;
+	return;					/* should never enter here */
+
+/* trace_mc - primitive to turn on/off the hardcore machine condition trace mechanism
+   initially coded by James A. Bush March 1977 */
+
+dcl (a_segptr, segptr) ptr;
+dcl (a_trace_sw, trace_sw) bit (1) aligned;
+dcl (a_code, code) fixed bin (35);
+dcl (p, a_bp) ptr;
+dcl  dirname char (168);
+dcl (i, a_buf_size, buf_size) fixed bin;
+dcl  ename char (32);
+dcl  vl fixed bin (3);
+dcl  based_segno fixed bin (35);
+dcl  rba (3) fixed bin (3);				/* ring bracket array */
+dcl  init_buf (0 : buf_size) bit (36) based (bp);
+dcl 1 bseg based (addr (based_segno)) aligned,
+    2 seg fixed bin unal,
+    2 pad1 fixed bin unal;
+
+dcl  level$set entry (fixed bin (3));
+dcl  level$get entry returns (fixed bin (3));
+dcl  unique_chars_ entry (bit (*)) returns (char (15));
+dcl  append$branch entry (char (*), char (*), fixed bin (5), fixed bin (35));
+dcl  initiate entry (char (*), char (*), char (*), fixed bin (1), fixed bin (1), ptr, fixed bin (35));
+dcl  ringbr_$set entry (char (*), char (*), (3) fixed bin (3), fixed bin (35));
+dcl  delentry$dseg entry (ptr, fixed bin (35));
+dcl  user_wire entry (ptr, bit (1) aligned, fixed bin (18), fixed bin (18), fixed bin (35));
+dcl  set$bc_seg entry (ptr, fixed bin (24), fixed bin (35));
+
+dcl  pds$process_dir_name char (32) ext;
+dcl  pds$mc_trace_buf ptr unaligned ext;		/* Note packed pointer */
+dcl  pds$mc_trace_seg fixed bin (35) ext;
+dcl 1 pds$mc_trace_sw aligned ext,
+    2 hc_trace_sw bit (1) unaligned,
+    2 init_sw bit (1) unaligned;
+dcl  error_table_$action_not_performed fixed bin (35) ext;
+dcl  error_table_$buffer_big fixed bin (35) ext;
+
+dcl (addr, fixed, addrel, null, rel, ptr, divide) builtin;
+
+/*  */
+% include mc_trace_buf;
+% include its;
+
+/*  */
+
+/* trace_buffer_init - entry to create and init M. C. buff | delete M. C. trace buff, per state of a_trace_sw */
+
+trace_buffer_init: entry (a_segptr, a_trace_sw, a_buf_size, a_bp, a_code);
+
+/* copy args */
+
+	segptr = a_segptr;
+	trace_sw = a_trace_sw;
+	a_bp = null;
+	a_code = 0;
+
+	vl = level$get ();				/* Save current validation level. */
+	call level$set (0);				/* Set hardcore ring validation level. */
+	if trace_sw then do;			/* are we turning trace on? */
+	     if a_buf_size <= 0 | a_buf_size > max_buf_size then do; /* user requested invalid buffer size */
+		code = error_table_$buffer_big;
+		go to erret;
+	     end;
+	     ename = unique_chars_ ("0"b) || ".mct";	/* Create unique buffer segment name. */
+	     call append$branch (pds$process_dir_name, ename, 01010b, code);
+	     if code ^= 0 then go to erret;		/* Create the buffer segment. */
+	     call initiate (pds$process_dir_name, ename, "", 0b, 1b, bp, code);
+	     if bp = null then go to erret;		/* Initiate the segment. */
+	     rba (1) = 0;				/* set ring brackets to 0 N N */
+	     rba (2), rba (3) = vl;
+	     call ringbr_$set (pds$process_dir_name, ename, rba, code); /* Change the ring brackets of the buf seg. */
+	     if code ^= 0 then go to erret;
+	     buf_size = a_buf_size * 1024;		/* set up buffer size */
+	     call set$bc_seg (bp, buf_size * 36, code);	/* set bit count  */
+	     if code ^= 0 then go to erret;
+
+/* initialize buffer */
+
+	     do i = 0 to buf_size - 1;
+		init_buf (i) = buf_init;		/* set up constant in entire buffer */
+	     end;
+
+/* initialize trace buffer header */
+
+	     mc_trace_buf.hr_cnt = buf_size / ((8 * mc_size) + hr_size); /* 8:1 ratio mc's to hr's */
+	     mc_trace_buf.mc_cnt = (mc_trace_buf.hr_cnt * 8) - 1; /* have to have room for header */
+	     mc_trace_buf.hr_strt = fixed (rel (addr (mc_trace_buf.h_regs (1)))); /* figure out starting loc's */
+	     mc_trace_buf.mc_strt = fixed (rel (addr (mc_trace_buf.mach_cond (1))));
+	     mc_trace_buf.hr_lim = (mc_trace_buf.hr_cnt * hr_size) + hr_strt;
+	     mc_trace_buf.mc_lim = (mc_trace_buf.mc_cnt * mc_size) + mc_strt;
+	     mc_trace_buf.hr_nxtad = mc_trace_buf.hr_strt;
+	     mc_trace_buf.mc_nxtad = mc_trace_buf.mc_strt;
+
+/* wire trace buffer */
+
+	     call user_wire (bp, "1"b, 0, -1, code);
+	     if code = 0 then do;
+
+/* set up trace buffer pointer, segno to trace and turn on trace switch in pds */
+
+		a_bp = bp;			/* set buffer pointer for user */
+		p = addr (segptr);
+		bseg.seg = fixed (p -> its.segno, 15);	/* set up seg  number in upper half of word */
+		bseg.pad1 = 0;			/* set lower half of word to zero */
+		pds$mc_trace_buf = bp;
+		pds$mc_trace_seg = based_segno;
+		pds$mc_trace_sw.init_sw = "1"b;	/* let user turn on trace */
+	     end;
+	end;
+	else do;					/* user wants to turn trace off */
+	     pds$mc_trace_sw.init_sw = "0"b;		/* don't let user turn on trace */
+	     pds$mc_trace_sw.hc_trace_sw = "0"b;	/*  must turn switch off first */
+	     pds$mc_trace_seg = 0;
+	     bp = pds$mc_trace_buf;			/* save buffer pointer */
+	     pds$mc_trace_buf = null;			/* this makes it cleaner */
+
+/* Unwire trace buffer */
+
+	     call user_wire (bp, "0"b, 0, 0, code);
+	     if code ^= 0 then go to erret;
+	     call delentry$dseg (bp, code);		/* delete buffer segment */
+
+	end;
+erret:
+	a_code = code;
+	call level$set (vl);			/* Restore original validation level. */
+	return;
+
+/* hc_trace_on_off - entry to turn the hc_trace_sw in the pds on or off */
+
+hc_trace_on_off: entry (a_trace_sw, a_code);
+
+	a_code = 0;				/* preset good return code */
+	if a_trace_sw then				/* user wants to turn trace on */
+	     if ^pds$mc_trace_sw.init_sw then		/* if we haven't initialized the trace buffer */
+		a_code = error_table_$action_not_performed; /* don't let user turn trace on */
+	     else pds$mc_trace_sw.hc_trace_sw = "1"b;
+	else pds$mc_trace_sw.hc_trace_sw = "0"b;	/* user wants to turn hc_trace_sw off */
+	return;
+
+     end trace_mc;
+
+
+
+
+		    user_wire.pl1                   11/11/89  1136.0r w 11/11/89  0801.0       28566
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4,indattr,ifthenstmt,ifthen,idind35,^indcomtxt */
+
+user_wire: user_wire_seg: proc (a_segptr, a_wiring, a_fp, a_np, a_code);
+
+/* Greenberg 2/10/77 */
+/* Modified 7/3/84 by Keith Loepere to use the new dc_find. */
+
+/* Parameters */
+
+dcl  a_code			fixed bin (35) parameter;
+dcl  a_dn				char (*) parameter;
+dcl  a_en				char (*) parameter;
+dcl  a_fp				fixed bin parameter;
+dcl  a_np				fixed bin parameter;
+dcl  a_segptr			ptr parameter;
+dcl  a_wiring			bit (1) aligned parameter;
+
+/* Variables */
+
+dcl  code				fixed bin (35);
+dcl  dn				char (168);
+dcl  en				char (32);
+dcl  fp				fixed bin;
+dcl  np				fixed bin;
+dcl  pathentry			bit (1);
+dcl  segptr			ptr;
+dcl  wiring			bit (1) aligned;
+
+/* External */
+
+dcl  error_table_$argerr		fixed bin (35) ext;
+dcl  error_table_$bad_ring_brackets	fixed bin (35) ext;
+dcl  error_table_$invalidsegno	fixed bin (35) ext;
+
+/* Entries */
+
+dcl  activate			entry (ptr, fixed bin (35)) returns (ptr);
+dcl  level$get			entry returns (fixed bin (3));
+dcl  lock$dir_unlock		entry (ptr);
+dcl  lock$unlock_ast		entry;
+dcl  pc_wired$unwire		entry (ptr, fixed bin, fixed bin);
+dcl  pc_wired$wire_wait		entry (ptr, fixed bin, fixed bin);
+
+/* Misc */
+
+dcl  (fixed, ptr)			builtin;
+%page;
+	segptr = a_segptr;
+	pathentry = "0"b;
+	go to join;
+
+user_wire_file: entry (a_dn, a_en, a_wiring, a_fp, a_np, a_code);
+
+	dn = a_dn;
+	en = a_en;
+	pathentry = "1"b;
+join:
+	wiring = a_wiring;
+
+	if wiring then do;
+	     fp = a_fp;
+	     np = a_np;
+	end;
+	else do;
+	     fp = 0;
+	     np = -1;
+	end;
+
+	if pathentry then call dc_find$obj_status_read_priv (dn, en, DC_FIND_CHASE, ep, code);
+	else call dc_find$obj_status_read_priv_ptr (segptr, ep, code);
+	if code = 0 then do;
+	     if level$get () > fixed (entry.ring_brackets (1), 3) then code = error_table_$bad_ring_brackets;
+	     else astep = activate (ep, code);
+	     if code = 0 then do;
+		if aste.hc_sdw then code = error_table_$invalidsegno;
+		else if fp >= fixed (aste.csl, 9)
+			| (np ^= -1 & fp + np > fixed (aste.csl, 9))
+			| (np < 1 & np ^= -1)
+		then code = error_table_$argerr;
+		else do;
+		     aste.ehs = wiring;
+		     if wiring then call pc_wired$wire_wait (astep, fp, np);
+		     else call pc_wired$unwire (astep, fp, np);
+		end;
+		call lock$unlock_ast;
+	     end;
+	     call lock$dir_unlock (ptr (ep, 0));
+	     if pathentry then call dc_find$finished (ep, "0"b);
+	end;
+
+	a_code = code;
+	return;
+%page;
+%page; %include aste;
+%page; %include dc_find_dcls;
+%page; %include dir_entry;
+     end;
+
+
+
+
+
+		    bull_copyright_notice.txt       08/30/05  1008.4r   08/30/05  1007.3    00020025
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group Bull including Bull HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell Bull Inc., Groupe Bull
+and Bull HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato.Users consider that Multics provided the best software architecture for 
+managing computer hardware properly and for executing programs. Many subsequent operating systems
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, Bull or Bull HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by Bull HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

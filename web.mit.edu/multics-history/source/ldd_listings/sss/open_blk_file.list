@@ -1,0 +1,2124 @@
+	COMPILATION LISTING OF SEGMENT open_blk_file
+	Compiled by: Multics PL/I Compiler, Release 33e, of October 6, 1992
+	Compiled at: CGI                             
+	Compiled on: 2000-04-18_1125.10_Tue_mdt
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        4*   *                                                         *
+        5*   * Copyright (c) 1972 by Massachusetts Institute of        *
+        6*   * Technology and Honeywell Information Systems, Inc.      *
+        7*   *                                                         *
+        8*   *********************************************************** */
+        9 
+       10 
+       11 /* This module supports I/O on blocked files */
+       12 
+       13 open_blk_file:
+       14      proc (iocb_ptr, fcb_ptr_arg, first_seg_ptr, is_new_file, mode, close_x, first_seg_bitcount, max_comp_size, code);
+       15 	code = 0;
+       16 	if is_new_file | ((first_seg_ptr -> bf_head.end_pos = 0) & (mode > 4) & (atb.max_rec_len > 0) & ^atb.inv_lock_reset)
+       17 	then do;					/* initialize empty file */
+       18 		first_seg_ptr -> bf_head.max_rec_len = iocb_ptr -> iocb.attach_data_ptr -> atb.max_rec_len;
+       19 						/* determines block size */
+       20 		first_seg_ptr -> bf_head.max_comp_size = max_comp_size;
+       21 		if is_new_file
+       22 		then call hcs_$set_bc_seg (first_seg_ptr, 36 * (size (bf_head)), code);
+       23 						/*
+       24*						   sets initial bitcount */
+       25 		first_seg_ptr -> bf_head.version = current_bf_version;
+       26 	     end;
+       27 	call create_initialize_cb;			/* prepare control block */
+       28 	call create_seg_ptrs;			/* allocates seg_ptr_array if msf */
+       29 	if (cb_ptr -> cb.file_base_ptr -> bf_head.file_action ^= 0) & (mode > 4)
+       30 						/*
+       31*						   operation in progress and output opening */
+       32 	then call adjust_op;			/* adjusts the inconsistency */
+       33 	if (code = 0) & (file_base_ptr -> bf_head.version ^= current_bf_version /* old or bad file */)
+       34 	then if mode > 4				/* modify opening */
+       35 	     then call convert_file;			/* brings version up to date */
+       36 	     else cb.old_version = "1"b;		/* can use without converting if input-only */
+       37 	if code = 0
+       38 	then call set_entries_and_positions;		/* opening is successful */
+       39 	else do;					/* cleanup */
+       40 		call free_seg_ptrs;			/* de-allocates seg_ptr_array if msf */
+       41 		call free_cb_file (size (cb), cb_ptr);	/* release open_data_block */
+       42 		return;
+       43 	     end;
+       44 	if mode > 4
+       45 	then if ^cb.shared
+       46 	     then do;				/* set action and time_stamp */
+       47 		     file_base_ptr -> bf_head.file_action = unshared_opening;
+       48 		     file_base_ptr -> bf_head.time_last_modified = clock ();
+       49 		     return;
+       50 		end;
+       51 	     else go to unlock;			/* leave unlocked for shared openings */
+       52 exit:
+       53 	return;					/* end of open routine */
+       54 
+       55 verify_done:
+       56 	if cb.shared
+       57 	then if file_base_ptr -> bf_head.time_last_modified ^= initial_time_stamp
+       58 	     then do;				/* asynch changes--must retry or abort */
+       59 		     cb.scan_backward = was_scan_backward;
+       60 		     cb.current_pos = old_current_pos;
+       61 		     cb.next_pos = old_next_pos;
+       62 		     cb.current_status = old_current_status;
+       63 		     if clock () < time_limit		/* time left to keep trying */
+       64 		     then go to retry_ent (current_entry);
+       65 		     code = error_table_$file_busy;	/* unable to verify result in time */
+       66 		end;
+       67 	return;					/* back to caller */
+       68 
+       69 init_entry:					/* initialization for passive shared operations */
+       70 	if cb.wait_time < 0
+       71 	then time_limit = forever;
+       72 	else time_limit = clock () + cb.micro_wait_time;
+       73 	was_scan_backward = cb.scan_backward;
+       74 	old_current_pos = cb.current_pos;
+       75 	old_next_pos = cb.next_pos;
+       76 	old_end_pos = cb.end_pos;			/* save for detecting asynch eof changes */
+       77 	old_current_status = cb.current_status;
+       78 	cb.as_ins_del = "00"b;			/* set if asynch insertion or deletion detected */
+       79 	if cb.handler_required			/* asynch component deletions possible */
+       80 	then do;
+       81 setup_handler:
+       82 		comp_num = 0;			/* initial ref is to header comp */
+       83 		on seg_fault_error
+       84 		     begin;			/* deals with asynch comp deletions */
+       85 			on seg_fault_error
+       86 			     system;		/* fuck you */
+       87 			dname = substr (attach_descrip_string, 8, dname_len);
+       88 			ename = substr (attach_descrip_string, 9 + dname_len, ename_len);
+       89 			on seg_fault_error
+       90 			     go to inv_header;
+       91 			call hcs_$status_mins (cb.file_base_ptr, type, bc, foo);
+       92 			if foo ^= 0
+       93 			then do;			/* re-initiate header ptr */
+       94 inv_header:
+       95 				on seg_fault_error
+       96 				     system;
+       97 				call hcs_$terminate_seg (cb.file_base_ptr, 1, foo);
+       98 				call hcs_$initiate ((dname), (ename), "", 1, 1, cb.file_base_ptr, foo);
+       99 						/*
+      100*						   re-initiate header component, in case this was cause of fault */
+      101 				if foo = 0
+      102 				then go to resume;
+      103 				dname = dname || ">" || ename;
+      104 						/* probably is an msf */
+      105 				call hcs_$initiate ((dname), "0", "", 1, 1, cb.file_base_ptr, foo);
+      106 				if foo = 0	/* header ptr had to be re-initialized, msf case */
+      107 				then go to resume;
+      108 			     end;
+      109 			else if comp_num > 0	/* may have faulted because of ref to later comp */
+      110 			then do;			/* try re-initiating this component if necessary */
+      111 				on seg_fault_error
+      112 				     system;
+      113 				call hcs_$status_mins (cb.seg_ptr_array_ptr -> seg_ptr_array (comp_num), type, bc,
+      114 				     foo);
+      115 				if foo ^= 0
+      116 				then do;		/* re-obtain ptr to component */
+      117 					dname = dname || ">" || ename;
+      118 					call hcs_$terminate_seg (seg_ptr_array (comp_num), 1, foo);
+      119 					call hcs_$initiate ((dname), ltrim (char (comp_num)), "", 1, 1,
+      120 					     cb.seg_ptr_array_ptr -> seg_ptr_array (comp_num), foo);
+      121 					if foo = 0/* that was the problem */
+      122 					then go to resume;
+      123 				     end;
+      124 			     end;
+      125 			call continue_to_signal_ (foo);
+      126 						/* unaccountable error */
+      127 resume:
+      128 			dcl     dname		 char (168) var;
+      129 			dcl     ename		 char (32) var;
+      130 			dcl     type		 fixed (2);
+      131 			dcl     bc		 fixed (24);
+      132 			dcl     foo		 fixed (35);
+      133 		     end;				/* end of handler logic */
+      134 	     end;
+      135 	go to retry_ent (current_entry);		/* continue with operation */
+      136 
+      137 position_blk_file:
+      138      entry (iocb_ptr, pos_type, n_recs, code);
+      139 	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+      140 	if cb.shared
+      141 	then do;
+      142 		current_entry = 1;
+      143 		go to init_entry;
+      144 retry_ent (1):
+      145 		call prepare_process;
+      146 	     end;
+      147 	code = 0;
+      148 
+      149 	if pos_type = 2				/* direct positioning */
+      150 	then if n_recs < 0				/* absolute position must be >=0 */
+      151 	     then code = error_table_$negative_nelem;
+      152 	     else if (n_recs > cb_ptr -> cb.end_pos) & ^cb.noend
+      153 						/* attempt to pass eof */
+      154 	     then do;				/* signal error and go to end of file */
+      155 eof_error:
+      156 		     call position_eof;
+      157 		     code = error_table_$end_of_info;
+      158 		end;
+      159 	     else do;				/* successful position operation */
+      160 		     cb_ptr -> cb.next_pos = n_recs;
+      161 		     cb_ptr -> cb.current_pos = n_recs;
+      162 		     cb.current_status = "00"b;	/* indicates that record is
+      163*						   not definitely known to be either present or absent */
+      164 		end;
+      165 	else if pos_type = 0			/* relative positioning */
+      166 	then if (cb.as_ins_del = "01"b) & ^cb.noend
+      167 	     then do;
+      168 		     code = error_table_$asynch_deletion;
+      169 						/* warn user his
+      170*						   position is not where he may think */
+      171 		     cb.current_status = "01"b;	/* current known absent */
+      172 		end;
+      173 	     else do;				/* skip forward or backward */
+      174 		     cb_ptr -> cb.next_pos = cb_ptr -> cb.next_pos + n_recs;
+      175 						/* move next position */
+      176 		     if cb_ptr -> cb.next_pos < 0	/* attempt to pass bof */
+      177 		     then do;			/* signal error and go to file base */
+      178 			     call position_bof;
+      179 			     code = error_table_$end_of_info;
+      180 			end;
+      181 		     else if (cb_ptr -> cb.next_pos > cb_ptr -> cb.end_pos) & ^cb.noend
+      182 						/* attempt to pass eof */
+      183 		     then go to eof_error;
+      184 		     else do;
+      185 			     cb.current_status = "00"b;
+      186 			     cb_ptr -> cb.current_pos = cb_ptr -> cb.next_pos;
+      187 						/* successful skip */
+      188 			end;
+      189 		end;
+      190 
+      191 	else if pos_type = -1			/* beginning of file */
+      192 	then call position_bof;
+      193 
+      194 	else if pos_type = 1			/* end of file */
+      195 	then call position_eof;
+      196 	else do;
+      197 		code = error_table_$bad_arg;
+      198 		return;				/* don't alter scan state */
+      199 	     end;
+      200 	cb_ptr -> cb.scan_backward = ((code = 0) & (pos_type = 0) & (n_recs < 0));
+      201 						/* for masking logically absent records */
+      202 	go to verify_done;				/* end of main position routine */
+      203 
+      204 read_length_blk_file:
+      205      entry (iocb_ptr, rec_len, code);
+      206 	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+      207 	if cb.shared
+      208 	then do;
+      209 		current_entry = 2;
+      210 		go to init_entry;
+      211 retry_ent (2):
+      212 		call prepare_process;
+      213 	     end;
+      214 	call find_next_record;			/* sets code */
+      215 	if code = 0				/* record found at next position */
+      216 	then rec_len = max (0, seg_ptr -> seg (pos));	/* record length at record head */
+      217 	go to verify_done;				/* end of read_length routine */
+      218 
+      219 read_blk_file:
+      220      entry (iocb_ptr, buff_ptr, buff_len, rec_len, code);
+      221 	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+      222 	if cb.shared
+      223 	then do;
+      224 		current_entry = 3;
+      225 		go to init_entry;
+      226 retry_ent (3):
+      227 		call prepare_process;
+      228 	     end;
+      229 	call find_next_record;
+      230 	if code = 0				/* record found */
+      231 	then do;					/* read the record */
+      232 		rec_len = max (0, seg_ptr -> seg (pos));/* length in record header */
+      233 		if rec_len > buff_len		/* record too big for buffer */
+      234 		then do;				/* signal error, but still prepare to move part record */
+      235 			code = error_table_$long_record;
+      236 			n = buff_len;		/* smaller than rec_len */
+      237 		     end;
+      238 		else n = rec_len;			/* move entire record into buffer */
+      239 		if n > 0				/* in case negative */
+      240 		then substr (buff_ptr -> buffer, 1, n) = substr (seg_ptr -> seg_str, 4 * (pos + 1) + 1, n);
+      241 						/* move record into buffer */
+      242 		cb_ptr -> cb.next_pos = cb_ptr -> cb.next_pos + 1;
+      243 						/* advance next record position */
+      244 	     end;
+      245 	go to verify_done;				/* end of read_record routine */
+      246 
+      247 end_update:
+      248 	if cb.shared
+      249 	then do;
+      250 		file_base_ptr -> bf_head.file_action = 0;
+      251 						/* mark operation complete */
+      252 		go to unlock;
+      253 	     end;
+      254 	return;
+      255 
+      256 unlock_exit:
+      257 	if cb.shared
+      258 	then do;
+      259 unlock:
+      260 		if stacq (file_base_ptr -> bf_head.file_lock, "0"b, cb.saved_lock_copy)
+      261 						/* resets the lock */
+      262 		then ;
+      263 	     end;
+      264 	return;					/* exit */
+      265 
+      266 write_blk_file:
+      267      entry (iocb_ptr, buff_ptr, buff_len, code);
+      268 	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+      269 	code = 0;
+      270 	if buff_len > cb_ptr -> cb.max_rec_len		/* record length exceeds maximum */
+      271 	then code = error_table_$long_record;
+      272 	else if buff_len < 0
+      273 	then code = error_table_$negative_nelem;
+      274 	else do;
+      275 		if cb.shared
+      276 		then do;
+      277 			if cb.handler_required	/* comps may vanish */
+      278 			then do;			/* handle seg_fault_errors */
+      279 				current_entry = 6;	/* handler must be in my frame */
+      280 				go to setup_handler;/* kludged call */
+      281 			     end;			/* now OK to reference file */
+      282 retry_ent (6):
+      283 			call lock_file_check;
+      284 		     end;
+      285 		if cb_ptr -> cb.next_pos < cb_ptr -> cb.end_pos
+      286 						/* not at end of file */
+      287 		then if cb_ptr -> cb.appending | (cb_ptr -> cb.mode = 5)
+      288 		     then do;			/* go to eof--not an error */
+      289 			     action = append;
+      290 			     call position_eof;	/* instead go to end of file */
+      291 			end;
+      292 		     else if cb.as_ins_del = "10"b
+      293 		     then do;			/* warn user he is not appending as expected */
+      294 			     code = error_table_$asynch_insertion;
+      295 			     cb.current_status = "00"b;
+      296 						/* still may be logically
+      297*						   deleted, however */
+      298 			     cb.scan_backward = "0"b;
+      299 			end;
+      300 		     else if cb_ptr -> cb.mode = 6	/* input_output */
+      301 		     then action = write_trunc;	/* truncate after write */
+      302 		     else action = rewrite;		/* replace an existing rec */
+      303 		else if cb.as_ins_del = "01"b
+      304 		then if ^cb_ptr -> cb.noend & (cb_ptr -> cb.mode = 5)
+      305 						/* output opening */
+      306 		     then do;			/* no error--just get back to eof */
+      307 			     action = append;
+      308 			     call position_eof;
+      309 			end;
+      310 		     else do;			/* asynchronously moved to eof--warn him */
+      311 			     code = error_table_$asynch_deletion;
+      312 			     cb.current_status = "01"b;
+      313 						/* known absent */
+      314 			     cb.scan_backward = "0"b;
+      315 			end;
+      316 		else action = append;		/* extending file */
+      317 		cb_ptr -> cb.current_pos = cb_ptr -> cb.next_pos;
+      318 						/* set current position */
+      319 		if code ^= 0			/* asynch insertion or deletion */
+      320 		then go to unlock_exit;
+      321 	     end;
+      322 	if code = 0
+      323 	then do;
+      324 		if cb_ptr -> cb.ssf_sw		/* might be full */
+      325 		then if cb_ptr -> cb.current_pos >= cb_ptr -> cb.capacity
+      326 						/* not enough room */
+      327 		     then do;
+      328 			     code = error_table_$file_is_full;
+      329 			     go to unlock_exit;
+      330 			end;
+      331 		call init_update (action);
+      332 		call get_current_pos;
+      333 		if comp_num > cb_ptr -> cb.last_comp_num/* must extend msf */
+      334 		then do while (comp_num > cb.last_comp_num);
+      335 			call set_bc (cb_ptr -> cb.capacity);
+      336 						/* set bitcount of full component */
+      337 			call extend_seg_ptr_array (cb.last_comp_num + 1);
+      338 						/* may re-allocate seg_ptr_array */
+      339 			cb_ptr -> cb.last_comp_num = cb.last_comp_num + 1;
+      340 			call msf_manager_$get_ptr (cb.fcb_ptr, cb.last_comp_num, "1"b, seg_ptr, foo24, code);
+      341 						/* create a new component */
+      342 			if code ^= 0
+      343 			then go to exit;
+      344 			cb.seg_ptr_array_ptr -> seg_ptr_array (cb.last_comp_num) = seg_ptr;
+      345 			file_base_ptr -> bf_head.last_comp = cb.last_comp_num;
+      346 		     end;
+      347 		else seg_ptr = get_seg_ptr (comp_num);
+      348 		call insert_record;			/* does the assignment */
+      349 		if cb_ptr -> cb.current_pos >= cb_ptr -> cb.end_pos
+      350 						/* at eof */
+      351 		then do;
+      352 			if cb.shared
+      353 			then file_base_ptr -> bf_head.end_pos = cb.next_pos;
+      354 			cb_ptr -> cb.end_pos = cb_ptr -> cb.next_pos;
+      355 						/* advance end */
+      356 		     end;
+      357 		else if action = write_trunc		/* must truncate now */
+      358 		then do;
+      359 			call truncate_file;		/* truncates at next position */
+      360 			cb.current_pos = cb.next_pos - 1;
+      361 		     end;				/* current_pos at record just written, next at eof */
+      362 		go to end_update;			/* clears action and unlocks if shared */
+      363 	     end;
+      364 	return;					/* end of write_record routine */
+      365 
+      366 rewrite_blk_file:
+      367      entry (iocb_ptr, buff_ptr, buff_len, code);
+      368 	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+      369 	if buff_len > cb_ptr -> cb.max_rec_len		/* record length exceeds maximum */
+      370 	then code = error_table_$long_record;
+      371 	else if buff_len < 0
+      372 	then code = error_table_$negative_nelem;
+      373 	else do;					/* proceed with rewrite */
+      374 		if cb.shared
+      375 		then do;
+      376 			if cb.handler_required
+      377 			then do;
+      378 				current_entry = 7;
+      379 				go to setup_handler;
+      380 			     end;
+      381 retry_ent (7):
+      382 			call lock_file_check;
+      383 		     end;
+      384 		if cb.current_pos >= cb.end_pos	/* end of file */
+      385 		then do;
+      386 			if cb.as_ins_del = "01"b
+      387 			then code = error_table_$asynch_deletion;
+      388 			else code = error_table_$no_record;
+      389 			cb.current_status = "01"b;	/* known absent */
+      390 			cb.scan_backward = "0"b;
+      391 			go to unlock_exit;		/* abort */
+      392 		     end;
+      393 		call get_current_pos;
+      394 		seg_ptr = get_seg_ptr (comp_num);
+      395 		if seg_ptr -> seg (pos) = 0		/* logically absent record--error */
+      396 		then do;
+      397 			if cb.current_status = "10"b	/* should be present */
+      398 			then code = error_table_$asynch_deletion;
+      399 			else code = error_table_$no_record;
+      400 			cb.current_status = "01"b;	/* now we know it's absent */
+      401 		     end;
+      402 		else do;				/* successful rewrite */
+      403 			call init_update (rewrite);
+      404 			code = 0;
+      405 			call insert_record;		/* does the work */
+      406 			go to end_update;
+      407 		     end;
+      408 		go to unlock_exit;
+      409 	     end;
+      410 	return;					/* end of rewrite routine */
+      411 
+      412 delete_blk_file:
+      413      entry (iocb_ptr, code);
+      414 	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+      415 	if cb.shared
+      416 	then do;
+      417 		if cb.handler_required
+      418 		then do;
+      419 			current_entry = 8;
+      420 			go to setup_handler;
+      421 		     end;
+      422 retry_ent (8):
+      423 		call lock_file_check;
+      424 	     end;
+      425 	if cb.current_pos >= cb.end_pos		/* at or beyond eof */
+      426 	then do;					/* treat as an error */
+      427 		if cb.as_ins_del = "01"b
+      428 		then code = error_table_$asynch_deletion;
+      429 		else code = error_table_$no_record;
+      430 		cb.current_status = "01"b;
+      431 		cb.scan_backward = "0"b;
+      432 		go to unlock_exit;
+      433 	     end;
+      434 	call get_current_pos;
+      435 	seg_ptr = get_seg_ptr (comp_num);
+      436 	if seg_ptr -> seg (pos) = 0			/* already deleted or not present */
+      437 	then do;
+      438 		if cb.current_status = "10"b
+      439 		then code = error_table_$asynch_deletion;
+      440 		else code = error_table_$no_record;
+      441 		cb.current_status = "01"b;
+      442 	     end;
+      443 	else do;					/* successful deletion */
+      444 		if cb.current_pos = cb.end_pos - 1	/* last record */
+      445 		then action = eof_delete;
+      446 		else action = non_eof_delete;
+      447 		call init_update (action);
+      448 		code = 0;
+      449 		unspec (addr (seg_ptr -> seg (pos)) -> record_block) = "0"b;
+      450 						/* zero entire block */
+      451 		if action = non_eof_delete
+      452 		then do;
+      453 			cb.current_status = "00"b;
+      454 			cb_ptr -> cb.current_pos = cb_ptr -> cb.current_pos + 1;
+      455 						/* advance */
+      456 		     end;
+      457 		else call set_true_eof;		/* finds last non-deleted record */
+      458 		cb_ptr -> cb.next_pos = cb_ptr -> cb.current_pos;
+      459 						/* by convention after delete */
+      460 		cb_ptr -> cb.scan_backward = "0"b;	/* resume default forward scanning */
+      461 		go to end_update;
+      462 	     end;
+      463 	go to unlock_exit;
+      464 
+      465 control_blk_file:
+      466      entry (iocb_ptr, order, info_ptr, code);
+      467 	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+      468 	code = 0;
+      469 
+      470 	if order = "read_position"
+      471 	then do;					/* return next record and end of file positions */
+      472 		if cb.shared
+      473 		then do;
+      474 			current_entry = 4;
+      475 			go to init_entry;
+      476 retry_ent (4):
+      477 			call prepare_process;
+      478 		     end;
+      479 		info_ptr -> info1.end_pos = cb_ptr -> cb.end_pos;
+      480 						/* get eof position */
+      481 		info_ptr -> info1.next_pos = cb_ptr -> cb.next_pos;
+      482 						/* get next position */
+      483 		go to verify_done;
+      484 	     end;
+      485 
+      486 	else if order = "record_status"
+      487 	then do;
+      488 		rs_info_ptr = info_ptr;
+      489 		if (rs_info.version < rs_info_version_1) | (rs_info.version > rs_info_version_2)
+      490 		then code = error_table_$unimplemented_version;
+      491 		else if substr (string (rs_info.flags), 1, 6) ^= "0"b
+      492 						/* only 7th bit is supported */
+      493 		then code = error_table_$bad_arg;
+      494 		else do;				/* fill in info structure */
+      495 			if cb.shared
+      496 			then do;
+      497 				current_entry = 5;
+      498 				go to init_entry;
+      499 retry_ent (5):
+      500 				call prepare_process;
+      501 			     end;
+      502 
+      503 			if rs_info.locate_pos_sw	/* set position */
+      504 			then if (rs_info.record_length >= cb.end_pos) & ^cb_ptr -> cb.noend
+      505 			     then go to norec;
+      506 			     else do;		/* use record_length arg as absolute pos */
+      507 				     cb.next_pos = rs_info.record_length;
+      508 				     cb.current_pos = rs_info.record_length;
+      509 				     cb.scan_backward = "0"b;
+      510 				end;
+      511 			else if cb.current_pos >= cb.end_pos
+      512 			then do;
+      513 norec:
+      514 				if cb.as_ins_del = "01"b
+      515 				then code = error_table_$asynch_deletion;
+      516 				else code = error_table_$no_record;
+      517 				cb.current_status = "01"b;
+      518 				go to exit;	/* no need to verify */
+      519 			     end;
+      520 			call get_current_pos;
+      521 			seg_ptr = get_seg_ptr (comp_num);
+      522 			rs_info.max_rec_len = cb.max_rec_len;
+      523 			rs_desc.comp_num = comp_num;
+      524 			rs_desc.offset = pos_bits;
+      525 			if seg_ptr ^= null
+      526 			then do;
+      527 				rs_info.record_ptr = addr (seg_ptr -> seg (pos + 1));
+      528 				rs_info.record_length = max (0, seg_ptr -> seg (pos));
+      529 			     end;
+      530 			if (seg_ptr = null) | ((seg_ptr -> seg (pos) = 0) & ^cb_ptr -> cb.old_version)
+      531 			then do;			/* error--logically absent record */
+      532 				if cb.current_status = "10"b
+      533 				then code = error_table_$asynch_deletion;
+      534 				else code = error_table_$no_record;
+      535 				cb.current_status = "01"b;
+      536 				rs_info.record_ptr = null;
+      537 				rs_info.record_length = 0;
+      538 			     end;
+      539 			else code = 0;
+      540 			go to verify_done;
+      541 		     end;
+      542 	     end;
+      543 
+      544 	else if (order = "truncate") & (cb_ptr -> cb.mode > 4)
+      545 	then do;
+      546 		if cb.shared
+      547 		then do;
+      548 			if cb.handler_required
+      549 			then do;
+      550 				current_entry = 9;
+      551 				go to setup_handler;
+      552 			     end;
+      553 retry_ent (9):
+      554 			call lock_file_check;
+      555 		     end;
+      556 		if cb.next_pos > cb.end_pos		/* beyond end of file--error */
+      557 		then do;
+      558 			if cb.as_ins_del = "01"b
+      559 			then code = error_table_$asynch_deletion;
+      560 			else code = error_table_$end_of_info;
+      561 			cb.current_status = "01"b;
+      562 			go to unlock_exit;
+      563 		     end;
+      564 		cb.current_pos = cb.next_pos;
+      565 		cb.scan_backward = "0"b;
+      566 		if ^cb.shared
+      567 		then do;
+      568 			file_base_ptr -> bf_head.file_action = truncate;
+      569 			call truncate_file;
+      570 			file_base_ptr -> bf_head.file_action = unshared_opening;
+      571 			return;
+      572 		     end;
+      573 		call init_update (truncate);
+      574 		call truncate_file;			/* does the truncation at next_record_pos */
+      575 		go to end_update;
+      576 	     end;
+      577 
+      578 	else if order = "max_rec_len"
+      579 	then do;					/* obtain and possibly set the file's max_rec_len */
+      580 		info_ptr -> info2.old_max_recl = cb_ptr -> cb.max_rec_len;
+      581 		if info_ptr -> info2.new_max_recl < 0	/* negative length is meaningless */
+      582 		then code = error_table_$negative_nelem;
+      583 		else if info_ptr -> info2.new_max_recl > 0
+      584 						/* indicates setting desired */
+      585 		then if (cb_ptr -> cb.mode = 4)	/* changing
+      586*						   max_rec_len not permitted unless file empty and opened for output */
+      587 		     then code = error_table_$no_operation;
+      588 		     else do;			/* OK to change max_rec_len */
+      589 			     if cb.shared
+      590 			     then do;
+      591 				     if cb.handler_required
+      592 				     then do;
+      593 					     current_entry = 10;
+      594 					     go to setup_handler;
+      595 					end;
+      596 retry_ent (10):
+      597 				     call lock_file_check;
+      598 				     file_base_ptr -> bf_head.time_last_modified = clock ();
+      599 				     cb.old_time_stamp = file_base_ptr -> bf_head.time_last_modified;
+      600 				end;
+      601 			     if cb.end_pos > 0
+      602 			     then code = error_table_$no_operation;
+      603 			     else do;
+      604 				     cb_ptr -> cb.file_base_ptr -> bf_head.max_rec_len =
+      605 					info_ptr -> info2.new_max_recl;
+      606 				     call set_maxl; /* propagates change to cb variables */
+      607 				end;
+      608 			     go to unlock_exit;
+      609 			end;
+      610 	     end;
+      611 
+      612 	else if order = "file_status"
+      613 	then do;
+      614 		call vfile_status_$seg (iocb_ptr, cb.file_base_ptr, info_ptr, code);
+      615 		return;
+      616 	     end;
+      617 
+      618 	else if order = "io_call"
+      619 	then call vfile_io_control (iocb_ptr, cb.file_base_ptr, info_ptr, code);
+      620 	else code = error_table_$no_operation;		/* invalid order call */
+      621 	return;					/* end of main control routine */
+      622 
+      623 close_blk_file:
+      624      entry (iocb_ptr);				/* cleanup routine called by vfile_attach */
+      625 	cb_ptr = iocb_ptr -> iocb.open_data_ptr;
+      626 	if cb_ptr -> cb.mode > 4			/* eof may have moved */
+      627 	then do;					/* set end of file properly */
+      628 		if cb.shared			/* file not locked */
+      629 		then do;
+      630 			if cb.handler_required
+      631 			then do;
+      632 				current_entry = 11;
+      633 				go to setup_handler;
+      634 			     end;
+      635 retry_ent (11):
+      636 			if ^stac (addr (file_base_ptr -> bf_head.file_lock), cb.saved_lock_copy)
+      637 			then go to just_cleanup;	/* unable to lock--let other user close */
+      638 			else if file_base_ptr -> bf_head.file_action ^= 0
+      639 			then do;			/* leave locked invalidly */
+      640 leave_locked:
+      641 				if stacq (file_base_ptr -> bf_head.file_lock, (36)"1"b, cb.saved_lock_copy)
+      642 				then ;		/* make the lock invalid */
+      643 				go to just_cleanup;
+      644 			     end;
+      645 			else if cb.old_time_stamp ^= file_base_ptr -> bf_head.time_last_modified
+      646 			then call reinit_cb_vars;	/* for asynch changes */
+      647 			else ;			/* cb info is valid */
+      648 		     end;
+      649 		else if (file_base_ptr -> bf_head.file_action ^= unshared_opening)
+      650 			& (file_base_ptr -> bf_head.file_action ^= 0)
+      651 		then go to leave_locked;
+      652 		call position_eof;
+      653 		call get_current_pos;
+      654 		rel_pos = cb_ptr -> cb.end_pos - base_pos;
+      655 						/* eof position relative to base of last comp */
+      656 		if (rel_pos = 0) & (cb_ptr -> cb.end_pos > 0)
+      657 						/* eof at seg_end */
+      658 		then rel_pos = cb_ptr -> cb.capacity;	/* indicates last comp is full */
+      659 		call set_bc (rel_pos);		/* set bitcount of last_comp_num */
+      660 		cb_ptr -> cb.file_base_ptr -> bf_head.end_pos = cb_ptr -> cb.end_pos;
+      661 						/* set end position in header */
+      662 		file_base_ptr -> bf_head.file_action = 0;
+      663 		if stacq (file_base_ptr -> bf_head.file_lock, "0"b, cb.saved_lock_copy)
+      664 						/* unlock the file */
+      665 		then ;
+      666 	     end;
+      667 just_cleanup:
+      668 	call free_seg_ptrs;				/* de-allocates seg_ptr_array, if any */
+      669 	call free_cb_file (size (cb), cb_ptr);		/* deallocates open data block */
+      670 	return;					/* end of close routine */
+      671 
+      672 find_next_record:
+      673      proc;					/* locates record at next position */
+      674 
+      675 	do while ("1"b);				/* may loop past logically absent records */
+      676 	     cb_ptr -> cb.current_pos = cb_ptr -> cb.next_pos;
+      677 	     if cb_ptr -> cb.current_pos >= cb_ptr -> cb.end_pos
+      678 						/* beyond eof */
+      679 	     then do;				/* error--at end of file */
+      680 		     cb.current_status = "01"b;	/* no current record */
+      681 		     if cb.as_ins_del = "01"b
+      682 		     then code = error_table_$asynch_deletion;
+      683 		     else code = error_table_$end_of_info;
+      684 		     cb_ptr -> cb.scan_backward = "0"b; /* reset to default forward scanning */
+      685 		     return;
+      686 		end;
+      687 	     else do;				/* next record found */
+      688 		     call get_current_pos;
+      689 		     seg_ptr = get_seg_ptr (comp_num);
+      690 		     if (seg_ptr -> seg (pos) ^= 0) | cb.old_version
+      691 						/* not logically absent */
+      692 		     then do;
+      693 			     code = 0;
+      694 			     cb.current_status = "10"b;
+      695 						/* known to be present */
+      696 			     cb.scan_backward = "0"b;
+      697 			     return;
+      698 			end;
+      699 		     else if cb.current_status = "10"b	/* should have been present */
+      700 		     then do;
+      701 			     code = error_table_$asynch_deletion;
+      702 			     cb.current_status = "01"b;
+      703 			     return;
+      704 			end;
+      705 		     cb.current_status = "00"b;	/* will have to scan */
+      706 		     if cb_ptr -> cb.scan_backward	/* preceding operation was backspace */
+      707 		     then if cb_ptr -> cb.next_pos <= 0 /* at bof */
+      708 			then do;			/* error--scanned to bof */
+      709 				code = error_table_$end_of_info;
+      710 				cb.scan_backward = "0"b;
+      711 				cb.current_status = "01"b;
+      712 				return;
+      713 			     end;
+      714 			else cb_ptr -> cb.next_pos = cb_ptr -> cb.next_pos - 1;
+      715 						/* scan backward */
+      716 		     else cb_ptr -> cb.next_pos = cb_ptr -> cb.next_pos + 1;
+      717 						/* scan forward--default case */
+      718 		end;
+      719 	end;					/* end of scan loop */
+      720 
+      721      end find_next_record;
+      722 
+      723 get_seg_ptr:
+      724      proc (comp) returns (ptr);
+      725 	if cb.seg_ptr_array_ptr -> seg_ptr_array (comp) = null
+      726 	then call msf_manager_$get_ptr (cb.fcb_ptr, comp, "0"b, cb.seg_ptr_array_ptr -> seg_ptr_array (comp), foo24, foo);
+      727 	return (cb.seg_ptr_array_ptr -> seg_ptr_array (comp));
+      728 	dcl     comp		 fixed;
+      729      end get_seg_ptr;
+      730 
+      731 get_current_pos:
+      732      proc;
+      733 	comp_num = divide (cb_ptr -> cb.current_pos, capacity, 34, 0);
+      734 	base_pos = comp_num * cb_ptr -> cb.capacity;
+      735 	pos = (cb.current_pos - base_pos) * cb.block_size + size (bf_head);
+      736      end get_current_pos;
+      737 
+      738 prepare_process:
+      739      proc;					/* initialize for attempt at passive shared operation */
+      740 	code = 0;
+      741 
+      742 	do while ("1"b);				/* wait loop */
+      743 	     initial_time_stamp = file_base_ptr -> bf_head.time_last_modified;
+      744 	     if file_base_ptr -> bf_head.file_action = 0
+      745 	     then go to not_busy;
+      746 	     lock_copy = file_base_ptr -> bf_head.file_lock;
+      747 	     if stac (addr (lock_copy), cb.saved_lock_copy)
+      748 	     then go to not_busy;
+      749 	     if clock () >= time_limit
+      750 	     then do;
+      751 file_busy:
+      752 		     code = error_table_$file_busy;
+      753 		     go to exit;			/* abort entire operation */
+      754 		end;
+      755 	     call set_lock_$lock (lock_copy, 1, code);
+      756 	     if code ^= error_table_$lock_wait_time_exceeded
+      757 	     then go to file_busy;
+      758 	end;					/* end of wait loop */
+      759 
+      760 not_busy:
+      761 	if initial_time_stamp ^= cb.old_time_stamp
+      762 	then do;
+      763 		call reinit_cb_vars;		/* note asynch header changes */
+      764 		cb.old_time_stamp = initial_time_stamp;
+      765 	     end;
+      766 	dcl     lock_copy		 bit (36) aligned;
+      767      end prepare_process;
+      768 
+      769 reinit_cb_vars:
+      770      proc;					/* used to reinitialize cb variables to corresponding
+      771*						   header values after detecting asynch changes since last saving these vals */
+      772 	if cb.end_pos ^= file_base_ptr -> bf_head.end_pos
+      773 	then do;
+      774 		if (cb.current_pos < old_end_pos) & (cb.current_pos >= file_base_ptr -> bf_head.end_pos)
+      775 		then cb.as_ins_del = "01"b;
+      776 		else if (cb.current_pos >= old_end_pos) & (cb.current_pos < file_base_ptr -> bf_head.end_pos)
+      777 		then cb.as_ins_del = "10"b;
+      778 		else cb.as_ins_del = "00"b;
+      779 		cb.end_pos = file_base_ptr -> bf_head.end_pos;
+      780 	     end;
+      781 	if ^cb.noend
+      782 	then if cb.current_pos >= cb.end_pos		/* asynch deletions from eof */
+      783 	     then call position_eof;			/* might be more reasonable to return an
+      784*						   error code as well--in any case we can't let user stay at an
+      785*						   impossible position */
+      786 	if cb.last_comp_num ^= file_base_ptr -> bf_head.last_comp
+      787 	then do;
+      788 		call extend_seg_ptr_array (file_base_ptr -> bf_head.last_comp);
+      789 		cb.last_comp_num = file_base_ptr -> bf_head.last_comp;
+      790 	     end;
+      791 	if cb.max_rec_len ^= file_base_ptr -> bf_head.max_rec_len
+      792 	then call set_maxl;				/* asynch record size change */
+      793      end reinit_cb_vars;
+      794 
+      795 insert_record:
+      796      proc;					/* places buffer contents into current record position */
+      797 	cb_ptr -> cb.next_pos = cb_ptr -> cb.current_pos + 1;
+      798 						/* set next position to following record */
+      799 	if buff_len <= 0				/* special case zero length records to distinguish from logically absent */
+      800 	then seg_ptr -> seg (pos) = -1;		/* convention for zero-length records */
+      801 	else do;					/* copy buffer and set record_length */
+      802 		substr (seg_ptr -> seg_str, 4 * (pos + 1) + 1, buff_len) = substr (buff_ptr -> buffer, 1, buff_len);
+      803 						/* copy buffer contents */
+      804 		seg_ptr -> seg (pos) = buff_len;	/* sets record length */
+      805 	     end;
+      806 	cb_ptr -> cb.scan_backward = "0"b;		/* resume default forward scanning */
+      807 	cb.current_status = "10"b;
+      808      end insert_record;
+      809 
+      810 lock_file_check:
+      811      proc;					/* used to lock file in shared openings */
+      812 	if ^stac (addr (file_base_ptr -> bf_head.file_lock), cb.saved_lock_copy)
+      813 	then do;					/* more effort required to set lock */
+      814 		call set_lock_$lock (file_base_ptr -> bf_head.file_lock, cb.wait_time, code);
+      815 		if code ^= 0			/* as we expect unless it was just unlocked */
+      816 		then if code = error_table_$invalid_lock_reset
+      817 		     then code = 0;			/* file_action will still be checked */
+      818 		     else do;			/* locked by live process--abort or may interfere */
+      819 			     code = error_table_$file_busy;
+      820 			     go to exit;		/* external return to caller */
+      821 			end;
+      822 	     end;
+      823 	old_end_pos = cb.end_pos;
+      824 	cb.as_ins_del = "00"b;
+      825 	if cb.old_time_stamp ^= file_base_ptr -> bf_head.time_last_modified
+      826 	then do;
+      827 		call reinit_cb_vars;		/* note asynch header changes */
+      828 		cb.old_time_stamp = file_base_ptr -> bf_head.time_last_modified;
+      829 	     end;
+      830 	if file_base_ptr -> bf_head.file_action ^= 0	/* update in progress */
+      831 	then call adjust_op;			/* cleans up interrupted operation */
+      832      end lock_file_check;
+      833 
+      834 init_update:
+      835      proc (action_code);				/* sets file_action and time_last_modified */
+      836 						/* for shared updates--otherwise header is only altered on closing
+      837*						   or when a truncate operation occurs */
+      838 	if ^cb.shared
+      839 	then return;
+      840 	file_base_ptr -> bf_head.change_pos = cb.current_pos;
+      841 						/* save position
+      842*						   at which change is to occur */
+      843 	file_base_ptr -> bf_head.file_action = action_code;
+      844 						/* identifies which
+      845*						   update entry is involved */
+      846 	file_base_ptr -> bf_head.time_last_modified = clock ();
+      847 						/* tells shared
+      848*						   readers that the file has changed asynchronously */
+      849 	cb.old_time_stamp = file_base_ptr -> bf_head.time_last_modified;
+      850 	dcl     action_code		 fixed;
+      851      end init_update;				/* file marked as having an operation in progress */
+      852 
+      853 position_eof:
+      854      proc;					/* sets positions to end of file */
+      855 	cb.current_status = "01"b;			/* current record not defined */
+      856 	cb_ptr -> cb.next_pos = cb_ptr -> cb.end_pos;
+      857 	cb_ptr -> cb.current_pos = cb_ptr -> cb.end_pos;
+      858      end position_eof;
+      859 
+      860 position_bof:
+      861      proc;					/* sets positions to beginning of file */
+      862 	cb.current_status = "00"b;			/* current record status unknown */
+      863 	cb_ptr -> cb.next_pos = 0;
+      864 	cb_ptr -> cb.current_pos = 0;
+      865      end position_bof;
+      866 
+      867 set_true_eof:
+      868      proc;					/* sets eof after last non-deleted record */
+      869 
+      870 	do while (cb.current_pos > 0);		/* find true eof */
+      871 	     cb_ptr -> cb.current_pos = cb_ptr -> cb.current_pos - 1;
+      872 						/* backspace */
+      873 	     call get_current_pos;			/* look at preceding record */
+      874 	     seg_ptr = get_seg_ptr (comp_num);
+      875 	     if seg_ptr -> seg (pos) ^= 0		/* record found */
+      876 	     then do;
+      877 		     cb_ptr -> cb.current_pos = cb_ptr -> cb.current_pos + 1;
+      878 		     go to set_eof;			/* exit from loop */
+      879 		end;
+      880 	end;					/* backspace loop */
+      881 
+      882 set_eof:
+      883 	cb_ptr -> cb.end_pos = cb_ptr -> cb.current_pos;
+      884 	if cb.shared
+      885 	then file_base_ptr -> bf_head.end_pos = cb.end_pos;
+      886 	cb.current_status = "01"b;
+      887      end set_true_eof;
+      888 
+      889 create_initialize_cb:
+      890      proc;					/* prepares open data block */
+      891 	call alloc_cb_file (size (cb), cb_ptr);		/* allocates space in linkage section */
+      892 	iocb_ptr -> iocb.open_data_ptr = cb_ptr;	/* set pointer in iocb */
+      893 	cb_ptr -> cb.mode = mode;			/* save opening mode */
+      894 	cb_ptr -> cb.file_base_ptr = first_seg_ptr;	/* pointer to base of file component */
+      895 	cb_ptr -> cb.appending = iocb_ptr -> iocb.attach_data_ptr -> atb.appending;
+      896 						/*
+      897*						   causes positioning to eof instead of truncation in input_output openings */
+      898 	cb.fcb_ptr = fcb_ptr_arg;
+      899 	cb.is_msf = atb.msf;
+      900 	cb.ssf_sw = atb.ssf;
+      901 	cb.noend = atb.noend_sw;
+      902 	cb.scan_backward = "0"b;			/* determines direction of scanning over logically absent records */
+      903 	cb.old_version = "0"b;			/* for read-only openings on old version files */
+      904 	cb.shared = atb.shared;
+      905 	cb.saved_lock_copy = "0"b;
+      906 	cb.as_ins_del = "00"b;
+      907 	call set_lock_$lock (cb.saved_lock_copy, 0, foo);
+      908 	if cb.shared
+      909 	then do;
+      910 		current_entry = 12;
+      911 		go to setup_handler;
+      912 	     end;
+      913 retry_ent (12):
+      914 	if file_base_ptr -> bf_head.version = current_bf_version
+      915 	then cb.last_comp_num = file_base_ptr -> bf_head.last_comp;
+      916 	else cb.last_comp_num = atb.last_comp;
+      917 	if (mode > 4) & (file_base_ptr -> bf_head.max_comp_size <= 0)
+      918 						/* old file */
+      919 	then file_base_ptr -> bf_head.max_comp_size = max_comp_size;
+      920 	cb_ptr -> cb.max_comp_size = file_base_ptr -> bf_head.max_comp_size;
+      921 						/* needed to determine capacity */
+      922 	call set_maxl;				/* initializes max_len dependent cb variables */
+      923 	cb_ptr -> cb.end_pos = file_base_ptr -> bf_head.end_pos;
+      924 						/* get eof position */
+      925 	if cb.shared
+      926 	then do;					/* see if asynch component deletions possible */
+      927 		call hcs_$get_safety_sw_seg (file_base_ptr, safety_sw, code);
+      928 		cb.handler_required = ^ssf_sw & (^safety_sw | ^is_msf);
+      929 		cb.wait_time = atb.wait_time;
+      930 		cb.micro_wait_time = 1000000 * cb.wait_time;
+      931 		cb.old_time_stamp = file_base_ptr -> bf_head.time_last_modified;
+      932 	     end;
+      933      end create_initialize_cb;
+      934 
+      935 set_entries_and_positions:
+      936      proc;					/* sets iocb entries for valid operations and positions
+      937*						   to start or end of file depending on opening mode */
+      938 	close_x = close_blk_file;			/* close routine called by vfile_attach */
+      939 	call position_bof;
+      940 	if mode ^= 5				/* input operations supported */
+      941 	then do;					/* set passive entries */
+      942 		iocb_ptr -> iocb.read_record = read_blk_file;
+      943 		iocb_ptr -> iocb.read_length = read_length_blk_file;
+      944 		iocb_ptr -> iocb.position = position_blk_file;
+      945 		iocb_ptr -> iocb.control = control_blk_file;
+      946 	     end;
+      947 	else do;					/* output-only opening */
+      948 		iocb_ptr -> iocb.control = control_blk_file;
+      949 		iocb_ptr -> iocb.write_record = write_blk_file;
+      950 	     end;
+      951 	if mode = 6				/* input_output */
+      952 	then iocb_ptr -> iocb.write_record = write_blk_file;
+      953 	else if mode = 7				/* sequential_update */
+      954 	then do;					/* output operations also supported */
+      955 		iocb_ptr -> iocb.write_record = write_blk_file;
+      956 		iocb_ptr -> iocb.rewrite_record = rewrite_blk_file;
+      957 		iocb_ptr -> iocb.delete_record = delete_blk_file;
+      958 	     end;
+      959 	if (mode = 5) | ((mode = 6) & (^cb_ptr -> cb.appending))
+      960 						/* output or input_output
+      961*						   without -append attach option */
+      962 	then call position_eof;			/* position at open should be eof */
+      963      end set_entries_and_positions;
+      964 
+      965 truncate_file:
+      966      proc;					/* truncates file at next record position */
+      967 	cb_ptr -> cb.current_pos = cb.next_pos;
+      968 	cb_ptr -> cb.end_pos = cb_ptr -> cb.next_pos;	/* next position becomes eof */
+      969 	cb_ptr -> cb.file_base_ptr -> bf_head.end_pos = cb_ptr -> cb.end_pos;
+      970 						/* mark new eof in file header */
+      971 	if ^cb.is_msf
+      972 	then call hcs_$truncate_seg (cb_ptr -> cb.file_base_ptr,
+      973 		size (bf_head) + cb_ptr -> cb.end_pos * cb_ptr -> cb.block_size, code);
+      974 						/* truncates the file */
+      975 	else do;
+      976 		call get_current_pos;
+      977 		if (base_pos = cb.end_pos) & (comp_num > 0)
+      978 						/* end of segment case */
+      979 		then do;				/* don't keep last seg with just a header */
+      980 			comp_num = comp_num - 1;	/* true last comp */
+      981 			pos = size (bf_head) + cb.capacity * cb.block_size;
+      982 						/* word offset of first word
+      983*						   beyond last record in the file */
+      984 		     end;
+      985 		call msf_manager_$adjust (cb.fcb_ptr, comp_num, 36 * pos, "010"b, code);
+      986 		file_base_ptr -> bf_head.last_comp = comp_num;
+      987 		cb.last_comp_num = comp_num;
+      988 	     end;
+      989 	call set_true_eof;				/* in case preceding records are absent anyway */
+      990 	cb.next_pos = cb.end_pos;
+      991      end truncate_file;
+      992 
+      993 set_maxl:
+      994      proc;					/* sets cb variables which depend on max_rec_len */
+      995 	cb_ptr -> cb.max_rec_len = cb_ptr -> cb.file_base_ptr -> bf_head.max_rec_len;
+      996 						/* use max from file header */
+      997 	cb_ptr -> cb.block_size = divide (cb_ptr -> cb.max_rec_len + 7, 4, 19, 0);
+      998 						/* block
+      999*						   has single word header */
+     1000 	cb_ptr -> cb.capacity = divide (cb_ptr -> cb.max_comp_size - size (bf_head), cb_ptr -> cb.block_size, 17, 0);
+     1001 						/* capacity of each seg, in records */
+     1002      end set_maxl;
+     1003 
+     1004 create_seg_ptrs:
+     1005      proc;					/* allocates seg_ptr_array if file is an msf */
+     1006 	if cb.last_comp_num <= 0
+     1007 	then do;					/* ssf case--just return */
+     1008 		cb_ptr -> cb.seg_ptr_array_limit = -1;	/* indicates no separate allocation */
+     1009 		cb_ptr -> seg_ptr_array_ptr = addr (cb.file_base_ptr);
+     1010 						/* superimpose array */
+     1011 		return;
+     1012 	     end;
+     1013 	cb.seg_ptr_array_limit = max (3, cb.last_comp_num);
+     1014 	call alloc_cb_file (size (seg_ptr_array), cb.seg_ptr_array_ptr);
+     1015 
+     1016 	do i = 0 to cb.seg_ptr_array_limit;		/* initialize array to null */
+     1017 	     cb.seg_ptr_array_ptr -> seg_ptr_array (i) = null;
+     1018 	end;
+     1019 
+     1020 	seg_ptr_array (0) = cb.file_base_ptr;
+     1021      end create_seg_ptrs;
+     1022 
+     1023 free_seg_ptrs:
+     1024      proc;					/* de-allocates seg_ptr_array, if any */
+     1025 	if cb_ptr -> cb.seg_ptr_array_limit < 0		/* no array */
+     1026 	then return;
+     1027 	call free_cb_file (size (seg_ptr_array), cb_ptr -> cb.seg_ptr_array_ptr);
+     1028      end free_seg_ptrs;
+     1029 
+     1030 extend_seg_ptr_array:
+     1031      proc (new_last_comp);				/* may re-allocate seg_ptr_array to accomodate
+     1032*						   a new msf component */
+     1033 	if new_last_comp <= cb.seg_ptr_array_limit	/* enough room */
+     1034 	then return;
+     1035 	if ^cb_ptr -> cb.is_msf			/* msf not yet opened */
+     1036 	then do;
+     1037 		call msf_manager_$open (substr (attach_descrip_string, 8, dname_len),
+     1038 		     substr (attach_descrip_string, 9 + dname_len, ename_len), cb.fcb_ptr, foo);
+     1039 		cb_ptr -> cb.is_msf = "1"b;
+     1040 		atb.fcbp = cb.fcb_ptr;
+     1041 	     end;
+     1042 	old_array_limit = cb.seg_ptr_array_limit;
+     1043 	cb.seg_ptr_array_limit = 4 * divide (new_last_comp + 4, 4, 17, 0) - 1;
+     1044 	old_array_ptr = cb.seg_ptr_array_ptr;
+     1045 	call alloc_cb_file (size (seg_ptr_array), cb.seg_ptr_array_ptr);
+     1046 
+     1047 	do i = 0 to cb.seg_ptr_array_limit;		/* initialize array to null */
+     1048 	     cb.seg_ptr_array_ptr -> seg_ptr_array (i) = null;
+     1049 	end;
+     1050 
+     1051 
+     1052 	do i = 0 to cb.last_comp_num;
+     1053 	     cb.seg_ptr_array_ptr -> seg_ptr_array (i) = old_seg_ptr_array (i);
+     1054 	end;
+     1055 
+     1056 	if old_array_limit > 0			/* old array was separately allocated */
+     1057 	then call free_cb_file (size (old_seg_ptr_array), old_array_ptr);
+     1058 
+     1059 	dcl     old_seg_ptr_array	 (0:old_array_limit) ptr based (old_array_ptr);
+     1060 	dcl     old_array_limit	 fixed;
+     1061 	dcl     old_array_ptr	 ptr;
+     1062 	dcl     new_last_comp	 fixed;
+     1063      end extend_seg_ptr_array;
+     1064 
+     1065 set_bc:
+     1066      proc (nrecs);					/* sets bitcount on last comp */
+     1067 	call hcs_$set_bc_seg (get_seg_ptr (cb.last_comp_num), 36 * (size (bf_head) + nrecs * cb.block_size), foo);
+     1068 	dcl     nrecs		 fixed (19);
+     1069      end set_bc;
+     1070 
+     1071 adjust_file:
+     1072      proc;					/* called when an interrupted opening is detected */
+     1073 	call adjust_bit_count_ (substr (attach_descrip_string, 8, dname_len),
+     1074 	     substr (attach_descrip_string, 9 + dname_len, ename_len), "0"b, bc, code);
+     1075 						/* find last non-zero word */
+     1076 	if bc > 0
+     1077 	then do;					/* proceed with adjustment */
+     1078 		tot_nz_words = divide (bc, 36, 34, 0);
+     1079 		full_comp_size = size (bf_head) + cb.capacity * cb.block_size;
+     1080 		full_comps = divide (tot_nz_words, full_comp_size, 17, 0);
+     1081 		nz_words = tot_nz_words - full_comps * full_comp_size;
+     1082 						/* words in last comp */
+     1083 		base_pos = cb.capacity * full_comps;	/* rec_no at base of last comp */
+     1084 		nz_recs =
+     1085 		     divide (nz_words - size (bf_head) + cb_ptr -> cb.block_size - 1, cb_ptr -> cb.block_size, 17, 0);
+     1086 						/* count of non-zero records */
+     1087 		tot_nz_recs = base_pos + nz_recs;	/* total adjusted record count */
+     1088 		file_base_ptr -> bf_head.last_comp = full_comps;
+     1089 		cb.last_comp_num = full_comps;
+     1090 		if (tot_nz_recs > cb_ptr -> cb.end_pos)
+     1091 		     |
+     1092 		     /* eof is not properly set */ ((tot_nz_recs ^= cb.end_pos)
+     1093 		     & (file_base_ptr -> bf_head.version = current_bf_version))
+     1094 		then if get_seg_ptr (cb.last_comp_num)
+     1095 			-> seg (size (bf_head) + cb_ptr -> cb.block_size * (nz_recs - 1)) ^= 0
+     1096 						/*
+     1097*						   last record is valid */
+     1098 		     then do;
+     1099 			     cb_ptr -> cb.end_pos = tot_nz_recs;
+     1100 			     file_base_ptr -> bf_head.end_pos = tot_nz_recs;
+     1101 			end;
+     1102 		     else do;			/* last record is incomplete--delete it */
+     1103 			     cb_ptr -> cb.next_pos = tot_nz_recs - 1;
+     1104 			     call truncate_file;	/* removes dubious last record */
+     1105 			end;
+     1106 		     end;
+     1107      end adjust_file;
+     1108 
+     1109 adjust_op:
+     1110      proc;					/* makes file consistent */
+     1111 	if (file_base_ptr -> bf_head.file_action = eof_delete) | (file_base_ptr -> bf_head.file_action = unshared_opening)
+     1112 	     | (file_base_ptr -> bf_head.file_action = append)
+     1113 	then call adjust_file;
+     1114 	else if file_base_ptr -> bf_head.file_action = write_trunc
+     1115 	then if file_base_ptr -> bf_head.end_pos > file_base_ptr -> bf_head.change_pos + 1
+     1116 						/* rewrite phase */
+     1117 	     then call print_warning;			/* contents may be bad */
+     1118 	     else go to finish_trunc;			/* just do the truncation */
+     1119 	else if file_base_ptr -> bf_head.file_action = non_eof_delete
+     1120 	then call re_zero;				/* clean up garbage */
+     1121 	else if file_base_ptr -> bf_head.file_action = truncate
+     1122 	then do;					/* finish a truncation */
+     1123 finish_trunc:
+     1124 		call position_eof;
+     1125 		call truncate_file;
+     1126 	     end;
+     1127 	else call print_warning;			/* non_eof_replacement */
+     1128 	cb.current_pos = old_current_pos;		/* reset positions */
+     1129 	cb.next_pos = old_next_pos;
+     1130 	file_base_ptr -> bf_head.file_action = 0;
+     1131 	return;					/* operation in progress has been adjusted */
+     1132 
+     1133 print_warning:
+     1134      proc;					/* signals fact that record may have bad contents */
+     1135 	call sub_err_ (0, "vfile_", "c", null, foo, "Record contents may be damaged for position: ^d",
+     1136 	     file_base_ptr -> bf_head.change_pos);
+     1137      end print_warning;
+     1138 
+     1139 re_zero:
+     1140      proc;					/* handles interrupted deletions */
+     1141 	cb.current_pos = file_base_ptr -> bf_head.change_pos;
+     1142 	call get_current_pos;
+     1143 	seg_ptr = get_seg_ptr (comp_num);
+     1144 	unspec (addr (seg_ptr -> seg (pos)) -> record_block) = "0"b;
+     1145 	cb.current_pos = old_current_pos;
+     1146      end re_zero;
+     1147 
+     1148      end adjust_op;
+     1149 
+     1150 convert_file:
+     1151      proc;					/* brings old file up to current version, or detects bad version */
+     1152 	if first_seg_ptr -> bf_head.version ^= bf_version_0
+     1153 						/* previous version file? */
+     1154 	then do;					/* not previous version */
+     1155 		code = error_table_$unimplemented_version;
+     1156 						/* unknown version--abort */
+     1157 		return;				/* opening will fail */
+     1158 	     end;
+     1159 	if atb.inv_lock_reset			/* old file was being updated */
+     1160 	then call adjust_file;			/* not really necessary if operation was truncate */
+     1161 	call position_bof;
+     1162 
+     1163 	do while (cb_ptr -> cb.current_pos < cb_ptr -> cb.end_pos);
+     1164 						/* convert zero-length records */
+     1165 	     call get_current_pos;
+     1166 	     seg_ptr = get_seg_ptr (comp_num);
+     1167 	     if seg_ptr -> seg (pos) = 0		/* old-style zero-length record */
+     1168 	     then seg_ptr -> seg (pos) = -1;		/* new representation for zero-length records */
+     1169 	     cb_ptr -> cb.current_pos = cb_ptr -> cb.current_pos + 1;
+     1170 						/* advance through file */
+     1171 	end;					/* end of loop which converts records */
+     1172 
+     1173 	file_base_ptr -> bf_head.last_comp = cb.last_comp_num;
+     1174 	first_seg_ptr -> bf_head.version = current_bf_version;
+     1175 						/* completes conversion atomically */
+     1176      end convert_file;
+     1177 
+     1178 	dcl     (vfile_io_control, vfile_status_$seg)
+     1179 				 entry (ptr, ptr, ptr, fixed (35));
+     1180 	dcl     current_entry	 fixed;
+     1181 	dcl     full_comp_size	 fixed (19);
+     1182 	dcl     stacq		 builtin;
+     1183 	dcl     set_lock_$lock	 entry (bit (36) aligned, fixed, fixed (35));
+     1184 	dcl     seg_ptr		 ptr;
+     1185 	dcl     sub_err_		 entry options (variable);
+     1186 	dcl     action		 fixed;
+     1187 	dcl     clock		 builtin;
+     1188 	dcl     (iocb_ptr, fcb_ptr_arg, first_seg_ptr)
+     1189 				 ptr;
+     1190 	dcl     rel_pos		 fixed (19);
+     1191 	dcl     base_pos		 fixed (34);
+     1192 	dcl     tot_nz_words	 fixed (34);
+     1193 	dcl     full_comps		 fixed;
+     1194 	dcl     tot_nz_recs		 fixed;
+     1195 	dcl     comp_num		 fixed;
+     1196 	dcl     seg_ptr_array	 (0:cb_ptr -> cb.seg_ptr_array_limit) ptr based (cb.seg_ptr_array_ptr);
+     1197 	dcl     msf_manager_$open	 entry (char (*), char (*), ptr, fixed (35));
+     1198 	dcl     msf_manager_$adjust	 entry (ptr,	/* fcb_ptr */
+     1199 				 fixed bin,	/* component number of segment to be
+     1200*						   made last segment */
+     1201 				 fixed bin (24),	/* bit count for that seg */
+     1202 				 bit (3),		/* "010" = dont set bit counts, truncate
+     1203*						   segment, dont terminate components */
+     1204 				 fixed bin (35));	/* status code */
+     1205 	dcl     msf_manager_$get_ptr	 entry (ptr,	/* fcb_ptr */
+     1206 				 fixed bin,	/* component number of desired segment */
+     1207 				 bit (1),		/* create switch */
+     1208 				 ptr,		/* ptr to seg or null if error, output */
+     1209 				 fixed bin (24),	/* bitcount of segment, output */
+     1210 				 fixed bin (35));	/* status code */
+     1211 	dcl     adjust_bit_count_	 entry (char (168) aligned, char (32) aligned, bit (1) aligned, fixed (24),
+     1212 				 fixed (35));
+     1213 	dcl     d_name		 char (168) aligned;
+     1214 	dcl     e_name		 char (32) aligned;
+     1215 	dcl     d_len		 fixed;
+     1216 	dcl     bc		 fixed (24);
+     1217 	dcl     hcs_$fs_get_path_name	 entry (ptr, char (*) aligned, fixed, char (*) aligned, fixed (35));
+     1218 	dcl     hcs_$status_mins	 entry (ptr, fixed (2), fixed (24), fixed (35));
+     1219 	dcl     hcs_$terminate_seg	 entry (ptr, fixed (1), fixed (35));
+     1220 	dcl     hcs_$initiate	 entry (char (*), char (*), char (*), fixed (1), fixed (2), ptr, fixed (35));
+     1221 	dcl     is_new_file		 bit (1) aligned;
+     1222 	dcl     mode		 fixed;		/* may be 4,5,6, or 7 */
+     1223 	dcl     close_x		 entry;
+     1224 	dcl     first_seg_bitcount	 fixed (24);	/* of no interest in this module */
+     1225 	dcl     max_comp_size	 fixed (19);
+     1226 	dcl     code		 fixed (35);
+     1227 	dcl     1 bf_head		 aligned based,	/* standard header for blocked files */
+     1228 		2 common_header_words,
+     1229 		  3 file_type_code	 fixed (35),
+     1230 		  3 file_lock	 bit (36) aligned,
+     1231 		  3 time_last_modified
+     1232 				 fixed (71),
+     1233 		2 version		 fixed,
+     1234 		2 change_pos	 fixed (34),	/* record being modified when shared */
+     1235 		2 reserved1	 (1) fixed,
+     1236 		2 last_comp	 fixed,		/* last msf component number */
+     1237 		2 max_rec_len	 fixed (21),	/* bytes */
+     1238 		2 end_pos		 fixed,		/* number of records */
+     1239 		2 file_action	 fixed,		/* non-zero value indicates truncation in progress */
+     1240 		2 max_comp_size	 fixed (19),
+     1241 		2 reserved2	 (4) fixed;
+  1     1 
+  1     2      dcl	   1 iocb		      aligned based (iocb_ptr),
+  1     3 						/* I/O control block. */
+  1     4 	     2 iocb_version	      fixed init (1),	/* Version number of structure. */
+  1     5 	     2 name	      char (32),		/* I/O name of this block. */
+  1     6 	     2 actual_iocb_ptr    ptr,		/* IOCB ultimately SYNed to. */
+  1     7 	     2 attach_descrip_ptr ptr,		/* Ptr to printable attach description. */
+  1     8 	     2 attach_data_ptr    ptr,		/* Ptr to attach data structure. */
+  1     9 	     2 open_descrip_ptr   ptr,		/* Ptr to printable open description. */
+  1    10 	     2 open_data_ptr      ptr,		/* Ptr to open data structure (old SDB). */
+  1    11 	     2 reserved	      bit (72),		/* Reserved for future use. */
+  1    12 	     2 detach_iocb	      entry (ptr, fixed (35)),/* detach_iocb(p,s) */
+  1    13 	     2 open	      entry (ptr, fixed, bit (1) aligned, fixed (35)),
+  1    14 						/* open(p,mode,not_used,s) */
+  1    15 	     2 close	      entry (ptr, fixed (35)),/* close(p,s) */
+  1    16 	     2 get_line	      entry (ptr, ptr, fixed (21), fixed (21), fixed (35)),
+  1    17 						/* get_line(p,bufptr,buflen,actlen,s) */
+  1    18 	     2 get_chars	      entry (ptr, ptr, fixed (21), fixed (21), fixed (35)),
+  1    19 						/* get_chars(p,bufptr,buflen,actlen,s) */
+  1    20 	     2 put_chars	      entry (ptr, ptr, fixed (21), fixed (35)),
+  1    21 						/* put_chars(p,bufptr,buflen,s) */
+  1    22 	     2 modes	      entry (ptr, char (*), char (*), fixed (35)),
+  1    23 						/* modes(p,newmode,oldmode,s) */
+  1    24 	     2 position	      entry (ptr, fixed, fixed (21), fixed (35)),
+  1    25 						/* position(p,u1,u2,s) */
+  1    26 	     2 control	      entry (ptr, char (*), ptr, fixed (35)),
+  1    27 						/* control(p,order,infptr,s) */
+  1    28 	     2 read_record	      entry (ptr, ptr, fixed (21), fixed (21), fixed (35)),
+  1    29 						/* read_record(p,bufptr,buflen,actlen,s) */
+  1    30 	     2 write_record	      entry (ptr, ptr, fixed (21), fixed (35)),
+  1    31 						/* write_record(p,bufptr,buflen,s) */
+  1    32 	     2 rewrite_record     entry (ptr, ptr, fixed (21), fixed (35)),
+  1    33 						/* rewrite_record(p,bufptr,buflen,s) */
+  1    34 	     2 delete_record      entry (ptr, fixed (35)),/* delete_record(p,s) */
+  1    35 	     2 seek_key	      entry (ptr, char (256) varying, fixed (21), fixed (35)),
+  1    36 						/* seek_key(p,key,len,s) */
+  1    37 	     2 read_key	      entry (ptr, char (256) varying, fixed (21), fixed (35)),
+  1    38 						/* read_key(p,key,len,s) */
+  1    39 	     2 read_length	      entry (ptr, fixed (21), fixed (35));
+  1    40 						/* read_length(p,len,s) */
+  1    41 
+     1242 
+  2     1 /* include file for info structure used with record_status control order
+  2     2*   created by M. Asherman 1/6/76 */
+  2     3 /* modified 6/15/77 to support stationary type records */
+  2     4 
+  2     5      dcl	   rs_info_ptr	      ptr;
+  2     6      dcl	   1 rs_info	      based (rs_info_ptr) aligned,
+  2     7 	     2 version	      fixed,		/* must be set to 1 or 2 (Input) */
+  2     8 	     2 flags	      aligned,
+  2     9 	       3 lock_sw	      bit (1) unal,		/* Input -- if ="1"b  try to lock record */
+  2    10 	       3 unlock_sw	      bit (1) unal,		/* Input -- if ="1"b try to unlock record */
+  2    11 	       3 create_sw	      bit (1) unal,		/* Input--if set creat new record */
+  2    12 	       3 locate_sw	      bit (1) unal,		/* Input--if set causes current rec to be
+  2    13*						   located outside the index by descrip, or created without key */
+  2    14 	       3 inc_ref_count    bit (1) unal,		/* Input--bump reference count of record, if stationary */
+  2    15 	       3 dec_ref_count    bit (1) unal,		/* Input--decrement ref count if this flag set and record stationary */
+  2    16 	       3 locate_pos_sw    bit (1) unal,		/* Input--if set the record_length is taken
+  2    17*						   as an input argument specifying the absolute logical record positioni	  to which both the current and next positions will be set */
+  2    18 	       3 mbz1	      bit (29) unal,	/* must be set to "0"b, reserved for future use */
+  2    19 	     2 record_length      fixed (21),		/* length in bytes, Input if create_sw set */
+  2    20 	     2 max_rec_len	      fixed (21),		/* max length of contained record
+  2    21*						   Input if create_sw is set--overrides min_block_size in effect */
+  2    22 	     2 record_ptr	      ptr,		/* points to first byte of record--will be word aligned */
+  2    23 	     2 descriptor	      fixed (35),		/* Input if locate_sw set and create_sw="0"b */
+  2    24 	     2 ref_count	      fixed (34),		/* Output--should match number of keys on this record-- = -1 if non-stationary record */
+  2    25 	     2 time_last_modified fixed (71),		/* Output */
+  2    26 	     2 modifier	      fixed (35),		/* Output--also Input when locking */
+  2    27 	     2 block_ptr	      ptr unal,		/* Output */
+  2    28 	     2 last_image_modifier
+  2    29 			      fixed (35),
+  2    30 	     2 mbz2	      fixed;
+  2    31 
+  2    32      dcl	   1 rs_desc	      based (addr (rs_info.descriptor)),
+  2    33 						/* record block descriptor structure */
+  2    34 	     2 comp_num	      fixed (17) unal,	/* msf component number */
+  2    35 	     2 offset	      bit (18) unal;	/* word offset of record block */
+  2    36 
+  2    37      dcl	   1 seq_desc	      based (addr (rs_info.descriptor)),
+  2    38 						/* for sequential files */
+  2    39 	     2 bitno	      bit (6) unal,
+  2    40 	     2 comp_num	      fixed (11) unal,	/* msf component number */
+  2    41 	     2 wordno	      bit (18) unal;	/* word offset */
+  2    42 
+  2    43      dcl	   rs_info_version_1      static internal fixed init (1);
+  2    44      dcl	   rs_info_version_2      static internal fixed init (2);
+  2    45 
+     1243 
+  3     1 /* include file for common portions of vfile_'s attach block used in
+  3     2*   several modules--created by M. Asherman 1/9/76
+  3     3*   Modified 8/28/76 to add last_comp */
+  3     4 
+  3     5      dcl	   1 atb		      based (iocb_ptr -> iocb.actual_iocb_ptr -> iocb.attach_data_ptr),
+  3     6 						/* attach block */
+  3     7 	     2 flags	      aligned,
+  3     8 	       3 (pad1, appending, no_trunc, pad2, ssf, header_present, blocked, shared, pad3, msf, inv_lock_reset,
+  3     9 		  dup_ok_sw, trans_sw, noend_sw, exclu_sw, stat_sw, checkpoint_sw)
+  3    10 			      bit (1) unal,
+  3    11 	       3 pad5	      bit (19) unal,
+  3    12 	     2 wait_time	      fixed (35),
+  3    13 	     2 word	      fixed,
+  3    14 	     2 max_rec_len	      fixed (35),
+  3    15 	     2 header_id	      fixed (35),
+  3    16 	     2 word2	      fixed,
+  3    17 	     2 attach_descrip_string
+  3    18 			      char (256),
+  3    19 	     2 dname_len,
+  3    20 	     2 ename_len	      fixed,
+  3    21 	     2 words3	      (9) fixed,
+  3    22 	     2 opening_mode	      fixed,
+  3    23 	     2 word4	      fixed,
+  3    24 	     2 fcbp	      ptr,
+  3    25 	     2 fsp	      ptr,		/* first seg ptr */
+  3    26 	     2 close_x	      entry,		/* set to close routine */
+  3    27 	     2 last_comp	      fixed,		/* msf component number */
+  3    28 	     2 tcf_iocbp	      ptr;		/* iocb ptr for transaction control switch */
+     1244 
+     1245 	dcl     hcs_$set_bc_seg	 entry (ptr, fixed (24), fixed (35));
+     1246 	dcl     (size, max, null, divide)
+     1247 				 builtin;
+     1248 	dcl     i			 fixed;
+     1249 	dcl     cb_ptr		 ptr;
+     1250 	dcl     bf_version_0	 static internal fixed options (constant) init (0);
+     1251 	dcl     current_bf_version	 static internal fixed options (constant) init (1);
+     1252 	dcl     1 cb		 based (cb_ptr) aligned,
+     1253 						/* open data block--controls blocked files */
+     1254 		2 file_base_ptr	 ptr,		/* points to base of segment */
+     1255 		2 seg_ptr_array_ptr	 ptr,
+     1256 		2 fcb_ptr		 ptr,
+     1257 		2 mode		 fixed,		/* opening mode (=4,5,6, or 7) */
+     1258 		2 appending	 bit (1) aligned,	/* -append option */
+     1259 		2 max_comp_size	 fixed (19),	/* determines capacity of file */
+     1260 		2 max_rec_len	 fixed (21),	/* determines block size */
+     1261 		2 block_size	 fixed (19),	/* words, including header */
+     1262 		2 capacity	 fixed (19),	/* max number of records per comp */
+     1263 		2 current_pos	 fixed (34),	/* current record number */
+     1264 		2 next_pos	 fixed (34),	/* next record position (0,1,2,...) */
+     1265 		2 end_pos		 fixed (34),	/* number of records in file */
+     1266 		2 last_comp_num	 fixed,
+     1267 		2 is_msf		 bit (1) aligned,
+     1268 		2 ssf_sw		 bit (1) aligned,
+     1269 		2 seg_ptr_array_limit
+     1270 				 fixed,
+     1271 		2 noend		 bit (1) aligned,	/* if on, user pay position beyond eof */
+     1272 		2 scan_backward	 bit (1) aligned,	/* for masking logically absent records */
+     1273 		2 old_version	 bit (1) aligned,	/* set if file does not support logical deletion */
+     1274 		2 shared		 bit (1) aligned,	/* on if -share attachment */
+     1275 		2 wait_time	 fixed,		/* applies only if shared */
+     1276 		2 saved_lock_copy	 bit (36) aligned,	/* copy of my lock id */
+     1277 		2 micro_wait_time	 fixed (71),	/* wait_time in microseconds */
+     1278 		2 old_time_stamp	 fixed (71),
+     1279 		2 handler_required	 bit (1) aligned,	/* applies if sharing */
+     1280 		2 current_status	 bit (2) aligned,
+     1281 		2 as_ins_del	 bit (2) aligned;
+     1282 	dcl     old_end_pos		 fixed (34);
+     1283 	dcl     old_current_status	 bit (2) aligned;
+     1284 	dcl     (pos_type, n_recs)	 fixed;
+     1285 	dcl     seg_fault_error	 condition;
+     1286 	dcl     time_limit		 fixed (71);
+     1287 	dcl     forever		 static internal fixed (54) aligned init (1.801e16);
+     1288 	dcl     (error_table_$negative_nelem, error_table_$asynch_insertion, error_table_$asynch_deletion,
+     1289 	        error_table_$lock_wait_time_exceeded, error_table_$invalid_lock_reset, error_table_$safety_sw_on,
+     1290 	        error_table_$file_busy, error_table_$unimplemented_version, error_table_$end_of_info,
+     1291 	        error_table_$no_record, error_table_$bad_arg, error_table_$no_operation, error_table_$long_record,
+     1292 	        error_table_$file_is_full)
+     1293 				 external fixed (35);
+     1294 	dcl     seg		 (0:cb.max_comp_size) fixed aligned based;
+     1295 	dcl     pos		 fixed (19);
+     1296 	dcl     1 pos_struct	 based (addr (pos)),
+     1297 		2 pad_bits	 bit (18) unal,
+     1298 		2 pos_bits	 bit (18) unal;
+     1299 	dcl     buff_ptr		 ptr;
+     1300 	dcl     (buff_len, rec_len)	 fixed (21);
+     1301 	dcl     buffer		 char (buff_len) based (buff_ptr);
+     1302 	dcl     n			 fixed (21);
+     1303 	dcl     substr		 builtin;
+     1304 	dcl     order		 char (*);
+     1305 	dcl     info_ptr		 ptr;
+     1306 	dcl     was_scan_backward	 bit (1) aligned;
+     1307 	dcl     (old_next_pos, old_current_pos)
+     1308 				 fixed (34);
+     1309 	dcl     write_trunc		 static internal fixed options (constant) init (-9);
+     1310 	dcl     rewrite		 static internal fixed options (constant) init (-2);
+     1311 	dcl     eof_delete		 static internal fixed options (constant) init (-3);
+     1312 	dcl     non_eof_delete	 static internal fixed options (constant) init (-10);
+     1313 	dcl     unshared_opening	 static internal fixed options (constant) init (-11);
+     1314 	dcl     append		 static internal fixed options (constant) init (-1);
+     1315 	dcl     truncate		 static internal fixed options (constant) init (1);
+     1316 	dcl     1 info1		 based (info_ptr),	/* for "read_position" order */
+     1317 		2 next_pos	 fixed,		/* output */
+     1318 		2 end_pos		 fixed;		/* output */
+     1319 	dcl     continue_to_signal_	 entry (fixed (35));
+     1320 	dcl     initial_time_stamp	 fixed (71);
+     1321 	dcl     safety_sw		 bit (1);
+     1322 	dcl     hcs_$get_safety_sw_seg entry (ptr, bit (1), fixed (35));
+     1323 	dcl     1 info2		 based (info_ptr),	/* for "max_rec_len" order */
+     1324 		2 old_max_recl	 fixed (21),	/* output */
+     1325 		2 new_max_recl	 fixed (21);	/* input */
+     1326 	dcl     foo		 fixed (35);
+     1327 	dcl     foo24		 fixed (24);
+     1328 	dcl     nz_words		 fixed (19);
+     1329 	dcl     nz_recs		 fixed;
+     1330 	dcl     addr		 builtin;
+     1331 	dcl     1 record_block	 based,
+     1332 		2 recl		 fixed (21),
+     1333 		2 rec_words	 (cb.block_size - 1) fixed;
+     1334 	dcl     seg_str		 char (1000000) aligned based;
+     1335 	dcl     alloc_cb_file	 entry (fixed, ptr);
+     1336 	dcl     free_cb_file	 entry (fixed, ptr);
+     1337 	dcl     hcs_$truncate_seg	 entry (ptr, fixed (18), fixed (35));
+     1338      end open_blk_file;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/18/00  1125.1  open_blk_file.pl1                 >udd>sm>ds>w>ml>open_blk_file.pl1
+1242         1    07/02/81  2005.0  iocbv.incl.pl1                    >ldd>incl>iocbv.incl.pl1
+1243         2    07/19/79  1647.0  rs_info.incl.pl1                  >ldd>incl>rs_info.incl.pl1
+1244         3    07/19/79  1647.0  vf_attach_block.incl.pl1          >ldd>incl>vf_attach_block.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+action                          000104 automatic       fixed bin(17,0)          dcl 1186 set ref 289* 300* 302* 307* 316* 331* 357
+                                                                                  444* 446* 447* 451
+action_code                            parameter       fixed bin(17,0)          dcl 850 ref 834 843
+actual_iocb_ptr          12            based           pointer                  level 2 dcl 1-2 ref 16 16 87 87 88 88 88 899 900 901
+                                                                                  904 916 929 1037 1037 1037 1037 1037 1037 1037
+                                                                                  1037 1037 1037 1040 1073 1073 1073 1073 1073 1073
+                                                                                  1073 1073 1073 1073 1159
+addr                                                   builtin function         dcl 1330 ref 449 523 524 524 527 635 747 812 1009
+                                                                                  1144
+adjust_bit_count_               000026 constant        entry                    external dcl 1211 ref 1073
+alloc_cb_file                   000076 constant        entry                    external dcl 1335 ref 891 1014 1045
+append                          005356 constant        fixed bin(17,0)          initial dcl 1314 ref 289 307 316 1111
+appending                 0(01)        based           bit(1)                   level 3 in structure "atb" packed packed unaligned
+                                                                                  dcl 3-5 in procedure "open_blk_file" ref 895
+appending                 7            based           bit(1)                   level 2 in structure "cb" dcl 1252 in procedure
+                                                                                  "open_blk_file" set ref 285 895* 959
+as_ins_del               40            based           bit(2)                   level 2 dcl 1252 set ref 78* 165 292 303 386 427 513
+                                                                                  558 681 774* 776* 778* 824* 906*
+atb                                    based           structure                level 1 unaligned dcl 3-5
+attach_data_ptr          16            based           pointer                  level 2 dcl 1-2 ref 16 16 18 87 87 88 88 88 895 899
+                                                                                  900 901 904 916 929 1037 1037 1037 1037 1037 1037
+                                                                                  1037 1037 1037 1037 1040 1073 1073 1073 1073 1073
+                                                                                  1073 1073 1073 1073 1073 1159
+attach_descrip_string
+                          6            based           char(256)                level 2 packed packed unaligned dcl 3-5 ref 87 88
+                                                                                  1037 1037 1037 1037 1073 1073 1073 1073
+base_pos                        000106 automatic       fixed bin(34,0)          dcl 1191 set ref 654 734* 735 977 1083* 1087
+bc                              000165 automatic       fixed bin(24,0)          dcl 131 in on unit on line 83 set ref 91* 113*
+bc                              000113 automatic       fixed bin(24,0)          dcl 1216 in procedure "open_blk_file" set ref 1073*
+                                                                                  1076 1078
+bf_head                                based           structure                level 1 dcl 1227 set ref 21 735 971 981 1000 1067
+                                                                                  1079 1084 1090
+bf_version_0                           constant        fixed bin(17,0)          initial dcl 1250 ref 1152
+block_size               12            based           fixed bin(19,0)          level 2 dcl 1252 set ref 449 735 971 981 997* 1000
+                                                                                  1067 1079 1084 1084 1090 1144
+buff_len                               parameter       fixed bin(21,0)          dcl 1300 ref 219 233 236 239 266 270 272 366 369 371
+                                                                                  799 802 802 802 804
+buff_ptr                               parameter       pointer                  dcl 1299 ref 219 239 266 366 802
+buffer                                 based           char                     packed unaligned dcl 1301 set ref 239* 802
+capacity                 13            based           fixed bin(19,0)          level 2 dcl 1252 set ref 324 335* 656 733 734 981
+                                                                                  1000* 1079 1083
+cb                                     based           structure                level 1 dcl 1252 set ref 41 41 669 669 891 891
+cb_ptr                          000120 automatic       pointer                  dcl 1249 set ref 29 33 36 41 41 41* 44 47 48 55 55
+                                                                                  59 60 61 62 69 72 73 74 75 76 77 78 79 91 97 98
+                                                                                  105 113 118 119 139* 140 152 152 160 161 162 165
+                                                                                  165 171 174 174 176 181 181 181 185 186 186 200
+                                                                                  206* 207 221* 222 242 242 247 250 256 259 259 268*
+                                                                                  270 275 277 285 285 285 285 292 295 298 300 303
+                                                                                  303 303 312 314 317 317 324 324 324 333 333 335
+                                                                                  337 339 339 340 340 344 344 345 345 349 349 352
+                                                                                  352 352 354 354 360 360 368* 369 374 376 384 384
+                                                                                  386 389 390 397 400 414* 415 417 425 425 427 430
+                                                                                  431 438 441 444 444 449 453 454 454 458 458 460
+                                                                                  467* 472 479 481 495 503 503 507 508 509 511 511
+                                                                                  513 517 522 530 532 535 544 546 548 556 556 558
+                                                                                  561 564 564 565 566 568 570 580 583 589 591 598
+                                                                                  599 599 601 604 614 618 625* 626 628 630 635 635
+                                                                                  638 640 640 645 645 649 649 654 656 656 660 660
+                                                                                  662 663 663 669 669 669* 676 676 677 677 680 681
+                                                                                  684 690 694 696 699 702 705 706 706 710 711 714
+                                                                                  714 716 716 725 725 725 727 733 733 734 735 735
+                                                                                  743 744 746 747 760 764 772 772 774 774 774 774
+                                                                                  776 776 776 776 778 779 779 781 781 781 786 786
+                                                                                  788 789 789 791 791 797 797 806 807 812 812 814
+                                                                                  814 823 824 825 825 828 828 830 838 840 840 843
+                                                                                  846 849 849 855 856 856 857 857 862 863 864 870
+                                                                                  871 871 877 877 882 882 884 884 884 886 891 891
+                                                                                  891* 892 893 894 895 898 899 900 901 902 903 904
+                                                                                  905 906 907 908 913 913 913 916 917 917 920 920
+                                                                                  923 923 925 927 928 928 928 929 930 930 931 931
+                                                                                  959 967 967 968 968 969 969 971 971 971 971 977
+                                                                                  981 981 985 986 987 990 990 995 995 997 997 1000
+                                                                                  1000 1000 1006 1008 1009 1009 1013 1013 1014 1014
+                                                                                  1014 1014 1014 1016 1017 1020 1020 1025 1027 1027
+                                                                                  1027 1027 1027 1033 1035 1037 1039 1040 1042 1043
+                                                                                  1044 1045 1045 1045 1045 1045 1047 1048 1052 1053
+                                                                                  1067 1067 1067 1079 1079 1083 1084 1084 1088 1089
+                                                                                  1090 1090 1090 1090 1090 1099 1100 1103 1111 1111
+                                                                                  1111 1114 1114 1114 1119 1121 1128 1129 1130 1135
+                                                                                  1141 1141 1144 1145 1163 1163 1169 1169 1173 1173
+change_pos                5            based           fixed bin(34,0)          level 2 dcl 1227 set ref 840* 1114 1135* 1141
+clock                                                  builtin function         dcl 1187 ref 48 63 72 598 749 846
+close_x                                parameter       entry variable           dcl 1223 set ref 13 938*
+code                                   parameter       fixed bin(35,0)          dcl 1226 set ref 13 15* 21* 33 37 65* 137 147* 149*
+                                                                                  157* 168* 179* 197* 200 204 215 219 230 235* 266
+                                                                                  269* 270* 272* 294* 311* 319 322 328* 340* 342 366
+                                                                                  369* 371* 386* 388* 397* 399* 404* 412 427* 429*
+                                                                                  438* 440* 448* 465 468* 489* 491* 513* 516* 532*
+                                                                                  534* 539* 558* 560* 581* 583* 601* 614* 618* 620*
+                                                                                  681* 683* 693* 701* 709* 740* 751* 755* 756 814*
+                                                                                  815 815 815* 819* 927* 971* 985* 1073* 1155*
+common_header_words                    based           structure                level 2 dcl 1227
+comp                                   parameter       fixed bin(17,0)          dcl 728 set ref 723 725 725* 725 727
+comp_num                               based           fixed bin(17,0)          level 2 in structure "rs_desc" packed packed
+                                                                                  unaligned dcl 2-32 in procedure "open_blk_file"
+                                                                                  set ref 523*
+comp_num                        000112 automatic       fixed bin(17,0)          dcl 1195 in procedure "open_blk_file" set ref 81*
+                                                                                  109 113 118 119 119 119 333 333 347* 394* 435*
+                                                                                  521* 523 689* 733* 734 874* 977 980* 980 985* 986
+                                                                                  987 1143* 1166*
+continue_to_signal_             000072 constant        entry                    external dcl 1319 ref 125
+control                  66            based           entry variable           level 2 dcl 1-2 set ref 945* 948*
+current_bf_version                     constant        fixed bin(17,0)          initial dcl 1251 ref 25 33 913 1090 1174
+current_entry                   000100 automatic       fixed bin(17,0)          dcl 1180 set ref 63 135 142* 209* 224* 279* 378*
+                                                                                  419* 474* 497* 550* 593* 632* 910*
+current_pos              14            based           fixed bin(34,0)          level 2 dcl 1252 set ref 60* 74 161* 186* 317* 324
+                                                                                  349 360* 384 425 444 454* 454 458 508* 511 564*
+                                                                                  676* 677 733 735 774 774 776 776 781 797 840 857*
+                                                                                  864* 870 871* 871 877* 877 882 967* 1128* 1141*
+                                                                                  1145* 1163 1169* 1169
+current_status           37            based           bit(2)                   level 2 dcl 1252 set ref 62* 77 162* 171* 185* 295*
+                                                                                  312* 389* 397 400* 430* 438 441* 453* 517* 532
+                                                                                  535* 561* 680* 694* 699 702* 705* 711* 807* 855*
+                                                                                  862* 886*
+delete_record           106            based           entry variable           level 2 dcl 1-2 set ref 957*
+descriptor                6            based           fixed bin(35,0)          level 2 dcl 2-6 set ref 523 524
+divide                                                 builtin function         dcl 1246 ref 733 997 1000 1043 1078 1080 1084
+dname                           000100 automatic       varying char(168)        dcl 127 set ref 87* 98 103* 103 105 117* 117 119
+dname_len               106            based           fixed bin(17,0)          level 2 dcl 3-5 ref 87 88 1037 1037 1037 1037 1073
+                                                                                  1073 1073 1073
+ename                           000153 automatic       varying char(32)         dcl 129 set ref 88* 98 103 117
+ename_len               107            based           fixed bin(17,0)          level 2 dcl 3-5 ref 88 1037 1037 1073 1073
+end_pos                  11            based           fixed bin(17,0)          level 2 in structure "bf_head" dcl 1227 in procedure
+                                                                                  "open_blk_file" set ref 16 352* 660* 772 774 776
+                                                                                  779 884* 923 969* 1100* 1114
+end_pos                  16            based           fixed bin(34,0)          level 2 in structure "cb" dcl 1252 in procedure
+                                                                                  "open_blk_file" set ref 76 152 181 285 349 354*
+                                                                                  384 425 444 479 503 511 556 601 654 656 660 677
+                                                                                  772 779* 781 823 856 857 882* 884 923* 968* 969
+                                                                                  971 977 990 1090 1090 1099* 1163
+end_pos                   1            based           fixed bin(17,0)          level 2 in structure "info1" dcl 1316 in procedure
+                                                                                  "open_blk_file" set ref 479*
+eof_delete                      005361 constant        fixed bin(17,0)          initial dcl 1311 ref 444 1111
+error_table_$asynch_deletion    000044 external static fixed bin(35,0)          dcl 1288 ref 168 311 386 397 427 438 513 532 558 681
+                                                                                  701
+error_table_$asynch_insertion   000042 external static fixed bin(35,0)          dcl 1288 ref 294
+error_table_$bad_arg            000062 external static fixed bin(35,0)          dcl 1288 ref 197 491
+error_table_$end_of_info        000056 external static fixed bin(35,0)          dcl 1288 ref 157 179 560 683 709
+error_table_$file_busy          000052 external static fixed bin(35,0)          dcl 1288 ref 65 751 819
+error_table_$file_is_full       000070 external static fixed bin(35,0)          dcl 1288 ref 328
+error_table_$invalid_lock_reset 000050 external static fixed bin(35,0)          dcl 1288 ref 815
+error_table_$lock_wait_time_exceeded
+                                000046 external static fixed bin(35,0)          dcl 1288 ref 756
+error_table_$long_record        000066 external static fixed bin(35,0)          dcl 1288 ref 235 270 369
+error_table_$negative_nelem     000040 external static fixed bin(35,0)          dcl 1288 ref 149 272 371 581
+error_table_$no_operation       000064 external static fixed bin(35,0)          dcl 1288 ref 583 601 620
+error_table_$no_record          000060 external static fixed bin(35,0)          dcl 1288 ref 388 399 429 440 516 534
+error_table_$unimplemented_version
+                                000054 external static fixed bin(35,0)          dcl 1288 ref 489 1155
+fcb_ptr                   4            based           pointer                  level 2 dcl 1252 set ref 340* 725* 898* 985* 1037*
+                                                                                  1040
+fcb_ptr_arg                            parameter       pointer                  dcl 1188 ref 13 898
+fcbp                    124            based           pointer                  level 2 dcl 3-5 set ref 1040*
+file_action              12            based           fixed bin(17,0)          level 2 dcl 1227 set ref 29 47* 250* 568* 570* 638
+                                                                                  649 649 662* 744 830 843* 1111 1111 1111 1114 1119
+                                                                                  1121 1130*
+file_base_ptr                          based           pointer                  level 2 dcl 1252 set ref 29 33 47 48 55 91* 97* 98*
+                                                                                  105* 250 259 345 352 568 570 598 599 604 614* 618*
+                                                                                  635 638 640 645 649 649 660 662 663 743 744 746
+                                                                                  772 774 776 779 786 788 789 791 812 814 825 828
+                                                                                  830 840 843 846 849 884 894* 913 913 917 917 920
+                                                                                  923 927* 931 969 971* 986 995 1009 1020 1088 1090
+                                                                                  1100 1111 1111 1111 1114 1114 1114 1119 1121 1130
+                                                                                  1135 1141 1173
+file_lock                 1            based           bit(36)                  level 3 dcl 1227 set ref 259 635 640 663 746 812
+                                                                                  814*
+first_seg_bitcount                     parameter       fixed bin(24,0)          dcl 1224 ref 13
+first_seg_ptr                          parameter       pointer                  dcl 1188 set ref 13 16 18 20 21* 25 894 1152 1174
+flags                                  based           structure                level 2 in structure "atb" dcl 3-5 in procedure
+                                                                                  "open_blk_file"
+flags                     1            based           structure                level 2 in structure "rs_info" dcl 2-6 in procedure
+                                                                                  "open_blk_file" ref 491
+foo                             000145 automatic       fixed bin(35,0)          dcl 1326 in procedure "open_blk_file" set ref 725*
+                                                                                  907* 1037* 1067* 1135*
+foo                             000166 automatic       fixed bin(35,0)          dcl 132 in on unit on line 83 set ref 91* 92 97* 98*
+                                                                                  101 105* 106 113* 115 118* 119* 121 125*
+foo24                           000146 automatic       fixed bin(24,0)          dcl 1327 set ref 340* 725*
+forever                         000016 constant        fixed bin(54,0)          initial dcl 1287 ref 69
+free_cb_file                    000100 constant        entry                    external dcl 1336 ref 41 669 1027 1056
+full_comp_size                  000101 automatic       fixed bin(19,0)          dcl 1181 set ref 1079* 1080 1081
+full_comps                      000110 automatic       fixed bin(17,0)          dcl 1193 set ref 1080* 1081 1083 1088 1089
+handler_required         36            based           bit(1)                   level 2 dcl 1252 set ref 79 277 376 417 548 591 630
+                                                                                  928*
+hcs_$get_safety_sw_seg          000074 constant        entry                    external dcl 1322 ref 927
+hcs_$initiate                   000034 constant        entry                    external dcl 1220 ref 98 105 119
+hcs_$set_bc_seg                 000036 constant        entry                    external dcl 1245 ref 21 1067
+hcs_$status_mins                000030 constant        entry                    external dcl 1218 ref 91 113
+hcs_$terminate_seg              000032 constant        entry                    external dcl 1219 ref 97 118
+hcs_$truncate_seg               000102 constant        entry                    external dcl 1337 ref 971
+i                               000116 automatic       fixed bin(17,0)          dcl 1248 set ref 1016* 1017* 1047* 1048* 1052* 1053
+                                                                                  1053*
+info1                                  based           structure                level 1 unaligned dcl 1316
+info2                                  based           structure                level 1 unaligned dcl 1323
+info_ptr                               parameter       pointer                  dcl 1305 set ref 465 479 481 488 580 581 583 604
+                                                                                  614* 618*
+initial_time_stamp              000142 automatic       fixed bin(71,0)          dcl 1320 set ref 55 743* 760 764
+inv_lock_reset            0(10)        based           bit(1)                   level 3 packed packed unaligned dcl 3-5 ref 16 1159
+iocb                                   based           structure                level 1 dcl 1-2
+iocb_ptr                               parameter       pointer                  dcl 1188 set ref 13 16 16 18 87 87 88 88 88 137 139
+                                                                                  204 206 219 221 266 268 366 368 412 414 465 467
+                                                                                  614* 618* 623 625 892 895 899 900 901 904 916 929
+                                                                                  942 943 944 945 948 949 951 955 956 957 1037 1037
+                                                                                  1037 1037 1037 1037 1037 1037 1037 1037 1040 1073
+                                                                                  1073 1073 1073 1073 1073 1073 1073 1073 1073 1159
+is_msf                   20            based           bit(1)                   level 2 dcl 1252 set ref 899* 928 971 1035 1039*
+is_new_file                            parameter       bit(1)                   dcl 1221 ref 13 16 21
+last_comp               134            based           fixed bin(17,0)          level 2 in structure "atb" dcl 3-5 in procedure
+                                                                                  "open_blk_file" ref 916
+last_comp                 7            based           fixed bin(17,0)          level 2 in structure "bf_head" dcl 1227 in procedure
+                                                                                  "open_blk_file" set ref 345* 786 788* 789 913 986*
+                                                                                  1088* 1173*
+last_comp_num            17            based           fixed bin(17,0)          level 2 dcl 1252 set ref 333 333 337 339* 339 340*
+                                                                                  344 345 786 789* 913* 916* 987* 1006 1013 1052
+                                                                                  1067* 1067* 1089* 1090* 1173
+locate_pos_sw             1(06)        based           bit(1)                   level 3 packed packed unaligned dcl 2-6 ref 503
+lock_copy                       000206 automatic       bit(36)                  dcl 766 set ref 746* 747 755*
+max                                                    builtin function         dcl 1246 ref 215 232 528 1013
+max_comp_size            10            based           fixed bin(19,0)          level 2 in structure "cb" dcl 1252 in procedure
+                                                                                  "open_blk_file" set ref 920* 1000
+max_comp_size                          parameter       fixed bin(19,0)          dcl 1225 in procedure "open_blk_file" ref 13 20 917
+max_comp_size            13            based           fixed bin(19,0)          level 2 in structure "bf_head" dcl 1227 in procedure
+                                                                                  "open_blk_file" set ref 20* 917 917* 920
+max_rec_len               3            based           fixed bin(21,0)          level 2 in structure "rs_info" dcl 2-6 in procedure
+                                                                                  "open_blk_file" set ref 522*
+max_rec_len               3            based           fixed bin(35,0)          level 2 in structure "atb" dcl 3-5 in procedure
+                                                                                  "open_blk_file" ref 16 18
+max_rec_len              10            based           fixed bin(21,0)          level 2 in structure "bf_head" dcl 1227 in procedure
+                                                                                  "open_blk_file" set ref 18* 604* 791 995
+max_rec_len              11            based           fixed bin(21,0)          level 2 in structure "cb" dcl 1252 in procedure
+                                                                                  "open_blk_file" set ref 270 369 522 580 791 995*
+                                                                                  997
+micro_wait_time          32            based           fixed bin(71,0)          level 2 dcl 1252 set ref 72 930*
+mode                                   parameter       fixed bin(17,0)          dcl 1222 in procedure "open_blk_file" ref 13 16 29
+                                                                                  33 44 893 917 940 951 953 959 959
+mode                      6            based           fixed bin(17,0)          level 2 in structure "cb" dcl 1252 in procedure
+                                                                                  "open_blk_file" set ref 285 300 303 544 583 626
+                                                                                  893*
+msf                       0(09)        based           bit(1)                   level 3 packed packed unaligned dcl 3-5 ref 899
+msf_manager_$adjust             000022 constant        entry                    external dcl 1198 ref 985
+msf_manager_$get_ptr            000024 constant        entry                    external dcl 1205 ref 340 725
+msf_manager_$open               000020 constant        entry                    external dcl 1197 ref 1037
+n                               000135 automatic       fixed bin(21,0)          dcl 1302 set ref 236* 238* 239 239 239
+n_recs                                 parameter       fixed bin(17,0)          dcl 1284 ref 137 149 152 160 161 174 200
+new_last_comp                          parameter       fixed bin(17,0)          dcl 1062 ref 1030 1033 1043
+new_max_recl              1            based           fixed bin(21,0)          level 2 dcl 1323 ref 581 583 604
+next_pos                               based           fixed bin(17,0)          level 2 in structure "info1" dcl 1316 in procedure
+                                                                                  "open_blk_file" set ref 481*
+next_pos                 15            based           fixed bin(34,0)          level 2 in structure "cb" dcl 1252 in procedure
+                                                                                  "open_blk_file" set ref 61* 75 160* 174* 174 176
+                                                                                  181 186 242* 242 285 317 352 354 360 458* 481 507*
+                                                                                  556 564 676 706 714* 714 716* 716 797* 856* 863*
+                                                                                  967 968 990* 1103* 1129*
+noend                    23            based           bit(1)                   level 2 dcl 1252 set ref 152 165 181 303 503 781
+                                                                                  901*
+noend_sw                  0(13)        based           bit(1)                   level 3 packed packed unaligned dcl 3-5 ref 901
+non_eof_delete                  005360 constant        fixed bin(17,0)          initial dcl 1312 ref 446 451 1119
+nrecs                                  parameter       fixed bin(19,0)          dcl 1068 ref 1065 1067
+null                                                   builtin function         dcl 1246 ref 525 530 536 725 1017 1048 1135 1135
+nz_recs                         000150 automatic       fixed bin(17,0)          dcl 1329 set ref 1084* 1087 1090
+nz_words                        000147 automatic       fixed bin(19,0)          dcl 1328 set ref 1081* 1084
+offset                    0(18)        based           bit(18)                  level 2 packed packed unaligned dcl 2-32 set ref
+                                                                                  524*
+old_array_limit                 000336 automatic       fixed bin(17,0)          dcl 1060 set ref 1042* 1056 1056 1056
+old_array_ptr                   000340 automatic       pointer                  dcl 1061 set ref 1044* 1053 1056 1056 1056*
+old_current_pos                 000140 automatic       fixed bin(34,0)          dcl 1307 set ref 60 74* 1128 1145
+old_current_status              000123 automatic       bit(2)                   dcl 1283 set ref 62 77*
+old_end_pos                     000122 automatic       fixed bin(34,0)          dcl 1282 set ref 76* 774 776 823*
+old_max_recl                           based           fixed bin(21,0)          level 2 dcl 1323 set ref 580*
+old_next_pos                    000137 automatic       fixed bin(34,0)          dcl 1307 set ref 61 75* 1129
+old_seg_ptr_array                      based           pointer                  array dcl 1059 ref 1053 1056 1056
+old_time_stamp           34            based           fixed bin(71,0)          level 2 dcl 1252 set ref 599* 645 760 764* 825 828*
+                                                                                  849* 931*
+old_version              25            based           bit(1)                   level 2 dcl 1252 set ref 36* 530 690 903*
+open_data_ptr            22            based           pointer                  level 2 dcl 1-2 set ref 139 206 221 268 368 414 467
+                                                                                  625 892*
+order                                  parameter       char                     packed unaligned dcl 1304 ref 465 470 486 544 578
+                                                                                  612 618
+pos                             000134 automatic       fixed bin(19,0)          dcl 1295 set ref 215 232 239 395 436 449 524 527 528
+                                                                                  530 690 735* 799 802 804 875 981* 985 1144 1167
+                                                                                  1167
+pos_bits                  0(18)        based           bit(18)                  level 2 packed packed unaligned dcl 1296 ref 524
+pos_struct                             based           structure                level 1 packed packed unaligned dcl 1296
+pos_type                               parameter       fixed bin(17,0)          dcl 1284 ref 137 149 165 191 194 200
+position                 62            based           entry variable           level 2 dcl 1-2 set ref 944*
+read_length             122            based           entry variable           level 2 dcl 1-2 set ref 943*
+read_record              72            based           entry variable           level 2 dcl 1-2 set ref 942*
+rec_len                                parameter       fixed bin(21,0)          dcl 1300 set ref 204 215* 219 232* 233 238
+record_block                           based           structure                level 1 unaligned dcl 1331 set ref 449* 1144*
+record_length             2            based           fixed bin(21,0)          level 2 dcl 2-6 set ref 503 507 508 528* 537*
+record_ptr                4            based           pointer                  level 2 dcl 2-6 set ref 527* 536*
+rel_pos                         000105 automatic       fixed bin(19,0)          dcl 1190 set ref 654* 656 656* 659*
+rewrite                         000014 constant        fixed bin(17,0)          initial dcl 1310 set ref 302 403*
+rewrite_record          102            based           entry variable           level 2 dcl 1-2 set ref 956*
+rs_desc                                based           structure                level 1 packed packed unaligned dcl 2-32
+rs_info                                based           structure                level 1 dcl 2-6
+rs_info_ptr                     000114 automatic       pointer                  dcl 2-5 set ref 488* 489 489 491 503 503 507 508 522
+                                                                                  523 524 527 528 536 537
+rs_info_version_1                      constant        fixed bin(17,0)          initial dcl 2-43 ref 489
+rs_info_version_2                      constant        fixed bin(17,0)          initial dcl 2-44 ref 489
+safety_sw                       000144 automatic       bit(1)                   packed unaligned dcl 1321 set ref 927* 928
+saved_lock_copy          30            based           bit(36)                  level 2 dcl 1252 set ref 259 635 640 663 747 812
+                                                                                  905* 907*
+scan_backward            24            based           bit(1)                   level 2 dcl 1252 set ref 59* 73 200* 298* 314* 390*
+                                                                                  431* 460* 509* 565* 684* 696* 706 710* 806* 902*
+seg                                    based           fixed bin(17,0)          array dcl 1294 set ref 215 232 395 436 449 527 528
+                                                                                  530 690 799* 804* 875 1090 1144 1167 1167*
+seg_fault_error                 000124 stack reference condition                dcl 1285 ref 83 85 89 94 111
+seg_ptr                         000102 automatic       pointer                  dcl 1184 set ref 215 232 239 340* 344 347* 394* 395
+                                                                                  435* 436 449 521* 525 527 528 530 530 689* 690 799
+                                                                                  802 804 874* 875 1143* 1144 1166* 1167 1167
+seg_ptr_array                          based           pointer                  array dcl 1196 set ref 113* 118* 119* 344* 725 725*
+                                                                                  727 1014 1014 1017* 1020* 1027 1027 1045 1045
+                                                                                  1048* 1053*
+seg_ptr_array_limit      22            based           fixed bin(17,0)          level 2 dcl 1252 set ref 1008* 1013* 1014 1014 1016
+                                                                                  1025 1027 1027 1033 1042 1043* 1045 1045 1047
+seg_ptr_array_ptr         2            based           pointer                  level 2 dcl 1252 set ref 113 118 119 344 725 725 727
+                                                                                  1009* 1014 1014 1014* 1017 1020 1027 1027 1027*
+                                                                                  1044 1045 1045 1045* 1048 1053
+seg_str                                based           char(1000000)            dcl 1334 set ref 239 802*
+set_lock_$lock                  000014 constant        entry                    external dcl 1183 ref 755 814 907
+shared                    0(07)        based           bit(1)                   level 3 in structure "atb" packed packed unaligned
+                                                                                  dcl 3-5 in procedure "open_blk_file" ref 904
+shared                   26            based           bit(1)                   level 2 in structure "cb" dcl 1252 in procedure
+                                                                                  "open_blk_file" set ref 44 55 140 207 222 247 256
+                                                                                  275 352 374 415 472 495 546 566 589 628 838 884
+                                                                                  904* 908 925
+size                                                   builtin function         dcl 1246 ref 21 41 41 669 669 735 891 891 971 981
+                                                                                  1000 1014 1014 1027 1027 1045 1045 1056 1056 1067
+                                                                                  1079 1084 1090
+ssf                       0(04)        based           bit(1)                   level 3 packed packed unaligned dcl 3-5 ref 900
+ssf_sw                   21            based           bit(1)                   level 2 dcl 1252 set ref 324 900* 928
+stacq                                                  builtin function         dcl 1182 ref 259 640 663
+sub_err_                        000016 constant        entry                    external dcl 1185 ref 1135
+substr                                                 builtin function         dcl 1303 set ref 87 88 239* 239 491 802* 802 1037
+                                                                                  1037 1037 1037 1073 1073 1073 1073
+time_last_modified        2            based           fixed bin(71,0)          level 3 dcl 1227 set ref 48* 55 598* 599 645 743 825
+                                                                                  828 846* 849 931
+time_limit                      000132 automatic       fixed bin(71,0)          dcl 1286 set ref 63 69* 72* 749
+tot_nz_recs                     000111 automatic       fixed bin(17,0)          dcl 1194 set ref 1087* 1090 1090 1099 1100 1103
+tot_nz_words                    000107 automatic       fixed bin(34,0)          dcl 1192 set ref 1078* 1080 1081
+truncate                               constant        fixed bin(17,0)          initial dcl 1315 set ref 568 573* 1121
+type                            000164 automatic       fixed bin(2,0)           dcl 130 set ref 91* 113*
+unshared_opening                005357 constant        fixed bin(17,0)          initial dcl 1313 ref 47 570 649 1111
+version                   4            based           fixed bin(17,0)          level 2 in structure "bf_head" dcl 1227 in procedure
+                                                                                  "open_blk_file" set ref 25* 33 913 1090 1152 1174*
+version                                based           fixed bin(17,0)          level 2 in structure "rs_info" dcl 2-6 in procedure
+                                                                                  "open_blk_file" ref 489 489
+vfile_io_control                000010 constant        entry                    external dcl 1178 ref 618
+vfile_status_$seg               000012 constant        entry                    external dcl 1178 ref 614
+wait_time                27            based           fixed bin(17,0)          level 2 in structure "cb" dcl 1252 in procedure
+                                                                                  "open_blk_file" set ref 69 814* 929* 930
+wait_time                 1            based           fixed bin(35,0)          level 2 in structure "atb" dcl 3-5 in procedure
+                                                                                  "open_blk_file" ref 929
+was_scan_backward               000136 automatic       bit(1)                   dcl 1306 set ref 59 73*
+write_record             76            based           entry variable           level 2 dcl 1-2 set ref 949* 951* 955*
+write_trunc                     005362 constant        fixed bin(17,0)          initial dcl 1309 ref 300 357 1114
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+d_len                                  automatic       fixed bin(17,0)          dcl 1215
+d_name                                 automatic       char(168)                dcl 1213
+e_name                                 automatic       char(32)                 dcl 1214
+error_table_$safety_sw_on              external static fixed bin(35,0)          dcl 1288
+hcs_$fs_get_path_name           000000 constant        entry                    external dcl 1217
+seq_desc                               based           structure                level 1 packed packed unaligned dcl 2-37
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+adjust_file                     004732 constant        entry                    internal dcl 1071 ref 1111 1159
+adjust_op                       005072 constant        entry                    internal dcl 1109 ref 29 830
+close_blk_file                  003017 constant        entry                    external dcl 623 ref 938
+control_blk_file                002345 constant        entry                    external dcl 465 ref 945 948
+convert_file                    005245 constant        entry                    internal dcl 1150 ref 33
+create_initialize_cb            003714 constant        entry                    internal dcl 889 ref 27
+create_seg_ptrs                 004371 constant        entry                    internal dcl 1004 ref 28
+delete_blk_file                 002201 constant        entry                    external dcl 412 ref 957
+end_update                      001534 constant        label                    dcl 247 ref 362 406 461 575
+eof_error                       001273 constant        label                    dcl 155 ref 181
+exit                            000304 constant        label                    dcl 52 ref 342 518 753 820
+extend_seg_ptr_array            004467 constant        entry                    internal dcl 1030 ref 337 788
+file_busy                       003356 constant        label                    dcl 751 ref 756
+find_next_record                003151 constant        entry                    internal dcl 672 ref 214 229
+finish_trunc                    005124 constant        label                    dcl 1123 ref 1114
+free_seg_ptrs                   004445 constant        entry                    internal dcl 1023 ref 40 667
+get_current_pos                 003315 constant        entry                    internal dcl 731 ref 332 393 434 520 653 688 873 976
+                                                                                  1142 1165
+get_seg_ptr                     003246 constant        entry                    internal dcl 723 ref 347 394 435 521 689 874 1067
+                                                                                  1067 1090 1143 1166
+init_entry                      000335 constant        label                    dcl 69 ref 143 210 225 475 498
+init_update                     003624 constant        entry                    internal dcl 834 ref 331 403 447 573
+insert_record                   003502 constant        entry                    internal dcl 795 ref 348 405
+inv_header                      000504 constant        label                    dcl 94 ref 89
+just_cleanup                    003134 constant        label                    dcl 667 ref 635 643
+leave_locked                    003060 constant        label                    dcl 640 ref 649
+lock_file_check                 003536 constant        entry                    internal dcl 810 ref 282 381 422 553 596
+norec                           002475 constant        label                    dcl 513 ref 503
+not_busy                        003404 constant        label                    dcl 760 ref 744 747
+open_blk_file                   000121 constant        entry                    external dcl 13
+position_blk_file               001230 constant        entry                    external dcl 137 ref 944
+position_bof                    003655 constant        entry                    internal dcl 860 ref 178 191 939 1161
+position_eof                    003644 constant        entry                    internal dcl 853 ref 155 194 290 308 652 781 959
+                                                                                  1123
+prepare_process                 003332 constant        entry                    internal dcl 738 ref 144 211 226 476 499
+print_warning                   005140 constant        entry                    internal dcl 1133 ref 1114 1127
+re_zero                         005217 constant        entry                    internal dcl 1139 ref 1119
+read_blk_file                   001446 constant        entry                    external dcl 219 ref 942
+read_length_blk_file            001402 constant        entry                    external dcl 204 ref 943
+reinit_cb_vars                  003415 constant        entry                    internal dcl 769 ref 645 763 827
+resume                          001220 constant        label                    dcl 127 ref 101 106 121
+retry_ent                       000000 constant        label                    array(11) dcl 144 ref 63 135
+rewrite_blk_file                002056 constant        entry                    external dcl 366 ref 956
+set_bc                          004671 constant        entry                    internal dcl 1065 ref 335 659
+set_entries_and_positions       004136 constant        entry                    internal dcl 935 ref 37
+set_eof                         003703 constant        label                    dcl 882 ref 878
+set_maxl                        004353 constant        entry                    internal dcl 993 ref 606 791 922
+set_true_eof                    003663 constant        entry                    internal dcl 867 ref 457 989
+setup_handler                   000364 constant        label                    dcl 81 ref 280 379 420 551 594 633 911
+truncate_file                   004245 constant        entry                    internal dcl 965 ref 359 569 574 1104 1125
+unlock                          001546 constant        label                    dcl 259 ref 44 252
+unlock_exit                     001543 constant        label                    dcl 256 ref 319 329 391 408 432 463 562 608
+verify_done                     000305 constant        label                    dcl 55 ref 202 217 245 483 540
+write_blk_file                  001564 constant        entry                    external dcl 266 ref 949 951 955
+
+NAMES DECLARED BY CONTEXT OR IMPLICATION.
+char                                                   builtin function         ref 119 119
+ltrim                                                  builtin function         ref 119 119
+stac                                                   builtin function         ref 635 747 812
+string                                                 builtin function         ref 491
+unspec                                                 builtin function         set ref 449 1144*
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      6106        6212    5364        6116
+Length      6554    5364       104         326     522           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+open_blk_file                       542 external procedure  is an external procedure.  
+on unit on line 83                  177 on unit             enables or reverts conditions.  
+on unit on line 85                   64 on unit               
+on unit on line 89                   64 on unit               
+on unit on line 94                   64 on unit               
+on unit on line 111                  64 on unit               
+find_next_record                        internal procedure  shares stack frame of external procedure open_blk_file.  
+get_seg_ptr                             internal procedure  shares stack frame of external procedure open_blk_file.  
+get_current_pos                         internal procedure  shares stack frame of external procedure open_blk_file.  
+prepare_process                         internal procedure  shares stack frame of external procedure open_blk_file.  
+reinit_cb_vars                          internal procedure  shares stack frame of external procedure open_blk_file.  
+insert_record                           internal procedure  shares stack frame of external procedure open_blk_file.  
+lock_file_check                         internal procedure  shares stack frame of external procedure open_blk_file.  
+init_update                             internal procedure  shares stack frame of external procedure open_blk_file.  
+position_eof                            internal procedure  shares stack frame of external procedure open_blk_file.  
+position_bof                            internal procedure  shares stack frame of external procedure open_blk_file.  
+set_true_eof                            internal procedure  shares stack frame of external procedure open_blk_file.  
+create_initialize_cb                    internal procedure  shares stack frame of external procedure open_blk_file.  
+set_entries_and_positions               internal procedure  shares stack frame of external procedure open_blk_file.  
+truncate_file                           internal procedure  shares stack frame of external procedure open_blk_file.  
+set_maxl                                internal procedure  shares stack frame of external procedure open_blk_file.  
+create_seg_ptrs                         internal procedure  shares stack frame of external procedure open_blk_file.  
+free_seg_ptrs                           internal procedure  shares stack frame of external procedure open_blk_file.  
+extend_seg_ptr_array                    internal procedure  shares stack frame of external procedure open_blk_file.  
+set_bc                                  internal procedure  shares stack frame of external procedure open_blk_file.  
+adjust_file                             internal procedure  shares stack frame of external procedure open_blk_file.  
+adjust_op                               internal procedure  shares stack frame of external procedure open_blk_file.  
+print_warning                           internal procedure  shares stack frame of external procedure open_blk_file.  
+re_zero                                 internal procedure  shares stack frame of external procedure open_blk_file.  
+convert_file                            internal procedure  shares stack frame of external procedure open_blk_file.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+on unit on line 83       000100 dname                       on unit on line 83
+                         000153 ename                       on unit on line 83
+                         000164 type                        on unit on line 83
+                         000165 bc                          on unit on line 83
+                         000166 foo                         on unit on line 83
+open_blk_file            000100 current_entry               open_blk_file
+                         000101 full_comp_size              open_blk_file
+                         000102 seg_ptr                     open_blk_file
+                         000104 action                      open_blk_file
+                         000105 rel_pos                     open_blk_file
+                         000106 base_pos                    open_blk_file
+                         000107 tot_nz_words                open_blk_file
+                         000110 full_comps                  open_blk_file
+                         000111 tot_nz_recs                 open_blk_file
+                         000112 comp_num                    open_blk_file
+                         000113 bc                          open_blk_file
+                         000114 rs_info_ptr                 open_blk_file
+                         000116 i                           open_blk_file
+                         000120 cb_ptr                      open_blk_file
+                         000122 old_end_pos                 open_blk_file
+                         000123 old_current_status          open_blk_file
+                         000132 time_limit                  open_blk_file
+                         000134 pos                         open_blk_file
+                         000135 n                           open_blk_file
+                         000136 was_scan_backward           open_blk_file
+                         000137 old_next_pos                open_blk_file
+                         000140 old_current_pos             open_blk_file
+                         000142 initial_time_stamp          open_blk_file
+                         000144 safety_sw                   open_blk_file
+                         000145 foo                         open_blk_file
+                         000146 foo24                       open_blk_file
+                         000147 nz_words                    open_blk_file
+                         000150 nz_recs                     open_blk_file
+                         000206 lock_copy                   prepare_process
+                         000336 old_array_limit             extend_seg_ptr_array
+                         000340 old_array_ptr               extend_seg_ptr_array
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+r_l_a               r_e_as              alloc_char_temp     cat_realloc_chars   call_ext_out_desc   call_ext_out
+return_mac          tra_ext_1           stac_mac            mpfx2               enable_op           shorten_stack
+ext_entry           ext_entry_desc      int_entry           stacq_mac           clock_mac
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+adjust_bit_count_             alloc_cb_file                 continue_to_signal_           free_cb_file
+hcs_$get_safety_sw_seg        hcs_$initiate                 hcs_$set_bc_seg               hcs_$status_mins
+hcs_$terminate_seg            hcs_$truncate_seg             msf_manager_$adjust           msf_manager_$get_ptr
+msf_manager_$open             set_lock_$lock                sub_err_                      vfile_io_control
+vfile_status_$seg
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$asynch_deletion  error_table_$asynch_insertion error_table_$bad_arg          error_table_$end_of_info
+error_table_$file_busy        error_table_$file_is_full     error_table_$invalid_lock_reset
+error_table_$lock_wait_time_exceeded                        error_table_$long_record      error_table_$negative_nelem
+error_table_$no_operation     error_table_$no_record        error_table_$unimplemented_version
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     13 000112        15 000131        16 000132        18 000156        20 000166        21 000170        25 000206
+     27 000213        28 000214        29 000215        33 000226        36 000243        37 000246        40 000252
+     41 000253        42 000266        44 000267        47 000276        48 000301        49 000303        52 000304
+     55 000305        59 000314        60 000316        61 000320        62 000322        63 000324        65 000331
+     67 000334        69 000335        72 000343        73 000347        74 000351        75 000353        76 000355
+     77 000357        78 000361        79 000362        81 000364        83 000365        85 000401        87 000416
+     88 000434        89 000445        91 000464        92 000502        94 000504        97 000521        98 000537
+    101 000625       103 000630       105 000664       106 000745       108 000750       109 000751       111 000754
+    113 000771       115 001012       117 001014       118 001050       119 001073       121 001206       125 001211
+    133 001220       135 001221       137 001223       139 001240       140 001245       142 001247       143 001251
+    144 001252       147 001253       149 001254       152 001266       155 001273       157 001274       158 001277
+    160 001300       161 001301       162 001302       164 001303       165 001304       168 001316       171 001321
+    172 001323       174 001324       176 001326       178 001330       179 001331       180 001334       181 001335
+    185 001341       186 001342       189 001343       191 001344       194 001350       197 001354       198 001357
+    200 001360       202 001375       204 001376       206 001414       207 001421       209 001423       210 001425
+    211 001426       214 001427       215 001430       217 001440       219 001441       221 001460       222 001465
+    224 001467       225 001471       226 001472       229 001473       230 001474       232 001476       233 001504
+    235 001507       236 001512       237 001514       238 001515       239 001516       242 001531       245 001533
+    247 001534       250 001537       252 001541       254 001542       256 001543       259 001546       264 001556
+    266 001557       268 001574       269 001601       270 001602       272 001611       275 001617       277 001621
+    279 001623       280 001625       282 001626       285 001627       289 001640       290 001642       291 001643
+    292 001644       294 001647       295 001652       298 001653       299 001654       300 001655       302 001662
+    303 001665       307 001675       308 001677       309 001700       311 001701       312 001704       314 001706
+    315 001707       316 001710       317 001712       319 001715       322 001717       324 001721       328 001727
+    329 001732       331 001733       332 001735       333 001736       335 001746       337 001754       339 001762
+    340 001764       342 002007       344 002011       345 002016       346 002021       347 002023       348 002025
+    349 002026       352 002032       354 002037       356 002041       357 002042       359 002045       360 002046
+    362 002052       364 002053       366 002054       368 002066       369 002073       371 002102       374 002110
+    376 002112       378 002114       379 002116       381 002117       384 002120       386 002124       388 002133
+    389 002136       390 002140       391 002141       393 002142       394 002143       395 002145       397 002150
+    399 002160       400 002163       401 002165       403 002166       404 002170       405 002171       406 002172
+    408 002173       410 002174       412 002175       414 002211       415 002216       417 002220       419 002222
+    420 002224       422 002225       425 002226       427 002232       429 002241       430 002244       431 002246
+    432 002247       434 002250       435 002251       436 002253       438 002256       440 002266       441 002271
+    442 002273       444 002274       446 002304       447 002306       448 002310       449 002311       451 002323
+    453 002326       454 002327       456 002330       457 002331       458 002332       460 002335       461 002336
+    463 002337       465 002340       467 002363       468 002370       470 002371       472 002377       474 002401
+    475 002403       476 002404       479 002405       481 002413       483 002415       486 002416       488 002422
+    489 002425       491 002436       495 002445       497 002447       498 002451       499 002452       503 002453
+    507 002465       508 002466       509 002467       510 002470       511 002471       513 002475       516 002504
+    517 002507       518 002511       520 002512       521 002513       522 002515       523 002521       524 002524
+    525 002526       527 002532       528 002536       530 002543       532 002554       534 002563       535 002566
+    536 002570       537 002572       538 002573       539 002574       540 002575       542 002576       544 002577
+    546 002606       548 002610       550 002612       551 002614       553 002615       556 002616       558 002622
+    560 002631       561 002634       562 002636       564 002637       565 002640       566 002641       568 002643
+    569 002646       570 002647       571 002653       573 002654       574 002656       575 002657       578 002660
+    580 002664       581 002667       583 002676       589 002706       591 002710       593 002712       594 002714
+    596 002715       598 002716       599 002722       601 002724       604 002733       606 002741       608 002742
+    610 002743       612 002744       614 002750       615 002765       618 002766       620 003010       621 003013
+    623 003014       625 003024       626 003031       628 003034       630 003036       632 003040       633 003042
+    635 003043       638 003054       640 003060       643 003070       645 003071       648 003076       649 003077
+    652 003105       653 003106       654 003107       656 003113       659 003120       660 003122       662 003126
+    663 003127       667 003134       669 003135       670 003150       672 003151       676 003152       677 003155
+    680 003157       681 003161       683 003167       684 003172       685 003173       688 003174       689 003175
+    690 003177       693 003205       694 003206       696 003211       697 003212       699 003213       701 003216
+    702 003221       703 003223       705 003224       706 003225       709 003231       710 003234       711 003235
+    712 003237       714 003240       716 003243       719 003244       721 003245       723 003246       725 003250
+    727 003305       731 003315       733 003316       734 003322       735 003324       736 003331       738 003332
+    740 003333       743 003334       744 003340       746 003342       747 003344       749 003353       751 003356
+    753 003361       755 003362       756 003377       758 003403       760 003404       763 003410       764 003411
+    767 003414       769 003415       772 003416       774 003423       776 003433       778 003442       779 003443
+    781 003445       786 003453       788 003460       789 003466       791 003473       793 003501       795 003502
+    797 003503       799 003507       802 003516       804 003527       806 003532       807 003533       808 003535
+    810 003536       812 003537       814 003550       815 003566       819 003575       820 003577       823 003600
+    824 003603       825 003604       827 003610       828 003611       830 003616       832 003623       834 003624
+    838 003626       840 003632       843 003635       846 003637       849 003641       851 003643       853 003644
+    855 003645       856 003650       857 003652       858 003654       860 003655       862 003656       863 003660
+    864 003661       865 003662       867 003663       870 003664       871 003667       873 003671       874 003672
+    875 003674       877 003677       878 003701       880 003702       882 003703       884 003705       886 003711
+    887 003713       889 003714       891 003715       892 003730       893 003735       894 003740       895 003743
+    898 003752       899 003755       900 003765       901 003771       902 003775       903 003776       904 003777
+    905 004003       906 004004       907 004005       908 004021       910 004024       911 004026       913 004027
+    916 004036       917 004046       920 004056       922 004060       923 004061       925 004066       927 004070
+    928 004103       929 004120       930 004130       931 004132       933 004135       935 004136       938 004137
+    939 004145       940 004146       942 004152       943 004160       944 004163       945 004166       946 004171
+    948 004172       949 004200       951 004203       953 004215       955 004217       956 004225       957 004230
+    959 004233       963 004244       965 004245       967 004246       968 004251       969 004253       971 004255
+    976 004276       977 004277       980 004305       981 004307       985 004313       986 004337       987 004343
+    989 004346       990 004347       991 004352       993 004353       995 004354       997 004361      1000 004364
+   1002 004370      1004 004371      1006 004372      1008 004375      1009 004377      1011 004401      1013 004402
+   1014 004406      1016 004422      1017 004431      1018 004436      1020 004440      1021 004444      1023 004445
+   1025 004446      1027 004452      1028 004466      1030 004467      1033 004471      1035 004476      1037 004500
+   1039 004552      1040 004556      1042 004565      1043 004570      1044 004577      1045 004601      1047 004615
+   1048 004625      1049 004632      1052 004634      1053 004643      1054 004650      1056 004652      1063 004670
+   1065 004671      1067 004673      1069 004731      1071 004732      1073 004733      1076 004772      1078 004774
+   1079 004776      1080 005003      1081 005006      1083 005012      1084 005015      1087 005023      1088 005025
+   1089 005030      1090 005031      1099 005060      1100 005062      1101 005064      1103 005065      1104 005070
+   1107 005071      1109 005072      1111 005073      1114 005106      1119 005116      1121 005122      1123 005124
+   1125 005125      1126 005126      1127 005127      1128 005130      1129 005133      1130 005135      1131 005137
+   1133 005140      1135 005141      1137 005216      1139 005217      1141 005220      1142 005225      1143 005226
+   1144 005230      1145 005242      1146 005244      1150 005245      1152 005246      1155 005253      1157 005256
+   1159 005257      1161 005266      1163 005267      1165 005274      1166 005275      1167 005277      1169 005304
+   1171 005306      1173 005307      1174 005312      1176 005317
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

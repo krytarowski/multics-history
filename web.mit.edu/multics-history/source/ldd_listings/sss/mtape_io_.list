@@ -1,0 +1,2281 @@
+	COMPILATION LISTING OF SEGMENT mtape_io_
+	Compiled by: Multics PL/I Compiler, Release 33e, of October 6, 1992
+	Compiled at: CGI                             
+	Compiled on: 2000-04-18_1123.66_Tue_mdt
+	    Options: optimize map
+
+        1 /****^  ***********************************************************
+        2*        *                                                         *
+        3*        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        4*        *                                                         *
+        5*        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        6*        *                                                         *
+        7*        *********************************************************** */
+        8 
+        9 
+       10 /****^  HISTORY COMMENTS:
+       11*  1) change(87-08-17,GWMay), approve(87-09-09,MECR0006),
+       12*     audit(87-09-04,Farley), install(87-09-09,MR12.1-1101):
+       13*     Added cleanup handlers and code check returns.
+       14*  2) change(87-10-19,GWMay), approve(87-10-19,MCR7779), audit(87-11-02,Farley),
+       15*     install(87-11-30,MR12.2-1006):
+       16*     Formally install MECR0006.
+       17*  3) change(88-06-28,Farley), approve(88-10-06,MCR7938),
+       18*     audit(88-10-06,Fawcett), install(88-10-10,MR12.2-1152):
+       19*     Modified buffer allocation to only allocate one I/O buffer when
+       20*     reading in large records (> 4096 words).  Having more than one will
+       21*     allow tape_ioi_ to attempt chained I/O, which can result in a hardware
+       22*     channel error of "Incorrect DCW during list service"..
+       23*                                                   END HISTORY COMMENTS */
+       24 
+       25 
+       26 mtape_io_: procedure;
+       27 
+       28 /* format: style4 */
+       29 
+       30 /* *	This program is part of the mtape_ I/O module and as such is not
+       31*   *	called directly by users, but through the iox_ I/O system.
+       32*   *	This module implements the physical tape interface for the Per-Format
+       33*   *	modules.
+       34*   *
+       35*   *	Modification History:
+       36*   *
+       37*   *	Created by J. A. Bush 10/05/82
+       38*   *	Modified by J. A. Bush 12/01/83 for performance improvements
+       39**/
+       40 
+       41 /*		ARGUMENT DATA		*/
+       42 
+       43 dcl  arg_mtdp ptr;					/* Pointer to the mtape data structure */
+       44 dcl  arg_code fixed bin (35);				/* Return error code */
+       45 dcl  arg_lr_ptr ptr;				/* Pointer to current label record structure */
+       46 dcl  arg_buf_size fixed bin (21);			/* Requested length of users buffer */
+       47 dcl  arg_order char (*);				/* Control order mnemonic */
+       48 dcl  arg_mode char (*);				/* Mode mnemonic for set_mode entry */
+       49 dcl  arg_index fixed bin;				/* Mode index for set_mode entry */
+       50 dcl  arg_repeat_cnt fixed bin;			/* Control order repeat count */
+       51 dcl  arg_infop ptr;					/* Control order info pointer */
+       52 dcl  arg_mode_ptr ptr;				/* Mode info ptr for set_mode entry */
+       53 
+       54 /*		AUTOMATIC DATA		*/
+       55 
+       56 dcl  (infop, mode_ptr) ptr;
+       57 dcl  (label_len, act_length) fixed bin (21);
+       58 dcl  (code, scode, unr_code) fixed bin (35);
+       59 dcl  (oidx, rx, req_buffers, repeat_cnt, descrep_cnt, act_cnt, i, n_rdy_bufs, n_qed_bufs, alloc_tries) fixed bin;
+       60 dcl  spec_status bit (36) aligned;
+       61 dcl  order char (4);
+       62 dcl  1 auto_ths like ths aligned;
+       63 
+       64 /*		CONSTANT DATA		*/
+       65 
+       66 dcl  LC char (26) int static options (constant) init
+       67 	("abcdefghijklmnopqrstuvwxyz");
+       68 dcl  UC char (26) int static options (constant) init
+       69 	("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+       70 dcl  HDW_MODE_STR (6) char (4) int static options (constant) init
+       71 	("bin", "tap9", "bcd", "asc", "ebc", "a/e");
+       72 dcl  WRITE_IO fixed bin int static options (constant) init (2);
+       73 dcl  BYTES_PER_DCW fixed bin int static options (constant) init (4 * 4096);
+       74 dcl  BYTES_PER_WORD fixed bin int static options (constant) init (4);
+       75 dcl  LENGTH_MODES (0:1) bit (1) aligned int static options (constant) init ("0"b, "1"b);
+       76 dcl  ALIGN_MODES (0:1) bit (1) aligned int static options (constant) init ("0"b, "1"b);
+       77 dcl  RECOVERY_MODES (0:1) bit (1) aligned int static options (constant) init ("0"b, "1"b);
+       78 dcl  WAIT_MODES (0:1) bit (1) aligned int static options (constant) init ("0"b, "1"b);
+       79 dcl  (WAIT init ("1"b),				/* wait for order to complete */
+       80      NO_WAIT init ("0"b),				/* do not wait for order to complete */
+       81      FORWARD init ("1"b),				/* space files/blocks forward */
+       82      BACKWARD init ("0"b)				/* space files/blocks backward */
+       83      ) bit (1) aligned int static options (constant);
+       84 
+       85 dcl  order_mnemonics (0:22) char (4) static options (constant)
+       86 	init ("bsf", "bsr", "fsf", "fsr", "eof", "ers", "dse", "rew", "run", "lod", "rqs",
+       87 	"rss", "rqd", "rsd", "den", "per", "pro", "rsv", "rel", "rcr", "wcr", "rwnw", "runw");
+       88 
+       89 dcl  mode_mnemonics (0:6) char (8) static options (constant) init
+       90 	("data", "length", "align", "recovery", "wait", "event", "cif");
+       91 
+       92 /*		EXTERNAL STATIC DATA	*/
+       93 
+       94 dcl  error_table_$end_of_info fixed bin (35) ext static;
+       95 dcl  error_table_$eov_on_write fixed bin (35) ext static;
+       96 dcl  error_table_$buffer_big fixed bin (35) ext static;
+       97 dcl  error_table_$device_not_active fixed bin (35) ext static;
+       98 dcl  error_table_$nine_mode_parity fixed bin (35) ext static;
+       99 dcl  error_table_$positioned_on_bot fixed bin (35) ext static;
+      100 dcl  error_table_$bad_arg fixed bin (35) ext static;
+      101 dcl  mtape_dev_attention_recovery condition;
+      102 dcl  cleanup condition;
+      103 
+      104 /*		BUILTIN FUNCTIONS		*/
+      105 
+      106 dcl  (addr, copy, divide, hbound, lbound, mod, null, translate) builtin;
+      107 
+      108 /*		EXTERNAL ENTRIES		*/
+      109 
+      110 dcl  ascii_to_ebcdic_ entry (char (*), char (*));
+      111 dcl  ebcdic_to_ascii_ entry (char (*), char (*));
+      112 dcl  ascii_to_bcd_ entry (char (*), bit (*));
+      113 dcl  bcd_to_ascii_ entry (bit (*), char (*));
+      114 dcl  mtape_util_$error entry options (variable);
+      115 dcl  mtape_mount_cntl_$mount entry (ptr, fixed bin (35));
+      116 dcl  mtape_check_status_ entry (ptr, fixed bin (35));
+      117 
+      118 /*		BASED VARIABLES		*/
+      119 
+      120 dcl  based_label char (label_len) based (mtape_label_record.lab_ptr);
+      121 dcl  based_bits bit (label_len * 6) based;
+      122 dcl  based_area area based (mtape_data.areap);
+      123 dcl  blk_pad char (mtape_data.remain) based (addr (tape_blk (mtape_data.processed + 1))) unaligned;
+      124 
+      125 /* read_block - entry to read the next block from the tape */
+      126 
+      127 read_block: entry (arg_mtdp, arg_code);
+      128 
+      129 	call SETUP;				/* setup our enviornment */
+      130 	call UNLOAD_LREC_CNT;			/* Update block/lrec history */
+      131 	on mtape_dev_attention_recovery begin;		/* set up condition handler */
+      132 	     call tape_ioi_$read (mtape_data.tioi_id, mtape_data.cur_buf_ptr, mtape_data.length, rx, code);
+      133 	     call CHECK_RX;				/* go check result index */
+      134 	     if code = 0 then do;			/* if no error.. */
+      135 		call mtape_util_$error (mtdp, 0, "^[Device Attention^;Power Off^] recovery successful.",
+      136 		     mtape_vol_set.dev_att_retry);
+      137 		mtape_vol_set.pwr_off_retry, mtape_vol_set.dev_att_retry = "0"b; /* reset flags */
+      138 	     end;
+      139 	     go to continue_read;			/* take non-local goto to get out of condition */
+      140 	end;
+      141 	call tape_ioi_$read (mtape_data.tioi_id, mtape_data.cur_buf_ptr, mtape_data.length, rx, code);
+      142 	call CHECK_RX;				/* go check result index */
+      143 continue_read:					/* target of non-local goto */
+      144 	if code = 0 then do;			/* if no error.. */
+      145 	     if mtape_data.length > mtape_data.block_size then /* eliminate obvious padding */
+      146 		mtape_data.length = mtape_data.block_size;
+      147 	     mtape_data.position.phy_block = mtape_data.position.phy_block + 1; /* increment block number */
+      148 	     mtape_data.processed = mtape_data.buffer_offset; /* prime buffer variables */
+      149 	     mtape_data.log_record_ptr = addr (tape_blk (mtape_data.processed + 1));
+      150 	     mtape_data.remain = mtape_data.length - mtape_data.processed;
+      151 	end;
+      152 
+      153 	arg_code = code;				/* return error code */
+      154 	return;
+      155 
+      156 /* write_block - entry to write the current block to tape */
+      157 
+      158 write_block: entry (arg_mtdp, arg_code);
+      159 
+      160 	call SETUP;				/* setup our environment */
+      161 	mtape_data.position.phy_block = mtape_data.position.phy_block + 1; /* increment block number */
+      162 	call UNLOAD_LREC_CNT;			/* save block/log record history */
+      163 	if mtape_data.hdw_mode = MTAPE_HWM_BIN then do;	/* if writing in binary, must pad mod 4 */
+      164 	     mtape_data.remain = mod (mtape_data.processed, BYTES_PER_WORD);
+      165 	     if mtape_data.remain ^= 0 then do;		/* Have to pad block? */
+      166 		mtape_data.remain = BYTES_PER_WORD - mtape_data.remain; /* get bytes to add */
+      167 		blk_pad = copy (mtape_data.padding_char, mtape_data.remain); /* yes, do it */
+      168 		mtape_data.processed = mtape_data.processed + mtape_data.remain;
+      169 	     end;
+      170 	end;
+      171 	if ^mtape_data.run then do;			/* if no I/O currently queued */
+      172 	     mtape_data.buf_len (mtape_data.cur_buf_idx) = mtape_data.processed; /* copy length to be written */
+      173 	     mtape_data.cur_buf_idx = mtape_data.cur_buf_idx + 1; /* increment buffer index */
+      174 	     if mtape_data.cur_buf_idx > mtape_data.bufs_per_subset then do; /* its time to write the subset */
+      175 		do i = lbound (mtape_data.buf_ptrs, 1) to mtape_data.bufs_per_subset; /* queue half of the buffers */
+      176 
+      177 		     call tape_ioi_$queue_write (mtape_data.tioi_id, mtape_data.buf_ptrs (i),
+      178 			mtape_data.buf_len (i), code);
+      179 		     if code ^= 0 then do;		/* error from queue_write */
+      180 			call mtape_util_$error (mtdp, code, /* report it */
+      181 			     "Error from tape_ioi_$queue_write (^run) queuing buffer ^p, length ^d",
+      182 			     mtape_data.buf_ptrs (i), mtape_data.buf_len (i));
+      183 			go to write_block_return;	/* return on error */
+      184 		     end;
+      185 		end;
+      186 		call tape_ioi_$list_buffers (mtape_data.tioi_id, READY_STATE, mtape_data.buf_ptrs, n_rdy_bufs, code);
+      187 		if code ^= 0 then do;		/* error from list_buffers */
+      188 		     call mtape_util_$error (mtdp, code,/* report it */
+      189 			"Error from tape_ioi_$list_buffers");
+      190 		     go to write_block_return;
+      191 		end;
+      192 		mtape_data.run = "1"b;		/* We now have I/O going */
+      193 		mtape_data.cur_buf_idx = lbound (mtape_data.buf_ptrs, 1);
+      194 	     end;
+      195 	     mtape_data.cur_buf_ptr = mtape_data.buf_ptrs (mtape_data.cur_buf_idx); /* set for current buffer */
+      196 	end;
+      197 	else do;					/* buffers have been queued and are running */
+      198 	     call tape_ioi_$queue_write (mtape_data.tioi_id, mtape_data.cur_buf_ptr, mtape_data.processed, code);
+      199 	     if code ^= 0 then do;
+      200 		call mtape_util_$error (mtdp, code,
+      201 		     "Error from tape_ioi_$queue_write (run mode), queueing buffer at ^p, length ^d",
+      202 		     mtape_data.cur_buf_ptr, mtape_data.processed);
+      203 		go to write_block_return;
+      204 	     end;
+      205 	     call tape_ioi_$list_buffers (mtape_data.tioi_id, QUEUED_STATE, mtape_data.buf_ptrs, n_qed_bufs, code);
+      206 	     if code ^= 0 then do;			/* error from list_buffers */
+      207 		call mtape_util_$error (mtdp, code,	/* report it */
+      208 		     "Error from tape_ioi_$list_buffers (QUEUED_STATE).");
+      209 		go to write_block_return;
+      210 	     end;
+      211 	     if n_qed_bufs < mtape_data.nbufs then do;	/* all buffers not full? */
+      212 		call tape_ioi_$list_buffers (mtape_data.tioi_id, READY_STATE, mtape_data.buf_ptrs, n_rdy_bufs, code);
+      213 		if code ^= 0 then do;		/* error from list_buffers */
+      214 		     call mtape_util_$error (mtdp, code,/* report it */
+      215 			"Error from tape_ioi_$list_buffers (READY_STATE).");
+      216 		     go to write_block_return;
+      217 		end;
+      218 	     end;
+      219 	     else do;				/* all buffers full, check oldest */
+      220 
+      221 /* Establish condition handler for recovery of DEV ATTENTION and PWR OFF statuses */
+      222 
+      223 		on mtape_dev_attention_recovery go to feov_target; /* take non-local goto to flush out buffers */
+      224 
+      225 		call tape_ioi_$check_write (mtape_data.tioi_id, mtape_data.buf_ptrs (1), rx, code);
+      226 		if rx ^= 0 then do;
+      227 		     call CHECK_RX;
+      228 		     go to write_block_return;
+      229 		end;
+      230 	     end;
+      231 	     mtape_data.cur_buf_ptr = mtape_data.buf_ptrs (1); /* let user fill this one */
+      232 	end;
+      233 	mtape_data.processed = mtape_data.buffer_offset;	/* prime buffer variables */
+      234 	mtape_data.log_record_ptr = addr (tape_blk (mtape_data.processed + 1));
+      235 	mtape_data.remain = mtape_data.buf_size - mtape_data.processed;
+      236 	if mtape_data.force_end_of_volume then		/* if feov cntl op has been executed.. */
+      237 	     go to feov_target;			/* take non-local goto to flush buffers entry */
+      238 
+      239 write_block_return:
+      240 	arg_code = code;				/* return error code */
+      241 	return;
+      242 
+      243 /* flush_buffers - entry to queue up and wait for all buffers to be written out */
+      244 
+      245 flush_buffers: entry (arg_mtdp, arg_code);
+      246 
+      247 	call SETUP;				/* set up our environment */
+      248 	if ^mtape_vol_set.volume_end then		/* if we havn't reached end of volume yet, */
+      249 	     if mtape_data.nbufs > 0 then do;		/* and we have allocated buffers */
+      250 		on mtape_dev_attention_recovery go to feov_target;
+      251 feov_target:					/* target of non-local goto */
+      252 						/* the recovery may fail so return here on nz code */
+      253 
+      254 		if code ^= 0 then
+      255 		     go to flush_bufs_return;
+      256 
+      257 		if mtape_data.cur_buf_idx > lbound (mtape_data.buf_ptrs, 1) then /* if we have un-queued buffers */
+      258 		     do i = lbound (mtape_data.buf_ptrs, 1) to mtape_data.cur_buf_idx - 1; /* do it now */
+      259 		     call tape_ioi_$queue_write (mtape_data.tioi_id, all_buf_ptrs (i), all_buf_lens (i), code);
+      260 		     if code ^= 0 then do;		/* error from queue_write */
+      261 			call mtape_util_$error (mtdp, code, /* report it */
+      262 			     "Error from tape_ioi_$queue_write (flush) queuing buffer ^p, length ^d",
+      263 			     all_buf_ptrs (i), all_buf_lens (i));
+      264 			go to flush_bufs_return;	/* return on error */
+      265 		     end;
+      266 		end;
+      267 		rx, code = 0;
+      268 		do while (code = 0 & rx = 0);		/* do until no more buffers */
+      269 		     call tape_ioi_$check_write (mtape_data.tioi_id, null, rx, code);
+      270 		end;
+      271 		if code = error_table_$device_not_active then /* all I/O is finished */
+      272 		     code, rx = 0;
+      273 		else call CHECK_RX;			/* otherwise check the error */
+      274 		if code = 0 then do;		/* if no error */
+      275 		     mtape_data.run = "0"b;		/* I/O no longer in progress */
+      276 		     if mtape_data.phy_block = 0 then	/* called to wrt blks after volume switch */
+      277 			mtape_data.phy_block = mtape_data.cur_buf_idx - 1; /* set blocks written */
+      278 		     call tape_ioi_$list_buffers (mtape_data.tioi_id,
+      279 			READY_STATE, mtape_data.buf_ptrs, n_rdy_bufs, code);
+      280 		     if code ^= 0 then do;		/* error from list_buffers */
+      281 			call mtape_util_$error (mtdp, code, /* report it */
+      282 			     "Error from tape_ioi_$list_buffers (flush)");
+      283 			go to flush_bufs_return;
+      284 		     end;
+      285 		     mtape_data.cur_buf_idx = lbound (mtape_data.buf_ptrs, 1); /* reset buffer index */
+      286 		     mtape_data.cur_buf_ptr = mtape_data.buf_ptrs (1); /* let user fill this one */
+      287 		     mtape_data.processed = mtape_data.buffer_offset; /* prime buffer variables */
+      288 		     mtape_data.log_record_ptr = addr (tape_blk (mtape_data.processed + 1));
+      289 		     mtape_data.remain = mtape_data.buf_size - mtape_data.processed;
+      290 		     if mtape_vol_set.pwr_off_retry | mtape_vol_set.dev_att_retry then do;
+      291 			call mtape_util_$error (mtdp, 0, "^[Device Attention^;Power Off^] recovery successful.",
+      292 			     mtape_vol_set.dev_att_retry);
+      293 			mtape_vol_set.pwr_off_retry, mtape_vol_set.dev_att_retry = "0"b; /* reset flags */
+      294 		     end;
+      295 		     if mtape_data.force_end_of_volume then do; /* but feov order executed */
+      296 			mtape_data.force_end_of_volume = "0"b; /* reset flag */
+      297 			rx = TAPE_IO_EOT;		/* simulate EOT */
+      298 			call CHECK_RX;
+      299 		     end;
+      300 		end;
+      301 	     end;
+      302 flush_bufs_return:
+      303 	arg_code = code;
+      304 	return;
+      305 
+      306 /* allocate_buffers - entry to allocate data buffers to read or write tape blocks from/to */
+      307 
+      308 allocate_buffers: entry (arg_mtdp, arg_buf_size, arg_code);
+      309 
+      310 	call SETUP;				/* set up our environment */
+      311 	req_buffers = hbound (mtape_data.buf_ptrs, 1) * 2;/* request 2 subsets of max size */
+      312 	if arg_buf_size > BYTES_PER_DCW then		/* if large records */
+      313 	     if mtape_data.last_io ^= WRITE_IO then	/* and reading tape */
+      314 		req_buffers = 1;			/* only ask for one */
+      315 	code = error_table_$buffer_big;		/* set code for at least one loop */
+      316 	do alloc_tries = 1 to 2 while (code = error_table_$buffer_big);
+      317 	     call tape_ioi_$allocate_buffers (mtape_data.tioi_id, arg_buf_size, req_buffers,
+      318 		act_length, mtape_data.nbufs, all_buf_ptrs, code);
+      319 	     if code = error_table_$buffer_big then	/* if he can't fit req buffs */
+      320 		req_buffers = 0;			/* let him decide */
+      321 	end;
+      322 	if code ^= 0 then				/* problem allocating buffers */
+      323 	     go to allocate_buffers_return;		/* let caller handle it */
+      324 	if act_length < arg_buf_size then do;		/* can't allow this */
+      325 	     code = error_table_$buffer_big;
+      326 	     go to allocate_buffers_return;
+      327 	end;
+      328 	mtape_data.buf_size = act_length;		/* save allocated buffer length */
+      329 	mtape_data.bufs_per_subset = divide (mtape_data.nbufs, 2, 17, 0); /* subset is <= 1/2 of buffers */
+      330 	if mtape_data.bufs_per_subset = 0 then		/* but we must have at least 1 buffer */
+      331 	     mtape_data.bufs_per_subset = 1;
+      332 	mtape_data.cur_buf_idx = lbound (mtape_data.buf_ptrs, 1);
+      333 	mtape_data.cur_buf_ptr = mtape_data.buf_ptrs (mtape_data.cur_buf_idx);
+      334 	call set_mode (mtdp, "data", mtape_data.hdw_mode, null, code); /* set desired HW mode */
+      335 	if code = 0 then
+      336 	     call set_mode (mtdp, "length", mtape_data.length_mode, null, code); /* and length mode */
+      337 allocate_buffers_return:
+      338 	arg_code = code;				/* return error code */
+      339 	return;
+      340 
+      341 /* write_label - entry to copy contents of label record to an ioi_ buffer and initiate a sync write */
+      342 
+      343 write_label: entry (arg_mtdp, arg_lr_ptr, arg_code);
+      344 
+      345 	call SETUP;				/* set up our environment */
+      346 	mtape_data.last_io = 0;			/* indicates not data I/O */
+      347 	lr_ptr = arg_lr_ptr;
+      348 
+      349 	if mtape_data.lab_bufp = null then do;		/* first label I/O? */
+      350 	     call ALLOCATE_LABEL_BUFFER (mtape_label_record.lab_length); /* yes, get one allocated */
+      351 	     if code ^= 0 then			/* if fatal error.. */
+      352 		go to write_label_return;		/* let caller handle it */
+      353 	end;
+      354 	label_len = mtape_label_record.lab_length;	/* copy length */
+      355 	if mtape_label_record.conversion = MTAPE_CV_UC_ASCII | /* if label to be converted to upper case */
+      356 	     mtape_label_record.conversion = MTAPE_CV_UC_EBCDIC then /* convert in place */
+      357 	     based_label = translate (based_label, UC, LC);
+      358 	on mtape_dev_attention_recovery go to wcopy_label_end;
+      359 	go to wcopy_label (mtape_label_record.conversion);/* copy label and convert if neccessary */
+      360 
+      361 wcopy_label (1):					/* No conversion, copy as is */
+      362 wcopy_label (4):					/* Convert to upper case ASCII */
+      363 	mtape_data.lab_bufp -> based_label = based_label;
+      364 	go to wcopy_label_end;
+      365 wcopy_label (2):					/* Copy and convert to EBCDIC */
+      366 wcopy_label (5):					/* Copy and convert to upper case EBCDIC */
+      367 	call ascii_to_ebcdic_ (based_label, mtape_data.lab_bufp -> based_label);
+      368 	go to wcopy_label_end;
+      369 wcopy_label (3):					/* Copy and convert to BCD */
+      370 	call ascii_to_bcd_ (based_label, mtape_data.lab_bufp -> based_bits);
+      371 	label_len = divide (label_len * 6, 9, 21, 0);	/* recompute length */
+      372 wcopy_label_end:
+      373 	on mtape_dev_attention_recovery goto wcopy_label_retry;
+      374 
+      375 wcopy_label_retry:
+      376 	call set_mode (mtdp, "data", mtape_label_record.mode, null, code); /* make sure we are writing in right mode */
+      377 	if code ^= 0 then				/* if fatal error let user handle it */
+      378 	     go to write_label_return;
+      379 	call tape_ioi_$queue_write (mtape_data.tioi_id, mtape_data.lab_bufp, label_len, code);
+      380 	if code = 0 then do;			/* if everything ok.. */
+      381 	     call tape_ioi_$check_write (mtape_data.tioi_id, mtape_data.lab_bufp, rx, code);
+      382 	     call CHECK_RX;				/* go check result index */
+      383 	     if code = 0 then
+      384 		mtape_data.phy_block = mtape_data.phy_block + 1; /* increment block number */
+      385 	end;
+      386 write_label_return:
+      387 	arg_code = code;
+      388 	return;					/* return to caller */
+      389 
+      390 /* read_label - entry to initiate a sync read for a label record and put it into the indicated buffer,
+      391*   converted if necessary */
+      392 
+      393 read_label: entry (arg_mtdp, arg_lr_ptr, arg_code);
+      394 
+      395 	call SETUP;				/* set up our environment */
+      396 	mtape_data.last_io = 0;			/* indicates not data I/O */
+      397 	lr_ptr = arg_lr_ptr;
+      398 	if mtape_data.lab_bufp = null then do;		/* first label I/O? */
+      399 	     call ALLOCATE_LABEL_BUFFER (mtape_label_record.lab_length); /* yes, get one allocated */
+      400 	     if code ^= 0 then			/* if fatal error.. */
+      401 		go to read_label_return;		/* let caller handle it */
+      402 	end;
+      403 	on mtape_dev_attention_recovery go to read_label_retry;
+      404 read_label_retry:
+      405 	call set_mode (mtdp, "data", mtape_label_record.mode, null, code); /* make sure we are reading in right mode */
+      406 	if code ^= 0 then				/* if fatal error.. */
+      407 	     go to read_label_return;			/* let caller handle it */
+      408 	call tape_ioi_$queue_read (mtape_data.tioi_id, mtape_data.lab_bufp, code);
+      409 	if code ^= 0 then				/* if fatal error.. */
+      410 	     go to read_label_return;			/* let caller handle it */
+      411 	call tape_ioi_$check_read (mtape_data.tioi_id, mtape_data.lab_bufp, label_len, rx, code);
+      412 	call CHECK_RX;
+      413 	if code ^= 0 then				/* if some error */
+      414 	     go to read_label_return;			/* let caller handle it */
+      415 	mtape_data.phy_block = mtape_data.phy_block + 1;	/* increment block number */
+      416 	go to rcopy_label (mtape_label_record.conversion);/* convert label if necessary */
+      417 
+      418 rcopy_label (1):					/* No conversion */
+      419 rcopy_label (4):					/* convert to upper case ASCII (write only) */
+      420 	based_label = mtape_data.lab_bufp -> based_label; /* copy directly */
+      421 	go to rcopy_label_end;
+      422 rcopy_label (2):					/* convert EBCDIC to ASCII */
+      423 rcopy_label (5):					/* convert to upper case ASCII (write only) */
+      424 	call ebcdic_to_ascii_ (mtape_data.lab_bufp -> based_label, based_label);
+      425 	go to rcopy_label_end;
+      426 rcopy_label (3):					/* convert BCD to ASCII */
+      427 	call bcd_to_ascii_ (mtape_data.lab_bufp -> based_bits, based_label);
+      428 	label_len = divide (label_len * 9, 6, 21, 0);	/* adjust label length */
+      429 rcopy_label_end:
+      430 	mtape_label_record.lab_length = label_len;	/* set length of label */
+      431 read_label_return:
+      432 	arg_code = code;
+      433 	return;
+      434 
+      435 /* order - entry to issue tape control orders (e.g. positioning commands),
+      436*   on behalf of the Per-Format modules */
+      437 
+      438 order: entry (arg_mtdp, arg_order, arg_repeat_cnt, arg_infop, arg_code);
+      439 
+      440 	call SETUP;				/* set up our environment */
+      441 	order = arg_order;				/* copy the rest of the arguments */
+      442 	repeat_cnt = arg_repeat_cnt;
+      443 	infop = arg_infop;
+      444 	do oidx = hbound (order_mnemonics, 1) to lbound (order_mnemonics, 1) by -1
+      445 	     while (order_mnemonics (oidx) ^= arg_order); /* get the order index */
+      446 	end;
+      447 	go to PROC_ORDER (oidx);			/* and go process it */
+      448 
+      449 PROC_ORDER (-1):					/* unknown order */
+      450 	code = error_table_$bad_arg;			/* set appropriate error code */
+      451 	go to order_return;
+      452 
+      453 PROC_ORDER (0):					/* backspace file */
+      454 	call SPACE_FILE (BACKWARD);			/* correct for position and do the order */
+      455 	go to order_return;
+      456 
+      457 PROC_ORDER (1):					/* backspace record (block) */
+      458 	call SPACE_BLOCK (BACKWARD);			/* correct for position and do the order */
+      459 	go to order_return;
+      460 
+      461 PROC_ORDER (2):					/* forward space file */
+      462 	call SPACE_FILE (FORWARD);			/* correct for position and do the order */
+      463 	go to order_return;
+      464 
+      465 PROC_ORDER (3):					/* forward space record (block) */
+      466 	call SPACE_BLOCK (FORWARD);			/* correct for position and do the order */
+      467 	go to order_return;
+      468 
+      469 PROC_ORDER (4):					/* write end of file mark */
+      470 	on mtape_dev_attention_recovery go to RETRY_WEOF; /* establis condition handler */
+      471 	do while (repeat_cnt > 0);			/* write requested EOFs */
+      472 	     call tape_ioi_$order (mtape_data.tioi_id, order, repeat_cnt, null, act_cnt, rx, code);
+      473 	     mtape_data.phy_file = mtape_data.phy_file + act_cnt; /* increment file count */
+      474 	     repeat_cnt = repeat_cnt - act_cnt;
+      475 	     call CHECK_RX;				/* go check the result index */
+      476 	     if code ^= 0 then			/* if error */
+      477 		if code ^= error_table_$eov_on_write then /* if not EOT */
+      478 		     go to order_return;		/* return the error */
+      479 		else code = 0;			/* EOT is not error in this case */
+      480 RETRY_WEOF:
+      481 	end;
+      482 	mtape_data.phy_block = 0;			/* reset block position to 0 */
+      483 	go to order_return;
+      484 
+      485 PROC_ORDER (5):					/* erase */
+      486 PROC_ORDER (6):					/* data security erase */
+      487 	call RESOLVE_POSITION;			/* make sure we are positioned where we think we are */
+      488 	if code = 0 then				/* if no error yet */
+      489 	     call DO_ORDER (order, repeat_cnt);		/* do the requested order */
+      490 	go to order_return;
+      491 
+      492 PROC_ORDER (7):					/* rewind */
+      493 PROC_ORDER (8):					/* rewind unload */
+      494 	call REWIND_PROC (order, WAIT);		/* do it all from this subroutine */
+      495 	go to order_return;
+      496 
+      497 PROC_ORDER (21):					/* "rwnw", rewind no wait */
+      498 	call REWIND_PROC ("rew", NO_WAIT);		/* do it all from this subroutine */
+      499 	go to order_return;
+      500 
+      501 PROC_ORDER (22):					/* "runw", rewind unload no wait */
+      502 	call REWIND_PROC ("run", NO_WAIT);		/* do it all from this subroutine */
+      503 	go to order_return;
+      504 
+      505 PROC_ORDER (14):					/* set density */
+      506 	call REWIND_PROC ("rew", WAIT);		/* rewind the tape first */
+      507 	if code = 0 then				/* if no error on rewind.. */
+      508 	     call DO_ORDER (order, repeat_cnt);		/* go do the density order */
+      509 	go to order_return;
+      510 
+      511 /* The following control orders require no special action, except that the tape must be stopped first */
+      512 
+      513 PROC_ORDER (9):					/* load tape */
+      514 PROC_ORDER (10):					/* request status */
+      515 PROC_ORDER (11):					/* reset status */
+      516 PROC_ORDER (12):					/* request device status */
+      517 PROC_ORDER (13):					/* reset device status */
+      518 PROC_ORDER (15):					/* set file protect */
+      519 PROC_ORDER (16):					/* set file permit */
+      520 PROC_ORDER (17):					/* reserve device */
+      521 PROC_ORDER (18):					/* release device */
+      522 PROC_ORDER (19):					/* read control registers */
+      523 PROC_ORDER (20):					/* write control registers */
+      524 	call STOP_TAPE;				/* stop the tape drive */
+      525 	if code = 0 then				/* if no errors stopping the tape */
+      526 	     call DO_ORDER (order, repeat_cnt);		/* then do the control order */
+      527 
+      528 order_return:
+      529 	arg_code = code;
+      530 	return;
+      531 
+      532 /* set_mode - entry to allow PFMs to set tape_ioi_ modes */
+      533 
+      534 set_mode: entry (arg_mtdp, arg_mode, arg_index, arg_mode_ptr, arg_code);
+      535 
+      536 	call SETUP;				/* set up our enviornment */
+      537 	mode_ptr = arg_mode_ptr;
+      538 	arg_code = 0;
+      539 	do oidx = hbound (mode_mnemonics, 1) to lbound (mode_mnemonics, 1) by -1
+      540 	     while (mode_mnemonics (oidx) ^= arg_mode);	/* get the mode index */
+      541 	end;
+      542 	go to PROC_MODE (oidx);			/* go process correct mode */
+      543 
+      544 PROC_MODE (-1):					/* unknown mode */
+      545 	arg_code = error_table_$bad_arg;
+      546 	return;
+      547 
+      548 PROC_MODE (0):					/* set data mode */
+      549 	mode_ptr = addr (HDW_MODE_STR (arg_index));	/* set desired data mode */
+      550 	go to PROC_MODE_END;
+      551 
+      552 PROC_MODE (1):					/* set length mode */
+      553 	mode_ptr = addr (LENGTH_MODES (arg_index));
+      554 	go to PROC_MODE_END;
+      555 
+      556 PROC_MODE (2):					/* set alignment mode */
+      557 	mode_ptr = addr (ALIGN_MODES (arg_index));
+      558 	go to PROC_MODE_END;
+      559 
+      560 PROC_MODE (3):					/* set data recovery mode */
+      561 	mode_ptr = addr (RECOVERY_MODES (arg_index));
+      562 	go to PROC_MODE_END;
+      563 
+      564 PROC_MODE (4):					/* set wait mode */
+      565 	mode_ptr = addr (WAIT_MODES (arg_index));
+      566 	go to PROC_MODE_END;
+      567 
+      568 PROC_MODE (5):					/* set event channel, mode_ptr already set */
+      569 PROC_MODE (6):					/* set recovery channel instruction field */
+      570 PROC_MODE_END:
+      571 	call tape_ioi_$set_mode (mtape_data.tioi_id, arg_mode, mode_ptr, arg_code); /* set the mode */
+      572 	return;
+      573 
+      574 /* stop_tape - entry to stop tape motion and syncronize position */
+      575 
+      576 stop_tape: entry (arg_mtdp, arg_code);
+      577 
+      578 	call SETUP;				/* set up our enviornment */
+      579 	if mtape_data.nbufs > 0 & (mtape_file_info.position_within_file = AT_BOFD |
+      580 	     mtape_file_info.position_within_file = AT_IFD) then do; /* don't bother if buffers not allocated */
+      581 	     call STOP_TAPE;			/* stop the tape and get the last status */
+      582 	     if ths.major = END_OF_FILE & descrep_cnt > 0 then do; /* if end of file status */
+      583 		mtape_data.position.phy_file = mtape_data.position.phy_file + 1; /* increment file # */
+      584 		mtape_data.position.phy_block = 0;	/* and zero out block number */
+      585 		mtape_file_info.position_within_file = AT_BOFT;
+      586 	     end;
+      587 	     else mtape_data.position.phy_block = mtape_data.position.phy_block + descrep_cnt;
+      588 	end;
+      589 	return;
+      590 
+      591 /* ALLOCATE_LABEL_BUFFER - internal procedure to allocate and reserve a sync buffer for reading and writing labels */
+      592 
+      593 ALLOCATE_LABEL_BUFFER: proc (buf_len);
+      594 
+      595 dcl  buf_len fixed bin;
+      596 dcl  act_length fixed bin (21);
+      597 dcl  act_number fixed bin;
+      598 dcl  lbuf_arrayp (1) ptr;
+      599 
+      600 	call tape_ioi_$allocate_buffers (mtape_data.tioi_id, (buf_len), 1, act_length, act_number, lbuf_arrayp, code);
+      601 	if code ^= 0 then return;			/* return on fatal error */
+      602 	call tape_ioi_$reserve_buffer (mtape_data.tioi_id, lbuf_arrayp (1), code); /* reserve the buffer */
+      603 	if code ^= 0 then return;			/* return on fatal error */
+      604 	mtape_data.lab_bufp = lbuf_arrayp (1);		/* copy label buffer ptr */
+      605 	mtape_data.lab_buf_len = buf_len;		/* set label buffer length */
+      606 
+      607      end ALLOCATE_LABEL_BUFFER;
+      608 
+      609 /* RESOLVE_POSITION - subroutine to correct position resulting from reading ahead/writing behind */
+      610 
+      611 RESOLVE_POSITION: proc;
+      612 
+      613 	if mtape_data.nbufs > 0 then do;		/* don't bother if buffers not allocated */
+      614 	     call STOP_TAPE;			/* stop the tape and get the last status */
+      615 	     if ths.major = END_OF_FILE then do;	/* if end of file status */
+      616 		descrep_cnt = descrep_cnt - 1;	/* decrease descrepency count */
+      617 		call DO_ORDER ("bsf", 1);		/* and backspace across file mark */
+      618 	     end;
+      619 	     if descrep_cnt > 0 then			/* if we are not already where we should be */
+      620 		call DO_ORDER ("bsr", descrep_cnt);	/* backspace this many blocks */
+      621 	end;
+      622 
+      623      end RESOLVE_POSITION;
+      624 
+      625 /* REWIND_PROC - subroutine to stop tape, rewind tape and wait for special */
+      626 
+      627 REWIND_PROC: proc (rew_order, wait);
+      628 
+      629 dcl  rew_order char (4);				/* either "rew" or "run" */
+      630 dcl  wait bit (1) aligned;
+      631 
+      632 	mtape_data.phy_file, mtape_data.phy_block = 0;	/* reset position */
+      633 	on mtape_dev_attention_recovery go to WAIT_FOR_REWIND; /* wait for special on recovery */
+      634 
+      635 	on cleanup begin;
+      636 	     call tape_ioi_$order (mtape_data.tioi_id, "rdy", 0, addr (spec_status), act_cnt, rx, code);
+      637 	     call CHECK_RX;				/* if already rewinding, wait until complete */
+      638 	end;
+      639 
+      640 	call tape_ioi_$stop_tape (mtape_data.tioi_id, descrep_cnt, rx, code); /* stop the tape first */
+      641 	call CHECK_RX;				/* check the result index */
+      642 	if code ^= 0 then				/* if error */
+      643 	     return;
+      644 	call tape_ioi_$order (mtape_data.tioi_id, "rdy", 0, addr (spec_status), act_cnt, rx, code);
+      645 	call CHECK_RX;				/* if already rewinding, wait until complete */
+      646 	if code ^= 0 then				/* if error */
+      647 	     return;
+      648 	call tape_ioi_$order (mtape_data.tioi_id, rew_order, 0, null, act_cnt, rx, code); /* issue rewind order */
+      649 	call CHECK_RX;				/* check the result index */
+      650 	if code ^= 0 then				/* if error */
+      651 	     return;
+      652 	mtape_vol_set.volume_end = "0"b;		/* reset EOV flag in vol set structure */
+      653 	if wait then do;				/* user wants to wait for rewind to complete */
+      654 WAIT_FOR_REWIND:
+      655 	     call tape_ioi_$order (mtape_data.tioi_id, "rdy", 0, addr (spec_status), act_cnt, rx, code);
+      656 	     call CHECK_RX;				/* wait for special interrupt & check the result index */
+      657 						/* set the density after rewind.    */
+      658 	     if vs_ptr ^= null then do;
+      659 		infop = addr (mtape_vol_set.volume_density);
+      660 		call DO_ORDER ("den", 1);
+      661 	     end;
+      662 	end;
+      663 	return;
+      664 
+      665      end REWIND_PROC;
+      666 
+      667 /* SPACE_FILE - subroutine to correct position when forward/backspacing files  */
+      668 
+      669 SPACE_FILE: proc (direction);
+      670 
+      671 dcl  direction bit (1) aligned;			/* "1"b => forward space; "0"b => backspace */
+      672 
+      673 	if mtape_data.nbufs > 0 then do;		/* don't bother if buffers not allocated */
+      674 	     call STOP_TAPE;			/* stop the tape and get the last status */
+      675 
+      676 /* if EOF status & we were not already stopped, must correct for async position */
+      677 
+      678 	     if ths.major = END_OF_FILE & descrep_cnt > 0 then do;
+      679 		if direction = FORWARD then		/* forward */
+      680 		     repeat_cnt = repeat_cnt - 1;	/* decrease repeat count by 1 */
+      681 		else repeat_cnt = repeat_cnt + 1;	/* backspacing, must backspace 1 more */
+      682 
+      683 	     end;
+      684 	end;
+      685 	mtape_data.position.phy_block = 0;		/* reset block position */
+      686 
+      687 /* Note that block position is undefined if backspacing files */
+      688 
+      689 	if repeat_cnt = 0 then do;			/* if position adjusted to 0 .. */
+      690 	     mtape_data.position.phy_file = mtape_data.position.phy_file + 1; /* increment file position */
+      691 	     return;				/* don't do the order, we are already where we should be */
+      692 	end;
+      693 
+      694 	call DO_ORDER (order, repeat_cnt);		/* do the order */
+      695 	if code = error_table_$end_of_info then code = 0; /* ignore EOF status */
+      696 	if direction = FORWARD then			/* if spacing forward */
+      697 	     mtape_data.position.phy_file = mtape_data.position.phy_file + act_cnt; /* add files spaced */
+      698 	else mtape_data.position.phy_file = mtape_data.position.phy_file - act_cnt; /* back, subtract files spaced */
+      699 
+      700      end SPACE_FILE;
+      701 
+      702 /* SPACE_BLOCK - subroutine to correct position when forward/backspacing records (blocks)  */
+      703 
+      704 SPACE_BLOCK: proc (direction);
+      705 
+      706 dcl  direction bit (1) aligned;			/* "1"b => forward space; "0"b => backspace */
+      707 
+      708 	if mtape_data.nbufs > 0 then do;		/* don't bother if buffers not allocated */
+      709 	     call STOP_TAPE;			/* stop the tape and get the last status */
+      710 	     if ths.major = END_OF_FILE & descrep_cnt > 0 then do; /* if end of file status */
+      711 		if direction = FORWARD then		/* forward spacing? */
+      712 		     if repeat_cnt >= descrep_cnt then do; /* farther than we can go */
+      713 			mtape_data.position.phy_block = 0; /* correct position */
+      714 			mtape_data.position.phy_file = mtape_data.position.phy_file + 1;
+      715 			code = error_table_$end_of_info; /* return EOF status to caller */
+      716 			return;
+      717 		     end;
+      718 		call DO_ORDER ("bsf", 1);		/* must backspace across file mark */
+      719 		descrep_cnt = descrep_cnt - 1;	/* correct descrepency count */
+      720 	     end;
+      721 	     if direction = FORWARD then		/* if forward spacing */
+      722 		if descrep_cnt > repeat_cnt then do;	/* but actual position is beyond desired position */
+      723 		     order = "bsr";			/* we will actually have to backspace */
+      724 		     repeat_cnt = (descrep_cnt - repeat_cnt) + 1; /* this many blocks to get to desired position */
+      725 		end;
+      726 		else repeat_cnt = repeat_cnt - descrep_cnt; /* forward, desired position is beyond actual position */
+      727 	     else repeat_cnt = repeat_cnt + descrep_cnt;	/* backward, adjust position */
+      728 	end;
+      729 	call DO_ORDER (order, repeat_cnt);		/* execute the control order */
+      730 	if code = 0 then do;
+      731 	     if direction = FORWARD then		/* spacing forward */
+      732 		mtape_data.position.phy_block = mtape_data.position.phy_block + arg_repeat_cnt;
+      733 	     else mtape_data.position.phy_block = mtape_data.position.phy_block - arg_repeat_cnt;
+      734 	end;
+      735 
+      736      end SPACE_BLOCK;
+      737 
+      738 /* CHECK_RX - internal procedure to check the result index returned by tape_ioi_ and take appropriate action */
+      739 
+      740 CHECK_RX: proc;
+      741 
+      742 	if rx = TAPE_IO_SUCCESS then			/* if no problems */
+      743 	     return;
+      744 	mtape_data.run = "0"b;			/* anything else has stopped I/O */
+      745 	go to RX_ACTION (rx);			/* otherwise take appropriate action */
+      746 
+      747 
+      748 RX_ACTION (-1):					/* TAPE_IO_BLOCK, we should never have to go blocked */
+      749 RX_ACTION (1):					/* TAPE_IO_USER_PROGRAM_ERROR */
+      750 RX_ACTION (3):					/* TAPE_IO_RECOVERABLE_IO_ERROR, error code set */
+      751 RX_ACTION (7):					/* TAPE_IO_RECOVERABLE_IO_ERROR_AND_EOT, will lose EOT stat */
+      752 	return;
+      753 
+      754 RX_ACTION (4):					/* TAPE_IO_EOF, encountered EOF mark */
+      755 	mtape_data.position.phy_file = mtape_data.position.phy_file + 1; /* increment file number */
+      756 	mtape_data.position.phy_block = 0;		/* reset block number */
+      757 	code = error_table_$end_of_info;		/* set appropriate error code */
+      758 	return;
+      759 
+      760 RX_ACTION (5):					/* TAPE_IO_EOT, EOT foil detected */
+      761 	mtape_vol_set.volume_end = "1"b;		/* set EOV flag in vol set structure */
+      762 	call SYNC_POSITION;				/* correct block count */
+      763 	code = error_table_$eov_on_write;		/* set appropriate error code */
+      764 	return;
+      765 
+      766 RX_ACTION (6):					/* TAPE_IO_BOT, backspaced into BOT */
+      767 	code = error_table_$positioned_on_bot;		/* set appropriate error code */
+      768 	return;
+      769 
+      770 RX_ACTION (8):					/* TAPE_IO_CODE_ALERT */
+      771 	code = error_table_$nine_mode_parity;		/* set appropriate error code */
+      772 
+      773 RX_ACTION (2):					/* TAPE_IO_UNRECOVERABLE_IO_ERROR, error code set */
+      774 	unr_code = code;				/* save error code */
+      775 	call SYNC_POSITION;				/* correct the block count */
+      776 	if mtape_data.last_io = WRITE_IO then		/* if we are writing data */
+      777 	     mtape_data.phy_block = mtape_data.phy_block - 1; /* subtract current buffer */
+      778 	call mtape_check_status_ (mtdp, unr_code);	/* go check the error */
+      779 	code = unr_code;				/* copy returned error code */
+      780 
+      781      end CHECK_RX;
+      782 
+      783 /* UNLOAD_LREC_CNT - internal procedure to increment the logical record round robin counter */
+      784 
+      785 UNLOAD_LREC_CNT: proc;
+      786 
+      787 	mtape_data.tot_lrec = mtape_data.tot_lrec + mtape_data.log_record; /* increment total */
+      788 	mtape_data.blk_rrrc (mtape_data.blk_rrcx) = mtape_data.log_record; /* save lrecs in last block */
+      789 	mtape_data.log_record = 0;			/* reset inter-block rec count */
+      790 	mtape_data.blk_rrcx = mtape_data.blk_rrcx + 1;	/* increment index for next block */
+      791 	if mtape_data.blk_rrcx > hbound (mtape_data.blk_rrrc, 1) then /* if at end of RRC */
+      792 	     mtape_data.blk_rrcx = 0;			/* reset it to top of RRC */
+      793 
+      794      end UNLOAD_LREC_CNT;
+      795 
+      796 /* GET_HDW_STATUS - internal procedure to get the current hardware status from tape_ioi_ */
+      797 
+      798 GET_HDW_STATUS: proc;
+      799 
+      800 	ths_ptr = addr (auto_ths);			/* set pointer to auto structure */
+      801 	ths.version = THS_VERSION;			/* set version */
+      802 	call tape_ioi_$hardware_status (mtape_data.tioi_id, ths_ptr, scode); /* get status */
+      803 
+      804      end GET_HDW_STATUS;
+      805 
+      806 /* STOP_TAPE - subroutine to stop the tape and get the last hardware status */
+      807 
+      808 STOP_TAPE: proc;
+      809 
+      810 	code = 0;
+      811 	call tape_ioi_$stop_tape (mtape_data.tioi_id, descrep_cnt, rx, code);
+      812 	call CHECK_RX;				/* check result index */
+      813 	call GET_HDW_STATUS;			/* get the current hardware status */
+      814 
+      815      end STOP_TAPE;
+      816 
+      817 /* DO_ORDER - subroutine to execute a control order */
+      818 
+      819 DO_ORDER: proc (order, arg_repeat_cnt);
+      820 
+      821 dcl  order char (4);
+      822 dcl  (arg_repeat_cnt, repeat_cnt) fixed bin;
+      823 
+      824 	code = 0;
+      825 	repeat_cnt = arg_repeat_cnt;
+      826 
+      827 /* establish conditon handler */
+      828 
+      829 	on mtape_dev_attention_recovery go to REPEAT_ORDER;
+      830 
+      831 	do while (repeat_cnt > 0 & code = 0);		/* do requested orders */
+      832 
+      833 	     call tape_ioi_$order (mtape_data.tioi_id, order, repeat_cnt,
+      834 		infop, act_cnt, rx, code);
+      835 	     repeat_cnt = repeat_cnt - act_cnt;
+      836 	     call CHECK_RX;				/* go check the result index */
+      837 REPEAT_ORDER:
+      838 	end;
+      839 
+      840 	if code ^= 0 then do;
+      841 	     if code = error_table_$end_of_info then
+      842 		code = 0;
+      843 	     else
+      844 		call mtape_util_$error (mtdp, code,
+      845 		     "While attempting a ^a control order.", order);
+      846 	end;
+      847 
+      848 	return;
+      849 
+      850      end DO_ORDER;
+      851 
+      852 /* SYNC_POSITION - internal procedure to syncronize the position after a write err */
+      853 
+      854 SYNC_POSITION: proc;
+      855 
+      856 dcl  susp_smple (1) ptr;
+      857 dcl  n_susp_bufs fixed bin;
+      858 
+      859 	call tape_ioi_$list_buffers (mtape_data.tioi_id, SUSPENDED_STATE, susp_smple, n_susp_bufs, code);
+      860 	if code ^= 0 then do;			/* error from list_buffers */
+      861 	     call mtape_util_$error (mtdp, code,	/* report it */
+      862 		"Error from tape_ioi_$list_buffers");
+      863 	     return;
+      864 	end;
+      865 	mtape_data.position.phy_block = mtape_data.position.phy_block - n_susp_bufs;
+      866 
+      867      end SYNC_POSITION;
+      868 
+      869 /* SETUP - internal procedure to set up environment for the external entries */
+      870 
+      871 SETUP: proc;
+      872 
+      873 	mtdp = arg_mtdp;				/* get pointers to pertinent data */
+      874 	vs_ptr = mtape_data.vs_current;
+      875 	fi_ptr = mtape_data.fi_current;
+      876 	if mtape_data.tioi_id = "0"b then do;		/* should only happen if "ring_in" order executed */
+      877 	     call mtape_mount_cntl_$mount (mtdp, code);	/* get the volume mounted */
+      878 	     if code ^= 0 then do;
+      879 		call mtape_util_$error (mtdp, code,
+      880 		     "^/Attempting to mount volume ^a following ""ring_in"" control operation",
+      881 		     mtape_vol_set.volume_name);
+      882 		go to ERROR_RETURN;			/* take non_local goto */
+      883 	     end;
+      884 	     arg_mtdp = mtdp;			/* reset callers control structure ptr */
+      885 	     free mtape_data.cmtdp -> mtape_data in (based_area); /* free the old structure */
+      886 	     mtape_data.cmtdp = null;
+      887 	end;
+      888 	rx, arg_code, code = 0;			/* and reset error codes */
+      889 
+      890      end SETUP;
+      891 
+      892 ERROR_RETURN:					/* target of non-local gotos */
+      893 	arg_code = code;				/* copy return code */
+      894 	return;					/* return to caller */
+      895 
+  1     1 /* BEGIN INCLUDE FILE mtape_data.incl.pl1. Created by J. A. Bush 10/06/82  */
+  1     2 /* format: style4 */
+  1     3 
+  1     4 dcl  mtdp ptr;
+  1     5 
+  1     6 dcl  mtape_data_version_1 char (8) int static options (constant) init ("mtdv0001");
+  1     7 
+  1     8 dcl  1 mtape_data aligned based (mtdp),
+  1     9        2 version char (8),				/* Current structure version */
+  1    10        2 areap ptr,					/* Pointer to an allocation area  */
+  1    11        2 iocb_ptr ptr,				/* Pointer to our IO control block */
+  1    12        2 atdp ptr,					/* Pointer to the attach description string  */
+  1    13        2 opdp ptr,					/* Pointer to the open description string */
+  1    14        2 cldp ptr,					/* Pointer to close description string */
+  1    15        2 dtdp ptr,					/* Pointer to detach description string */
+  1    16        2 cmtdp ptr,					/* If non-null, Ptr to allocated copy of mtape_data */
+  1    17        2 vs_head ptr,				/* Pointer to the first volume_set structure  */
+  1    18        2 vs_tail ptr,				/* Pointer to the last volume_set structure  */
+  1    19        2 vs_current ptr,				/* Pointer to the current volume_set structure  */
+  1    20        2 vs_mounted_tail ptr,				/* Pointer to MRM volume_set member */
+  1    21        2 fi_head ptr,				/* Pointer to the first file_info structure  */
+  1    22        2 fi_tail ptr,				/* Pointer to the last file_info structure  */
+  1    23        2 fi_current ptr,				/* Pointer to the current file_info structure  */
+  1    24        2 tape_infop ptr,				/* Pointer to rcp tape info structure */
+  1    25        2 last_ur_status_ptr ptr,			/* If non-null, Ptr to last unrecoverable status */
+  1    26        2 io_echan fixed bin (71),			/* Fast wait channel for I/O interrupts */
+  1    27        2 mount_echan fixed bin (71),			/* Regular wait channel for mount requests */
+  1    28        2 data_xfer_args,				/* Arguments for time critical (read/write) calls */
+  1    29          3 arg_buf_ptr ptr,				/* Pointer to users buffer */
+  1    30          3 arg_buf_len fixed bin (21),			/* Length of users buffer in bytes */
+  1    31          3 arg_rec_len fixed bin (21),			/* Length of record read in bytes */
+  1    32        2 error_lock fixed bin (35),			/* if ^= 0 = file locked error code */
+  1    33        2 abs_ans char (3),				/* Query answer (yes or no) for abs user */
+  1    34        2 user_type bit (1),				/* "1"b => interactive; "0"b => absentee */
+  1    35        2 display_errors bit (1),			/* "1"b => display verbose error messages */
+  1    36        2 force_end_of_volume bit (1),			/* "1"b => simulate EOV on next write */
+  1    37        2 opd_len fixed bin (21),			/* Allocated length of open description */
+  1    38        2 drives_in_use fixed bin,			/* Number of tape drives currently in use */
+  1    39        2 data_buffers,				/* Info about data buffers */
+  1    40          3 buf_ptrs (8) ptr,				/* Pointers to a subset of ioi buffers */
+  1    41          3 blind_buf_ptrs (8) ptr,			/* Pointers to other subset of buffers */
+  1    42          3 buf_len (8) fixed bin (21),			/* Length of buffers in 9 bit bytes */
+  1    43          3 blind_buf_len (8) fixed bin (21),		/* Lengths of other subset of buffers */
+  1    44          3 nbufs fixed bin,				/* Number of data buffers currently in use */
+  1    45          3 buf_size fixed bin (21),			/* Allocated size of data buffers in bytes */
+  1    46          3 bufs_per_subset fixed bin,			/* Number of buffers to write/read per I/O */
+  1    47          3 cur_buf_idx fixed bin,			/* Index into subset of current buffer */
+  1    48          3 run bit (1),				/* "1"b => wrt I/O queued thru tape_ioi_; "0"b => ^Queued */
+  1    49        2 label_buffer,				/* Info about label record buffer */
+  1    50          3 lab_bufp ptr,				/* Pointer to label I/O buffer */
+  1    51          3 lab_buf_len fixed bin (21),			/* Length of label buffer in 9 bit bytes */
+  1    52        2 tlb ptr,					/* Pointer to a temp label record structure */
+  1    53        2 position,					/* Position on current volume */
+  1    54          3 phy_file fixed bin,			/* physical file number */
+  1    55          3 phy_block fixed bin,			/* physical block within physical file */
+  1    56        2 current_file,				/* instantanious info about current file */
+  1    57          3 cur_block,				/* info about current block */
+  1    58 	 4 cur_buf_ptr ptr,				/* Pointer to the current data buffer */
+  1    59 	 4 log_record_ptr ptr,			/* Pointer to current logical record */
+  1    60 	 4 length fixed bin (21),			/* Length of current block in bytes */
+  1    61 	 4 processed fixed bin (21),			/* Number of chars processed already */
+  1    62 	 4 remain fixed bin (21),			/* Number of chars remaining to be processed */
+  1    63 	 4 log_record fixed bin (21),			/* Log. record within the current block */
+  1    64          3 char_size fixed bin,			/* Size in bits of the data chars of this file */
+  1    65          3 padding_char char (1),			/* To pad blocks to mod 4 on binary writes */
+  1    66          3 length_mode fixed bin,			/* 0 => W/R mod 4 blocks; 1 => W/R non-mod 4 blocks */
+  1    67          3 hdw_mode fixed bin,			/* Hardware recording mode:
+  1    68*						   1 = binary; 2 = nine track; 3 = BCD */
+  1    69          3 conversion fixed bin,			/* File data conversion:
+  1    70*						   0 = no conversion; 1 = ASCII<->EBCDIC; 2 = ASCII<->BCD */
+  1    71          3 buffer_offset fixed bin,			/* Number of bytes prior to data */
+  1    72          3 block_size fixed bin (21),			/* Maximum block size for this file */
+  1    73          3 record_size fixed bin (21),			/* Maximum record size for this file */
+  1    74          3 prev_block_no fixed bin (21),		/* Number of previous block read */
+  1    75          3 ad_file_format fixed bin,			/* 1 = U; 2 = F; 3 = D or V; 4 = S or VS */
+  1    76          3 file_blocked bit (1),			/* "1"b => file is blocked */
+  1    77          3 native_file bit (1),			/* "1"b => current file written by mtape_ PFM */
+  1    78          3 write_after_read bit (1),			/* "1"b => truncate file (and file_set) at this record */
+  1    79          3 first_file bit (1),			/* "1"b => first file has been processed */
+  1    80          3 tot_bytes_processed fixed bin (35),		/* total bytes in this file section */
+  1    81          3 last_io fixed bin,				/* Last I/O operation (1 = read; 2 = write) */
+  1    82          3 lrec_rrcx fixed bin,			/* current index of the lrec round robin counter */
+  1    83          3 lrec_rrc,				/* history of last n logical records */
+  1    84 	 4 block_no (0:7) fixed bin (35),		/* block (within file section) where lrec starts */
+  1    85 	 4 block_len (0:7) fixed bin (35),		/* block len of current block */
+  1    86 	 4 lrec_no (0:7) fixed bin (35),		/* logical record within currnt block */
+  1    87 	 4 abs_byte (0:7) fixed bin (35),		/* byte (within file section) where lrec starts */
+  1    88 	 4 byte_offset (0:7) fixed bin,		/* offset of 1st byte of lrec (within block) */
+  1    89          3 blk_rrcx fixed bin,			/* index into blk_rrrc array of last block */
+  1    90          3 blk_rrrc (0:7) fixed bin (35),		/* contains Lrec count of last n blocks */
+  1    91          3 tot_lrec fixed bin (35),			/* Total logical records processed in current file */
+  1    92        2 tioi_id bit (36),				/* Identifier used for calls to tape_ioi_ */
+  1    93        2 attach_info_ptr ptr,				/* Pointer to attach option info */
+  1    94        2 open_info_ptr ptr,				/* Pointer to open option info */
+  1    95        2 close_info_ptr ptr,				/* Pointer to close option info */
+  1    96        2 detach_info_ptr ptr,				/* Pointer to detach option info */
+  1    97        2 pfm_info_ptr ptr,				/* Pointer to PFM info block */
+  1    98        2 saved_pfm_info_ptr ptr,			/* Pointer to info for "change_module" control OP */
+  1    99        2 pfm_name char (32),				/* Name of Per-Format module */
+  1   100        2 pfm_required_entries like pfm_entries,		/* Required entry point declarations in PFM */
+  1   101        2 pfm_work_area (32) fixed bin (35);		/* PFM work buffer */
+  1   102 
+  1   103 dcl  1 pfm_entries based aligned,			/* Entry declarations for PFM entries */
+  1   104        2 pfm_init entry (ptr, fixed bin (35)),		/* PFM initialization entry */
+  1   105        2 file_open entry (ptr, fixed bin (35)),		/* PFM file_open entry */
+  1   106        2 file_close entry (ptr, fixed bin (35)),		/* PFM file_close entry */
+  1   107        2 read entry (ptr, fixed bin (35)),		/* PFM read entry */
+  1   108        2 write entry (ptr, fixed bin (35)),		/* PFM write entry */
+  1   109        2 order entry (ptr, char (*), ptr, ptr, fixed bin (35)), /* PFM control order entry */
+  1   110        2 decode_file_labels entry (ptr, ptr, fixed bin, fixed bin, fixed bin (35)),
+  1   111        2 encode_file_labels entry (ptr, ptr, fixed bin, fixed bin, fixed bin, fixed bin (35));
+  1   112 
+  1   113 dcl  all_buf_ptrs (16) ptr based (addr (mtape_data.buf_ptrs));
+  1   114 dcl  all_buf_lens (16) fixed bin (21) based (addr (mtape_data.buf_len));
+  1   115 dcl  tape_blk (mtape_data.length) char (1) unaligned based (mtape_data.cur_buf_ptr); /* template for a tape block */
+  1   116 
+  1   117 /* END INCLUDE FILE mtape_data.incl.pl1 */
+      896 
+      897 
+  2     1 /* BEGIN INCLUDE FILE mtape_vol_set.incl.pl1. Created by J. A. Bush 10/13/82 */
+  2     2 /* The include file mtape_err_stats.incl.pl1 is referenced by this include file */
+  2     3 /* format: style4 */
+  2     4 
+  2     5 dcl  vs_ptr ptr;
+  2     6 
+  2     7 dcl  mtape_vs_version_1 char (8) int static options (constant) init ("mtvsv001");
+  2     8 
+  2     9 dcl  1 mtape_vol_set aligned based (vs_ptr),
+  2    10        2 version char (8),				/* Current version */
+  2    11        2 prev_vs_ptr ptr,				/* Pointer to previous volume set entry */
+  2    12        2 next_vs_ptr ptr,				/* Pointer to next volume set entry */
+  2    13        2 mrm_vs_ptr ptr,				/* Pointer to Most Recently Mounted VS member */
+  2    14        2 lrm_vs_ptr ptr,				/* Pointer to Least Recently Mounted VS member */
+  2    15        2 first_vl_ptr ptr,				/* Pointer to the first volume label record structure */
+  2    16        2 last_vl_ptr ptr,				/* Pointer to the last volume label record structure */
+  2    17        2 volume_name char (32),			/* Name specified in the attach description */
+  2    18        2 volume_id char (32),				/* Name as recorded in the volume label */
+  2    19        2 mount_comment char (64),			/* Mount comment from attach description */
+  2    20        2 demount_comment char (64),			/* Demount comment from detach description */
+  2    21        2 device_name char (8),			/* Device volume is currently or last mounted on */
+  2    22        2 rcp_id bit (36),				/* RCP activation for this volume */
+  2    23        2 tioi_id bit (36),				/* tape_ioi_ activation for this volume */
+  2    24        2 volume_index fixed bin,			/* Volume sequence number within volume set */
+  2    25        2 volume_density fixed bin,			/* Actual volume density determined by RCP */
+  2    26        2 volume_type fixed bin,			/* Use rcp_volume_formats.incl.pl1 for decode */
+  2    27        2 volume_check fixed bin,			/* Refer to named constants below for values */
+  2    28        2 number_of_vol_labels fixed bin,		/* # of volume label records on this volume */
+  2    29        2 auth_required bit (1),			/* "1"b => Operator authentication was required */
+  2    30        2 mounted bit (1),				/* "1"b => volume currently mounted */
+  2    31        2 ever_mounted bit (1),			/* "1"b => volume has been mounted */
+  2    32        2 volume_end bit (1),				/* "1"b => reached end of volume (EOT foil) on write */
+  2    33        2 first_file_unexpired bit (1),			/* "1"b => first file of volume is unexpired */
+  2    34        2 dev_att_retry bit (1),			/* "1"b => DEVICE ATTENTION recovery in progress */
+  2    35        2 pwr_off_retry bit (1),			/* "1"b => POWER OFF recovery in progress */
+  2    36        2 mounts fixed bin,				/* Number of times volume mounted during attachment */
+  2    37        2 tot_error_stats like mtape_err_stats,		/* Summation of error statistics for all mounts */
+  2    38        2 rel_error_stats like mtape_err_stats;		/* Summation of error statistics, this mount */
+  2    39 
+  2    40 /* Named constants applied to volume_check variable, when volume label read by PFMs pfm_init entry */
+  2    41 
+  2    42 dcl  (MTAPE_VOLUME init (1),				/* Volume recorded by mtape_ (desired type) */
+  2    43      MULT_PRIOR_VOLUME init (2),			/* Volume recorded by prior Multics software
+  2    44*						   (desired type) */
+  2    45      NON_MULT_VOLUME init (3),			/* Volume recorded by other vendor (desired type) */
+  2    46      BLANK_VOLUME init (4),				/* Volume is blank/unreadable */
+  2    47      UNLABELED_VOLUME init (5),			/* Volume is unlabeled or has unrecognized label */
+  2    48      RECOG_FORMAT_VOLUME init (6)			/* Volume has label of other recognized format */
+  2    49      ) fixed bin int static options (constant);
+  2    50 
+  2    51 /* END INCLUDE FILE mtape_vol_set.incl.pl1 */
+      898 
+      899 
+  3     1 /* BEGIN INCLUDE FILE mtape_label_record.incl.pl1. Created by J. A. Bush 10/13/82 */
+  3     2 /* format: style4 */
+  3     3 
+  3     4 dcl  lr_ptr ptr;
+  3     5 
+  3     6 dcl  mtape_lr_version_1 char (8) int static options (constant) init ("mtlrv001");
+  3     7 
+  3     8 dcl  1 mtape_label_record aligned based (lr_ptr),
+  3     9        2 version char (8),				/* Current version */
+  3    10        2 prev_lab_ptr ptr,				/* Pointer to previous label record structure */
+  3    11        2 next_lab_ptr ptr,				/* Pointer to next label record structure */
+  3    12        2 lab_ptr ptr,				/* Pointer to the actual format specific label record */
+  3    13        2 lab_length fixed bin,			/* Length in 9 bit bytes of the label record */
+  3    14        2 mode fixed bin,				/* Hardware recording mode:
+  3    15*						   1 = binary
+  3    16*						   2 = nine
+  3    17*						   3 = bcd */
+  3    18        2 conversion fixed bin;			/* Character set conversion required:
+  3    19*						   1 = no conversion
+  3    20*						   2 = ASCII <==> EBCDIC (any case)
+  3    21*						   3 = ASCII <==> BCD
+  3    22*						   4 = ASCII ==> Upper case ASCII
+  3    23*						   5 = ASCII ==> Upper case EBCDIC */
+  3    24 
+  3    25 /* END INCLUDE FILE mtape_label_record.incl.pl1 */
+      900 
+      901 
+  4     1 /* BEGIN INCLUDE FILE mtape_err_stats.incl.pl1. Created by J. A. Bush 07/22/83. */
+  4     2 /* format: style4 */
+  4     3 
+  4     4 dcl  es_ptr ptr;
+  4     5 
+  4     6 dcl  1 mtape_err_stats aligned based (es_ptr),		/* Error statistics block */
+  4     7        2 read like err_entry,				/* For read operations */
+  4     8        2 write like err_entry,			/* For write operations */
+  4     9        2 orders like err_entry,			/* For non-data xfer operations */
+  4    10        2 successful_retry (7) fixed bin (35);		/* retrys that succeeded after 1-7 trys */
+  4    11 
+  4    12 dcl  1 err_entry aligned based,
+  4    13        2 errors fixed bin (35),
+  4    14        2 operations fixed bin (35);
+  4    15 
+  4    16 /* END INCLUDE FILE mtape_err_stats.incl.pl1 */
+      902 
+      903 
+  5     1 /* BEGIN INCLUDE FILE mtape_file_info.incl.pl1. Created by J. A. Bush 10/13/82 */
+  5     2 /* format: style4 */
+  5     3 
+  5     4 dcl  fi_ptr ptr;
+  5     5 
+  5     6 dcl  mtape_fi_version_1 char (8) int static options (constant) init ("mtfiv001");
+  5     7 
+  5     8 dcl  1 mtape_file_info aligned based (fi_ptr),
+  5     9        2 version char (8),				/* Current version */
+  5    10        2 prev_fi_ptr ptr,				/* Pointer to the previous file info structure */
+  5    11        2 next_fi_ptr ptr,				/* Pointer to the next file info structure */
+  5    12        2 first_file_lab_ptr ptr,			/* Pointer to 1st label record struc. */
+  5    13        2 last_file_lab_ptr ptr,			/* Pointer to last label record struc. */
+  5    14        2 first_file_trail_ptr ptr,			/* Pointer to 1st trailer record struc. */
+  5    15        2 last_file_trail_ptr ptr,			/* Pointer to last trailer record struc. */
+  5    16        2 first_file_section_ptr ptr,			/* Pointer to file_info struct. of 1st file section */
+  5    17        2 begin_vs_ptr ptr,				/* Pointer to 1st volume set struct. containing this file */
+  5    18        2 end_vs_ptr ptr,				/* Pointer to last volume set struct. containing this file */
+  5    19        2 position_within_file fixed bin,		/* 0 = In HDR; 1 = In data file; 2 = In trailer;
+  5    20*						   3 = Not positioned within this file
+  5    21*						   4 = At beginning of data file; 5 = At EOF */
+  5    22        2 per_file_info,				/* Information pertaining to entire file */
+  5    23          3 file_id char (32),				/* File identifier or name */
+  5    24          3 file_set_id char (32),			/* Identifies the file set */
+  5    25          3 creation_date char (6),			/* File creation date in form " yyddd" */
+  5    26          3 expiration_date char (6),			/* File expiration date in form " yyddd" */
+  5    27          3 file_code char (3),			/* Printable file code */
+  5    28          3 file_format fixed bin,			/* Current file format:
+  5    29*						   0 = unspecified; 1 = U; 2 = F; 3 = D or V;
+  5    30*						   4 = S or VS; 5 = FB;
+  5    31*						   6 = DB or VB; 7 = SB or VBS; */
+  5    32          3 seq_number fixed bin,			/* File sequence number */
+  5    33          3 generation fixed bin,			/* File generation number, if supported */
+  5    34          3 gen_version fixed bin,			/* File generation version number, if supported */
+  5    35          3 char_size fixed bin,			/* Size in bits of the data chars of this file */
+  5    36          3 hdw_mode fixed bin,			/* Hardware mode: 1 = binary; 2 = nine; 3 = BCD */
+  5    37          3 conversion fixed bin,			/* File data conversion:
+  5    38*						   1 = no conversion; 2 = ASCII<->EBCDIC; 3 = ASCII<->BCD */
+  5    39          3 buffer_offset fixed bin,			/* Number of bytes prior to data */
+  5    40          3 length_mode fixed bin,			/* 0 => W/R mod 4 blocks; 1 => W/R non-mod 4 blocks */
+  5    41          3 block_size fixed bin (21),			/* Maximum block size for this file */
+  5    42          3 record_size fixed bin (21),			/* Maximum record size for this file */
+  5    43          3 native_file bit (1),			/* "1"b => current file written by mtape_ PFM */
+  5    44          3 user_labels_present bit (1),			/* "1"b => UHL<n>/UTL<n> are present */
+  5    45          3 unlabeled_file bit (1),			/* "1"b => this is unlabeled file */
+  5    46          3 pfm_opt_sw (5) bit (1),			/* PFM dependent */
+  5    47          3 pfm_opt_value (5) fixed bin (35),		/* PFM dependent */
+  5    48          3 pfm_opt_str (5) char (32),			/* PFM dependent */
+  5    49        2 per_section_info,				/* Information pertaining only to this file section */
+  5    50          3 section fixed bin,				/* File section number for multi-volume files */
+  5    51          3 phy_file fixed bin,			/* Phy. file of HDR label GRP, on the current volume */
+  5    52          3 first_file_on_volume bit (1),		/* "1"b => First file or file section on this volume */
+  5    53          3 end_of_file_set bit (1),			/* "1"b => This is last file of file set */
+  5    54          3 block_count fixed bin (35),			/* Number of blocks in this file section */
+  5    55          3 read_errors fixed bin (35),			/* of errors encountered reading this file */
+  5    56          3 write_errors fixed bin (35);			/* of errors encountered writing this file */
+  5    57 
+  5    58 /* END INCLUDE FILE mtape_file_info.incl.pl1 */
+      904 
+      905 
+  6     1 /* BEGIN INCLUDE FILE mtape_constants.incl.pl1. Created by J. A. Bush 10/07/82 */
+  6     2 /* format: style4 */
+  6     3 
+  6     4 /* This include file defines various named constants used throughout mtape_
+  6     5*   and its associated Per-Format modules */
+  6     6 
+  6     7 /* Storage allocation constants, used to denote what type of storage to allocate */
+  6     8 
+  6     9 dcl  (MTAPE_ALLOC_VS init (1),			/* to allocate a volume_set structure */
+  6    10      MTAPE_ALLOC_LR init (2),				/* to allocate a label record structure */
+  6    11      MTAPE_ALLOC_FI init (3),				/* to allocate a file_info structure */
+  6    12      MTAPE_ALLOC_STR init (4)				/* to allocate a character string, or undefined block */
+  6    13      ) fixed bin int static options (constant);
+  6    14 
+  6    15 /* Volume density constants */
+  6    16 
+  6    17 dcl  MTAPE_VALID_DENSITIES (5) init (200, 556, 800, 1600, 6250)
+  6    18 	fixed bin int static options (constant);
+  6    19 
+  6    20 /* Device speed constants */
+  6    21 
+  6    22 dcl  MTAPE_SPEED_VALUES (4) init (0, 75, 125, 200)	/* 0 is any speed device */
+  6    23 	fixed bin int static options (constant);
+  6    24 
+  6    25 /* Hardware Mode constants */
+  6    26 
+  6    27 dcl  (MTAPE_HWM_BIN init (1),				/* For binary hardware mode */
+  6    28      MTAPE_HWM_NINE init (2),				/* For nine hardware mode */
+  6    29      MTAPE_HWM_BCD init (3)				/* For BCD hardware mode */
+  6    30      ) fixed bin int static options (constant);
+  6    31 
+  6    32 /* Data conversion constants */
+  6    33 
+  6    34 dcl  (MTAPE_UNSPECIFIED init (0),			/* attribute not specified */
+  6    35      MTAPE_NO_CONVERSION init (1),			/* No conversion on input or output */
+  6    36      MTAPE_CV_EBCDIC init (2),			/* Convert to/from EBCDIC (from/to ASCII) */
+  6    37      MTAPE_CV_BCD init (3),				/* Convert to/from BCD (from/to ASCII) */
+  6    38      MTAPE_CV_UC_ASCII init (4),			/* Convert to Upper case ASCII (from any case ASCII) */
+  6    39      MTAPE_CV_UC_EBCDIC init (5)			/* Convert to Upper case EBCDIC (from any case ASCII) */
+  6    40      ) fixed bin int static options (constant);
+  6    41 
+  6    42 /* File positioning constants */
+  6    43 
+  6    44 dcl  (NOT_POSITIONED_IN_FILE init (0),			/* Not currently positioned within this file */
+  6    45      AT_BOFH init (1),				/* Positioned at beginning of file hdr */
+  6    46      AT_EOFH init (2),				/* Positioned at end of file hdr */
+  6    47      AT_BOFD init (3),				/* Positioned at beginning of file data */
+  6    48      AT_IFD init (4),				/* Positioned in file data, not beginning */
+  6    49      AT_EOFD init (5),				/* Positioned prior to end of data file */
+  6    50      AT_BOFT init (6),				/* Positioned at beginning of trailer label file */
+  6    51      AT_EOFT init (7),				/* Positioned at end of trailer label file */
+  6    52      AT_EOF init (8),				/* Positioned after trailer labels at EOF */
+  6    53      FILES_PER_FILE_GRP init (3)			/* # of physical files per file (section) group */
+  6    54      ) fixed bin int static options (constant);
+  6    55 
+  6    56 dcl  (BOF_LABEL init (1),				/* indicates beginning of file label */
+  6    57      EOV_LABEL init (2),				/* indicates end of volume label */
+  6    58      EOF_LABEL init (3)				/* indicates end of file label */
+  6    59      ) fixed bin int static options (constant);
+  6    60 
+  6    61 /* user query constant codes */
+  6    62 
+  6    63 dcl  (Q_NO_NEXT_VOLUME init (1),
+  6    64      Q_LABELED_VOLUME init (2),
+  6    65      Q_UNEXPIRED_VOLUME init (3),
+  6    66      Q_INCORRECT_VOLUME init (4),
+  6    67      Q_UNEXPIRED_FILE init (5),
+  6    68      Q_ABORT_FILE init (6)
+  6    69      ) fixed bin int static options (constant);
+  6    70 
+  6    71 /* END INCLUDE FILE mtape_constants.incl.pl1 */
+      906 
+      907 
+  7     1 /*  START OF:	tape_ioi_dcls.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+  7     2 
+  7     3 /* Written 22 April 1982 by Chris Jones */
+  7     4 /* Modified September 1983 by Chris Jones for reserve_buffer and release_buffer */
+  7     5 /* format: style4,delnl,insnl,indattr,ifthen,declareind10,dclind10 */
+  7     6 
+  7     7 /* call   tape_ioi_$activate     (rsc_ptr, tioi_info_ptr, tioi_id, code); */
+  7     8 dcl	tape_ioi_$activate	   entry (ptr, ptr, bit (36) aligned, fixed bin (35));
+  7     9 
+  7    10 /* call   tape_ioi_$allocate_buffers (tioi_id, req_length, req_number, act_length, act_number, buffer_ptrs, code); */
+  7    11 dcl	tape_ioi_$allocate_buffers
+  7    12 			   entry (bit (36) aligned, fixed bin (21), fixed bin, fixed bin (21), fixed bin,
+  7    13 			   dim (*) ptr, fixed bin (35));
+  7    14 
+  7    15 /* call   tape_ioi_$allocate_work_area (tioi_id, req_size, act_size, work_area_ptr, code); */
+  7    16 dcl	tape_ioi_$allocate_work_area
+  7    17 			   entry (bit (36) aligned, fixed bin (19), fixed bin (19), ptr, fixed bin (35));
+  7    18 
+  7    19 /* call   tape_ioi_$buffer_status (tioi_id, buffer_ptr, tbs_ptr, code); */
+  7    20 dcl	tape_ioi_$buffer_status
+  7    21 			   entry (bit (36) aligned, ptr, ptr, fixed bin (35));
+  7    22 
+  7    23 /* call   tape_ioi_$check_order  (tioi_id, ocount, rx, code); */
+  7    24 dcl	tape_ioi_$check_order  entry (bit (36) aligned, fixed bin, fixed bin, fixed bin (35));
+  7    25 
+  7    26 /* call   tape_ioi_$check_read   (tioi_id, buffer_ptr, data_len, rx, code); */
+  7    27 dcl	tape_ioi_$check_read   entry (bit (36) aligned, ptr, fixed bin (21), fixed bin, fixed bin (35));
+  7    28 
+  7    29 /* call   tape_ioi_$check_write  (tioi_id, buffer_ptr, rx, code); */
+  7    30 dcl	tape_ioi_$check_write  entry (bit (36) aligned, ptr, fixed bin, fixed bin (35));
+  7    31 
+  7    32 /* call   tape_ioi_$deactivate   (tioi_id, error_ptr, code); */
+  7    33 dcl	tape_ioi_$deactivate   entry (bit (36) aligned, ptr, fixed bin (35));
+  7    34 
+  7    35 /* call   tape_ioi_$deallocate   (tioi_id, code); */
+  7    36 dcl	tape_ioi_$deallocate   entry (bit (36) aligned, fixed bin (35));
+  7    37 
+  7    38 /* call   tape_ioi_$deallocate_buffers   (tioi_id, code); */
+  7    39 dcl	tape_ioi_$deallocate_buffers
+  7    40 			   entry (bit (36) aligned, fixed bin (35));
+  7    41 
+  7    42 /* call   tape_ioi_$get_mode     (tioi_id, mode, data_ptr, code); */
+  7    43 dcl	tape_ioi_$get_mode	   entry (bit (36) aligned, char (*), ptr, fixed bin (35));
+  7    44 
+  7    45 /* call	tape_ioi_$get_statistics (tioi_id, tec_ptr, code); */
+  7    46 dcl	tape_ioi_$get_statistics
+  7    47 			   entry (bit (36) aligned, ptr, fixed bin (35));
+  7    48 
+  7    49 /* call   tape_ioi_$hardware_status (tioi_id, ths_ptr, code); */
+  7    50 dcl	tape_ioi_$hardware_status
+  7    51 			   entry (bit (36) aligned, ptr, fixed bin (35));
+  7    52 
+  7    53 /* call   tape_ioi_$list_buffers (tioi_id, state, buffer_ptrs, num_buffers, code); */
+  7    54 dcl	tape_ioi_$list_buffers entry (bit (36) aligned, fixed bin, dim (*) ptr, fixed bin, fixed bin (35));
+  7    55 
+  7    56 /* call   tape_ioi_$order        (tioi_id, order, count, data_ptr, ocount, rx, code); */
+  7    57 dcl	tape_ioi_$order	   entry (bit (36) aligned, char (4), fixed bin, ptr, fixed bin, fixed bin, fixed bin (35));
+  7    58 
+  7    59 /* call   tape_ioi_$queue_order  (tioi_id, order, count, data_ptr, code); */
+  7    60 dcl	tape_ioi_$queue_order  entry (bit (36) aligned, char (4), fixed bin, ptr, fixed bin (35));
+  7    61 
+  7    62 /* call   tape_ioi_$queue_read   (tioi_id, buffer_ptr, code); */
+  7    63 dcl	tape_ioi_$queue_read   entry (bit (36) aligned, ptr, fixed bin (35));
+  7    64 
+  7    65 /* call   tape_ioi_$queue_write  (tioi_id, buffer_ptr, data_len, code); */
+  7    66 dcl	tape_ioi_$queue_write  entry (bit (36) aligned, ptr, fixed bin (21), fixed bin (35));
+  7    67 
+  7    68 /* call   tape_ioi_$read         (tioi_id, buffer_ptr, data_len, rx, code); */
+  7    69 dcl	tape_ioi_$read	   entry (bit (36) aligned, ptr, fixed bin (21), fixed bin, fixed bin (35));
+  7    70 
+  7    71 /* call	tape_ioi_$release_buffer (tioi_id, buffer_ptr, code); */
+  7    72 dcl	tape_ioi_$release_buffer
+  7    73 			   entry (bit (36) aligned, ptr, fixed bin (35));
+  7    74 
+  7    75 /* call	tape_ioi_$reserve_buffer (tioi_id, buffer_ptr, code); */
+  7    76 dcl	tape_ioi_$reserve_buffer
+  7    77 			   entry (bit (36) aligned, ptr, fixed bin (35));
+  7    78 
+  7    79 /* call	tape_ioi_$reset_statistics (tioi_id, code); */
+  7    80 dcl	tape_ioi_$reset_statistics
+  7    81 			   entry (bit (36) aligned, fixed bin (35));
+  7    82 
+  7    83 /* call   tape_ioi_$set_buffer_ready (tioi_id, buffer_ptr, code); */
+  7    84 dcl	tape_ioi_$set_buffer_ready
+  7    85 			   entry (bit (36) aligned, ptr, fixed bin (35));
+  7    86 
+  7    87 /* call   tape_ioi_$set_mode     (tioi_id, mode, data_ptr, code); */
+  7    88 dcl	tape_ioi_$set_mode	   entry (bit (36) aligned, char (*), ptr, fixed bin (35));
+  7    89 
+  7    90 /* call   tape_ioi_$stop_tape    (tioi_id, count, rx, code); */
+  7    91 dcl	tape_ioi_$stop_tape	   entry (bit (36) aligned, fixed bin, fixed bin, fixed bin (35));
+  7    92 
+  7    93 /* call   tape_ioi_$write        (tioi_id, write_buffer_ptrs, data_len, buffer_ptr, rx, code); */
+  7    94 dcl	tape_ioi_$write	   entry (bit (36) aligned, (*) ptr, fixed bin (21), ptr, fixed bin, fixed bin (35));
+  7    95 
+  7    96 /*  END OF:	tape_ioi_dcls.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+      908 
+      909 
+  8     1 /* Begin include file ..... tape_ioi_buffer_status.incl.pl1 */
+  8     2 
+  8     3 /* This structure defines the data returned by tape_ioi_$buffer_status */
+  8     4 /* Modified April 1982 by Chris Jones */
+  8     5 /* Modified 2 February 1983 by Chris Jones to add support for reserved buffers. */
+  8     6 /* format: style4,delnl,insnl,indattr,ifthen,declareind10,dclind10 */
+  8     7 dcl	tbs_ptr		   ptr;
+  8     8 
+  8     9 dcl	1 tbs		   aligned based (tbs_ptr),
+  8    10 	  2 version	   fixed bin,
+  8    11 	  2 state		   fixed bin,
+  8    12 	  2 buffer_len	   fixed bin (21),
+  8    13 	  2 data_len	   fixed bin (21),
+  8    14 	  2 bit_count	   fixed bin (24),
+  8    15 	  2 channel_inst	   bit (6),
+  8    16 	  2 data_mode	   char (4),
+  8    17 	  (
+  8    18 	  2 align_mode	   bit (1),
+  8    19 	  2 length_mode	   bit (1),
+  8    20 	  2 recovery_mode	   bit (1),
+  8    21 	  2 reserved bit (1),
+  8    22 	  2 pad		   bit (32)
+  8    23 	  )		   unal;
+  8    24 
+  8    25 dcl	TBS_VERSION_1	   fixed bin internal static init (1) options (constant);
+  8    26 
+  8    27 dcl	TBS_VERSION	   fixed bin internal static init (1) options (constant);
+  8    28 
+  8    29 dcl	READY_STATE	   fixed bin internal static options (constant) init (1);
+  8    30 dcl	QUEUED_STATE	   fixed bin internal static options (constant) init (2);
+  8    31 dcl	SUSPENDED_STATE	   fixed bin internal static options (constant) init (3);
+  8    32 dcl READY_AND_RESERVED_STATE fixed bin internal static options (constant) init (4);
+  8    33 
+  8    34 /* End include file ..... tape_ioi_buffer_status.incl.pl1 */
+      910 
+      911 
+  9     1 /*  START OF:	tape_ioi_result_indexes.incl.pl1	  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+  9     2 
+  9     3 /* Result indexes for tape_ioi_.  */
+  9     4 /* Written 11 May 1982 by Chris Jones */
+  9     5 
+  9     6 /* format: style4,delnl,insnl,indattr,ifthen,declareind10,dclind10 */
+  9     7 dcl	TAPE_IO_BLOCK	   fixed bin static options (constant) init (-1);
+  9     8 dcl	TAPE_IO_SUCCESS	   fixed bin static options (constant) init (0);
+  9     9 dcl	TAPE_IO_USER_PROGRAM_ERROR
+  9    10 			   fixed bin static options (constant) init (1);
+  9    11 dcl	TAPE_IO_UNRECOVERABLE_IO_ERROR
+  9    12 			   fixed bin static options (constant) init (2);
+  9    13 dcl	TAPE_IO_RECOVERABLE_IO_ERROR
+  9    14 			   fixed bin static options (constant) init (3);
+  9    15 dcl	TAPE_IO_EOF	   fixed bin static options (constant) init (4);
+  9    16 dcl	TAPE_IO_EOT	   fixed bin static options (constant) init (5);
+  9    17 dcl	TAPE_IO_BOT	   fixed bin static options (constant) init (6);
+  9    18 dcl	TAPE_IO_RECOVERABLE_IO_ERROR_AND_EOT
+  9    19 			   fixed bin static options (constant) init (7);
+  9    20 dcl	TAPE_IO_CODE_ALERT	   fixed bin static options (constant) init (8);
+  9    21 
+  9    22 /*  END OF:	tape_ioi_result_indexes.incl.pl1	  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+      912 
+ 10     1 /* Begin include file ..... tape_ioi_hw_status.incl.pl1 */
+ 10     2 
+ 10     3 /* This structure defines the data returned by tape_ioi_$hardware_status */
+ 10     4 
+ 10     5 /* format: style4,delnl,insnl,indattr,ifthen,declareind10,dclind10 */
+ 10     6 /* Written May 1982 by Chris Jones */
+ 10     7 /* Modified 15 June 1982 by Chris Jones to add reformatted status constants */
+ 10     8 
+ 10     9 dcl	ths_ptr		   ptr;
+ 10    10 
+ 10    11 dcl	1 ths		   aligned based (ths_ptr),
+ 10    12 	  2 version	   fixed bin,
+ 10    13 	  2 description	   char (256) varying,
+ 10    14 	  2 major		   fixed bin,
+ 10    15 	  2 minor		   bit (36),
+ 10    16 	  2 iom		   bit (72),
+ 10    17 	  2 lpw		   bit (72);
+ 10    18 
+ 10    19 dcl	THS_VERSION_1	   fixed bin static options (constant) init (1);
+ 10    20 dcl	THS_VERSION	   fixed bin static options (constant) init (1);
+ 10    21 
+ 10    22 /* The following are used to describe the status in a non-hardware specific way. */
+ 10    23 
+ 10    24 /* Major Status */
+ 10    25 
+ 10    26 dcl	SUBSYSTEM_READY	   fixed bin static options (constant) init (0);
+ 10    27 dcl	DEVICE_BUSY	   fixed bin static options (constant) init (1);
+ 10    28 dcl	DEVICE_ATTENTION	   fixed bin static options (constant) init (2);
+ 10    29 dcl	DEVICE_DATA_ALERT	   fixed bin static options (constant) init (3);
+ 10    30 dcl	END_OF_FILE	   fixed bin static options (constant) init (4);
+ 10    31 dcl	COMMAND_REJECT	   fixed bin static options (constant) init (5);
+ 10    32 dcl	MPC_DEVICE_ATTENTION   fixed bin static options (constant) init (10);
+ 10    33 dcl	MPC_DEVICE_DATA_ALERT  fixed bin static options (constant) init (11);
+ 10    34 dcl	MPC_COMMAND_REJECT	   fixed bin static options (constant) init (13);
+ 10    35 dcl	POWER_OFF		   fixed bin static options (constant) init (16);
+ 10    36 dcl	SYSTEM_FAULT	   fixed bin static options (constant) init (17);
+ 10    37 dcl	IOM_CENTRAL	   fixed bin static options (constant) init (18);
+ 10    38 dcl	IOM_CHANNEL	   fixed bin static options (constant) init (19);
+ 10    39 dcl	TIME_OUT		   fixed bin static options (constant) init (20);
+ 10    40 
+ 10    41 /* Minor Status */
+ 10    42 
+ 10    43 /* Minor status for SUBSYSTEM_READY */
+ 10    44 
+ 10    45 dcl	WRITE_PROTECTED	   bit (36) aligned static options (constant)
+ 10    46 			   init ("100000000000000000000000000000000000"b);
+ 10    47 dcl	AT_BOT		   bit (36) aligned static options (constant)
+ 10    48 			   init ("010000000000000000000000000000000000"b);
+ 10    49 dcl	TWO_BIT_FILL	   bit (36) aligned static options (constant)
+ 10    50 			   init ("001000000000000000000000000000000000"b);
+ 10    51 dcl	FOUR_BIT_FILL	   bit (36) aligned static options (constant)
+ 10    52 			   init ("000100000000000000000000000000000000"b);
+ 10    53 dcl	SIX_BIT_FILL	   bit (36) aligned static options (constant)
+ 10    54 			   init ("000010000000000000000000000000000000"b);
+ 10    55 dcl	ASCII_ALERT	   bit (36) aligned static options (constant)
+ 10    56 			   init ("000001000000000000000000000000000000"b);
+ 10    57 
+ 10    58 /* Minor status for DEVICE_BUSY */
+ 10    59 
+ 10    60 dcl	REWINDING		   bit (36) aligned static options (constant)
+ 10    61 			   init ("100000000000000000000000000000000000"b);
+ 10    62 dcl	RESERVED		   bit (36) aligned static options (constant)
+ 10    63 			   init ("010000000000000000000000000000000000"b);
+ 10    64 dcl	ALTERNATE_CHANNEL	   bit (36) aligned static options (constant)
+ 10    65 			   init ("001000000000000000000000000000000000"b);
+ 10    66 dcl	LOADING		   bit (36) aligned static options (constant)
+ 10    67 			   init ("000100000000000000000000000000000000"b);
+ 10    68 
+ 10    69 /* Minor status for DEVICE_ATTENTION */
+ 10    70 
+ 10    71 /* WRITE_PROTECTED declared above with SUBSYSTEM_READY status */
+ 10    72 
+ 10    73 dcl	NO_SUCH_HANDLER	   bit (36) aligned static options (constant)
+ 10    74 			   init ("010000000000000000000000000000000000"b);
+ 10    75 dcl	HANDLER_IN_STANDBY	   bit (36) aligned static options (constant)
+ 10    76 			   init ("001000000000000000000000000000000000"b);
+ 10    77 dcl	HANDLER_CHECK	   bit (36) aligned static options (constant)
+ 10    78 			   init ("000100000000000000000000000000000000"b);
+ 10    79 dcl	BLANK_TAPE_ON_WRITE	   bit (36) aligned static options (constant)
+ 10    80 			   init ("000010000000000000000000000000000000"b);
+ 10    81 
+ 10    82 /* Minor status for DEVICE_DATA_ALERT */
+ 10    83 
+ 10    84 dcl	TRANSFER_TIMING_ALERT  bit (36) aligned static options (constant)
+ 10    85 			   init ("100000000000000000000000000000000000"b);
+ 10    86 dcl	BLANK_TAPE_ON_READ	   bit (36) aligned static options (constant)
+ 10    87 			   init ("010000000000000000000000000000000000"b);
+ 10    88 dcl	BIT_DURING_ERASE	   bit (36) aligned static options (constant)
+ 10    89 			   init ("001000000000000000000000000000000000"b);
+ 10    90 dcl	TRANSMISSION_PARITY_ALERT
+ 10    91 			   bit (36) aligned static options (constant)
+ 10    92 			   init ("000100000000000000000000000000000000"b);
+ 10    93 dcl	LATERAL_PARITY_ALERT   bit (36) aligned static options (constant)
+ 10    94 			   init ("000010000000000000000000000000000000"b);
+ 10    95 dcl	LONGITUDINAL_PARITY_ALERT
+ 10    96 			   bit (36) aligned static options (constant)
+ 10    97 			   init ("000001000000000000000000000000000000"b);
+ 10    98 dcl	END_OF_TAPE	   bit (36) aligned static options (constant)
+ 10    99 			   init ("000000100000000000000000000000000000"b);
+ 10   100 
+ 10   101 /* Minor status for END_OF_FILE */
+ 10   102 
+ 10   103 dcl	DATA_ALERT_CONDITION   bit (36) aligned static options (constant)
+ 10   104 			   init ("100000000000000000000000000000000000"b);
+ 10   105 
+ 10   106 /* Minor status for COMMAND_REJECT */
+ 10   107 
+ 10   108 dcl	READ_AFTER_WRITE	   bit (36) aligned static options (constant)
+ 10   109 			   init ("100000000000000000000000000000000000"b);
+ 10   110 /**** AT_BOT declared above with SUBSYSTEM_READY status */
+ 10   111 dcl	BAD_IDCW_PARITY	   bit (36) aligned static options (constant)
+ 10   112 			   init ("001000000000000000000000000000000000"b);
+ 10   113 dcl	BAD_DEVICE_CODE	   bit (36) aligned static options (constant)
+ 10   114 			   init ("000100000000000000000000000000000000"b);
+ 10   115 dcl	BAD_OP_CODE	   bit (36) aligned static options (constant)
+ 10   116 			   init ("000010000000000000000000000000000000"b);
+ 10   117 dcl	BAD_DENSITY	   bit (36) aligned static options (constant)
+ 10   118 			   init ("000001000000000000000000000000000000"b);
+ 10   119 dcl	NINE_TRACK_ERROR	   bit (36) aligned static options (constant)
+ 10   120 			   init ("000000100000000000000000000000000000"b);
+ 10   121 
+ 10   122 /* Minor status for MPC_DEVICE_ATTENTION */
+ 10   123 
+ 10   124 dcl	CONFIG_SWITCH_ERROR	   bit (36) aligned static options (constant)
+ 10   125 			   init ("100000000000000000000000000000000000"b);
+ 10   126 dcl	MULTIPLE_DEVICES	   bit (36) aligned static options (constant)
+ 10   127 			   init ("010000000000000000000000000000000000"b);
+ 10   128 dcl	ILLEGAL_DEVICE_ID	   bit (36) aligned static options (constant)
+ 10   129 			   init ("001000000000000000000000000000000000"b);
+ 10   130 dcl	INCOMPATIBLE_MODE	   bit (36) aligned static options (constant)
+ 10   131 			   init ("000100000000000000000000000000000000"b);
+ 10   132 dcl	TCA_MALFUNCTION	   bit (36) aligned static options (constant)
+ 10   133 			   init ("000010000000000000000000000000000000"b);
+ 10   134 dcl	MTH_MALFUNCTION	   bit (36) aligned static options (constant)
+ 10   135 			   init ("000001000000000000000000000000000000"b);
+ 10   136 dcl	MULTIPLE_BOT	   bit (36) aligned static options (constant)
+ 10   137 			   init ("000000100000000000000000000000000000"b);
+ 10   138 
+ 10   139 /* Minor status for MPC_DEVICE_DATA_ALERT */
+ 10   140 
+ 10   141 dcl	BYTE_LOCKED_OUT	   bit (36) aligned static options (constant)
+ 10   142 			   init ("100000000000000000000000000000000000"b);
+ 10   143 dcl	INCONSISTENT_COMMAND   bit (36) aligned static options (constant)
+ 10   144 			   init ("010000000000000000000000000000000000"b);
+ 10   145 dcl	SUM_CHECK_ERROR	   bit (36) aligned static options (constant)
+ 10   146 			   init ("001000000000000000000000000000000000"b);
+ 10   147 /**** TRANSMISSION_PARITY_ALERT declared above with DEVICE_DATA_ALERT */
+ 10   148 dcl	ID_BURST_WRITE_ERROR   bit (36) aligned static options (constant)
+ 10   149 			   init ("000010000000000000000000000000000000"b);
+ 10   150 dcl	PREAMBLE_ERROR	   bit (36) aligned static options (constant)
+ 10   151 			   init ("000001000000000000000000000000000000"b);
+ 10   152 dcl	MARGINAL_CONDITION	   bit (36) aligned static options (constant)
+ 10   153 			   init ("000000100000000000000000000000000000"b);
+ 10   154 dcl	MULTI_TRACK_ERROR	   bit (36) aligned static options (constant)
+ 10   155 			   init ("000000010000000000000000000000000000"b);
+ 10   156 dcl	SKEW_ERROR	   bit (36) aligned static options (constant)
+ 10   157 			   init ("000000001000000000000000000000000000"b);
+ 10   158 dcl	POSTAMBLE_ERROR	   bit (36) aligned static options (constant)
+ 10   159 			   init ("000000000100000000000000000000000000"b);
+ 10   160 dcl	NRZI_CCC_ERROR	   bit (36) aligned static options (constant)
+ 10   161 			   init ("000000000010000000000000000000000000"b);
+ 10   162 dcl	CODE_ALERT	   bit (36) aligned static options (constant)
+ 10   163 			   init ("000000000001000000000000000000000000"b);
+ 10   164 
+ 10   165 /* Minor status for MPC_COMMAND_REJECT */
+ 10   166 
+ 10   167 dcl	ILLEGAL_PROCEDURE	   bit (36) aligned static options (constant)
+ 10   168 			   init ("100000000000000000000000000000000000"b);
+ 10   169 dcl	ILLEGAL_LC_NUMBER	   bit (36) aligned static options (constant)
+ 10   170 			   init ("010000000000000000000000000000000000"b);
+ 10   171 dcl	ILLEGAL_SUSPENDED_LC_NUMBER
+ 10   172 			   bit (36) aligned static options (constant)
+ 10   173 			   init ("001000000000000000000000000000000000"b);
+ 10   174 dcl	CONTINUE_BIT_NOT_SET   bit (36) aligned static options (constant)
+ 10   175 			   init ("000100000000000000000000000000000000"b);
+ 10   176 
+ 10   177 /* Minor status for POWER_OFF */
+ 10   178 
+ 10   179 /* There are no minor statuses defined for POWER_OFF. */
+ 10   180 
+ 10   181 /* Minor status for SYSTEM_FAULT */
+ 10   182 
+ 10   183 /* Minor status for IOM_CENTRAL */
+ 10   184 
+ 10   185 dcl	LPW_TRO		   bit (36) aligned static options (constant)
+ 10   186 			   init ("100000000000000000000000000000000000"b);
+ 10   187 dcl	CONSECUTIVE_TDCWS	   bit (36) aligned static options (constant)
+ 10   188 			   init ("010000000000000000000000000000000000"b);
+ 10   189 dcl	BOUNDARY_ERROR	   bit (36) aligned static options (constant)
+ 10   190 			   init ("001000000000000000000000000000000000"b);
+ 10   191 dcl	EXT_CHANGE_WHILE_RESTRICTED
+ 10   192 			   bit (36) aligned static options (constant)
+ 10   193 			   init ("000100000000000000000000000000000000"b);
+ 10   194 dcl	IDCW_WHILE_RESTRICTED  bit (36) aligned static options (constant)
+ 10   195 			   init ("000010000000000000000000000000000000"b);
+ 10   196 dcl	CP_SIZE_DISCREPANCY	   bit (36) aligned static options (constant)
+ 10   197 			   init ("000001000000000000000000000000000000"b);
+ 10   198 dcl	BUS_PARITY_FROM_CHANNEL
+ 10   199 			   bit (36) aligned static options (constant)
+ 10   200 			   init ("000000100000000000000000000000000000"b);
+ 10   201 
+ 10   202 /* Minor status for IOM_CHANNEL */
+ 10   203 
+ 10   204 dcl	CONNECT_WHILE_BUSY	   bit (36) aligned static options (constant)
+ 10   205 			   init ("100000000000000000000000000000000000"b);
+ 10   206 dcl	BAD_PCW_CHANNEL_INST   bit (36) aligned static options (constant)
+ 10   207 			   init ("010000000000000000000000000000000000"b);
+ 10   208 dcl	INCORRECT_DCW	   bit (36) aligned static options (constant)
+ 10   209 			   init ("001000000000000000000000000000000000"b);
+ 10   210 dcl	INCOMPLETE_COMMAND_SEQUENCE
+ 10   211 			   bit (36) aligned static options (constant)
+ 10   212 			   init ("000100000000000000000000000000000000"b);
+ 10   213 dcl	PARITY_ERROR_AT_PRPH_INTERFACE
+ 10   214 			   bit (36) aligned static options (constant)
+ 10   215 			   init ("000010000000000000000000000000000000"b);
+ 10   216 dcl	BUS_PARITY_TO_CHANNEL  bit (36) aligned static options (constant)
+ 10   217 			   init ("000001000000000000000000000000000000"b);
+ 10   218 
+ 10   219 /* Minor status for TIME_OUT */
+ 10   220 
+ 10   221 /* There are no minor statuses defined for TIME_OUT. */
+ 10   222 
+ 10   223 /* End include file ..... tape_ioi_hw_status.incl.pl1 */
+      913 
+      914 
+      915      end mtape_io_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/18/00  1123.6  mtape_io_.pl1                     >udd>sm>ds>w>ml>mtape_io_.pl1
+896          1    02/16/84  1552.3  mtape_data.incl.pl1               >ldd>incl>mtape_data.incl.pl1
+898          2    02/16/84  1552.4  mtape_vol_set.incl.pl1            >ldd>incl>mtape_vol_set.incl.pl1
+900          3    02/16/84  1552.3  mtape_label_record.incl.pl1       >ldd>incl>mtape_label_record.incl.pl1
+902          4    02/16/84  1552.3  mtape_err_stats.incl.pl1          >ldd>incl>mtape_err_stats.incl.pl1
+904          5    02/16/84  1552.3  mtape_file_info.incl.pl1          >ldd>incl>mtape_file_info.incl.pl1
+906          6    02/16/84  1552.3  mtape_constants.incl.pl1          >ldd>incl>mtape_constants.incl.pl1
+908          7    09/16/83  1210.4  tape_ioi_dcls.incl.pl1            >ldd>incl>tape_ioi_dcls.incl.pl1
+910          8    09/16/83  1210.4  tape_ioi_buffer_status.incl.pl1   >ldd>incl>tape_ioi_buffer_status.incl.pl1
+912          9    12/01/82  1139.8  tape_ioi_result_indexes.incl.pl1  >ldd>incl>tape_ioi_result_indexes.incl.pl1
+913         10    12/01/82  1139.8  tape_ioi_hw_status.incl.pl1       >ldd>incl>tape_ioi_hw_status.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+ALIGN_MODES                     000136 constant        bit(1)                   initial array dcl 76 set ref 556
+AT_BOFD                                constant        fixed bin(17,0)          initial dcl 6-44 ref 579
+AT_BOFT                                constant        fixed bin(17,0)          initial dcl 6-44 ref 585
+AT_IFD                                 constant        fixed bin(17,0)          initial dcl 6-44 ref 579
+BACKWARD                               constant        bit(1)                   initial dcl 79 set ref 453* 457*
+BYTES_PER_DCW                          constant        fixed bin(17,0)          initial dcl 73 ref 312
+BYTES_PER_WORD                  005442 constant        fixed bin(17,0)          initial dcl 74 ref 164 166
+END_OF_FILE                            constant        fixed bin(17,0)          initial dcl 10-30 ref 582 615 678 710
+FORWARD                                constant        bit(1)                   initial dcl 79 set ref 461* 465* 679 696 711 721 731
+HDW_MODE_STR                    000142 constant        char(4)                  initial array packed unaligned dcl 70 set ref 548
+LC                              000157 constant        char(26)                 initial packed unaligned dcl 66 ref 355
+LENGTH_MODES                    000140 constant        bit(1)                   initial array dcl 75 set ref 552
+MTAPE_CV_UC_ASCII                      constant        fixed bin(17,0)          initial dcl 6-34 ref 355
+MTAPE_CV_UC_EBCDIC                     constant        fixed bin(17,0)          initial dcl 6-34 ref 355
+MTAPE_HWM_BIN                          constant        fixed bin(17,0)          initial dcl 6-27 ref 163
+NO_WAIT                         000132 constant        bit(1)                   initial dcl 79 set ref 497* 501*
+QUEUED_STATE                    000224 constant        fixed bin(17,0)          initial dcl 8-30 set ref 205*
+READY_STATE                     000226 constant        fixed bin(17,0)          initial dcl 8-29 set ref 186* 212* 278*
+RECOVERY_MODES                  000134 constant        bit(1)                   initial array dcl 77 set ref 560
+SUSPENDED_STATE                 000220 constant        fixed bin(17,0)          initial dcl 8-31 set ref 859*
+TAPE_IO_EOT                            constant        fixed bin(17,0)          initial dcl 9-16 ref 297
+TAPE_IO_SUCCESS                        constant        fixed bin(17,0)          initial dcl 9-8 ref 742
+THS_VERSION                            constant        fixed bin(17,0)          initial dcl 10-20 ref 801
+UC                              000150 constant        char(26)                 initial packed unaligned dcl 68 ref 355
+WAIT                            000214 constant        bit(1)                   initial dcl 79 set ref 492* 505*
+WAIT_MODES                      000132 constant        bit(1)                   initial array dcl 78 set ref 564
+WRITE_IO                               constant        fixed bin(17,0)          initial dcl 72 ref 312 776
+act_cnt                         000116 automatic       fixed bin(17,0)          dcl 59 set ref 472* 473 474 636* 644* 648* 654* 696
+                                                                                  698 833* 835
+act_length                      000105 automatic       fixed bin(21,0)          dcl 57 in procedure "mtape_io_" set ref 317* 324 328
+act_length                      000270 automatic       fixed bin(21,0)          dcl 596 in procedure "ALLOCATE_LABEL_BUFFER" set ref
+                                                                                  600*
+act_number                      000271 automatic       fixed bin(17,0)          dcl 597 set ref 600*
+addr                                                   builtin function         dcl 106 ref 149 167 234 259 259 261 261 288 317 548
+                                                                                  552 556 560 564 636 636 644 644 654 654 659 800
+all_buf_lens                           based           fixed bin(21,0)          array dcl 1-114 set ref 259* 261*
+all_buf_ptrs                           based           pointer                  array dcl 1-113 set ref 259* 261* 317*
+alloc_tries                     000122 automatic       fixed bin(17,0)          dcl 59 set ref 316*
+areap                     2            based           pointer                  level 2 dcl 1-8 ref 885
+arg_buf_size                           parameter       fixed bin(21,0)          dcl 46 set ref 308 312 317* 324
+arg_code                               parameter       fixed bin(35,0)          dcl 44 set ref 127 153* 158 239* 245 302* 308 337*
+                                                                                  343 386* 393 431* 438 528* 534 538* 544* 568* 576
+                                                                                  888* 892*
+arg_index                              parameter       fixed bin(17,0)          dcl 49 ref 534 548 552 556 560 564
+arg_infop                              parameter       pointer                  dcl 51 ref 438 443
+arg_lr_ptr                             parameter       pointer                  dcl 45 ref 343 347 393 397
+arg_mode                               parameter       char                     packed unaligned dcl 48 set ref 534 539 568*
+arg_mode_ptr                           parameter       pointer                  dcl 52 ref 534 537
+arg_mtdp                               parameter       pointer                  dcl 43 set ref 127 158 245 308 343 393 438 534 576
+                                                                                  873 884*
+arg_order                              parameter       char                     packed unaligned dcl 47 ref 438 441 444
+arg_repeat_cnt                         parameter       fixed bin(17,0)          dcl 50 in procedure "mtape_io_" ref 438 442 731 733
+arg_repeat_cnt                         parameter       fixed bin(17,0)          dcl 822 in procedure "DO_ORDER" ref 819 825
+ascii_to_bcd_                   000032 constant        entry                    external dcl 112 ref 369
+ascii_to_ebcdic_                000026 constant        entry                    external dcl 110 ref 365
+auto_ths                        000125 automatic       structure                level 1 dcl 62 set ref 800
+based_area                             based           area(1024)               dcl 122 ref 885
+based_bits                             based           bit                      packed unaligned dcl 121 set ref 369* 426*
+based_label                            based           char                     packed unaligned dcl 120 set ref 355* 355 361* 361
+                                                                                  365* 365* 369* 418* 418 422* 422* 426*
+bcd_to_ascii_                   000034 constant        entry                    external dcl 113 ref 426
+blk_pad                                based           char                     packed unaligned dcl 123 set ref 167*
+blk_rrcx                261            based           fixed bin(17,0)          level 3 dcl 1-8 set ref 788 790* 790 791 791*
+blk_rrrc                262            based           fixed bin(35,0)          array level 3 dcl 1-8 set ref 788* 791
+block_size              176            based           fixed bin(21,0)          level 3 dcl 1-8 ref 145 145
+buf_len                                parameter       fixed bin(17,0)          dcl 595 in procedure "ALLOCATE_LABEL_BUFFER" ref 593
+                                                                                  600 605
+buf_len                 122            based           fixed bin(21,0)          array level 3 in structure "mtape_data" dcl 1-8
+                                                                                  in procedure "mtape_io_" set ref 172* 177* 180*
+                                                                                  259 261
+buf_ptrs                 62            based           pointer                  array level 3 dcl 1-8 set ref 175 177* 180* 186* 193
+                                                                                  195 205* 212* 225* 231 257 257 259 261 278* 285
+                                                                                  286 311 317 332 333
+buf_size                143            based           fixed bin(21,0)          level 3 dcl 1-8 set ref 235 289 328*
+buffer_offset           175            based           fixed bin(17,0)          level 3 dcl 1-8 ref 148 233 287
+bufs_per_subset         144            based           fixed bin(17,0)          level 3 dcl 1-8 set ref 174 175 329* 330 330*
+cleanup                         000000 stack reference condition                dcl 102 ref 635
+cmtdp                    16            based           pointer                  level 2 dcl 1-8 set ref 885 886*
+code                            000106 automatic       fixed bin(35,0)          dcl 58 set ref 132* 134 141* 143 153 177* 179 180*
+                                                                                  186* 187 188* 198* 199 200* 205* 206 207* 212* 213
+                                                                                  214* 225* 239 251 259* 260 261* 267* 268 269* 271
+                                                                                  271* 274 278* 280 281* 302 315* 316 317* 319 322
+                                                                                  325* 334* 335 335* 337 351 375* 377 379* 380 381*
+                                                                                  383 386 400 404* 406 408* 409 411* 413 431 449*
+                                                                                  472* 476 476 479* 488 507 525 528 600* 601 602*
+                                                                                  603 636* 640* 642 644* 646 648* 650 654* 695 695*
+                                                                                  715* 730 757* 763* 766* 770* 773 779* 810* 811*
+                                                                                  824* 831 833* 840 841 841* 843* 859* 860 861* 877*
+                                                                                  878 879* 888* 892
+conversion               12            based           fixed bin(17,0)          level 2 dcl 3-8 ref 355 355 359 416
+copy                                                   builtin function         dcl 106 ref 167
+cur_block               160            based           structure                level 3 dcl 1-8
+cur_buf_idx             145            based           fixed bin(17,0)          level 3 dcl 1-8 set ref 172 173* 173 174 193* 195
+                                                                                  257 257 276 285* 332* 333
+cur_buf_ptr             160            based           pointer                  level 4 dcl 1-8 set ref 132* 141* 149 167 195* 198*
+                                                                                  200* 231* 234 286* 288 333*
+current_file            160            based           structure                level 2 dcl 1-8
+data_buffers             62            based           structure                level 2 dcl 1-8
+descrep_cnt                     000115 automatic       fixed bin(17,0)          dcl 59 set ref 582 587 616* 616 619 619* 640* 678
+                                                                                  710 711 719* 719 721 724 726 727 811*
+dev_att_retry           114            based           bit(1)                   level 2 dcl 2-9 set ref 135* 137* 290 291* 293*
+direction                              parameter       bit(1)                   dcl 706 in procedure "SPACE_BLOCK" ref 704 711 721
+                                                                                  731
+direction                              parameter       bit(1)                   dcl 671 in procedure "SPACE_FILE" ref 669 679 696
+divide                                                 builtin function         dcl 106 ref 329 371 428
+ebcdic_to_ascii_                000030 constant        entry                    external dcl 111 ref 422
+err_entry                              based           structure                level 1 dcl 4-12
+error_table_$bad_arg            000024 external static fixed bin(35,0)          dcl 100 ref 449 544
+error_table_$buffer_big         000014 external static fixed bin(35,0)          dcl 96 ref 315 316 319 325
+error_table_$device_not_active  000016 external static fixed bin(35,0)          dcl 97 ref 271
+error_table_$end_of_info        000010 external static fixed bin(35,0)          dcl 94 ref 695 715 757 841
+error_table_$eov_on_write       000012 external static fixed bin(35,0)          dcl 95 ref 476 763
+error_table_$nine_mode_parity   000020 external static fixed bin(35,0)          dcl 98 ref 770
+error_table_$positioned_on_bot  000022 external static fixed bin(35,0)          dcl 99 ref 766
+fi_current               34            based           pointer                  level 2 dcl 1-8 ref 875
+fi_ptr                          000252 automatic       pointer                  dcl 5-4 set ref 579 579 585 875*
+force_end_of_volume      56            based           bit(1)                   level 2 dcl 1-8 set ref 236 295 296*
+hbound                                                 builtin function         dcl 106 ref 311 444 539 791
+hdw_mode                173            based           fixed bin(17,0)          level 3 dcl 1-8 set ref 163 334*
+i                               000117 automatic       fixed bin(17,0)          dcl 59 set ref 175* 177 177 180 180* 257* 259 259
+                                                                                  261 261*
+infop                           000100 automatic       pointer                  dcl 56 set ref 443* 659* 833*
+lab_buf_len             152            based           fixed bin(21,0)          level 3 dcl 1-8 set ref 605*
+lab_bufp                150            based           pointer                  level 3 dcl 1-8 set ref 349 361 365 369 379* 381*
+                                                                                  398 408* 411* 418 422 426 604*
+lab_length               10            based           fixed bin(17,0)          level 2 dcl 3-8 set ref 350* 354 399* 429*
+lab_ptr                   6            based           pointer                  level 2 dcl 3-8 ref 355 355 361 365 369 418 422 426
+label_buffer            150            based           structure                level 2 dcl 1-8
+label_len                       000104 automatic       fixed bin(21,0)          dcl 57 set ref 354* 355 355 361 361 365 365 365 365
+                                                                                  369 369 369 369 371* 371 379* 411* 418 418 422 422
+                                                                                  422 422 426 426 426 426 428* 428 429
+last_io                 207            based           fixed bin(17,0)          level 3 dcl 1-8 set ref 312 346* 396* 776
+lbound                                                 builtin function         dcl 106 ref 175 193 257 257 285 332 444 539
+lbuf_arrayp                     000272 automatic       pointer                  array dcl 598 set ref 600* 602* 604
+length                  164            based           fixed bin(21,0)          level 4 dcl 1-8 set ref 132* 141* 145 145* 150
+length_mode             172            based           fixed bin(17,0)          level 3 dcl 1-8 set ref 335*
+log_record              167            based           fixed bin(21,0)          level 4 dcl 1-8 set ref 787 788 789*
+log_record_ptr          162            based           pointer                  level 4 dcl 1-8 set ref 149* 234* 288*
+lr_ptr                          000250 automatic       pointer                  dcl 3-4 set ref 347* 350 354 355 355 355 355 359 361
+                                                                                  365 369 375 397* 399 404 416 418 422 426 429
+major                   102            based           fixed bin(17,0)          level 2 dcl 10-11 ref 582 615 678 710
+mod                                                    builtin function         dcl 106 ref 164
+mode                     11            based           fixed bin(17,0)          level 2 dcl 3-8 set ref 375* 404*
+mode_mnemonics                  000064 constant        char(8)                  initial array packed unaligned dcl 89 ref 539 539
+                                                                                  539
+mode_ptr                        000102 automatic       pointer                  dcl 56 set ref 537* 548* 552* 556* 560* 564* 568*
+mtape_check_status_             000042 constant        entry                    external dcl 116 ref 778
+mtape_data                             based           structure                level 1 dcl 1-8 set ref 885
+mtape_dev_attention_recovery    000236 stack reference condition                dcl 101 ref 131 223 250 358 372 403 469 633 829
+mtape_err_stats                        based           structure                level 1 dcl 4-6
+mtape_file_info                        based           structure                level 1 dcl 5-8
+mtape_label_record                     based           structure                level 1 dcl 3-8
+mtape_mount_cntl_$mount         000040 constant        entry                    external dcl 115 ref 877
+mtape_util_$error               000036 constant        entry                    external dcl 114 ref 135 180 188 200 207 214 261 281
+                                                                                  291 843 861 879
+mtape_vol_set                          based           structure                level 1 dcl 2-9
+mtdp                            000244 automatic       pointer                  dcl 1-4 set ref 132 132 132 135* 141 141 141 145 145
+                                                                                  145 145 147 147 148 148 149 149 149 150 150 150
+                                                                                  161 161 163 164 164 165 166 166 167 167 167 167
+                                                                                  167 168 168 168 171 172 172 172 173 173 174 174
+                                                                                  175 175 177 177 177 180* 180 180 186 186 188* 192
+                                                                                  193 193 195 195 195 198 198 198 200* 200 200 205
+                                                                                  205 207* 211 212 212 214* 225 225 231 231 233 233
+                                                                                  234 234 234 235 235 235 236 248 257 257 257 257
+                                                                                  259 259 259 261* 261 261 269 275 276 276 276 278
+                                                                                  278 281* 285 285 286 286 287 287 288 288 288 289
+                                                                                  289 289 291* 295 296 311 312 317 317 317 328 329
+                                                                                  329 330 330 332 332 333 333 333 334* 334 335* 335
+                                                                                  346 349 361 365 369 375* 379 379 381 381 383 383
+                                                                                  396 398 404* 408 408 411 411 415 415 418 422 426
+                                                                                  472 473 473 482 568 579 583 583 584 587 587 600
+                                                                                  602 604 605 613 632 632 636 640 644 648 654 673
+                                                                                  685 690 690 696 696 698 698 708 713 714 714 731
+                                                                                  731 733 733 744 754 754 756 776 776 776 778* 787
+                                                                                  787 787 788 788 788 789 790 790 791 791 791 802
+                                                                                  811 833 843* 859 861* 865 865 873* 874 875 876
+                                                                                  877* 879* 884 885 885 886
+n_qed_bufs                      000121 automatic       fixed bin(17,0)          dcl 59 set ref 205* 211
+n_rdy_bufs                      000120 automatic       fixed bin(17,0)          dcl 59 set ref 186* 212* 278*
+n_susp_bufs                     000110 automatic       fixed bin(17,0)          dcl 857 set ref 859* 865
+nbufs                   142            based           fixed bin(17,0)          level 3 dcl 1-8 set ref 211 248 317* 329 579 613 673
+                                                                                  708
+null                                                   builtin function         dcl 106 ref 269 269 334 334 335 335 349 375 375 398
+                                                                                  404 404 472 472 648 648 658 886
+oidx                            000111 automatic       fixed bin(17,0)          dcl 59 set ref 444* 444* 447 539* 539* 542
+order                           000124 automatic       char(4)                  packed unaligned dcl 61 in procedure "mtape_io_" set
+                                                                                  ref 441* 472* 488* 492* 507* 525* 694* 723* 729*
+order                                  parameter       char(4)                  packed unaligned dcl 821 in procedure "DO_ORDER" set
+                                                                                  ref 819 833* 843*
+order_mnemonics                 000102 constant        char(4)                  initial array packed unaligned dcl 85 ref 444 444
+                                                                                  444
+padding_char            171            based           char(1)                  level 3 dcl 1-8 ref 167
+pfm_entries                            based           structure                level 1 dcl 1-103
+phy_block               157            based           fixed bin(17,0)          level 3 dcl 1-8 set ref 147* 147 161* 161 276 276*
+                                                                                  383* 383 415* 415 482* 584* 587* 587 632* 685*
+                                                                                  713* 731* 731 733* 733 756* 776* 776 865* 865
+phy_file                156            based           fixed bin(17,0)          level 3 dcl 1-8 set ref 473* 473 583* 583 632* 690*
+                                                                                  690 696* 696 698* 698 714* 714 754* 754
+position                156            based           structure                level 2 dcl 1-8
+position_within_file     24            based           fixed bin(17,0)          level 2 dcl 5-8 set ref 579 579 585*
+processed               165            based           fixed bin(21,0)          level 4 dcl 1-8 set ref 148* 149 150 164 167 168*
+                                                                                  168 172 198* 200* 233* 234 235 287* 288 289
+pwr_off_retry           115            based           bit(1)                   level 2 dcl 2-9 set ref 137* 290 293*
+remain                  166            based           fixed bin(21,0)          level 4 dcl 1-8 set ref 150* 164* 165 166* 166 167
+                                                                                  167 168 235* 289*
+repeat_cnt                      000114 automatic       fixed bin(17,0)          dcl 59 in procedure "mtape_io_" set ref 442* 471
+                                                                                  472* 474* 474 488* 507* 525* 679* 679 681* 681 689
+                                                                                  694* 711 721 724* 724 726* 726 727* 727 729*
+repeat_cnt                      000100 automatic       fixed bin(17,0)          dcl 822 in procedure "DO_ORDER" set ref 825* 831
+                                                                                  833* 835* 835
+req_buffers                     000113 automatic       fixed bin(17,0)          dcl 59 set ref 311* 312* 317* 319*
+rew_order                              parameter       char(4)                  packed unaligned dcl 629 set ref 627 648*
+run                     146            based           bit(1)                   level 3 dcl 1-8 set ref 171 192* 275* 744*
+rx                              000112 automatic       fixed bin(17,0)          dcl 59 set ref 132* 141* 225* 226 267* 268 269* 271*
+                                                                                  297* 381* 411* 472* 636* 640* 644* 648* 654* 742
+                                                                                  745 811* 833* 888*
+scode                           000107 automatic       fixed bin(35,0)          dcl 58 set ref 802*
+spec_status                     000123 automatic       bit(36)                  dcl 60 set ref 636 636 644 644 654 654
+susp_smple                      000106 automatic       pointer                  array dcl 856 set ref 859*
+tape_blk                               based           char(1)                  array packed unaligned dcl 1-115 set ref 149 167 234
+                                                                                  288
+tape_ioi_$allocate_buffers      000044 constant        entry                    external dcl 7-11 ref 317 600
+tape_ioi_$check_read            000046 constant        entry                    external dcl 7-27 ref 411
+tape_ioi_$check_write           000050 constant        entry                    external dcl 7-30 ref 225 269 381
+tape_ioi_$hardware_status       000052 constant        entry                    external dcl 7-50 ref 802
+tape_ioi_$list_buffers          000054 constant        entry                    external dcl 7-54 ref 186 205 212 278 859
+tape_ioi_$order                 000056 constant        entry                    external dcl 7-57 ref 472 636 644 648 654 833
+tape_ioi_$queue_read            000060 constant        entry                    external dcl 7-63 ref 408
+tape_ioi_$queue_write           000062 constant        entry                    external dcl 7-66 ref 177 198 259 379
+tape_ioi_$read                  000064 constant        entry                    external dcl 7-69 ref 132 141
+tape_ioi_$reserve_buffer        000066 constant        entry                    external dcl 7-76 ref 602
+tape_ioi_$set_mode              000070 constant        entry                    external dcl 7-88 ref 568
+tape_ioi_$stop_tape             000072 constant        entry                    external dcl 7-91 ref 640 811
+ths                                    based           structure                level 1 dcl 10-11
+ths_ptr                         000254 automatic       pointer                  dcl 10-9 set ref 582 615 678 710 800* 801 802*
+tioi_id                 273            based           bit(36)                  level 2 dcl 1-8 set ref 132* 141* 177* 186* 198*
+                                                                                  205* 212* 225* 259* 269* 278* 317* 379* 381* 408*
+                                                                                  411* 472* 568* 600* 602* 636* 640* 644* 648* 654*
+                                                                                  802* 811* 833* 859* 876
+tot_lrec                272            based           fixed bin(35,0)          level 3 dcl 1-8 set ref 787* 787
+translate                                              builtin function         dcl 106 ref 355
+unr_code                        000110 automatic       fixed bin(35,0)          dcl 58 set ref 773* 778* 779
+version                                based           fixed bin(17,0)          level 2 dcl 10-11 set ref 801*
+volume_density          103            based           fixed bin(17,0)          level 2 dcl 2-9 set ref 659
+volume_end              112            based           bit(1)                   level 2 dcl 2-9 set ref 248 652* 760*
+volume_name              16            based           char(32)                 level 2 dcl 2-9 set ref 879*
+vs_current               24            based           pointer                  level 2 dcl 1-8 ref 874
+vs_ptr                          000246 automatic       pointer                  dcl 2-5 set ref 135 137 137 248 290 290 291 293 293
+                                                                                  652 658 659 760 874* 879
+wait                                   parameter       bit(1)                   dcl 630 ref 627 653
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+ALTERNATE_CHANNEL                      internal static bit(36)                  initial dcl 10-64
+ASCII_ALERT                            internal static bit(36)                  initial dcl 10-55
+AT_BOFH                                internal static fixed bin(17,0)          initial dcl 6-44
+AT_BOT                                 internal static bit(36)                  initial dcl 10-47
+AT_EOF                                 internal static fixed bin(17,0)          initial dcl 6-44
+AT_EOFD                                internal static fixed bin(17,0)          initial dcl 6-44
+AT_EOFH                                internal static fixed bin(17,0)          initial dcl 6-44
+AT_EOFT                                internal static fixed bin(17,0)          initial dcl 6-44
+BAD_DENSITY                            internal static bit(36)                  initial dcl 10-117
+BAD_DEVICE_CODE                        internal static bit(36)                  initial dcl 10-113
+BAD_IDCW_PARITY                        internal static bit(36)                  initial dcl 10-111
+BAD_OP_CODE                            internal static bit(36)                  initial dcl 10-115
+BAD_PCW_CHANNEL_INST                   internal static bit(36)                  initial dcl 10-206
+BIT_DURING_ERASE                       internal static bit(36)                  initial dcl 10-88
+BLANK_TAPE_ON_READ                     internal static bit(36)                  initial dcl 10-86
+BLANK_TAPE_ON_WRITE                    internal static bit(36)                  initial dcl 10-79
+BLANK_VOLUME                           internal static fixed bin(17,0)          initial dcl 2-42
+BOF_LABEL                              internal static fixed bin(17,0)          initial dcl 6-56
+BOUNDARY_ERROR                         internal static bit(36)                  initial dcl 10-189
+BUS_PARITY_FROM_CHANNEL                internal static bit(36)                  initial dcl 10-198
+BUS_PARITY_TO_CHANNEL                  internal static bit(36)                  initial dcl 10-216
+BYTE_LOCKED_OUT                        internal static bit(36)                  initial dcl 10-141
+CODE_ALERT                             internal static bit(36)                  initial dcl 10-162
+COMMAND_REJECT                         internal static fixed bin(17,0)          initial dcl 10-31
+CONFIG_SWITCH_ERROR                    internal static bit(36)                  initial dcl 10-124
+CONNECT_WHILE_BUSY                     internal static bit(36)                  initial dcl 10-204
+CONSECUTIVE_TDCWS                      internal static bit(36)                  initial dcl 10-187
+CONTINUE_BIT_NOT_SET                   internal static bit(36)                  initial dcl 10-174
+CP_SIZE_DISCREPANCY                    internal static bit(36)                  initial dcl 10-196
+DATA_ALERT_CONDITION                   internal static bit(36)                  initial dcl 10-103
+DEVICE_ATTENTION                       internal static fixed bin(17,0)          initial dcl 10-28
+DEVICE_BUSY                            internal static fixed bin(17,0)          initial dcl 10-27
+DEVICE_DATA_ALERT                      internal static fixed bin(17,0)          initial dcl 10-29
+END_OF_TAPE                            internal static bit(36)                  initial dcl 10-98
+EOF_LABEL                              internal static fixed bin(17,0)          initial dcl 6-56
+EOV_LABEL                              internal static fixed bin(17,0)          initial dcl 6-56
+EXT_CHANGE_WHILE_RESTRICTED            internal static bit(36)                  initial dcl 10-191
+FILES_PER_FILE_GRP                     internal static fixed bin(17,0)          initial dcl 6-44
+FOUR_BIT_FILL                          internal static bit(36)                  initial dcl 10-51
+HANDLER_CHECK                          internal static bit(36)                  initial dcl 10-77
+HANDLER_IN_STANDBY                     internal static bit(36)                  initial dcl 10-75
+IDCW_WHILE_RESTRICTED                  internal static bit(36)                  initial dcl 10-194
+ID_BURST_WRITE_ERROR                   internal static bit(36)                  initial dcl 10-148
+ILLEGAL_DEVICE_ID                      internal static bit(36)                  initial dcl 10-128
+ILLEGAL_LC_NUMBER                      internal static bit(36)                  initial dcl 10-169
+ILLEGAL_PROCEDURE                      internal static bit(36)                  initial dcl 10-167
+ILLEGAL_SUSPENDED_LC_NUMBER            internal static bit(36)                  initial dcl 10-171
+INCOMPATIBLE_MODE                      internal static bit(36)                  initial dcl 10-130
+INCOMPLETE_COMMAND_SEQUENCE            internal static bit(36)                  initial dcl 10-210
+INCONSISTENT_COMMAND                   internal static bit(36)                  initial dcl 10-143
+INCORRECT_DCW                          internal static bit(36)                  initial dcl 10-208
+IOM_CENTRAL                            internal static fixed bin(17,0)          initial dcl 10-37
+IOM_CHANNEL                            internal static fixed bin(17,0)          initial dcl 10-38
+LATERAL_PARITY_ALERT                   internal static bit(36)                  initial dcl 10-93
+LOADING                                internal static bit(36)                  initial dcl 10-66
+LONGITUDINAL_PARITY_ALERT              internal static bit(36)                  initial dcl 10-95
+LPW_TRO                                internal static bit(36)                  initial dcl 10-185
+MARGINAL_CONDITION                     internal static bit(36)                  initial dcl 10-152
+MPC_COMMAND_REJECT                     internal static fixed bin(17,0)          initial dcl 10-34
+MPC_DEVICE_ATTENTION                   internal static fixed bin(17,0)          initial dcl 10-32
+MPC_DEVICE_DATA_ALERT                  internal static fixed bin(17,0)          initial dcl 10-33
+MTAPE_ALLOC_FI                         internal static fixed bin(17,0)          initial dcl 6-9
+MTAPE_ALLOC_LR                         internal static fixed bin(17,0)          initial dcl 6-9
+MTAPE_ALLOC_STR                        internal static fixed bin(17,0)          initial dcl 6-9
+MTAPE_ALLOC_VS                         internal static fixed bin(17,0)          initial dcl 6-9
+MTAPE_CV_BCD                           internal static fixed bin(17,0)          initial dcl 6-34
+MTAPE_CV_EBCDIC                        internal static fixed bin(17,0)          initial dcl 6-34
+MTAPE_HWM_BCD                          internal static fixed bin(17,0)          initial dcl 6-27
+MTAPE_HWM_NINE                         internal static fixed bin(17,0)          initial dcl 6-27
+MTAPE_NO_CONVERSION                    internal static fixed bin(17,0)          initial dcl 6-34
+MTAPE_SPEED_VALUES                     internal static fixed bin(17,0)          initial array dcl 6-22
+MTAPE_UNSPECIFIED                      internal static fixed bin(17,0)          initial dcl 6-34
+MTAPE_VALID_DENSITIES                  internal static fixed bin(17,0)          initial array dcl 6-17
+MTAPE_VOLUME                           internal static fixed bin(17,0)          initial dcl 2-42
+MTH_MALFUNCTION                        internal static bit(36)                  initial dcl 10-134
+MULTIPLE_BOT                           internal static bit(36)                  initial dcl 10-136
+MULTIPLE_DEVICES                       internal static bit(36)                  initial dcl 10-126
+MULTI_TRACK_ERROR                      internal static bit(36)                  initial dcl 10-154
+MULT_PRIOR_VOLUME                      internal static fixed bin(17,0)          initial dcl 2-42
+NINE_TRACK_ERROR                       internal static bit(36)                  initial dcl 10-119
+NON_MULT_VOLUME                        internal static fixed bin(17,0)          initial dcl 2-42
+NOT_POSITIONED_IN_FILE                 internal static fixed bin(17,0)          initial dcl 6-44
+NO_SUCH_HANDLER                        internal static bit(36)                  initial dcl 10-73
+NRZI_CCC_ERROR                         internal static bit(36)                  initial dcl 10-160
+PARITY_ERROR_AT_PRPH_INTERFACE         internal static bit(36)                  initial dcl 10-213
+POSTAMBLE_ERROR                        internal static bit(36)                  initial dcl 10-158
+POWER_OFF                              internal static fixed bin(17,0)          initial dcl 10-35
+PREAMBLE_ERROR                         internal static bit(36)                  initial dcl 10-150
+Q_ABORT_FILE                           internal static fixed bin(17,0)          initial dcl 6-63
+Q_INCORRECT_VOLUME                     internal static fixed bin(17,0)          initial dcl 6-63
+Q_LABELED_VOLUME                       internal static fixed bin(17,0)          initial dcl 6-63
+Q_NO_NEXT_VOLUME                       internal static fixed bin(17,0)          initial dcl 6-63
+Q_UNEXPIRED_FILE                       internal static fixed bin(17,0)          initial dcl 6-63
+Q_UNEXPIRED_VOLUME                     internal static fixed bin(17,0)          initial dcl 6-63
+READY_AND_RESERVED_STATE               internal static fixed bin(17,0)          initial dcl 8-32
+READ_AFTER_WRITE                       internal static bit(36)                  initial dcl 10-108
+RECOG_FORMAT_VOLUME                    internal static fixed bin(17,0)          initial dcl 2-42
+RESERVED                               internal static bit(36)                  initial dcl 10-62
+REWINDING                              internal static bit(36)                  initial dcl 10-60
+SIX_BIT_FILL                           internal static bit(36)                  initial dcl 10-53
+SKEW_ERROR                             internal static bit(36)                  initial dcl 10-156
+SUBSYSTEM_READY                        internal static fixed bin(17,0)          initial dcl 10-26
+SUM_CHECK_ERROR                        internal static bit(36)                  initial dcl 10-145
+SYSTEM_FAULT                           internal static fixed bin(17,0)          initial dcl 10-36
+TAPE_IO_BLOCK                          internal static fixed bin(17,0)          initial dcl 9-7
+TAPE_IO_BOT                            internal static fixed bin(17,0)          initial dcl 9-17
+TAPE_IO_CODE_ALERT                     internal static fixed bin(17,0)          initial dcl 9-20
+TAPE_IO_EOF                            internal static fixed bin(17,0)          initial dcl 9-15
+TAPE_IO_RECOVERABLE_IO_ERROR           internal static fixed bin(17,0)          initial dcl 9-13
+TAPE_IO_RECOVERABLE_IO_ERROR_AND_EOT   internal static fixed bin(17,0)          initial dcl 9-18
+TAPE_IO_UNRECOVERABLE_IO_ERROR         internal static fixed bin(17,0)          initial dcl 9-11
+TAPE_IO_USER_PROGRAM_ERROR             internal static fixed bin(17,0)          initial dcl 9-9
+TBS_VERSION                            internal static fixed bin(17,0)          initial dcl 8-27
+TBS_VERSION_1                          internal static fixed bin(17,0)          initial dcl 8-25
+TCA_MALFUNCTION                        internal static bit(36)                  initial dcl 10-132
+THS_VERSION_1                          internal static fixed bin(17,0)          initial dcl 10-19
+TIME_OUT                               internal static fixed bin(17,0)          initial dcl 10-39
+TRANSFER_TIMING_ALERT                  internal static bit(36)                  initial dcl 10-84
+TRANSMISSION_PARITY_ALERT              internal static bit(36)                  initial dcl 10-90
+TWO_BIT_FILL                           internal static bit(36)                  initial dcl 10-49
+UNLABELED_VOLUME                       internal static fixed bin(17,0)          initial dcl 2-42
+WRITE_PROTECTED                        internal static bit(36)                  initial dcl 10-45
+es_ptr                                 automatic       pointer                  dcl 4-4
+mtape_data_version_1                   internal static char(8)                  initial packed unaligned dcl 1-6
+mtape_fi_version_1                     internal static char(8)                  initial packed unaligned dcl 5-6
+mtape_lr_version_1                     internal static char(8)                  initial packed unaligned dcl 3-6
+mtape_vs_version_1                     internal static char(8)                  initial packed unaligned dcl 2-7
+tape_ioi_$activate              000000 constant        entry                    external dcl 7-8
+tape_ioi_$allocate_work_area    000000 constant        entry                    external dcl 7-16
+tape_ioi_$buffer_status         000000 constant        entry                    external dcl 7-20
+tape_ioi_$check_order           000000 constant        entry                    external dcl 7-24
+tape_ioi_$deactivate            000000 constant        entry                    external dcl 7-33
+tape_ioi_$deallocate            000000 constant        entry                    external dcl 7-36
+tape_ioi_$deallocate_buffers    000000 constant        entry                    external dcl 7-39
+tape_ioi_$get_mode              000000 constant        entry                    external dcl 7-43
+tape_ioi_$get_statistics        000000 constant        entry                    external dcl 7-46
+tape_ioi_$queue_order           000000 constant        entry                    external dcl 7-60
+tape_ioi_$release_buffer        000000 constant        entry                    external dcl 7-72
+tape_ioi_$reset_statistics      000000 constant        entry                    external dcl 7-80
+tape_ioi_$set_buffer_ready      000000 constant        entry                    external dcl 7-84
+tape_ioi_$write                 000000 constant        entry                    external dcl 7-94
+tbs                                    based           structure                level 1 dcl 8-9
+tbs_ptr                                automatic       pointer                  dcl 8-7
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+ALLOCATE_LABEL_BUFFER           003617 constant        entry                    internal dcl 593 ref 350 399
+CHECK_RX                        004531 constant        entry                    internal dcl 740 ref 133 142 227 273 298 382 412 475
+                                                                                  637 641 645 649 656 812 836
+DO_ORDER                        004710 constant        entry                    internal dcl 819 ref 488 507 525 617 619 660 694 718
+                                                                                  729
+ERROR_RETURN                    003614 constant        label                    dcl 892 ref 882
+GET_HDW_STATUS                  004637 constant        entry                    internal dcl 798 ref 813
+PROC_MODE                       000042 constant        label                    array(-1:6) dcl 544 ref 542
+PROC_MODE_END                   003515 constant        label                    dcl 568 ref 550 554 558 562 566
+PROC_ORDER                      000012 constant        label                    array(-1:22) dcl 449 ref 447
+REPEAT_ORDER                    005004 constant        label                    dcl 837 ref 829
+RESOLVE_POSITION                003717 constant        entry                    internal dcl 611 ref 485
+RETRY_WEOF                      003265 constant        label                    dcl 480 ref 469
+REWIND_PROC                     003764 constant        entry                    internal dcl 627 ref 492 497 501 505
+RX_ACTION                       000052 constant        label                    array(-1:8) dcl 748 ref 745
+SETUP                           005135 constant        entry                    internal dcl 871 ref 129 160 247 310 345 395 440 536
+                                                                                  578
+SPACE_BLOCK                     004403 constant        entry                    internal dcl 704 ref 457 465
+SPACE_FILE                      004316 constant        entry                    internal dcl 669 ref 453 461
+STOP_TAPE                       004661 constant        entry                    internal dcl 808 ref 513 581 614 674 709
+SYNC_POSITION                   005046 constant        entry                    internal dcl 854 ref 762 775
+UNLOAD_LREC_CNT                 004617 constant        entry                    internal dcl 785 ref 130 162
+WAIT_FOR_REWIND                 004230 constant        label                    dcl 654 ref 633
+allocate_buffers                002046 constant        entry                    external dcl 308
+allocate_buffers_return         002276 constant        label                    dcl 337 ref 322 326
+continue_read                   000653 constant        label                    dcl 143 ref 139
+feov_target                     001511 constant        label                    dcl 251 ref 223 236 250
+flush_buffers                   001453 constant        entry                    external dcl 245
+flush_bufs_return               002037 constant        label                    dcl 302 ref 251 264 283
+mtape_io_                       000476 constant        entry                    external dcl 26
+order                           003103 constant        entry                    external dcl 438
+order_return                    003404 constant        label                    dcl 528 ref 451 455 459 463 467 476 483 490 495 499
+                                                                                  503 509
+rcopy_label                     000005 constant        label                    array(5) dcl 418 ref 416
+rcopy_label_end                 003070 constant        label                    dcl 429 ref 421 425
+read_block                      000510 constant        entry                    external dcl 127
+read_label                      002623 constant        entry                    external dcl 393
+read_label_retry                002675 constant        label                    dcl 404 ref 403
+read_label_return               003073 constant        label                    dcl 431 ref 400 406 409 413
+set_mode                        003411 constant        entry                    external dcl 534 ref 334 335 375 404
+stop_tape                       003550 constant        entry                    external dcl 576
+wcopy_label                     000000 constant        label                    array(5) dcl 361 ref 359
+wcopy_label_end                 002474 constant        label                    dcl 372 ref 358 364 368
+wcopy_label_retry               002513 constant        label                    dcl 375 ref 372
+write_block                     000701 constant        entry                    external dcl 158
+write_block_return              001446 constant        label                    dcl 239 ref 183 190 203 209 216 228
+write_label                     002305 constant        entry                    external dcl 343
+write_label_return              002617 constant        label                    dcl 386 ref 351 377
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      6230        6324    5443        6240
+Length      7036    5443        74         476     564           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+mtape_io_                           462 external procedure  is an external procedure.  
+on unit on line 131                 110 on unit               
+on unit on line 223                  64 on unit               
+on unit on line 250                  64 on unit               
+on unit on line 358                  64 on unit               
+on unit on line 372                  64 on unit               
+on unit on line 403                  64 on unit               
+on unit on line 469                  64 on unit               
+ALLOCATE_LABEL_BUFFER                   internal procedure  shares stack frame of external procedure mtape_io_.  
+RESOLVE_POSITION                        internal procedure  shares stack frame of external procedure mtape_io_.  
+REWIND_PROC                         106 internal procedure  enables or reverts conditions.  
+on unit on line 633                  64 on unit               
+on unit on line 635                  84 on unit               
+SPACE_FILE                              internal procedure  shares stack frame of external procedure mtape_io_.  
+SPACE_BLOCK                             internal procedure  shares stack frame of external procedure mtape_io_.  
+CHECK_RX                            116 internal procedure  is called by several nonquick procedures.  
+UNLOAD_LREC_CNT                         internal procedure  shares stack frame of external procedure mtape_io_.  
+GET_HDW_STATUS                          internal procedure  shares stack frame of external procedure mtape_io_.  
+STOP_TAPE                               internal procedure  shares stack frame of external procedure mtape_io_.  
+DO_ORDER                            106 internal procedure  enables or reverts conditions.  
+on unit on line 829                  64 on unit               
+SYNC_POSITION                           internal procedure  shares stack frame of internal procedure CHECK_RX.  
+SETUP                                   internal procedure  shares stack frame of external procedure mtape_io_.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+CHECK_RX                 000106 susp_smple                  SYNC_POSITION
+                         000110 n_susp_bufs                 SYNC_POSITION
+DO_ORDER                 000100 repeat_cnt                  DO_ORDER
+mtape_io_                000100 infop                       mtape_io_
+                         000102 mode_ptr                    mtape_io_
+                         000104 label_len                   mtape_io_
+                         000105 act_length                  mtape_io_
+                         000106 code                        mtape_io_
+                         000107 scode                       mtape_io_
+                         000110 unr_code                    mtape_io_
+                         000111 oidx                        mtape_io_
+                         000112 rx                          mtape_io_
+                         000113 req_buffers                 mtape_io_
+                         000114 repeat_cnt                  mtape_io_
+                         000115 descrep_cnt                 mtape_io_
+                         000116 act_cnt                     mtape_io_
+                         000117 i                           mtape_io_
+                         000120 n_rdy_bufs                  mtape_io_
+                         000121 n_qed_bufs                  mtape_io_
+                         000122 alloc_tries                 mtape_io_
+                         000123 spec_status                 mtape_io_
+                         000124 order                       mtape_io_
+                         000125 auto_ths                    mtape_io_
+                         000244 mtdp                        mtape_io_
+                         000246 vs_ptr                      mtape_io_
+                         000250 lr_ptr                      mtape_io_
+                         000252 fi_ptr                      mtape_io_
+                         000254 ths_ptr                     mtape_io_
+                         000270 act_length                  ALLOCATE_LABEL_BUFFER
+                         000271 act_number                  ALLOCATE_LABEL_BUFFER
+                         000272 lbuf_arrayp                 ALLOCATE_LABEL_BUFFER
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+alloc_char_temp     call_ext_in_desc    call_ext_out_desc   call_ext_out        call_int_this       call_int_other
+return_mac          tra_ext_1           mdfx1               enable_op           shorten_stack       ext_entry
+ext_entry_desc      int_entry           repeat              set_chars_eis       op_freen_
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+ascii_to_bcd_                 ascii_to_ebcdic_              bcd_to_ascii_                 ebcdic_to_ascii_
+mtape_check_status_           mtape_mount_cntl_$mount       mtape_util_$error             tape_ioi_$allocate_buffers
+tape_ioi_$check_read          tape_ioi_$check_write         tape_ioi_$hardware_status     tape_ioi_$list_buffers
+tape_ioi_$order               tape_ioi_$queue_read          tape_ioi_$queue_write         tape_ioi_$read
+tape_ioi_$reserve_buffer      tape_ioi_$set_mode            tape_ioi_$stop_tape
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$bad_arg          error_table_$buffer_big       error_table_$device_not_active
+error_table_$end_of_info      error_table_$eov_on_write     error_table_$nine_mode_parity
+error_table_$positioned_on_bot
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     26 000475       127 000503       129 000520       130 000521       131 000522       132 000536       133 000556
+    134 000563       135 000566       137 000620       139 000624       141 000627       142 000647       143 000653
+    145 000655       147 000663       148 000664       149 000666       150 000671       153 000674       154 000676
+    158 000677       160 000711       161 000712       162 000714       163 000715       164 000721       165 000725
+    166 000726       167 000730       168 000743       171 000745       172 000747       173 000752       174 000753
+    175 000756       177 000765       179 001005       180 001007       183 001046       185 001047       186 001051
+    187 001102       188 001104       190 001130       192 001131       193 001134       195 001136       196 001142
+    198 001143       199 001160       200 001162       203 001216       205 001217       206 001250       207 001252
+    209 001276       211 001277       212 001303       213 001333       214 001335       216 001361       218 001362
+    223 001363       225 001402       226 001420       227 001422       228 001426       231 001427       233 001433
+    234 001436       235 001441       236 001444       239 001446       241 001450       245 001451       247 001463
+    248 001464       250 001472       251 001511       257 001513       259 001527       260 001547       261 001551
+    264 001610       266 001611       267 001613       268 001615       269 001622       270 001642       271 001643
+    273 001652       274 001656       275 001660       276 001662       278 001667       280 001717       281 001721
+    283 001745       285 001746       286 001751       287 001753       288 001755       289 001760       290 001763
+    291 001771       293 002022       295 002025       296 002030       297 002031       298 002033       302 002037
+    304 002041       308 002042       310 002056       311 002057       312 002061       315 002073       316 002076
+    317 002107       319 002147       321 002154       322 002156       324 002160       325 002164       326 002167
+    328 002170       329 002172       330 002175       332 002200       333 002202       334 002205       335 002240
+    337 002276       339 002300       343 002301       345 002315       346 002316       347 002320       349 002324
+    350 002330       351 002336       354 002340       355 002343       358 002362       359 002402       361 002405
+    364 002414       365 002415       368 002441       369 002442       371 002470       372 002474       375 002513
+    377 002547       379 002551       380 002567       381 002571       382 002607       383 002613       386 002617
+    388 002620       393 002621       395 002633       396 002634       397 002636       398 002642       399 002646
+    400 002654       403 002656       404 002675       406 002731       408 002733       409 002747       411 002751
+    412 002771       413 002775       415 002777       416 003001       418 003004       421 003012       422 003013
+    425 003036       426 003037       428 003064       429 003070       431 003073       433 003075       438 003076
+    440 003121       441 003122       442 003130       443 003132       444 003135       446 003152       447 003155
+    449 003156       451 003161       453 003162       455 003164       457 003165       459 003167       461 003170
+    463 003172       465 003173       467 003175       469 003176       471 003215       472 003220       473 003246
+    474 003251       475 003253       476 003257       479 003264       480 003265       482 003266       483 003270
+    485 003271       488 003272       490 003304       492 003305       495 003315       497 003316       499 003330
+    501 003331       503 003343       505 003344       507 003356       509 003370       513 003371       525 003372
+    528 003404       530 003406       534 003407       536 003427       537 003430       538 003434       539 003435
+    541 003453       542 003456       544 003460       546 003463       548 003464       550 003470       552 003471
+    554 003475       556 003476       558 003502       560 003503       562 003507       564 003510       566 003514
+    568 003515       572 003545       576 003546       578 003560       579 003561       581 003572       582 003573
+    583 003601       584 003603       585 003604       586 003607       587 003610       589 003613       892 003614
+    894 003616       593 003617       600 003621       601 003665       602 003670       603 003704       604 003707
+    605 003712       607 003716       611 003717       613 003720       614 003723       615 003724       616 003730
+    617 003732       619 003746       623 003762       627 003763       632 003771       633 003775       635 004014
+    636 004030       637 004064       638 004071       640 004072       641 004111       642 004116       644 004121
+    645 004152       646 004157       648 004162       649 004212       650 004217       652 004222       653 004224
+    654 004230       656 004263       658 004270       659 004275       660 004300       663 004315       669 004316
+    673 004320       674 004323       678 004324       679 004332       681 004342       685 004343       689 004345
+    690 004347       691 004350       694 004351       695 004361       696 004366       698 004377       700 004402
+    704 004403       708 004405       709 004410       710 004411       711 004417       713 004427       714 004431
+    715 004432       716 004435       718 004436       719 004452       721 004454       723 004464       724 004466
+    725 004471       726 004472       727 004475       729 004477       730 004507       731 004511       733 004523
+    736 004527       740 004530       742 004536       744 004541       745 004543       748 004544       754 004545
+    756 004546       757 004547       758 004551       760 004552       762 004555       763 004556       764 004562
+    766 004563       768 004565       770 004566       773 004570       775 004572       776 004573       778 004602
+    779 004613       781 004616       785 004617       787 004620       788 004625       789 004630       790 004631
+    791 004632       794 004636       798 004637       800 004640       801 004642       802 004644       804 004660
+    808 004661       810 004662       811 004663       812 004701       813 004705       815 004706       819 004707
+    824 004715       825 004717       829 004722       831 004741       833 004747       835 004774       836 004777
+    837 005004       840 005005       841 005010       843 005015       848 005045       854 005046       859 005047
+    860 005101       861 005104       863 005130       865 005131       867 005134       871 005135       873 005136
+    874 005142       875 005144       876 005146       877 005150       878 005161       879 005163       882 005214
+    884 005215       885 005220       886 005223       888 005226       890 005231
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

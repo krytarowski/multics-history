@@ -1,0 +1,1982 @@
+	COMPILATION LISTING OF SEGMENT tolts_io_int_
+	Compiled by: Multics PL/I Compiler, Release 29, of July 28, 1986
+	Compiled at: Honeywell Multics Op. - System M
+	Compiled on: 12/09/86  1528.4 mst Tue
+	    Options: optimize map
+
+        1 /****^  ***********************************************************
+        2*        *                                                         *
+        3*        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        4*        *                                                         *
+        5*        * Copyright (c) 1972 by Massachusetts Institute of        *
+        6*        * Technology and Honeywell Information Systems, Inc.      *
+        7*        *                                                         *
+        8*        *********************************************************** */
+        9 
+       10 
+       11 
+       12 /* Original coding by J. K. Rhodes 4Q/77
+       13*   Modified by J. A. Bush 78/9/25 to conform to Multics programming standards
+       14*   Modified by J. A. Bush 79/02/28 to handle ITR and MDR I/O interrupts
+       15*   Modified by G. Haney & R. Fakoury 80/03/24 to treat mtar i/o as polts i/o with no special modes,
+       16*   and to handle the second device alocation.
+       17*   Modified by R. Fakoury 80/06/03 to reverse the data and status store sequence for polts disk io security
+       18*   (iontp string used with finial iotd to status  words)
+       19*   Modified 07/30/80 by R. Fakoury to handle a dcw tally of zero and a dcw residue correctly.
+       20*   Modified 9/30/82 by R. Fakoury to change an illegal zero dcw to a valid do nothing dcw.
+       21*   Modified 12/83 by R. Fakoury to support hypercannel interrupts.
+       22**/
+       23 
+       24 
+       25 
+       26 
+       27 /****^  HISTORY COMMENTS:
+       28*  1) change(85-02-01,Fakoury), approve(86-08-21,MCR7514),
+       29*     audit(86-11-25,Martinson), install(86-12-04,MR12.0-1235):
+       30*     to implement the test nio request
+       31*     to implement extended status store,
+       32*     to fix a bug handling itr special interrupts for a suspend channel,
+       33*     to add changes for responder interrupts.
+       34*                                                   END HISTORY COMMENTS */
+       35 
+       36 
+       37 
+       38 
+       39 
+       40 /* tolts_io_int_ - I/O interrupt processor for POLTS and MOLTS */
+       41 
+       42 
+       43 /* format: style4,ifthenstmt,ifthen,ind3,ll125,lineconind1 */
+       44 tolts_io_int_: proc (event_ptr);
+       45 
+       46 
+       47 /*  External entries */
+       48 
+       49 dcl  com_err_ entry () options (variable);
+       50 dcl  com_err_$convert_status_code_ entry (fixed bin (35), char (*), char (*));
+       51 dcl  free_area area based (get_system_free_area_ ());
+       52 dcl  get_system_free_area_ entry () returns (ptr);
+       53 dcl  hcs_$wakeup entry (bit (36) aligned,
+       54       fixed bin (71), ptr, fixed bin (35));		/* arg 3 is suppose to be fixed bin (71) */
+       55 dcl  ioi_$connect_pcw entry (fixed bin (12), fixed bin (18), bit (36) aligned, fixed bin (35));
+       56 dcl  ioi_$get_detailed_status entry (fixed bin (12), bit (1) aligned, bit (*), fixed bin (35));
+       57 dcl  ioi_$release_devices entry (fixed bin (12), fixed bin (35));
+       58 dcl  ipc_$drain_chn entry (fixed bin (71), fixed bin (35));
+       59 dcl  mca_$process_io_event entry (fixed bin, ptr, ptr, fixed bin (35));
+       60 dcl  rcp_$check_attach entry (bit (36) aligned, ptr, char (*), fixed bin (12), fixed bin (19) aligned,
+       61       fixed bin (71) aligned, fixed bin, fixed bin (35));
+       62 dcl  terminate_process_ entry (char (*), ptr);
+       63 dcl  timer_manager_$reset_alarm_wakeup entry (fixed bin (71));
+       64 dcl  tolts_alm_util_$enter_ccc_req_ entry (ptr, bit (36));
+       65 dcl  tolts_init_$gc_tod entry (bit (36));
+       66 dcl  tolts_qttyio_$rs entry options (variable);
+       67 
+       68 /* Structures */
+       69 
+       70 dcl  detailed_status bit (288) based;
+       71 
+       72 dcl  1 event_info based (event_ptr),
+       73        2 causing_event fixed bin (71),
+       74        2 message,					/* event message */
+       75          (3 pad1 bit (15),
+       76          3 lv fixed bin (3) unsigned,			/* interrupt level */
+       77          3 pad2 bit (18),
+       78          3 istat bit (36)) unaligned,			/* first word of iom status (or special status) */
+       79        2 sender bit (36),
+       80        2 origin bit (36),				/*  upper 18 bits = signal, lower 18 bits = ring */
+       81        2 in_data_pointer ptr;
+       82 
+       83 dcl  1 fatal_desc aligned,
+       84        2 version fixed bin,
+       85        2 fatal_code fixed bin (35);
+       86 
+       87 dcl  workspace_move char (c_len * 4) based (mvp);		/* move data as char string for effiency */
+       88 
+       89 /* Builtins, Constants, and Static */
+       90 
+       91 dcl  (addr, addrel, bin, bit, fixed, hbound, ptr, rel, string, substr, unspec) builtin;
+       92 dcl  (bufp, event_ptr, mvp, wakeup_ptr) ptr;
+       93 dcl  code fixed bin (35);
+       94 dcl  (c_len, i) fixed bin, error fixed bin (35), stata fixed bin (18);
+       95 dcl  (found, continue, read) bit (1);
+       96 dcl  g_time bit (36);
+       97 dcl  longinfo char (100), shortinfo char (8);
+       98 
+       99       io_info_ptr = in_data_pointer;			/* get io_info_ptr from event info */
+      100       if ^io_info.io_in_progress then do;		/* no interrupt expected, lets see if */
+      101          if ^io_info.allocated & io_info.alloc_wait then do;/* allocation waiting, check RCP */
+      102 
+      103 	  if io_info.io_type = mca_io_type then do;
+      104 	     allocate mca_area in (free_area) set (mca_area_ptr);
+      105 	     call mca_$process_io_event (io_info.mca_ioi_idx, addr (event_info), addr (mca_area), io_info.attach_err);
+      106 	     io_info.mca_attach_state = mca_area.mca_attach_state;
+      107 	     if io_info.mca_attach_state = MCA_ATTACHING then call signal;
+      108 	  end;
+      109 	  else if io_info.p_att & ^io_info.p2_att
+      110 	   & (io_info.io_type = mdr_io_type
+      111 	   | io_info.io_type = mtar_io_type) then	/* if second attach */
+      112 	     call rcp_$check_attach (io_info.alt_rcp_id, addr (io_info.alt_rcp_area (1)),
+      113 	      longinfo, io_info.alt_device_index, tolts_info.max_wks_sz,
+      114 	      tolts_info.max_to, io_info.rcp_state, io_info.attach_err);
+      115 
+      116 	  else call rcp_$check_attach (io_info.rcp_id, addr (io_info.rcp_area (1)),
+      117 	        longinfo, io_info.device_index, tolts_info.max_wks_sz, tolts_info.max_to,
+      118 	        io_info.rcp_state, io_info.attach_err);
+      119 
+      120 	  if (io_info.io_type ^= mca_io_type
+      121 	   & io_info.rcp_state = 0)			/* or attach done */
+      122 	   | (io_info.io_type = mca_io_type
+      123 	   & io_info.mca_attach_state = MCA_ATTACHED)
+      124 	   | io_info.attach_err ^= 0 then do;		/* if attach err */
+      125 	     io_info.alloc_wait = "0"b;		/* turn off allocation wait flag */
+      126 	     if tolts_info.glob_int_cnt ^= 0 then
+      127 	        tolts_info.glob_int_cnt = tolts_info.glob_int_cnt - 1; /* decrement global IO count */
+      128 	     call queue_and_signal;			/* go queue up ccc request and issue wakeup */
+      129 	  end;
+      130 	  if io_info.io_type = mca_io_type then
+      131 	     free mca_area_ptr -> mca_area in (free_area);
+      132          end;
+      133          return;					/* and return */
+      134       end;
+      135 
+      136 
+      137 
+      138 
+      139 
+      140       if tolts_info.glob_int_cnt ^= 0 then
+      141          tolts_info.glob_int_cnt = tolts_info.glob_int_cnt - 1; /* decrement global IO count */
+      142       if io_info.io_type = mca_io_type then		/* if mca test */
+      143          mca_work_space_ptr = io_info.workspace_ptr;
+      144       if io_info.io_type = rspd_io_type			/* if rspd test */
+      145        then tolts_rspd_wksp = io_info.tolts_rspd_wksp;
+      146 
+      147       else ioi_wksp = io_info.workspace_ptr;
+      148       go to ilv (event_info.message.lv);		/* process correct interrupt level */
+      149 
+      150 ilv (1):						/* Level 1, IOM fault */
+      151 ilv (0): ilv (2): ilv (4): ilv (6):			/* Levels 0, 2, 4 & 6, Illegal */
+      152       call tolts_qttyio_$rs (0, "^as: ^[IOM fault^s^;Illegal Interrupt level - ^d^], IOM status = ^12.3b ^12.3b",
+      153        tolts_info.exec, (tolts_workspace.status.level = 1), tolts_workspace.status.level,
+      154        substr (tolts_workspace.iom_status, 1, 36), substr (tolts_workspace.iom_status, 37, 36));
+      155 
+      156 ilv (5):						/* Level 5, marker interrupt (not expected) */
+      157       if io_info.io_type ^= firm_ld_io_type then do;	/* if not loading firmware... */
+      158          call move_status;				/* go move status to test page */
+      159          status.channel_stat, status.central_stat = "7"b3;	/* phony up iom status */
+      160          status.initiate = "1"b;			/* set initiate */
+      161          status.soft = "01"b;				/* set "timeout" */
+      162          call queue_and_signal;			/* go enter courtesy call request */
+      163       end;
+      164       else call signal;				/* if loading firmware, just wakeup dispatcher */
+      165       return;
+      166 
+      167 ilv (3):						/* Level 3, terminate interrupt */
+      168       if io_info.io_type = mca_io_type then call mca_term;
+      169       else if io_info.io_type = rspd_io_type then call rspd_term;
+      170       else do;
+      171          statp = addr (tolts_workspace.iom_status);	/* set ptr to examine status  */
+      172          if io_info.io_type = polt_io_type		/* if polt io type  terminate interrupt */
+      173 	| io_info.io_type = mtar_io_type		/* or mtar, treat like Polts */
+      174 	| io_info.io_type = mtc_io_type		/* or mtc, treat like Polts */
+      175 	| io_info.io_type = mtg_io_type		/* or mtg, treat like Polts */
+      176 	| io_info.io_type = mdc_io_type then		/* or mtg, treat like Polts */
+      177 	  call polt_term;
+      178 
+      179          else if io_info.io_type = itr_io_type		/* if itr io type terminate interrupt */
+      180 	| io_info.io_type = mhp_io_type then		/* or mhp io_type then treat like itr */
+      181 	  call itr_term;
+      182 
+      183          else if io_info.io_type = mdr_io_type then	/* if mdr terminate interrupt */
+      184 	  call mdr_term;
+      185 
+      186          else if io_info.io_type = firm_ld_io_type then
+      187 	  call signal;				/* if terminate interrupt while loading firmware */
+      188       end;
+      189       return;
+      190 
+      191 ilv (7):						/* Level 7, special interrupt, get special status */
+      192       if io_info.io_type = rspd_io_type then call rspd_spec;
+      193 
+      194       else do;
+      195          io_info.sp_status = event_info.message.istat;	/* extract special status from event message */
+      196          io_info.sp_flag = "1"b;			/* set availablity flag */
+      197          if io_info.io_type = polt_io_type		/* if polts special interrupt */
+      198 	| io_info.io_type = mtc_io_type
+      199 	| io_info.io_type = mtg_io_type
+      200 	| io_info.io_type = mdc_io_type then
+      201 	  call polt_spec;
+      202 
+      203          else if io_info.io_type = itr_io_type		/* if itr special interrupt */
+      204 	| io_info.io_type = mhp_io_type then
+      205 	  call itr_spec;
+      206 
+      207          else if io_info.io_type = mdr_io_type then
+      208 	  call mdr_spec;				/* if mdr special interrupt */
+      209 
+      210          else if io_info.io_type = firm_ld_io_type then
+      211 	  call signal;				/* if special interrupt while loading firmware */
+      212       end;
+      213 
+      214       return;
+      215 
+      216 
+      217 
+      218 /* check_copy - internal procedure to copy data back to test page if reading */
+      219 
+      220 check_copy: proc;
+      221 
+      222       if status.r then do;				/* if reading copy data, otherwise don't */
+      223          read = "1"b;				/* set read flag */
+      224          idcwp = addr (tolts_workspace.p_idcw);		/* get ptr to primary idcw */
+      225          if idcw.control = "10"b then			/* if continue but set */
+      226 	  continue = "1"b;				/* set flag */
+      227          else continue = "0"b;			/* otherwise stop at first iotd */
+      228          found = "0"b;				/* reset terminate condition */
+      229          do i = 1 to hbound (io_info.dcw_list, 1) while (^found); /* go through dcw list */
+      230 	  dcwp = addr (io_info.dcw_list (i));		/* set test page dcw ptr */
+      231 	  if dcw.char_pos = "7"b3 then do;		/* if idcw */
+      232 	     if dcwp -> idcw.control = "10"b then	/* if idcw continue bit set */
+      233 	        continue = "1"b;			/* set continue flag */
+      234 	     else continue = "0"b;			/* otherwise reset it */
+      235 	     if substr (dcwp -> idcw.command, 3, 1) = "0"b then /* if read operation */
+      236 	        read = "1"b;			/* set read flag */
+      237 	     else read = "0"b;			/* otherwise reset it */
+      238 	  end;
+      239 	  else if read & dcw.type ^= "11"b then do;	/* if read and not iontp */
+      240 	     if dcw.type = "00"b then			/* if iotd */
+      241 	        if ^continue then			/* and continue flag not set */
+      242 		 found = "1"b;			/* set terminate condition */
+      243 	     tdcwp = addr (tolts_workspace.dcw_list (i)); /* set workspace dcw ptr */
+      244 	     mvp = addrel (execp, dcw.address);		/* get ptr to data to move */
+      245 	     c_len = bin (dcw.tally);			/* get length of data */
+      246 	     if c_len = 0 then c_len = 4096;		/* if tally is zero force tally equal to 4096 */
+      247 	     if string (dcw) = "0"b then do;		/* if zero dcw then  fake out dcw */
+      248 	        c_len = 1;				/* set tally = 1 */
+      249 	        mvp = addrel (execp, io_info.status_add); /* set mvp to status_word */
+      250 	     end;
+      251 	     if found & status.tally ^= "0000"b3 then	/* if last dcw and tally residue */
+      252 	        c_len = c_len - bin (status.tally);	/* subtract tally residue */
+      253 	     if c_len > 0 then do;			/* if <0 then error and skip */
+      254 	        bufp = ptr (ioi_wksp, tdcwp -> dcw.address); /* get ptr to workspace buffer address */
+      255 	        workspace_move = bufp -> workspace_move;	/* and move it */
+      256 	     end;
+      257 	  end;
+      258          end;
+      259       end;
+      260    end check_copy;
+      261 
+      262 
+      263 /* itr_spec - interrupt processor for Molt/ITR special interrupts */
+      264 
+      265 itr_spec: proc;
+      266 
+      267       statp = addrel (execp, io_info.status_add);		/* get ptr to test page status storage */
+      268       string (special_status) = io_info.sp_status;
+      269       if io_info.io_type = mhp_io_type then		/* if hyper leave staus */
+      270          substr (unspec (special_status), 1, 1) = "0"b;	/* just zero the first bit */
+      271       else substr (unspec (special_status), 1, 9) = "0"b;	/* else zero first 9 bits */
+      272       if io_info.release_chan then			/* if special from a release cmd */
+      273          call release_dev;				/* go call ioi_$release_devices */
+      274       else if ^io_info.suspend_chan then
+      275          call queue_and_signal;			/* go enter courtesy call request */
+      276 
+      277    end itr_spec;
+      278 
+      279 /* itr_term - interrupt processor for Molt/ITR terminate interrupts */
+      280 
+      281 itr_term: proc;
+      282 
+      283       if tolts_workspace.status.timeout then do;		/* if ioi timeout */
+      284          if ^io_info.to_no_cc then do;			/* if not executing IPCW */
+      285 	  statp = addrel (execp, io_info.status_add);	/* get ptr to test page status storage */
+      286 	  substr (unspec (status), 1, 18) = "510006"b3;	/* set time out status */
+      287 	  call queue_and_signal;			/* go queue up cc request */
+      288          end;
+      289          else io_info.to_no_cc = "0"b;			/* reset flag if set */
+      290       end;
+      291       else if status.power then do;			/* if power off status */
+      292          if io_info.suspend_chan then			/* if this is from suspend channel */
+      293 	  io_info.suspend_chan = "0"b;		/* this is the only int we will get */
+      294          call move_status;				/* move status to test page */
+      295          call queue_and_signal;			/* go queue up cc request */
+      296       end;
+      297       else if ^io_info.ignore_term then do;		/* if we are not ignoring terminates */
+      298          call check_copy;				/* go copy data if reading */
+      299          call move_status;				/* move the status to test page */
+      300          call queue_and_signal;			/* queue up cc request */
+      301       end;
+      302 
+      303    end itr_term;
+      304 
+      305 
+      306 
+      307 /* mca_term - interrupt processor for Molt/MCA terminate interrupts */
+      308 
+      309 mca_term: proc;
+      310 
+      311       allocate mca_area in (free_area) set (mca_area_ptr);
+      312       call mca_$process_io_event (io_info.mca_ioi_idx, addr (event_info), addr (mca_area), error);
+      313       if error ^= 0 then do;
+      314          if ^substr (unspec (error), 1, 1) then do;
+      315 	  call com_err_ (error, "tolts_io_int_", "fatal error, terminating process");
+      316 	  fatal_desc.version = 0;
+      317 	  fatal_desc.fatal_code = error;		/* copy error code */
+      318 	  call terminate_process_ ("fatal_error", addr (fatal_desc));
+      319          end;
+      320       end;
+      321       if mca_work_space.list_of_dcw.idcw1.command = "03"b3 then do;
+      322          data_header_ptr = addr (mca_work_space.data_header_1);
+      323          io_param_blk_ptr = addr (mca_work_space.data_header_1.io_param_blk);
+      324          data_size_1 = fixed (io_parameter_block.source_len_msb || io_parameter_block.source_len_lsb, 16);
+      325          dcwp = addr (io_info.dcw_list (2));
+      326          bufp = addr (mca_work_space.data_header_1);
+      327       end;
+      328       else do;
+      329          io_param_blk_ptr = addr (mca_work_space.data_header_1.io_param_blk);
+      330          data_size_1 = fixed (io_parameter_block.dest_len_msb || io_parameter_block.dest_len_lsb, 16);
+      331          dcwp = addr (io_info.dcw_list (4));
+      332          bufp = addr (mca_work_space.data_header_2);
+      333       end;
+      334       data_header_ptr = addr (mca_work_space.data_header_2);
+      335       io_param_blk_ptr = addr (mca_work_space.data_header_2.io_param_blk);
+      336       data_size_2 = fixed (io_parameter_block.source_len_msb || io_parameter_block.source_len_lsb, 16);
+      337       if string (dcw) = "0"b then do;
+      338          c_len = 1;
+      339          mvp = addrel (execp, io_info.status_add);
+      340       end;
+      341       else do;
+      342          mvp = addrel (execp, dcw.address);
+      343          if dcw.tally = "0"b then c_len = 4096;
+      344          else c_len = bin (dcw.tally);
+      345       end;
+      346       workspace_move = bufp -> workspace_move;
+      347       statp = addrel (execp, io_info.status_add);
+      348       unspec (status) = mca_area.mca_status;
+      349       free mca_area_ptr -> mca_area in (free_area);
+      350       call queue_and_signal;
+      351    end mca_term;
+      352 
+      353 
+      354 /* mdr_spec - interrupt processor for Molt/MDR special interrupts */
+      355 
+      356 mdr_spec: proc;
+      357 
+      358       statp = addrel (execp, io_info.status_add);		/* get ptr to test page status storage */
+      359       string (special_status) = io_info.sp_status;
+      360       if io_info.io_type ^= mhp_io_type then
+      361          substr (unspec (special_status), 1, 9) = "0"b;
+      362       if io_info.suspend_chan then			/* if this is a special from suspend cmd */
+      363          io_info.suspend_chan = "0"b;			/* reset flag */
+      364       if io_info.release_chan then			/* if special from a release cmd */
+      365          call release_dev;				/* go call ioi_$release_devices */
+      366 
+      367    end mdr_spec;
+      368 
+      369 /* mdr_term - interrupt processor for Molt/MDR terminate interrupts */
+      370 
+      371 mdr_term: proc;
+      372 
+      373       if tolts_workspace.timeout | status.power | status.major | status.sub |
+      374        status.channel_stat | status.central_stat then do;	/* debug trap */
+      375          c_len = 0;
+      376       end;
+      377       if tolts_workspace.status.timeout then do;		/* if ioi timeout */
+      378          statp = addrel (execp, io_info.status_add);	/* get ptr to test page status storage */
+      379          substr (unspec (status), 1, 18) = "510006"b3;	/* set time out status */
+      380          call queue_and_signal;			/* go queue up cc request */
+      381       end;
+      382       else if status.power then do;			/* if power off status */
+      383          call move_status;				/* move status to test page */
+      384          call queue_and_signal;			/* go queue up cc request */
+      385       end;
+      386       else do;					/* good terminate */
+      387 
+      388          call check_copy;				/* go copy data if reading */
+      389          call move_status;				/* move iom status to test page */
+      390          call queue_and_signal;			/* go enter courtesy call request */
+      391          if io_info.release_chan then			/* if special from a release cmd */
+      392 	  call release_dev;				/* go call ioi_$release_devices */
+      393       end;
+      394 
+      395    end mdr_term;
+      396 
+      397 
+      398 
+      399 /* move_status - internal procedure to move term status to test page and correct dcw residue address */
+      400 
+      401 move_status: proc;
+      402 
+      403       if io_info.ext_status_add ^= 0 then
+      404          call ioi_$get_detailed_status (io_info.device_index, "1"b,
+      405 	addrel (execp, io_info.ext_status_add) -> detailed_status, code);
+      406       statp = addrel (execp, io_info.status_add);		/* get ptr to test page status storage */
+      407       string (status) = tolts_workspace.iom_status;	/* move the status to the test page */
+      408       if substr (tolts_workspace.iom_status, 37, 36) = "777777777777"b3 then /* if garbage */
+      409          substr (string (status), 37, 36) = "0"b;		/* set to zero */
+      410       else do;					/* otherwise move it */
+      411          i = bin (rel (addr (tolts_workspace.dcw_list (1)))); /* get offset of dcw list */
+      412          if tolts_workspace.offset >= i then do;		/* if we have processed dcws */
+      413 	  i = tolts_workspace.offset - i + 1;		/* get array index of last dcw */
+      414 	  dcwp = addr (io_info.dcw_list (i));		/* get ptr to unaltered dcw */
+      415 	  stata = bin (dcw.address) + bin (dcw.tally);	/* add address and tally */
+      416 	  stata = stata - bin (status.tally);		/* and subtract tally residue */
+      417 	  status.address = bit (stata);		/* correct test page dcw residue add */
+      418          end;
+      419       end;
+      420    end move_status;
+      421 
+      422 
+      423 /* polt_spec - interrupt processor for Polt special interrupts */
+      424 
+      425 polt_spec: proc;
+      426 
+      427       if io_info.rew_wait then do;			/* special expected? ignore if not */
+      428          io_info.rew_wait = "0"b;			/* yes, reset flag */
+      429 
+      430 /* reconnect original dcw list, this will occur if device was busy before */
+      431 
+      432          call ioi_$connect_pcw (io_info.device_index, io_info.tio_off, io_info.pcwa, error);
+      433          if error ^= 0 then do;			/* error on connect */
+      434 	  call com_err_$convert_status_code_ (error, shortinfo, longinfo);
+      435 	  call tolts_qttyio_$rs (0, "^as: Error on connect after special interrupt:^/^a",
+      436 	   tolts_info.exec, longinfo);
+      437 	  tolts_info.special_fault = "1"b;		/* set special int fault flag */
+      438 	  call signal;				/* wakeup dispatcher, but do not queue up cc */
+      439          end;
+      440       end;
+      441 
+      442    end polt_spec;
+      443 
+      444 /* polt_term - interrupt processor for Polt terminate interrupts */
+      445 
+      446 polt_term: proc;
+      447 
+      448       if status.major | status.channel_stat | status.central_stat then do; /* debug trap */
+      449          c_len = 0;
+      450       end;
+      451       if tolts_workspace.status.timeout then do;		/* if ioi timeout */
+      452          statp = addrel (execp, io_info.status_add);	/* get ptr to test page status storage */
+      453          unspec (status) = "0"b;			/* clear status first */
+      454          substr (unspec (status), 1, 18) = "510006"b3;	/* set time out status */
+      455          call queue_and_signal;			/* go queue up cc request */
+      456       end;
+      457       else if status.major = "0001"b & io_info.rcp_name = DEVICE_TYPE (TAPE_DRIVE_DTYPEX) then /* else if tape device and */
+      458          io_info.rew_wait = "1"b;			/* device busy, wait for rewind complete */
+      459       else do;					/* normal terminate */
+      460 
+      461          call check_copy;				/* go copy data if reading */
+      462          call move_status;				/* move iom status to test page */
+      463          call queue_and_signal;			/* go enter courtesy call request */
+      464       end;
+      465 
+      466    end polt_term;
+      467 
+      468 
+      469 
+      470 /* queue_and_signal - subroutine to enter cc request for io completion (or alloc wait completion) and wakeup the dispatcher */
+      471 
+      472 queue_and_signal: proc;
+      473 
+      474       call tolts_alm_util_$enter_ccc_req_ (addr (tolts_info.ccc_queue),
+      475        string (io_info.icivlu));			/* enter ccc request */
+      476 
+      477 signal: entry;					/* wakeup the dispatcher */
+      478       io_info.io_in_progress = "0"b;			/* reset io in progress flag */
+      479       wakeup_ptr = in_data_pointer;
+      480       call tolts_init_$gc_tod (g_time);			/* get current time */
+      481       io_info.int_time = bin (g_time, 35);		/* set current interrupt time */
+      482       io_info.chan_time = io_info.chan_time + (io_info.int_time - io_info.con_time); /* delta chan time */
+      483       if tolts_info.gewake_active then do;		/* if gewake alarm set */
+      484          call timer_manager_$reset_alarm_wakeup (tolts_info.gewake_event); /* reset it */
+      485          call ipc_$drain_chn (tolts_info.gewake_event, error); /* make sure no alarms queue up */
+      486          tolts_info.gewake_active = "0"b;		/* reset flag */
+      487       end;
+      488       call hcs_$wakeup (tolts_info.process, tolts_info.wait_list.wait_event_id (1), wakeup_ptr, error);
+      489       if error ^= 0 then do;				/* error on wakeup, terminate proc */
+      490          call com_err_ (error, "tolts_io_int_", "fatal error, terminating process");
+      491          fatal_desc.version = 0;
+      492          fatal_desc.fatal_code = error;			/* copy error code */
+      493          call terminate_process_ ("fatal_error", addr (fatal_desc));
+      494       end;
+      495    end queue_and_signal;
+      496 
+      497 
+      498 /* release_dev - internal procedure to call ioi_$release_devices and reset release_chan flag */
+      499 
+      500 release_dev: proc;
+      501 
+      502       io_info.release_chan = "0"b;			/* reset flag */
+      503       call ioi_$release_devices (io_info.device_index, error); /* let ioi have a turn */
+      504       if error ^= 0 then do;				/* error, abort */
+      505          call com_err_$convert_status_code_ (error, shortinfo, longinfo);
+      506          call tolts_qttyio_$rs (0, "^as: Error from ioi_$release_devices:^/^a", tolts_info.exec, longinfo);
+      507          tolts_info.special_fault = "1"b;		/* set special int fault flag */
+      508          call signal;				/* wakeup dispatcher, but do not queue up cc */
+      509       end;
+      510    end release_dev;
+      511 
+      512 
+      513 /* rspd_spec - interrupt processor for Colt/RSPD special interrupts */
+      514 
+      515 rspd_spec: proc;
+      516 
+      517       tolts_rspd_workspace.mailbox.lvl7 =
+      518        tolts_rspd_workspace.mailbox.lvl7 + 1;		/* bump spec int count */
+      519       direct_channel_pcw_ptr = addr (io_info.pcwa);
+      520       tolts_rspd_workspace.mailbox.status_word = event_info.message.istat;
+      521 
+      522       if direct_channel_pcw.operation = "75"b3 then do;	/* if read pcw move data */
+      523          c_len = tolts_rspd_workspace.tcw.host_word_count;
+      524          bufp = addr (tolts_rspd_workspace.data_buf);
+      525          mvp = addrel (execp, direct_channel_pcw.tcw_address + 1);
+      526          workspace_move = bufp -> workspace_move;
+      527       end;
+      528       call signal;
+      529    end rspd_spec;
+      530 
+      531 
+      532 /* rspd_term - interrupt processor for Colt/RSPD terminate interrupts */
+      533 
+      534 rspd_term: proc;
+      535       tolts_rspd_workspace.mailbox.lvl3 =
+      536        tolts_rspd_workspace.mailbox.lvl3 + 1;		/* inc term int count */
+      537       direct_channel_pcw_ptr = addr (io_info.pcwa);
+      538       tolts_rspd_workspace.mailbox.status_word = event_info.message.istat;
+      539       if direct_channel_pcw.operation = "75"b3 then do;	/* if read pcw read data */
+      540          c_len = tolts_rspd_workspace.tcw.host_word_count;
+      541          bufp = addr (tolts_rspd_workspace.data_buf);
+      542          mvp = addrel (execp, direct_channel_pcw.tcw_address + 1);
+      543          workspace_move = bufp -> workspace_move;
+      544       end;
+      545       call signal;
+      546    end rspd_term;
+      547 
+      548 
+      549 
+  1     1 
+  1     2 /* Begin include file ...... iom_stat.incl.pl1 */
+  1     3 /* Last modified on 10/31/74 by Noel I. Morris */
+  1     4 
+  1     5 dcl  statp ptr;					/* pointer to status */
+  1     6 
+  1     7 dcl 1 status based (statp) aligned,			/* IOM status information */
+  1     8      (2 t bit (1),					/* set to "1"b by IOM */
+  1     9       2 power bit (1),				/* non-zero if peripheral absent or power off */
+  1    10       2 major bit (4),				/* major status */
+  1    11       2 sub bit (6),				/* substatus */
+  1    12       2 eo bit (1),					/* even/odd bit */
+  1    13       2 marker bit (1),				/* non-zero if marker status */
+  1    14       2 soft bit (2),				/* software status */
+  1    15       2 initiate bit (1),				/* initiate bit */
+  1    16       2 abort bit (1),				/* software abort bit */
+  1    17       2 channel_stat bit (3),				/* IOM channel status */
+  1    18       2 central_stat bit (3),				/* IOM central status */
+  1    19       2 mbz bit (6),
+  1    20       2 rcount bit (6),				/* record count residue */
+  1    21       2 address bit (18),				/* DCW address residue */
+  1    22       2 char_pos bit (3),				/* character position residue */
+  1    23       2 r bit (1),					/* non-zero if reading */
+  1    24       2 type bit (2),				/* type of last DCW */
+  1    25       2 tally bit (12)) unal;				/* DCW tally residue */
+  1    26 
+  1    27 dcl 1 faultword based (statp) aligned,			/* system fault word */
+  1    28      (2 mbz1 bit (9),
+  1    29       2 channel bit (9),				/* channel number */
+  1    30       2 serv_req bit (5),				/* service request */
+  1    31       2 mbz2 bit (3),
+  1    32       2 controller_fault bit (4),			/* system controller fault code */
+  1    33       2 io_fault bit (6)) unal;			/* I/O fault code */
+  1    34 
+  1    35 dcl 1 special_status based (statp) aligned,		/* special status from PSIA */
+  1    36    (2 t bit (1),					/* entry present bit */
+  1    37     2 channel bit (8),				/* channel number */
+  1    38     2 pad1 bit (3),
+  1    39     2 device bit (6),				/* device address */
+  1    40     2 pad2 bit (1),
+  1    41     2 byte2 bit (8),				/* device dependent information */
+  1    42     2 pad3 bit (1),
+  1    43     2 byte3 bit (8)) unal;				/* device dependent information */
+  1    44 
+  1    45 /* End of include file iom_stat.incl.pl1 */
+  1    46 
+      550 
+      551 
+  2     1 /* Begin mca_area.incl.pl1 */
+  2     2 
+  2     3 
+  2     4 /****^  HISTORY COMMENTS:
+  2     5*  1) change(86-03-19,Fawcett), approve(86-03-19,MCR7374),
+  2     6*     audit(86-04-28,Lippard), install(86-09-16,MR12.0-1159):
+  2     7*     This is the structure returned to the user after IO completion.
+  2     8*                                                   END HISTORY COMMENTS */
+  2     9 
+  2    10 dcl  1 mca_area aligned based (mca_area_ptr),
+  2    11        2 version char (8),                 /* version of structure */
+  2    12        2 io_outstanding bit (1) aligned,   /* true if section is not complete */
+  2    13        2 mca_attach_state fixed bin (17),  /* State of the attachment process, refer to mca_data.incl.pl1 */
+  2    14        2 mca_status bit (72),		   /* status from io */
+  2    15        2 ret_len fixed bin (21);	   /* length in characters of data returned */
+  2    16 
+  2    17 dcl  mca_area_ptr ptr;
+  2    18 
+  2    19 dcl  MCA_area_version_1 char (8) int static options
+  2    20 	(constant) init ("MCA00001");     /* current version */
+  2    21 
+  2    22 
+  2    23 /* End mca_area.incl.pl1 */
+      553 
+  3     1 /*	Begin  include file ... mca_data.incl.pl1
+  3     2*   *
+  3     3*   *	Created on 09/14/84 by Paul Farley.
+  3     4*   *      Modified by R. A. Fawcett 10/25/84
+  3     5**/
+  3     6 
+  3     7 /****^  HISTORY COMMENTS:
+  3     8*  1) change(85-09-11,Fawcett), approve(85-09-11,MCR6979),
+  3     9*     audit(86-01-17,CLJones), install(86-03-21,MR12.0-1033):
+  3    10*     Created for MCA
+  3    11*     support
+  3    12*  2) change(86-08-19,Fawcett), approve(86-08-19,MCR7374),
+  3    13*     audit(86-08-26,Lippard), install(86-09-16,MR12.0-1159):
+  3    14*     Fix problems found in audit of the Online manager code.
+  3    15*                                                   END HISTORY COMMENTS */
+  3    16 
+  3    17 dcl  MCA_data_version_1 char (8) int static options
+  3    18 	(constant) init ("MCA00001");
+  3    19 
+  3    20 dcl  mca_data_seg_ptr ptr static init (null ());
+  3    21 
+  3    22 dcl  mcad_ptr ptr;
+  3    23 
+  3    24 dcl  ipcd_ptr ptr;
+  3    25 
+  3    26 dcl  1 mca_data_seg based (mca_data_seg_ptr),
+  3    27        2 version char (8),
+  3    28        2 array (1:4) like mcad;
+  3    29 
+  3    30 
+  3    31 dcl  1 mcad based (mcad_ptr) aligned,
+  3    32        2 lock bit (36),				/* The mca write lock. */
+  3    33        2 state fixed bin,				/* Current mca state */
+  3    34        2 attach_time fixed bin (71),			/* DT/time of attach */
+  3    35        2 attach_pid bit (36),				/* PID of attaching process */
+  3    36        2 name char (1),				/* name of this mca (a b c d) */
+  3    37        2 imu_number fixed bin (17),			/* number of the IMU */
+  3    38        2 ioi_idx fixed bin,				/* value to use with ioi_ */
+  3    39        2 event_chn fixed bin (71),			/* ipc channel for IO processing ring_1 */
+  3    40        2 ioi_wks_ptr ptr,				/* pointer to IOI Workspace */
+  3    41        2 max_ws_size fixed bin (19),
+  3    42        2 pad fixed bin,
+  3    43        2 user_ptr ptr,				/* used for async_io */
+  3    44        2 return_data_ptr ptr,				/* user for async_io */
+  3    45        2 io_param_ptr ptr,				/* pointer to the io_parameter_block for mca returned data */
+  3    46        2 entry_to_return_data entry (ptr, fixed bin (21), fixed bin (35)),
+  3    47 						/* entry that will return the data to the user for async_io */
+  3    48        2 status_offset fixed bin,			/* offset into work space for status */
+  3    49        2 current_ws_size fixed bin (18),		/* current work_space */
+  3    50        2 rcp_id bit (36),
+  3    51        2 flags unaligned,
+  3    52          3 async_io bit (1),				/* 1 = outer ring will catch IO events */
+  3    53 						/* 0 = ring 1 will go blocked and wait for IO to complete */
+  3    54          3 config_data_requested bit (1),		/* used during mca attachment */
+  3    55          3 pad bit (34),
+  3    56        2 max_time_out fixed bin (71),			/* maximum time for time out */
+  3    57        2 last_status bit (71),			/* most recent MCA status return */
+  3    58 
+  3    59        2 ipcd_array (0:15) like ipcd aligned;
+  3    60 
+  3    61 dcl  1 ipcd based (ipcd_ptr) aligned,
+  3    62        2 ipc_name char (8),				/* "ipcXX" */
+  3    63        2 channel fixed bin (17) unaligned,		/* base channel */
+  3    64        2 nchan fixed bin (17) unaligned,		/* number of channels */
+  3    65        2 type_info,					/* type of IPC */
+  3    66          3 no_level_2_info bit (1) unaligned,
+  3    67          3 is_micro_cont bit (1) unaligned,
+  3    68          3 fbus_disable_latch bit (1) unaligned,
+  3    69          3 pad bit (6) unaligned,
+  3    70          3 type_index fixed bin (8) unaligned,
+  3    71        2 state fixed bin (17) unaligned,		/* current state */
+  3    72        2 level_1_state fixed bin (17),			/* LVL-1_STATE  */
+  3    73        2 prph_attachments fixed bin (17),		/* # of RCP attachments */
+  3    74        2 attach_data (8),
+  3    75          3 prph_name char (4),			/* Multics prph name */
+  3    76          3 flags unaligned,
+  3    77 	 4 attached_thru_rcp bit (1),			/* must detach when done */
+  3    78 	 4 io_suspended bit (1),			/* must resume IO when done */
+  3    79 	 4 pad (34) bit (1),
+  3    80          3 attach_time fixed bin (71),			/* DT/time of attach */
+  3    81          3 ipc_rcp_id bit (36),			/* rcp id */
+  3    82          3 ipc_ioi_idx fixed bin;			/* index from rcp */
+  3    83 
+  3    84 dcl  SYSTEM_DIR char (17) init (">system_library_1") static options (constant);
+  3    85 dcl  DATA_SEG char (12) init ("mca_data_seg") static options (constant);
+  3    86 
+  3    87 
+  3    88 dcl  (MCA_NOT_CONFIGURED init (0),			/* possible mcad.state values */
+  3    89      MCA_FREE init (1),
+  3    90      MCA_ATTACHING init (2),
+  3    91      MCA_ATTACHED init (3),
+  3    92      MAINT_SESSION init (10)) fixed bin internal static options (constant);
+  3    93 
+  3    94 dcl  (IPC_NOT_CONFIGURED init (0),			/* possible ipcd.state values */
+  3    95      IPC_FREE init (1),
+  3    96      IPC_ATTACHED init (2)) fixed bin internal static options (constant);
+  3    97 
+  3    98 /*	End of include file ... mca_data.incl.pl1	*/
+      554 
+      555 
+  4     1 /* Begin mca_data_area.incl.pl1 */
+  4     2 
+  4     3 /****^  HISTORY COMMENTS:
+  4     4*  1) change(86-03-19,Fawcett), approve(86-03-19,MCR7374),
+  4     5*     audit(86-04-28,Lippard), install(86-09-16,MR12.0-1159):
+  4     6*     Created for control of the MCA. This is a template for the ioi workspace
+  4     7*     needed for the MCA communications.
+  4     8*                                                   END HISTORY COMMENTS */
+  4     9 
+  4    10 /* Created Sept 84 by R. A. Fawcett from information in
+  4    11*   "EPS-1 DIPPER Maintainability" REV A (MAY 3, 1983) */
+  4    12 
+  4    13 
+  4    14 
+  4    15 dcl  data_header_ptr ptr;
+  4    16 
+  4    17 dcl  (data_size_1, data_size_2) fixed bin (21) init (0);
+  4    18 
+  4    19 dcl  io_param_blk_ptr ptr;
+  4    20 
+  4    21 dcl  mca_dcw_list_ptr ptr;
+  4    22 
+  4    23 dcl  mca_work_space_ptr ptr;
+  4    24 
+  4    25 dcl  1 mca_work_space based (mca_work_space_ptr),
+  4    26        2 list_of_dcw like mca_dcw_list,
+  4    27        2 status_area like istat,
+  4    28 
+  4    29        2 data_header_1 aligned like data_header,
+  4    30        2 data_1 char (data_size_1),
+  4    31        2 data_header_2 aligned like data_header,
+  4    32        2 data_2 char (data_size_2);
+  4    33 
+  4    34 
+  4    35 dcl  1 data_header based (data_header_ptr) aligned,
+  4    36        2 type bit (9) unal,				/* must be equal to "000"b3 (MBZ) */
+  4    37        2 definer fixed bin (9) unal unsigned,		/* defines type of info in header */
+  4    38        2 ctl_sw bit (18) unal,			/* "currently undfined" mbz  = "000000"b3 */
+  4    39 
+  4    40        2 host_sts_ign1 bit (1) unal,
+  4    41        2 host_sts_msb bit (8) unal,
+  4    42        2 host_sts_ign2 bit (1) unal,
+  4    43        2 host_sts_lsb bit (8) unal,
+  4    44 
+  4    45        2 rd_flpy fixed bin (9) unal unsigned,		/* 0 = data files from host */
+  4    46 						/* 1 = data files from flopy */
+  4    47        2 io_param_blk like io_parameter_block unal;
+  4    48 
+  4    49 
+  4    50 dcl  1 io_parameter_block based (io_param_blk_ptr) unal,
+  4    51        2 open fixed bin (9) unal unsigned,
+  4    52        2 cmd bit (18),
+  4    53        2 sts_ptr bit (18),				/* Unused */
+  4    54        2 file_name char (8),				/* file name for this request */
+  4    55        2 options bit (18),				/* Unused */
+  4    56        2 source_ptr bit (18),				/* Unused */
+  4    57        2 source_len,
+  4    58 						/* data_size = source_len_msb||source_len_lsb MCA to HOST */
+  4    59          3 source_len_ign1 bit (1),
+  4    60          3 source_len_msb bit (8),
+  4    61          3 source_len_ign2 bit (1),
+  4    62          3 source_len_lsb bit (8),
+  4    63        2 dest_ptr bit (18),				/* Unused */
+  4    64        2 blk_ct,
+  4    65 						/* if MCA to HOST blk_ct_msb||blk_ct_lsb = MAX number of 256 byte BLOCKS  */
+  4    66 						/* else not used */
+  4    67          3 blk_ct_ign1 bit (1),
+  4    68          3 blk_ct_msb bit (8),
+  4    69          3 blk_ct_ign2 bit (1),
+  4    70          3 blk_ct_lsb bit (8),
+  4    71        2 dest_len,
+  4    72 						/* supplied by host as the number of bytes in data_field max value is 16128 */
+  4    73 						/* dest_len_msb = substr(unspec(data_size),21,8) */
+  4    74 						/* dest_len_lsb = substr(unspec(data_size),29,8) */
+  4    75          3 dest_len_ign1 bit (1),
+  4    76          3 dest_len_msb bit (8),
+  4    77          3 dest_len_ign2 bit (1),
+  4    78          3 dest_len_lsb bit (8);
+  4    79 
+  4    80 
+  4    81 dcl  1 mca_dcw_list based (mca_dcw_list_ptr),
+  4    82        2 idcw1 like idcw,
+  4    83        2 dcw1 like dcw,
+  4    84        2 idcw2 like idcw,
+  4    85        2 dcw2 like dcw;
+  4    86 
+  4    87 
+  5     1 
+  5     2 /* Begin include file ...... iom_dcw.incl.pl1 */
+  5     3 
+  5     4 dcl  dcwp ptr,					/* pointer to DCW */
+  5     5      tdcwp ptr;					/* pointer to TDCW */
+  5     6 
+  5     7 dcl 1 dcw based (dcwp) aligned,			/* Data Control Word */
+  5     8      (2 address bit (18),				/* address for data transfer */
+  5     9       2 char_pos bit (3),				/* character position */
+  5    10       2 m64 bit (1),				/* non-zero for mod 64 address */
+  5    11       2 type bit (2),				/* DCW type */
+  5    12       2 tally bit (12)) unal;				/* tally for data transfer */
+  5    13 
+  5    14 dcl 1 tdcw based (tdcwp) aligned,			/* Transfer DCW */
+  5    15      (2 address bit (18),				/* address to transfer to */
+  5    16       2 mbz1 bit (4),
+  5    17       2 type bit (2),				/* should be "10"b for TDCW */
+  5    18       2 mbz2 bit (9),
+  5    19       2 ec bit (1),					/* non-zero to set LPW AE bit */
+  5    20       2 res bit (1),				/* non-zero to restrict further use of IDCW */
+  5    21       2 rel bit (1)) unal;				/* non-zero to set relative mode after transfer */
+  5    22 
+  5    23 /* End of include file ...... iom_dcw.incl.pl1 */
+  5    24 
+  4    88 
+
+
+
+
+  4    89 
+  6     1 
+  6     2 /* Begin include file ...... iom_pcw.incl.pl1 */
+  6     3 
+  6     4 dcl  pcwp ptr;					/* pointer to PCW */
+  6     5 
+  6     6 dcl 1 pcw based (pcwp) aligned,			/* Peripheral Control Word */
+  6     7      (2 command bit (6),				/* device command */
+  6     8       2 device bit (6),				/* device code */
+  6     9       2 ext bit (6),				/* address extension */
+  6    10       2 code bit (3),				/* should be "111"b for PCW */
+  6    11       2 mask bit (1),				/* channel mask bit */
+  6    12       2 control bit (2),				/* terminate/proceed and marker control bits */
+  6    13       2 chan_cmd bit (6),				/* type of I/O operation */
+  6    14       2 count bit (6),				/* record count or control character */
+  6    15       2 mbz1 bit (3),
+  6    16       2 channel bit (6),				/* channel number */
+  6    17       2 mbz2 bit (27)) unal;
+  6    18 
+  6    19 dcl  idcwp ptr;					/* pointer to IDCW */
+  6    20 
+  6    21 dcl 1 idcw based (idcwp) aligned,			/* Instruction DCW */
+  6    22      (2 command bit (6),				/* device command */
+  6    23       2 device bit (6),				/* device code */
+  6    24       2 ext bit (6),				/* address extension */
+  6    25       2 code bit (3),				/* should be "111"b for PCW */
+  6    26       2 ext_ctl bit (1),				/* "1"b if address extension to be used */
+  6    27       2 control bit (2),				/* terminate/proceed and marker control bits */
+  6    28       2 chan_cmd bit (6),				/* type of I/O operation */
+  6    29       2 count bit (6)) unal;				/* record count or control character */
+  6    30 
+  6    31 /* End include file ...... iom_pcw.incl.pl1 */
+  6    32 
+  4    90 
+
+
+
+
+  4    91 
+  7     1 
+  7     2 /* Begin include file ...... ioi_stat.incl.pl1 */
+  7     3 /* Last modified 3/24/75 by Noel I. Morris */
+  7     4 
+  7     5 dcl  isp ptr;					/* pointer to status structure */
+  7     6 
+  7     7 dcl 1 istat based (isp) aligned,			/* I/O Interfacer status structure */
+  7     8     2 completion,					/* completion flags */
+  7     9      (3 st bit (1),					/* "1"b if status returned */
+  7    10       3 er bit (1),					/* "1"b if status indicates error condition */
+  7    11       3 run bit (1),				/* "1"b if channel still running */
+  7    12       3 time_out bit (1)) unal,			/* "1"b if time-out occurred */
+  7    13     2 level fixed bin (3),				/* IOM interrupt level */
+  7    14     2 offset fixed bin (18),				/* DCW list offset */
+  7    15     2 absaddr fixed bin (24),				/* absolute address of workspace */
+  7    16     2 iom_stat bit (72),				/* IOM status */
+  7    17     2 lpw bit (72);					/* LPW residue */
+  7    18 
+  7    19 dcl  imp ptr;					/* pointer to message structure */
+  7    20 
+  7    21 dcl 1 imess based (imp) aligned,			/* I/O Interfacer event message structure */
+  7    22    (2 completion like istat.completion,			/* completion flags */
+  7    23     2 pad bit (11),
+  7    24     2 level bit (3),				/* interrupt level */
+  7    25     2 offset bit (18),				/* DCW list offset */
+  7    26     2 status bit (36)) unal;				/* first 36 bits of status */
+  7    27 
+  7    28 /* End of include file ...... ioi_stat.incl.pl1 */
+  7    29 
+  4    92 
+
+
+
+
+  4    93 
+  4    94 /* Constants used for data_header.definer */
+  4    95 
+  4    96 dcl  DATA_FROM_HOST
+  4    97 	fixed bin (9) unsigned init (0) static options (constant);
+  4    98 dcl  WRITE_CONSOLE
+  4    99 	fixed bin (9) unsigned init (1) static options (constant);
+  4   100 dcl  WRITE_READ_CONSOLE
+  4   101 	fixed bin (9) unsigned init (2) static options (constant);
+  4   102 dcl  DATA_FROM_MCA
+  4   103 	fixed bin (9) unsigned init (3) static options (constant);
+  4   104 dcl  REQ_DATA_FROM_HOST
+  4   105 	fixed bin (9) unsigned init (4) static options (constant);
+  4   106 dcl  STATUS_FROM_MCA
+  4   107 	fixed bin (9) unsigned init (5) static options (constant);
+  4   108 dcl  SEEK
+  4   109 	fixed bin (9) unsigned init (6) static options (constant);
+  4   110 dcl  CON_DATA_FROM_HOST
+  4   111 	fixed bin (9) unsigned init (7) static options (constant);
+  4   112 dcl  BIN_DATA_FROM_HOST
+  4   113 	fixed bin (9) unsigned init (8) static options (constant);
+  4   114 dcl  ABORT_SES_FROM_HOST
+  4   115 	fixed bin (9) unsigned init (9) static options (constant);
+  4   116 
+  4   117 
+  4   118 /* End mca_data_area.incl.pl1 */
+  4   119 
+      556 
+      557 
+  8     1 /*	Begin include file ... rcp_resource_types.incl.pl1
+  8     2*   *
+  8     3*   *	Created 3/79 by Michael R. Jordan for MR7.0R
+  8     4*   *
+  8     5*   *	This include file defines the official RCP resource types.
+  8     6*   *	The array of names is indexed by the corresponding device type.
+  8     7*   *      MOD by RAF for MCA
+  8     8**/
+  8     9 
+  8    10 
+  8    11 
+  8    12 /****^  HISTORY COMMENTS:
+  8    13*  1) change(85-09-09,Fawcett), approve(85-09-09,MCR6979),
+  8    14*     audit(85-12-09,CLJones), install(86-03-21,MR12.0-1033):
+  8    15*     Support of MCA.
+  8    16*                                                   END HISTORY COMMENTS */
+  8    17 
+  8    18 dcl  DEVICE_TYPE (8) char (32)
+  8    19 	internal static options (constant)
+  8    20 	init ("tape_drive", "disk_drive", "console", "printer", "punch", "reader", "special", "mca");
+  8    21 
+  8    22 dcl  NUM_QUALIFIERS (8) fixed bin			/* Number of qualifiers for each device type. */
+  8    23 	internal static init (3, 0, 0, 2, 0, 0, 0, 0);
+  8    24 
+  8    25 dcl  VOLUME_TYPE (8) char (32)
+  8    26 	internal static options (constant)
+  8    27 	init ("tape_vol", "disk_vol", "", "", "", "", "", "");
+  8    28 
+  8    29 dcl  TAPE_DRIVE_DTYPEX fixed bin static internal options (constant) init (1);
+  8    30 dcl  DISK_DRIVE_DTYPEX fixed bin static internal options (constant) init (2);
+  8    31 dcl  CONSOLE_DTYPEX fixed bin static internal options (constant) init (3);
+  8    32 dcl  PRINTER_DTYPEX fixed bin static internal options (constant) init (4);
+  8    33 dcl  PUNCH_DTYPEX fixed bin static internal options (constant) init (5);
+  8    34 dcl  READER_DTYPEX fixed bin static internal options (constant) init (6);
+  8    35 dcl  SPECIAL_DTYPEX fixed bin static internal options (constant) init (7);
+  8    36 dcl  MCA_DTYPEX fixed bin static internal options (constant) init (8);
+  8    37 dcl  TAPE_VOL_VTYPEX fixed bin static internal options (constant) init (1);
+  8    38 dcl  DISK_VOL_VTYPEX fixed bin static internal options (constant) init (2);
+  8    39 
+  8    40 
+  8    41 /*	End include file ... rcp_resource_types.incl.pl1 */
+      558 
+      559 
+  9     1 /*        BEGIN INCLUDE FILE tolts_info.incl.pl1     */
+  9     2 
+  9     3    
+  9     4 
+  9     5 
+  9     6 
+  9     7 
+  9     8 
+  9     9 /****^  HISTORY COMMENTS:
+  9    10*  1) change(80-03-24,Fakoury), approve(), audit(86-11-25,Martinson),
+  9    11*     install(86-12-04,MR12.0-1235):
+  9    12*     to add second sct for 500/501 MTAR
+  9    13*  2) change(80-09-01,Fakoury), approve(), audit(86-11-25,Martinson),
+  9    14*     install(86-12-04,MR12.0-1235):
+  9    15*     to init rcp_area and alt_rcp_area to 0.
+  9    16*  3) change(81-09-01,Fakoury), approve(), audit(86-11-25,Martinson),
+  9    17*     install(86-12-04,MR12.0-1235):
+  9    18*     to add new statements for colts.
+  9    19*  4) change(81-09-01,Fakoury), approve(), audit(86-11-25,Martinson),
+  9    20*     install(86-12-04,MR12.0-1235):
+  9    21*     to increase the dcw_list size.
+  9    22*  5) change(82-04-01,Fakoury), approve(), audit(86-11-25,Martinson),
+  9    23*     install(86-12-04,MR12.0-1235):
+  9    24*     to add crcst and redefine devsct.
+  9    25*  6) change(82-09-01,Fakoury), approve(), audit(86-11-25,Martinson),
+  9    26*     install(86-12-04,MR12.0-1235):
+  9    27*     to increase the console buffer size for mtar.
+  9    28*  7) change(82-11-01,Fakoury), approve(), audit(86-11-25,Martinson),
+  9    29*     install(86-12-04,MR12.0-1235):
+  9    30*     for 128chan support.
+  9    31*  8) change(83-07-01,Fakoury), approve(), audit(86-11-25,Martinson),
+  9    32*     install(86-12-04,MR12.0-1235):
+  9    33*     to increase the dcw_list size for mtar perm file track repair.
+  9    34*  9) change(84-04-10,Fakoury), approve(86-08-21,MCR7514),
+  9    35*     audit(86-11-25,Martinson), install(86-12-04,MR12.0-1235):
+  9    36*     to add sct_info needed to support the DAU & DIPPER.
+  9    37* 10) change(85-02-21,Fakoury), approve(86-08-21,MCR7514),
+  9    38*     audit(86-11-25,Martinson), install(86-12-04,MR12.0-1235):
+  9    39*      2/85 to support test nio request.
+  9    40* 11) change(85-04-01,Fakoury), approve(86-08-21,MCR7514),
+  9    41*     audit(86-11-25,Martinson), install(86-12-04,MR12.0-1235):
+  9    42*     for extended status store.
+  9    43* 12) change(85-12-21,Fakoury), approve(86-08-21,MCR7514),
+  9    44*     audit(86-11-25,Martinson), install(86-12-04,MR12.0-1235):
+  9    45*     for Colts Responder changes.
+  9    46* 13) change(86-02-01,Fakoury), approve(86-08-20,MCR7514),
+  9    47*     audit(86-11-25,Martinson), install(86-12-04,MR12.0-1235):
+  9    48*      implement the test nio request.
+  9    49*      support of a Colts responder test request.
+  9    50*                                                   END HISTORY COMMENTS */
+  9    51 
+  9    52 
+  9    53 
+  9    54 
+  9    55 
+  9    56 
+  9    57 /* format: style4,ifthenstmt,ifthen,ind3,ll125,lineconind1 */
+  9    58 
+  9    59 dcl  polt_io_type fixed bin int static options (constant) init (0);
+  9    60 dcl  itr_io_type fixed bin int static options (constant) init (1);
+  9    61 dcl  mdr_io_type fixed bin int static options (constant) init (2);
+  9    62 dcl  mtar_io_type fixed bin int static options (constant) init (3);
+  9    63 dcl  firm_ld_io_type fixed bin int static options (constant) init (4);
+  9    64 dcl  mtc_io_type fixed bin int static options (constant) init (5);
+  9    65 dcl  mtg_io_type fixed bin int static options (constant) init (6);
+  9    66 dcl  mdc_io_type fixed bin int static options (constant) init (7);
+  9    67 dcl  mhp_io_type fixed bin int static options (constant) init (8);
+  9    68 dcl  mca_io_type fixed bin int static options (constant) init (9);
+  9    69 dcl  rspd_io_type fixed bin int static options (constant) init (10);
+  9    70 
+  9    71 dcl  tolts_infop ptr external static;			/* ext static ptr to tolts_info structure */
+  9    72 dcl  colts_info_ptr ptr;				/* ptr to individual test page data */
+  9    73 dcl  io_info_ptr ptr;				/* ptr to individual test page data */
+  9    74 dcl  dmap ptr;					/* pointer to dial_manager_arg */
+  9    75 dcl  1 tolts_info based (tolts_infop) aligned,		/* data structure used for tolts routines */
+  9    76        2 cdtptr ptr,
+  9    77        2 df_iocbp ptr,				/* deckfile iocb ptr */
+  9    78        2 dm_event fixed bin (71),			/* dial_manager event_channel */
+  9    79        2 exec char (4),				/* executive name (polt, molt, colt etc) */
+  9    80        2 exec_dta_cnt fixed bin,			/* inter slave request count */
+  9    81        2 exec_page_count fixed bin,			/* number of test pages active */
+  9    82        2 exec_term_io_wait bit (1),			/* waiting for io to complete for exec termination */
+  9    83        2 execp ptr,					/* ptr to slave polt or molt segment */
+  9    84        2 file_attach bit (1),				/* = "1"b if print file attached */
+  9    85        2 file_open bit (1),				/* = "1"b if print file open */
+  9    86        2 finish_cond bit (1),				/* = "1"b if finish condition has been signaled */
+  9    87        2 first_request_done bit (1),			/* first terminal io request complete */
+  9    88        2 gc_date bit (36),				/* gcos 6 char bcd date (set at init time, updated at rollover) */
+  9    89        2 gewake_active bit (1),			/* = "1"b if gewake alarm timer is active */
+  9    90        2 gewake_event fixed bin (71),			/* gewake alarm timer event channel id */
+  9    91        2 glob_int_cnt fixed bin,			/*  total number of outstanding test IOs */
+  9    92        2 hdir char (168),				/* users home directory pathname */
+  9    93        2 init_time fixed bin (71),			/* gcos time of executive initialize (mme poinit) */
+  9    94        2 max_to fixed bin (71),			/* max ioi timeout ( from rcp_$check_attach) */
+  9    95        2 max_wks_sz fixed bin (19),			/* max ioi wkspace size (from rcp_$check_attach) */
+  9    96        2 micro_time fixed bin (71),			/* time at midnight in usecs. (set at init time, updated at rollover */
+  9    97        2 optflag fixed bin,				/* option request flag */
+  9    98        2 padx (2) fixed bin,				/* reserved area */
+  9    99        2 pf_iocbp ptr,				/* print file iocb ptr */
+  9   100        2 pf_name char (32),				/* seg name of print file */
+  9   101        2 process bit (36),				/* T & D users process id */
+  9   102        2 quith_event fixed bin (71),			/* quit handler event call channel id */
+  9   103        2 special_fault bit (1),			/* error on reconnect after special int */
+  9   104        2 term_io_in_prog bit (1),			/* terminal io in progress */
+  9   105        2 term_io_req_cnt fixed bin,			/* outstanding terminal io requests */
+  9   106        2 tty_ccc_event fixed bin (71),			/* term io courtesy call event call channel id */
+  9   107        2 tty_display_event fixed bin (71),		/* term io display event channel id */
+  9   108        2 tty_issue_event fixed bin (71),		/* term io issue event call channel id */
+  9   109        2 wks_sz fixed bin,				/* workspace size in words (4096 for polts, 6144 for molts) */
+  9   110        2 exec_dta (16),				/* inter slave request queue */
+  9   111          3 word (4) bit (36),				/* inter slave data */
+  9   112        2 ccc_queue,					/* courtesy call queue */
+  9   113          3 ccc_requests fixed bin,			/* courtesy call requests */
+  9   114          3 icivlu (16) bit (36),			/* ic and ind of courtesy call routine */
+  9   115        2 isc_queue,					/* interslave communication queue */
+  9   116          3 icivlu bit (36),				/* ic and i of queue entry */
+  9   117          3 status_add fixed bin,			/*  :: */
+  9   118          3 data_add fixed bin,			/* :: */
+  9   119 
+  9   120        2 tadio (8),					/* T & D user io rqt queue */
+  9   121          3 optrd bit (1),				/* = "1"b if options are to be read */
+  9   122          3 inuse bit (1),				/* = "1"b if queue entry in use */
+  9   123          3 return_word (3) bit (36),			/* data returned from mme tadiod */
+  9   124          3 option bit (6 * 84),			/* bcd option string */
+  9   125        2 wait_list,					/* wait list for dispatcher block */
+  9   126          3 nchan fixed bin,				/* number of event wait channels  */
+  9   127          3 wait_pad fixed bin,			/* will make wait_event_id on even boundary */
+  9   128          3 wait_event_id (2) fixed bin (71),		/* dispatcher event wait chan id */
+  9   129        2 clt_sw char (32),
+  9   130        2 att_desc char (32),
+  9   131        2 cdt_pointer ptr,				/* save pointer to cdt */
+  9   132        2 fnp_exec_cnt fixed bin init (0),
+  9   133        2 fnp (0:7),
+  9   134          3 exec_active bit (1) init ("0"b),
+  9   135          3 exec_chan char (32),
+  9   136          3 status_word bit (36) init ("0"b),
+  9   137          3 fnp_execp ptr,
+  9   138          3 type fixed bin,
+  9   139          3 exec_type_code bit (6) init ("0"b),
+  9   140          3 cdt_name (8) char (32) init ("empty"),		/* cdt name built from test request */
+  9   141          3 dm_arg like dial_manager_arg,
+  9   142        2 mess_buf,					/* terminal io message buffers */
+  9   143          3 first ptr,				/* ptr to start of message buffer */
+  9   144          3 nxt ptr,					/* ptr to nxt queue entry */
+  9   145          3 term_queue (8192) fixed bin,			/* message queu as fixed bin */
+  9   146          3 q_end bit (0),				/* to find end of queue */
+  9   147          3 q_pad (1024) fixed bin,			/* padding area */
+  9   148          3 mult_ans char (28) varying,			/* answer to local Multics question */
+  9   149          3 cv_buf char (4000) varying,			/* temporary conversion storage */
+  9   150        2 colts_pages (8) like colts_info,
+  9   151        2 pages (8) like io_info,			/* test pages (8 posible) */
+  9   152        2 firm_buf (10240) fixed bin;			/* storage for loading firmware */
+  9   153 
+  9   154 
+  9   155 dcl  1 io_info based (io_info_ptr) aligned,		/* this maps test pages in tolts_info */
+  9   156        2 alloc_wait bit (1),				/* = "1"b if waiting  for delayed allocation */
+  9   157        2 allocated bit (1),				/* = "1"b if device allocated to this page */
+  9   158        2 alt_dev_flag bit (1),			/* = "1"b if 2nd logical device configured (MTAR 500/501 only */
+  9   159        2 alt_device_index fixed bin (12),		/* ioi device index */
+  9   160        2 alt_device_name char (8),			/* alternate allocated device name */
+  9   161        2 alt_rcp_area (24) fixed bin init (0),		/* alternate device rcp */
+  9   162        2 alt_rcp_id bit (36) aligned,			/* rcp id for alternate attach/check_attach */
+  9   163        2 attach_err fixed bin (35),			/* error code returned durning attach */
+  9   164        2 cata_cycle bit (1),				/* cycle check for cata */
+  9   165        2 cat_name char (10),				/* itr or mdr catalog suffix */
+  9   166        2 n_keys fixed bin aligned,			/* number of catalog keys below */
+  9   167        2 cata_keys (10) char (24) aligned,		/* array of catalog keys */
+  9   168        2 catp ptr,					/* ptr to itr or mdr catalog in deckfile */
+  9   169        2 catx fixed bin,				/* current cata_info.index */
+  9   170        2 ccu_pun bit (1),				/* = "1"b if ccu to be used as punch */
+  9   171        2 chan_suspended bit (1),			/* = "1"b if channel has been suspended */
+  9   172        2 chan_time fixed bin (35),			/* channel time (in 1/64th miliseconds) */
+  9   173        2 con_time fixed bin (35),			/* abs time of connect (in 1/64 th miliseconds) */
+  9   174        2 cur_wks_sz fixed bin,			/* current size of ioi workspace (normally tolts_info.wks_sz) */
+  9   175        2 dcw_list (330) bit (36),			/* test page dcw list in unaltered form */
+  9   176        2 dev_busy bit (1),				/* = "1"b  if device busy before */
+  9   177        2 device_index fixed bin (12),			/* ioi device index */
+  9   178        2 device_name char (8),			/* allocated device name (in ascii) */
+  9   179        2 ev_ch_ass bit (1),				/* = "1"b if status event chan assigned to this page */
+  9   180        2 ext_status_add fixed bin,			/* extended status store address */
+  9   181        2 fnp_num fixed bin,
+  9   182        2 fpinfo_ptr ptr,				/* ptr to rspd info table */
+  9   183        2 ignore_term bit (1),				/* = "1"b if term int to be ignored, wait for special (ITR) */
+  9   184        2 in_use bit (1),				/* = "1"b if this test page in use */
+  9   185        2 int_time fixed bin (35),			/* abs time of interrupt (in 1/64 th miliseconds) */
+  9   186        2 io_in_progress bit (1),			/* = "1"b if io in progress for this page */
+  9   187        2 io_trc_flag bit (1),				/* = "1"b if io is being traced */
+  9   188        2 io_type fixed bin,				/* 0 = polt, 1 = ITR, 2 = MDR, 3 = MTAR, 4 = firmware load */
+  9   189        2 iocp ptr,
+  9   190        2 ipc_attached bit (1),
+  9   191        2 ipc_id char (3),
+  9   192        2 ipc_number fixed bin,
+  9   193        2 lostit_time fixed bin (35),			/* lost interrupt time in 1/64 th miliseconds */
+  9   194        2 mca_attach_state fixed bin,
+  9   195        2 mcata_idx fixed bin,				/* mca catalog indexer */
+  9   196        2 mcata_nkeys fixed bin aligned,			/* no of keys in a mca catalog */
+  9   197        2 mcata_keys (100) char (24) aligned,		/* mca catalog entries */
+  9   198        2 mca_ioi_idx fixed bin,			/* ioi index of attached mca /
+  9   199*       2 mca_iop ptr,				/* mca io ptr */
+  9   200        2 mca_workspace_ptr ptr,
+  9   201        2 mpc_dev_cnt fixed bin,			/* if urmpc to be booted, # of devices */
+  9   202        2 nff bit (1),				/* = "1"b new format flag */
+  9   203        2 num_connects fixed bin,			/* number of connects issued by this page */
+  9   204        2 p2_att bit (1),				/* ="1"b if alternate device is attached (MTAR 500/501 only) */
+  9   205        2 p_att bit (1),				/* = "1"b if perp. device attached to this page */
+  9   206        2 page_base fixed bin (18) uns,			/* base of this test page in slave seg */
+  9   207        2 pcwa bit (36),				/* pcw */
+  9   208        2 rcp_area (24) fixed bin init (0),		/* storage for rcp device info */
+  9   209        2 rcp_id bit (36) aligned,			/* rcp id for attach/check_attach */
+  9   210        2 rcp_name char (32),				/* rcp name for this device */
+  9   211        2 rcp_state fixed bin,				/* rcp attach state flag */
+  9   212        2 release_chan bit (1),			/* = "1"b if ioi_$release devices to be called */
+  9   213        2 rew_wait bit (1),				/* = "1"b if waiting for special on rewind complete */
+  9   214        2 sp_flag bit (1),				/* = "1"b if special status available */
+  9   215        2 sp_status bit (36),				/* special interrupt status storage */
+  9   216        2 spare1 bit (1),
+  9   217        2 status_add fixed bin,			/* address to store status in test page */
+  9   218        2 status_event fixed bin (71),			/* io completion status event call channel id */
+  9   219        2 suspend_chan bit (1),			/* = "1"b if ioi_$suspend devices to be called */
+  9   220        2 tolts_rspd_wksp ptr,
+  9   221        2 test_hdr char (16),				/* test header used for Multics local messages */
+  9   222        2 tio_off fixed bin (18),			/* dcw list offset for ioi */
+  9   223        2 to_no_cc bit (1),				/* = "1"b if timeout expected (set after mme ipcw) */
+  9   224        2 workspace_ptr ptr,				/* ioi workspace ptr */
+  9   225        2 altsct,					/* sct for MTAR alternate device */
+  9   226 	 (3 w1,					/* device sct word 1 */
+  9   227 	 4 type_code bit (6),			/* gcos 3 type code (see dd14 app. a) */
+  9   228 	 4 device_no bit (6),			/* device number */
+  9   229 	 4 com_prph bit (1),			/* = "1"b if common perph. device */
+  9   230 	 4 hi_speed bit (1),			/* = "1"b if hi speed printer */
+  9   231 	 4 ll160 bit (1),				/* = "1"b if 160 collum printer */
+  9   232 	 4 pad1 bit (2),
+  9   233 	 4 cr501_pr54 bit (1),			/* either a cr501 or pr54 device */
+  9   234 	 4 icc bit (11),				/* iom and channel (true channel index) */
+  9   235 	 4 pad2 bit (7),
+  9   236          3 w2,					/* device sct word 2 */
+  9   237 	 4 ptrain fixed bin (14),			/* print train number */
+  9   238 	 4 nmods bit (3),				/* not used in Multics */
+  9   239 	 4 pad4 bit (3),
+  9   240 	 4 den_cap bit (4),				/* density capability for tapes */
+  9   241 	 4 pad5 bit (11)) unaligned,
+  9   242        2 crcst,					/* controller sct */
+  9   243          (3 pad1 bit (1),
+  9   244          3 volatile bit (1),				/* reloadable firmware */
+  9   245          3 mpc bit (1),				/* = "1"b if mpc */
+  9   246          3 pad2 bit (4),
+  9   247          3 ms500 bit (1),				/* = "1"b if mss500 device */
+  9   248          3 mtp610 bit (1),				/* = "1"b if mtp 610 device */
+  9   249          3 pad3 bit (27)) unaligned,
+  9   250        2 dev_firm (4),				/* storage for device firmware edit names */
+  9   251          3 edit_name char (4),			/* for urmpc firmware */
+  9   252          3 mask bit (36),				/* port mask for this firmware */
+  9   253        2 devsct,					/* 2 word device sct entry */
+  9   254 	 (3 w1,					/* device sct word 1 */
+  9   255 	 4 type_code bit (6),			/* gcos 3 type code (see dd14 app. a) */
+  9   256 	 4 device_no bit (6),			/* device number */
+  9   257 	 4 com_prph bit (1),			/* = "1"b if common perph. device */
+  9   258 	 4 hi_speed bit (1),			/* = "1"b if hi speed printer */
+  9   259 	 4 ll160 bit (1),				/* = "1"b if 160 collum printer */
+  9   260 	 4 pad1 bit (2),
+  9   261 	 4 cr501_pr54 bit (1),			/* either a cr501 or pr54 device */
+  9   262 	 4 icc bit (11),				/* iom and channel (true channel index) */
+  9   263 	 4 pad2 bit (7),
+  9   264          3 w2,					/* device sct word 2 */
+  9   265 	 4 ptrain fixed bin (14),			/* print train number */
+  9   266 	 4 nmods bit (3),				/* not used in Multics */
+  9   267 	 4 pad4 bit (3),
+  9   268 	 4 den_cap bit (4),				/* density capability for tapes */
+  9   269 	 4 pad5 bit (11)) unaligned,
+  9   270        2 icivlu,					/* ic and i for courtesy call on io completion */
+  9   271          3 ic bit (18) unaligned,			/* instruction counter */
+  9   272          3 ind bit (18) unaligned,			/* indicator register */
+  9   273        2 sct_info,
+  9   274          (3 cntsct bit (18),				/* unchanged from before */
+  9   275          3 ioc_type bit (4),				/* 0 = IOM, 1 = IMU, 2 = IOX */
+  9   276          3 cnt_type bit (4),				/* 0 = MPC, 1 = DAU, 2 = EURC, 3 = FIPS */
+  9   277          3 pad1 bit (1),
+  9   278          3 xioc_type bit (4),				/* not used in Multics */
+  9   279          3 xcnt_type bit (4),				/* not used in Multics */
+  9   280          3 pad2 bit (1)) unaligned,
+  9   281        2 test_req aligned,
+  9   282          (3 fnccss bit (18),
+  9   283          3 tt bit (6),
+  9   284          3 pad1 bit (6)) unaligned;
+  9   285 
+  9   286 
+  9   287 dcl  1 colts_info aligned based (colts_info_ptr),
+  9   288        2 cdt_name char (32),
+  9   289        2 chanp pointer,				/* iox pointer to chan under test */
+  9   290        2 dm_arg aligned like dial_manager_arg,
+  9   291        2 fnp_num fixed bin (4),
+  9   292        2 in_use bit (1) unaligned init ("0"b),
+  9   293        2 status_word bit (36) aligned init ("0"b),
+  9   294        2 type_code bit (6) unaligned init ("0"b);
+  9   295 
+  9   296 
+  9   297 
+  9   298 
+ 10     1 /* BEGIN INCLUDE FILE ... dial_manager_arg.incl.pl1 */
+ 10     2 
+ 10     3 /* Modified by E. N. Kittlitz 11/80 to add reservation string, move dial-out
+ 10     4*   destination from dial_qualifier, add dial_message.
+ 10     5*   Modified by Robert Coren 4/83 to add required access class stuff.
+ 10     6*   Modified 1984-08-27 BIM for V4, privileged_operation.
+ 10     7**/
+ 10     8 
+ 10     9 
+ 10    10 dcl  dial_manager_arg_version_2 fixed bin internal static initial (2) options (constant);
+ 10    11 dcl  dial_manager_arg_version_3 fixed bin internal static initial (3) options (constant);
+ 10    12 dcl  dial_manager_arg_version_4 fixed bin internal static initial (4) options (constant);
+ 10    13 
+ 10    14 dcl 1 dial_manager_arg based aligned,
+ 10    15     2 version fixed bin,				/* = 4 */
+ 10    16     2 dial_qualifier char (22),			/* identify different processes with same process group id */
+ 10    17     2 dial_channel fixed bin (71),			/* event wait channel */
+ 10    18     2 channel_name char (32),				/* channel name for privileged attach */
+ 10    19 						/* limit of version 1 structure */
+ 10    20     2 dial_out_destination char (32),			/* dial-out destination (e.g. phone_no) */
+ 10    21     2 reservation_string char (256),			/* reservation string */
+ 10    22     2 dial_message fixed bin (71),			/* OUTPUT: A.S. message received by dial_manager_ */
+ 10    23 						/* limit of version 2 structure */
+ 10    24     2 access_class bit (72),				/* access class to be associated with the attachment */
+ 10    25     2 flags aligned,
+ 10    26      3 access_class_required bit (1) unaligned,		/* indicates whether to enforce access_class */
+ 10    27      3 privileged_operation bit (1) unaligned,		/* for accept_dials, accepts dials from */
+ 10    28 						/* system_low:access_class */
+ 10    29 						/* no effect on other operations yet. */
+ 10    30      3 mbz bit (34) unaligned;			/* must be zero */
+ 10    31 
+ 10    32 /* END INCLUDE FILE ... dial_manager_arg.incl.pl1 */
+  9   299 
+  9   300 
+  9   301 
+  9   302 
+  9   303 
+  9   304 /* END INCLUDE FILE tolts_info.incl.pl1  */
+      560 
+      561 
+ 11     1 /*  BEGIN INCLUDE FILE: tolts_rspd_workspace.incl.pl1  */
+ 11     2 
+ 11     3  
+ 11     4 
+ 11     5 /****^  HISTORY COMMENTS:
+ 11     6*  1) change(85-12-11,Fakoury), approve(86-08-21,MCR7514),
+ 11     7*     audit(86-12-03,Martinson), install(86-12-04,MR12.0-1235):
+ 11     8*     Created by Rick Fakoury to support the Colts rspd request.
+ 11     9*                                                   END HISTORY COMMENTS */
+ 11    10 
+ 11    11 /* tolts_rspd_workspace defines the wired workspace used for tolts responder io to the DN8.            */
+ 11    12 
+ 11    13 
+ 11    14 dcl tolts_rspd_wksp ptr;
+ 11    15 
+ 11    16 dcl  1 tolts_rspd_workspace aligned based (tolts_rspd_wksp),
+ 11    17        2  mailbox aligned,
+ 11    18           3  pcw aligned like direct_channel_pcw,
+ 11    19           3  num_int,
+ 11    20              4  lvl7 fixed bin (18) unsigned unaligned,
+ 11    21              4  lvl3 fixed bin (18) unsigned unaligned,
+ 11    22           3  status_word bit (36) aligned,
+ 11    23           3  pad1 bit (144) aligned,
+ 11    24       2  ima_level(0:7) like intercom_mbx_area,
+ 11    25       2  tcw like direct_channel_tcw,
+ 11    26       2  data_buf area (320);
+ 11    27  
+ 11    28 
+ 11    29 dcl 1  intercom_mbx_area aligned,
+ 11    30        2 word (0:7) bit (36);
+ 11    31  
+ 12     1 /*----------BEGIN ioi_direct_channel_dcls.incl.pl1---------------------------*/
+ 12     2 
+ 12     3 
+ 12     4 /****^  HISTORY COMMENTS:
+ 12     5*  1) change(86-07-30,Wong), approve(86-07-30,MCR7397), audit(86-08-01,Ex),
+ 12     6*     install(86-08-18,MR12.0-1131):
+ 12     7*     New include file
+ 12     8*                                                   END HISTORY COMMENTS */
+ 12     9 
+ 12    10 /*****************************************************************************/
+ 12    11 /*							       */
+ 12    12 /*   This include file declares the PCW (peripheral control word) and TCW    */
+ 12    13 /*   (transfer control word) used by direct channels.  This PCW should not   */
+ 12    14 /*   be confused with the PCW used in a connect to IOI.  These formats come  */
+ 12    15 /*   from "L66 FEP Coupler - EPS 1", #60132445, pp. 49 - 51.	       */
+ 12    16 /*							       */
+ 12    17 /*****************************************************************************/
+ 12    18 
+ 12    19 /* format: style3,linecom,ifthenstmt,indthenelse,^indnoniterdo,indnoniterend,initcol3,dclind5,idind32 */
+ 12    20 
+ 12    21 dcl  direct_channel_pcw_ptr	       ptr;
+ 12    22 
+ 12    23 dcl  1 direct_channel_pcw	       aligned based (direct_channel_pcw_ptr),
+ 12    24        2 tcw_address	       fixed bin (18) unsigned unaligned,
+ 12    25        2 error_flag		       bit (1) unaligned,
+ 12    26        2 mbz1		       bit (1) unaligned,
+ 12    27        2 logical_channel_number      fixed bin (2) unsigned unaligned,
+ 12    28        2 parity		       bit (1) unaligned,
+ 12    29        2 mbz2		       bit (1) unaligned,
+ 12    30        2 tcw_address_extension       fixed bin (6) unsigned unaligned,
+ 12    31        2 operation		       bit (6) unaligned;
+ 12    32 
+ 12    33 /*****************************************************************************/
+ 12    34 /*							       */
+ 12    35 /*   The memory address in the TCW is in frontend words.  If the address is  */
+ 12    36 /*   a small type, then the address * 2 is the frontend (byte) address.  If  */
+ 12    37 /*   the address is a big type, then the address * 2**9 is the frontend      */
+ 12    38 /*   (byte) address.					       */
+ 12    39 /*							       */
+ 12    40 /*****************************************************************************/
+ 12    41 
+ 12    42 dcl  direct_channel_tcw_ptr	       ptr;
+ 12    43 
+ 12    44 dcl  1 direct_channel_tcw	       aligned based (direct_channel_tcw_ptr),
+ 12    45        2 must_be_001b	       bit (3) unaligned,
+ 12    46        2 fep_memory_address	       fixed bin (15) unsigned unaligned,
+ 12    47        2 fep_address_type	       bit (1) unaligned,
+ 12    48        2 mbz		       bit (5) unaligned,
+ 12    49        2 host_word_count	       fixed bin (12) unsigned unaligned;
+ 12    50 
+ 12    51 dcl  FEP_SMALL_ADDRESS_TYPE	       bit (1) internal static options (constant) init ("0"b);
+ 12    52 dcl  FEP_BIG_ADDRESS_TYPE	       bit (1) internal static options (constant) init ("1"b);
+ 12    53 
+ 12    54 /*----------END ioi_direct_channel_dcls.incl.pl1-----------------------------*/
+ 11    32 
+ 11    33 
+ 11    34 
+ 11    35 /* END INCLUDE FILE tolts_rspd_workspace.incl.pl1 */
+ 11    36 
+      562 
+      563 
+ 13     1 
+ 13     2 
+ 13     3 /* BEGIN INCLUDE FILE tolts_workspace.incl.pl1 */
+ 13     4 
+ 13     5 /* created 10/6/78 by J. A. Bush to define the ioi workspace as used by TOLTS 
+ 13     6*   Modified b R. Fakoury 8106 & 8201 to increase dcw_list size for mtar linked io.
+ 13     7*  Modified by R. Fakoury 8206 to force the data buffer to an even location for eurc itr test 1.
+ 13     8*  Modified by R. Fakoury 7/83 to increase the dcw_list size for mtar perm file track repair.
+ 13     9**/
+ 13    10 
+ 13    11 dcl  ioi_wksp ptr;					/* ptr to workspace */
+ 13    12 
+ 13    13 dcl 1 tolts_workspace based (ioi_wksp) aligned,
+ 13    14     2 status,					/* ioi status structure */
+ 13    15       3 completion,					/* completion flags */
+ 13    16        (4 st bit (1),				/* "1"b if status returned */
+ 13    17         4 er bit (1),				/* "1"b if status indicates error */
+ 13    18         4 run bit (1),				/* "1"b if channel still running */
+ 13    19         4 timeout bit (1)) unaligned,			/* "1"b if io timeout */
+ 13    20       3 level fixed bin (3),				/* IOM interrupt level */
+ 13    21       3 offset fixed bin (18),			/* dcw list offset for connect */
+ 13    22       3 absaddr fixed bin (24),			/* absolute address of workspace */
+ 13    23       3 iom_status bit (72),				/* IOM status storage */
+ 13    24       3 lpw (2) bit (36),				/* LPW residue */
+ 13    25     2 buf_size fixed bin,				/* current length of data buffer */
+ 13    26     2 seek_add bit (36),				/* seek address for disk I/O */
+ 13    27     2 seek_idcw bit (36),				/* seek idcw for disk I/O */
+ 13    28     2 seek_dcw bit (36),				/* seek dcw for disk I/O */
+ 13    29     2 p_idcw bit (36),				/* primary idcw, secondary for disk I/O */
+ 13    30     2 dcw_list (330) bit (36),			/* test page dcw list */
+ 13    31     2 pad bit (36),					/* force the buffer to begin on an even address */
+ 13    32     2 l_pad,					/* pad area of lower buffer */
+ 13    33       3 e bit (36),
+ 13    34       3 o bit (36),
+ 13    35     2 data_buf (buf_size) fixed bin (35),		/* data buffer */
+ 13    36     2 h_pad,					/* pad area of upper buffer */
+ 13    37       3 e bit (36),
+ 13    38       3 o bit (36);
+ 13    39 
+ 13    40 dcl  wks_init char (165 * 4) based (ioi_wksp);		/* used to initialize control word area of ioiworkspace */
+ 13    41 
+ 13    42 /* END INCLUDE FILE tolts_workspace.incl.pl1 */
+ 13    43 
+      564 
+      565 
+      566 
+      567 
+      568    end tolts_io_int_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    12/09/86  1520.9  tolts_io_int_.pl1                 >special_ldd>install>MR12.0-1235>tolts_io_int_.pl1
+550          1    01/10/75  1343.6  iom_stat.incl.pl1                 >ldd>include>iom_stat.incl.pl1
+552          2    09/18/86  1317.5  mca_area.incl.pl1                 >ldd>include>mca_area.incl.pl1
+554          3    09/18/86  1317.5  mca_data.incl.pl1                 >ldd>include>mca_data.incl.pl1
+556          4    09/18/86  1317.5  mca_data_area.incl.pl1            >ldd>include>mca_data_area.incl.pl1
+4-88         5    11/12/74  1550.1  iom_dcw.incl.pl1                  >ldd>include>iom_dcw.incl.pl1
+4-90         6    05/06/74  1742.1  iom_pcw.incl.pl1                  >ldd>include>iom_pcw.incl.pl1
+4-92         7    08/17/79  2215.0  ioi_stat.incl.pl1                 >ldd>include>ioi_stat.incl.pl1
+558          8    03/27/86  1120.0  rcp_resource_types.incl.pl1       >ldd>include>rcp_resource_types.incl.pl1
+560          9    12/09/86  1521.3  tolts_info.incl.pl1               >special_ldd>install>MR12.0-1235>tolts_info.incl.pl1
+9-299       10    09/13/84  0921.5  dial_manager_arg.incl.pl1         >ldd>include>dial_manager_arg.incl.pl1
+562         11    12/09/86  1521.4  tolts_rspd_workspace.incl.pl1     >special_ldd>install>MR12.0-1235>tolts_rspd_workspace.incl.pl1
+11-32       12    08/19/86  0932.1  ioi_direct_channel_dcls.incl.pl1  >ldd>include>ioi_direct_channel_dcls.incl.pl1
+564         13    10/11/83  1240.7  tolts_workspace.incl.pl1          >ldd>include>tolts_workspace.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+DEVICE_TYPE                     000010 constant        char(32)                 initial array unaligned dcl 8-18 ref 457
+MCA_ATTACHED                           constant        fixed bin(17,0)          initial dcl 3-88 ref 120
+MCA_ATTACHING                          constant        fixed bin(17,0)          initial dcl 3-88 ref 107
+TAPE_DRIVE_DTYPEX                      constant        fixed bin(17,0)          initial dcl 8-29 ref 457
+addr                                                   builtin function         dcl 91 ref 105 105 105 105 109 109 116 116 171 224
+                                                                                  230 243 312 312 312 312 318 318 322 323 325 326
+                                                                                  329 331 332 334 335 411 414 474 474 493 493 519
+                                                                                  524 537 541
+addrel                                                 builtin function         dcl 91 ref 244 249 267 285 339 342 347 358 378 403
+                                                                                  406 452 525 542
+address                                based           bit(18)                  level 2 in structure "dcw" packed unaligned dcl 5-7
+                                                                                  in procedure "tolts_io_int_" ref 244 254 342 415
+address                   1            based           bit(18)                  level 2 in structure "status" packed unaligned
+                                                                                  dcl 1-7 in procedure "tolts_io_int_" set ref 417*
+alloc_wait                             based           bit(1)                   level 2 dcl 9-155 set ref 101 125*
+allocated                 1            based           bit(1)                   level 2 dcl 9-155 ref 101
+alt_device_index          3            based           fixed bin(12,0)          level 2 dcl 9-155 set ref 109*
+alt_rcp_area              6            based           fixed bin(17,0)          initial array level 2 dcl 9-155 set ref 109 109
+alt_rcp_id               36            based           bit(36)                  level 2 dcl 9-155 set ref 109*
+attach_err               37            based           fixed bin(35,0)          level 2 dcl 9-155 set ref 105* 109* 116* 120
+bin                                                    builtin function         dcl 91 ref 245 251 344 411 415 415 416 481
+bit                                                    builtin function         dcl 91 ref 417
+bufp                            000102 automatic       pointer                  dcl 92 set ref 254* 255 326* 332* 346 524* 526 541*
+                                                                                  543
+c_len                           000111 automatic       fixed bin(17,0)          dcl 94 set ref 245* 246 246* 248* 251* 251 253 255
+                                                                                  255 338* 343* 344* 346 346 375* 449* 523* 526 526
+                                                                                  540* 543 543
+ccc_queue               245            based           structure                level 2 dcl 9-75 set ref 474 474
+central_stat              0(21)        based           bit(3)                   level 2 packed unaligned dcl 1-7 set ref 159* 373
+                                                                                  448
+chan_time               147            based           fixed bin(35,0)          level 2 dcl 9-155 set ref 482* 482
+channel_stat              0(18)        based           bit(3)                   level 2 packed unaligned dcl 1-7 set ref 159* 373
+                                                                                  448
+char_pos                  0(18)        based           bit(3)                   level 2 packed unaligned dcl 5-7 ref 231
+code                            000110 automatic       fixed bin(35,0)          dcl 93 set ref 403*
+colts_info                             based           structure                level 1 dcl 9-287
+com_err_                        000010 constant        entry                    external dcl 49 ref 315 490
+com_err_$convert_status_code_   000012 constant        entry                    external dcl 50 ref 434 505
+command                                based           bit(6)                   level 4 in structure "mca_work_space" packed
+                                                                                  unaligned dcl 4-25 in procedure "tolts_io_int_"
+                                                                                  ref 321
+command                                based           bit(6)                   level 2 in structure "idcw" packed unaligned
+                                                                                  dcl 6-21 in procedure "tolts_io_int_" ref 235
+completion                4            based           structure                level 3 in structure "mca_work_space" packed
+                                                                                  unaligned dcl 4-25 in procedure "tolts_io_int_"
+completion                             based           structure                level 2 in structure "istat" dcl 7-7 in procedure
+                                                                                  "tolts_io_int_"
+completion                             based           structure                level 3 in structure "tolts_workspace" dcl 13-13
+                                                                                  in procedure "tolts_io_int_"
+con_time                150            based           fixed bin(35,0)          level 2 dcl 9-155 ref 482
+continue                        000116 automatic       bit(1)                   unaligned dcl 95 set ref 225* 227* 232* 234* 240
+control                   0(22)        based           bit(2)                   level 2 packed unaligned dcl 6-21 ref 225 232
+data_buf                110            based           area(320)                level 2 dcl 11-16 set ref 524 541
+data_header                            based           structure                level 1 dcl 4-35
+data_header_1            14            based           structure                level 2 dcl 4-25 set ref 322 326
+data_header_2                          based           structure                level 2 dcl 4-25 set ref 332 334
+data_header_ptr                 000160 automatic       pointer                  dcl 4-15 set ref 322* 334*
+data_size_1                     000162 automatic       fixed bin(21,0)          initial dcl 4-17 set ref 4-17* 324* 330* 332 334 335
+data_size_2                     000163 automatic       fixed bin(21,0)          initial dcl 4-17 set ref 4-17* 336*
+dcw                                    based           structure                level 1 dcl 5-7 ref 247 337
+dcw_list                 15            based           bit(36)                  array level 2 in structure "tolts_workspace"
+                                                                                  dcl 13-13 in procedure "tolts_io_int_" set ref 243
+                                                                                  411
+dcw_list                152            based           bit(36)                  array level 2 in structure "io_info" dcl 9-155
+                                                                                  in procedure "tolts_io_int_" set ref 229 230 325
+                                                                                  331 414
+dcwp                            000170 automatic       pointer                  dcl 5-4 set ref 230* 231 232 235 239 240 244 245 247
+                                                                                  325* 331* 337 342 343 344 414* 415 415
+dest_len                  5(27)        based           structure                level 2 packed unaligned dcl 4-50
+dest_len_lsb              6(01)        based           bit(8)                   level 3 packed unaligned dcl 4-50 ref 330
+dest_len_msb              5(28)        based           bit(8)                   level 3 packed unaligned dcl 4-50 ref 330
+detailed_status                        based           bit(288)                 unaligned dcl 70 set ref 403*
+device_index            665            based           fixed bin(12,0)          level 2 dcl 9-155 set ref 116* 403* 432* 503*
+dial_manager_arg                       based           structure                level 1 dcl 10-14
+direct_channel_pcw                     based           structure                level 1 dcl 12-23
+direct_channel_pcw_ptr          000212 automatic       pointer                  dcl 12-21 set ref 519* 522 525 537* 539 542
+direct_channel_tcw                     based           structure                level 1 dcl 12-44
+error                           000113 automatic       fixed bin(35,0)          dcl 94 set ref 312* 313 314 315* 317 432* 433 434*
+                                                                                  485* 488* 489 490* 492 503* 504 505*
+event_info                             based           structure                level 1 unaligned dcl 72 set ref 105 105 312 312
+event_ptr                              parameter       pointer                  dcl 92 ref 44 99 105 105 148 195 312 312 479 520 538
+exec                      6            based           char(4)                  level 2 dcl 9-75 set ref 150* 435* 506*
+execp                    12            based           pointer                  level 2 dcl 9-75 ref 244 249 267 285 339 342 347 358
+                                                                                  378 403 406 452 525 542
+ext_status_add          671            based           fixed bin(17,0)          level 2 dcl 9-155 ref 403 403
+fatal_code                1     000100 automatic       fixed bin(35,0)          level 2 dcl 83 set ref 317* 492*
+fatal_desc                      000100 automatic       structure                level 1 dcl 83 set ref 318 318 493 493
+firm_ld_io_type                        constant        fixed bin(17,0)          initial dcl 9-63 ref 156 186 210
+fixed                                                  builtin function         dcl 91 ref 324 330 336
+found                           000115 automatic       bit(1)                   unaligned dcl 95 set ref 228* 229 240* 251
+free_area                              based           area(1024)               dcl 51 ref 104 130 311 349
+g_time                          000120 automatic       bit(36)                  unaligned dcl 96 set ref 480* 481
+get_system_free_area_           000014 constant        entry                    external dcl 52 ref 104 130 311 349
+gewake_active            21            based           bit(1)                   level 2 dcl 9-75 set ref 483 486*
+gewake_event             22            based           fixed bin(71,0)          level 2 dcl 9-75 set ref 484* 485*
+glob_int_cnt             24            based           fixed bin(17,0)          level 2 dcl 9-75 set ref 126 126* 126 140 140* 140
+hbound                                                 builtin function         dcl 91 ref 229
+hcs_$wakeup                     000016 constant        entry                    external dcl 53 ref 488
+host_word_count         107(24)        based           fixed bin(12,0)          level 3 packed unsigned unaligned dcl 11-16 ref 523
+                                                                                  540
+i                               000112 automatic       fixed bin(17,0)          dcl 94 set ref 229* 230 243* 411* 412 413* 413 414
+icivlu                 2163            based           structure                level 2 dcl 9-155 ref 474 474
+idcw                                   based           structure                level 1 dcl 6-21
+idcw1                                  based           structure                level 3 packed unaligned dcl 4-25
+idcwp                           000174 automatic       pointer                  dcl 6-19 set ref 224* 225
+ignore_term             676            based           bit(1)                   level 2 dcl 9-155 ref 297
+in_data_pointer           6            based           pointer                  level 2 dcl 72 set ref 99 479
+initiate                  0(16)        based           bit(1)                   level 2 packed unaligned dcl 1-7 set ref 160*
+int_time                700            based           fixed bin(35,0)          level 2 dcl 9-155 set ref 481* 482
+intercom_mbx_area               000202 automatic       structure                level 1 dcl 11-29
+io_in_progress          701            based           bit(1)                   level 2 dcl 9-155 set ref 100 478*
+io_info                                based           structure                level 1 dcl 9-155
+io_info_ptr                     000176 automatic       pointer                  dcl 9-73 set ref 99* 100 101 101 103 105 105 106 107
+                                                                                  109 109 109 109 109 109 109 109 109 109 116 116
+                                                                                  116 116 116 116 120 120 120 120 120 125 130 142
+                                                                                  142 144 144 147 156 167 169 172 172 172 172 172
+                                                                                  179 179 183 186 191 195 196 197 197 197 197 203
+                                                                                  203 207 210 229 230 249 267 268 269 272 274 284
+                                                                                  285 289 292 292 297 312 325 331 339 347 358 359
+                                                                                  360 362 362 364 378 391 403 403 403 406 414 427
+                                                                                  428 432 432 432 452 457 457 474 474 478 481 482
+                                                                                  482 482 482 502 503 519 537
+io_param_blk             15(27)        based           structure                level 3 in structure "mca_work_space" packed
+                                                                                  unaligned dcl 4-25 in procedure "tolts_io_int_"
+                                                                                  set ref 323 329
+io_param_blk                           based           structure                level 3 in structure "mca_work_space" packed
+                                                                                  unaligned dcl 4-25 in procedure "tolts_io_int_"
+                                                                                  set ref 335
+io_param_blk_ptr                000164 automatic       pointer                  dcl 4-19 set ref 323* 324 324 329* 330 330 335* 336
+                                                                                  336
+io_parameter_block                     based           structure                level 1 packed unaligned dcl 4-50
+io_type                 703            based           fixed bin(17,0)          level 2 dcl 9-155 ref 103 109 109 120 120 130 142
+                                                                                  144 156 167 169 172 172 172 172 172 179 179 183
+                                                                                  186 191 197 197 197 197 203 203 207 210 269 360
+ioi_$connect_pcw                000020 constant        entry                    external dcl 55 ref 432
+ioi_$get_detailed_status        000022 constant        entry                    external dcl 56 ref 403
+ioi_$release_devices            000024 constant        entry                    external dcl 57 ref 503
+ioi_wksp                        000214 automatic       pointer                  dcl 13-11 set ref 147* 150 150 150 150 150 150 171
+                                                                                  224 243 254 283 373 377 407 408 411 412 413 451
+iom_status                4            based           bit(72)                  level 3 dcl 13-13 set ref 150 150 150 150 171 407
+                                                                                  408
+ipc_$drain_chn                  000026 constant        entry                    external dcl 58 ref 485
+ipcd                                   based           structure                level 1 dcl 3-61
+istat                                  based           structure                level 1 dcl 7-7 in procedure "tolts_io_int_"
+istat                     3            based           bit(36)                  level 3 in structure "event_info" packed unaligned
+                                                                                  dcl 72 in procedure "tolts_io_int_" set ref 195
+                                                                                  520 538
+itr_io_type                            constant        fixed bin(17,0)          initial dcl 9-60 ref 179 203
+level                     1            based           fixed bin(3,0)           level 3 dcl 13-13 set ref 150 150*
+list_of_dcw                            based           structure                level 2 packed unaligned dcl 4-25
+longinfo                        000121 automatic       char(100)                unaligned dcl 97 set ref 109* 116* 434* 435* 505*
+                                                                                  506*
+lv                        2(15)        based           fixed bin(3,0)           level 3 packed unsigned unaligned dcl 72 set ref 148
+lvl3                      1(18)        based           fixed bin(18,0)          level 4 packed unsigned unaligned dcl 11-16 set ref
+                                                                                  535* 535
+lvl7                      1            based           fixed bin(18,0)          level 4 packed unsigned unaligned dcl 11-16 set ref
+                                                                                  517* 517
+mailbox                                based           structure                level 2 dcl 11-16
+major                     0(02)        based           bit(4)                   level 2 packed unaligned dcl 1-7 set ref 373 448 457
+max_to                  102            based           fixed bin(71,0)          level 2 dcl 9-75 set ref 109* 116*
+max_wks_sz              104            based           fixed bin(19,0)          level 2 dcl 9-75 set ref 109* 116*
+mca_$process_io_event           000030 constant        entry                    external dcl 59 ref 105 312
+mca_area                               based           structure                level 1 dcl 2-10 set ref 104 105 105 130 311 312 312
+                                                                                  349
+mca_area_ptr                    000156 automatic       pointer                  dcl 2-17 set ref 104* 105 105 106 130 311* 312 312
+                                                                                  348 349
+mca_attach_state          3            based           fixed bin(17,0)          level 2 in structure "mca_area" dcl 2-10
+                                                                                  in procedure "tolts_io_int_" set ref 106
+mca_attach_state        712            based           fixed bin(17,0)          level 2 in structure "io_info" dcl 9-155
+                                                                                  in procedure "tolts_io_int_" set ref 106* 107 120
+mca_dcw_list                           based           structure                level 1 packed unaligned dcl 4-81
+mca_io_type                            constant        fixed bin(17,0)          initial dcl 9-68 ref 103 120 120 130 142 167
+mca_ioi_idx            2045            based           fixed bin(17,0)          level 2 dcl 9-155 set ref 105* 312*
+mca_status                4            based           bit(72)                  level 2 dcl 2-10 set ref 348
+mca_work_space                         based           structure                level 1 unaligned dcl 4-25
+mca_work_space_ptr              000166 automatic       pointer                  dcl 4-23 set ref 142* 321 322 323 326 329 332 334
+                                                                                  335
+mcad                                   based           structure                level 1 dcl 3-31
+mdc_io_type                            constant        fixed bin(17,0)          initial dcl 9-66 ref 172 197
+mdr_io_type                            constant        fixed bin(17,0)          initial dcl 9-61 ref 109 183 207
+message                   2            based           structure                level 2 packed unaligned dcl 72
+mhp_io_type                            constant        fixed bin(17,0)          initial dcl 9-67 ref 179 203 269 360
+mtar_io_type                           constant        fixed bin(17,0)          initial dcl 9-62 ref 109 172
+mtc_io_type                            constant        fixed bin(17,0)          initial dcl 9-64 ref 172 197
+mtg_io_type                            constant        fixed bin(17,0)          initial dcl 9-65 ref 172 197
+mvp                             000104 automatic       pointer                  dcl 92 set ref 244* 249* 255 339* 342* 346 525* 526
+                                                                                  542* 543
+num_int                   1            based           structure                level 3 dcl 11-16
+offset                    2            based           fixed bin(18,0)          level 3 dcl 13-13 ref 412 413
+operation                 0(30)        based           bit(6)                   level 2 packed unaligned dcl 12-23 ref 522 539
+p2_att                 2053            based           bit(1)                   level 2 dcl 9-155 ref 109
+p_att                  2054            based           bit(1)                   level 2 dcl 9-155 ref 109
+p_idcw                   14            based           bit(36)                  level 2 dcl 13-13 set ref 224
+pcwa                   2056            based           bit(36)                  level 2 dcl 9-155 set ref 432* 519 537
+polt_io_type                           constant        fixed bin(17,0)          initial dcl 9-59 ref 172 197
+power                     0(01)        based           bit(1)                   level 2 packed unaligned dcl 1-7 set ref 291 373 382
+process                 126            based           bit(36)                  level 2 dcl 9-75 set ref 488*
+ptr                                                    builtin function         dcl 91 ref 254
+r                         1(21)        based           bit(1)                   level 2 packed unaligned dcl 1-7 set ref 222
+rcp_$check_attach               000032 constant        entry                    external dcl 60 ref 109 116
+rcp_area               2057            based           fixed bin(17,0)          initial array level 2 dcl 9-155 set ref 116 116
+rcp_id                 2107            based           bit(36)                  level 2 dcl 9-155 set ref 116*
+rcp_name               2110            based           char(32)                 level 2 dcl 9-155 ref 457
+rcp_state              2120            based           fixed bin(17,0)          level 2 dcl 9-155 set ref 109* 116* 120
+read                            000117 automatic       bit(1)                   unaligned dcl 95 set ref 223* 235* 237* 239
+rel                                                    builtin function         dcl 91 ref 411
+release_chan           2121            based           bit(1)                   level 2 dcl 9-155 set ref 272 364 391 502*
+rew_wait               2122            based           bit(1)                   level 2 dcl 9-155 set ref 427 428* 457*
+rspd_io_type                           constant        fixed bin(17,0)          initial dcl 9-69 ref 144 169 191
+shortinfo                       000152 automatic       char(8)                  unaligned dcl 97 set ref 434* 505*
+soft                      0(14)        based           bit(2)                   level 2 packed unaligned dcl 1-7 set ref 161*
+source_len                4(09)        based           structure                level 2 packed unaligned dcl 4-50
+source_len_lsb            4(19)        based           bit(8)                   level 3 packed unaligned dcl 4-50 ref 324 336
+source_len_msb            4(10)        based           bit(8)                   level 3 packed unaligned dcl 4-50 ref 324 336
+sp_flag                2123            based           bit(1)                   level 2 dcl 9-155 set ref 196*
+sp_status              2124            based           bit(36)                  level 2 dcl 9-155 set ref 195* 268 359
+special_fault           132            based           bit(1)                   level 2 dcl 9-75 set ref 437* 507*
+special_status                         based           structure                level 1 dcl 1-35 set ref 268* 269 271 359* 360
+stata                           000114 automatic       fixed bin(18,0)          dcl 94 set ref 415* 416* 416 417
+statp                           000154 automatic       pointer                  dcl 1-5 set ref 159 159 160 161 171* 222 251 251
+                                                                                  267* 268 269 271 285* 286 291 347* 348 358* 359
+                                                                                  360 373 373 373 373 373 378* 379 382 406* 407 408
+                                                                                  416 417 448 448 448 452* 453 454 457
+status                                 based           structure                level 2 in structure "tolts_workspace" dcl 13-13
+                                                                                  in procedure "tolts_io_int_"
+status                                 based           structure                level 1 dcl 1-7 in procedure "tolts_io_int_" set ref
+                                                                                  286 348* 379 407* 408 453* 454
+status_add             2126            based           fixed bin(17,0)          level 2 dcl 9-155 ref 249 267 285 339 347 358 378
+                                                                                  406 452
+status_word               2            based           bit(36)                  level 3 dcl 11-16 set ref 520* 538*
+string                                                 builtin function         dcl 91 set ref 247 268* 337 359* 407* 408 474 474
+sub                       0(06)        based           bit(6)                   level 2 packed unaligned dcl 1-7 set ref 373
+substr                                                 builtin function         dcl 91 set ref 150 150 150 150 235 269* 271* 286*
+                                                                                  314 360* 379* 408 408* 454*
+suspend_chan           2132            based           bit(1)                   level 2 dcl 9-155 set ref 274 292 292* 362 362*
+tally                     0(24)        based           bit(12)                  level 2 in structure "dcw" packed unaligned dcl 5-7
+                                                                                  in procedure "tolts_io_int_" ref 245 343 344 415
+tally                     1(24)        based           bit(12)                  level 2 in structure "status" packed unaligned
+                                                                                  dcl 1-7 in procedure "tolts_io_int_" set ref 251
+                                                                                  251 416
+tcw                     107            based           structure                level 2 dcl 11-16
+tcw_address                            based           fixed bin(18,0)          level 2 packed unsigned unaligned dcl 12-23 ref 525
+                                                                                  542
+tdcwp                           000172 automatic       pointer                  dcl 5-4 set ref 243* 254
+terminate_process_              000034 constant        entry                    external dcl 62 ref 318 493
+timeout                   0(03)        based           bit(1)                   level 4 packed unaligned dcl 13-13 ref 283 373 377
+                                                                                  451
+timer_manager_$reset_alarm_wakeup
+                                000036 constant        entry                    external dcl 63 ref 484
+tio_off                2142            based           fixed bin(18,0)          level 2 dcl 9-155 set ref 432*
+to_no_cc               2143            based           bit(1)                   level 2 dcl 9-155 set ref 284 289*
+tolts_alm_util_$enter_ccc_req_  000040 constant        entry                    external dcl 64 ref 474
+tolts_info                             based           structure                level 1 dcl 9-75
+tolts_infop                     000046 external static pointer                  dcl 9-71 ref 109 109 116 116 126 126 126 140 140 140
+                                                                                  150 244 249 267 285 339 342 347 358 378 403 406
+                                                                                  435 437 452 474 474 483 484 485 486 488 488 506
+                                                                                  507 525 542
+tolts_init_$gc_tod              000042 constant        entry                    external dcl 65 ref 480
+tolts_qttyio_$rs                000044 constant        entry                    external dcl 66 ref 150 435 506
+tolts_rspd_wksp                 000200 automatic       pointer                  dcl 11-14 in procedure "tolts_io_int_" set ref 144*
+                                                                                  517 517 520 523 524 535 535 538 540 541
+tolts_rspd_wksp        2134            based           pointer                  level 2 in structure "io_info" dcl 9-155
+                                                                                  in procedure "tolts_io_int_" ref 144
+tolts_rspd_workspace                   based           structure                level 1 dcl 11-16
+tolts_workspace                        based           structure                level 1 dcl 13-13
+type                      0(22)        based           bit(2)                   level 2 packed unaligned dcl 5-7 ref 239 240
+unspec                                                 builtin function         dcl 91 set ref 269 271 286 314 348* 360 379 453* 454
+version                         000100 automatic       fixed bin(17,0)          level 2 dcl 83 set ref 316* 491*
+wait_event_id           524            based           fixed bin(71,0)          array level 3 dcl 9-75 set ref 488*
+wait_list               522            based           structure                level 2 dcl 9-75
+wakeup_ptr                      000106 automatic       pointer                  dcl 92 set ref 479* 488*
+workspace_move                         based           char                     unaligned dcl 87 set ref 255* 255 346* 346 526* 526
+                                                                                  543* 543
+workspace_ptr          2144            based           pointer                  level 2 dcl 9-155 ref 142 147
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+ABORT_SES_FROM_HOST                    internal static fixed bin(9,0)           initial unsigned dcl 4-114
+BIN_DATA_FROM_HOST                     internal static fixed bin(9,0)           initial unsigned dcl 4-112
+CONSOLE_DTYPEX                         internal static fixed bin(17,0)          initial dcl 8-31
+CON_DATA_FROM_HOST                     internal static fixed bin(9,0)           initial unsigned dcl 4-110
+DATA_FROM_HOST                         internal static fixed bin(9,0)           initial unsigned dcl 4-96
+DATA_FROM_MCA                          internal static fixed bin(9,0)           initial unsigned dcl 4-102
+DATA_SEG                               internal static char(12)                 initial unaligned dcl 3-85
+DISK_DRIVE_DTYPEX                      internal static fixed bin(17,0)          initial dcl 8-30
+DISK_VOL_VTYPEX                        internal static fixed bin(17,0)          initial dcl 8-38
+FEP_BIG_ADDRESS_TYPE                   internal static bit(1)                   initial unaligned dcl 12-52
+FEP_SMALL_ADDRESS_TYPE                 internal static bit(1)                   initial unaligned dcl 12-51
+IPC_ATTACHED                           internal static fixed bin(17,0)          initial dcl 3-94
+IPC_FREE                               internal static fixed bin(17,0)          initial dcl 3-94
+IPC_NOT_CONFIGURED                     internal static fixed bin(17,0)          initial dcl 3-94
+MAINT_SESSION                          internal static fixed bin(17,0)          initial dcl 3-88
+MCA_DTYPEX                             internal static fixed bin(17,0)          initial dcl 8-36
+MCA_FREE                               internal static fixed bin(17,0)          initial dcl 3-88
+MCA_NOT_CONFIGURED                     internal static fixed bin(17,0)          initial dcl 3-88
+MCA_area_version_1                     internal static char(8)                  initial unaligned dcl 2-19
+MCA_data_version_1                     internal static char(8)                  initial unaligned dcl 3-17
+NUM_QUALIFIERS                         internal static fixed bin(17,0)          initial array dcl 8-22
+PRINTER_DTYPEX                         internal static fixed bin(17,0)          initial dcl 8-32
+PUNCH_DTYPEX                           internal static fixed bin(17,0)          initial dcl 8-33
+READER_DTYPEX                          internal static fixed bin(17,0)          initial dcl 8-34
+REQ_DATA_FROM_HOST                     internal static fixed bin(9,0)           initial unsigned dcl 4-104
+SEEK                                   internal static fixed bin(9,0)           initial unsigned dcl 4-108
+SPECIAL_DTYPEX                         internal static fixed bin(17,0)          initial dcl 8-35
+STATUS_FROM_MCA                        internal static fixed bin(9,0)           initial unsigned dcl 4-106
+SYSTEM_DIR                             internal static char(17)                 initial unaligned dcl 3-84
+TAPE_VOL_VTYPEX                        internal static fixed bin(17,0)          initial dcl 8-37
+VOLUME_TYPE                            internal static char(32)                 initial array unaligned dcl 8-25
+WRITE_CONSOLE                          internal static fixed bin(9,0)           initial unsigned dcl 4-98
+WRITE_READ_CONSOLE                     internal static fixed bin(9,0)           initial unsigned dcl 4-100
+colts_info_ptr                         automatic       pointer                  dcl 9-72
+dial_manager_arg_version_2             internal static fixed bin(17,0)          initial dcl 10-10
+dial_manager_arg_version_3             internal static fixed bin(17,0)          initial dcl 10-11
+dial_manager_arg_version_4             internal static fixed bin(17,0)          initial dcl 10-12
+direct_channel_tcw_ptr                 automatic       pointer                  dcl 12-42
+dmap                                   automatic       pointer                  dcl 9-74
+faultword                              based           structure                level 1 dcl 1-27
+imess                                  based           structure                level 1 dcl 7-21
+imp                                    automatic       pointer                  dcl 7-19
+ipcd_ptr                               automatic       pointer                  dcl 3-24
+isp                                    automatic       pointer                  dcl 7-5
+mca_data_seg                           based           structure                level 1 unaligned dcl 3-26
+mca_data_seg_ptr                       internal static pointer                  initial dcl 3-20
+mca_dcw_list_ptr                       automatic       pointer                  dcl 4-21
+mcad_ptr                               automatic       pointer                  dcl 3-22
+pcw                                    based           structure                level 1 dcl 6-6
+pcwp                                   automatic       pointer                  dcl 6-4
+tdcw                                   based           structure                level 1 dcl 5-14
+wks_init                               based           char(660)                unaligned dcl 13-40
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+check_copy                      000767 constant        entry                    internal dcl 220 ref 298 388 461
+ilv                             000000 constant        label                    array(0:7) dcl 150 ref 148
+itr_spec                        001163 constant        entry                    internal dcl 265 ref 203
+itr_term                        001216 constant        entry                    internal dcl 281 ref 179
+mca_term                        001263 constant        entry                    internal dcl 309 ref 167
+mdr_spec                        001616 constant        entry                    internal dcl 356 ref 207
+mdr_term                        001645 constant        entry                    internal dcl 371 ref 183
+move_status                     001741 constant        entry                    internal dcl 401 ref 158 294 299 383 389 462
+polt_spec                       002062 constant        entry                    internal dcl 425 ref 197
+polt_term                       002171 constant        entry                    internal dcl 446 ref 172
+queue_and_signal                002254 constant        entry                    internal dcl 472 ref 128 162 274 287 295 300 350 380
+                                                                                  384 390 455 463
+release_dev                     002463 constant        entry                    internal dcl 500 ref 272 364 391
+rspd_spec                       002564 constant        entry                    internal dcl 515 ref 191
+rspd_term                       002634 constant        entry                    internal dcl 534 ref 169
+signal                          002276 constant        entry                    internal dcl 477 ref 107 164 186 210 438 508 528 545
+tolts_io_int_                   000234 constant        entry                    external dcl 44
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      3144        3214    2706        3154
+Length      3722    2706        50         472     235           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+tolts_io_int_                       490 external procedure  is an external procedure.  
+check_copy                              internal procedure  shares stack frame of external procedure tolts_io_int_.  
+itr_spec                                internal procedure  shares stack frame of external procedure tolts_io_int_.  
+itr_term                                internal procedure  shares stack frame of external procedure tolts_io_int_.  
+mca_term                                internal procedure  shares stack frame of external procedure tolts_io_int_.  
+mdr_spec                                internal procedure  shares stack frame of external procedure tolts_io_int_.  
+mdr_term                                internal procedure  shares stack frame of external procedure tolts_io_int_.  
+move_status                             internal procedure  shares stack frame of external procedure tolts_io_int_.  
+polt_spec                               internal procedure  shares stack frame of external procedure tolts_io_int_.  
+polt_term                               internal procedure  shares stack frame of external procedure tolts_io_int_.  
+queue_and_signal                        internal procedure  shares stack frame of external procedure tolts_io_int_.  
+release_dev                             internal procedure  shares stack frame of external procedure tolts_io_int_.  
+rspd_spec                               internal procedure  shares stack frame of external procedure tolts_io_int_.  
+rspd_term                               internal procedure  shares stack frame of external procedure tolts_io_int_.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+tolts_io_int_            000100 fatal_desc                  tolts_io_int_
+                         000102 bufp                        tolts_io_int_
+                         000104 mvp                         tolts_io_int_
+                         000106 wakeup_ptr                  tolts_io_int_
+                         000110 code                        tolts_io_int_
+                         000111 c_len                       tolts_io_int_
+                         000112 i                           tolts_io_int_
+                         000113 error                       tolts_io_int_
+                         000114 stata                       tolts_io_int_
+                         000115 found                       tolts_io_int_
+                         000116 continue                    tolts_io_int_
+                         000117 read                        tolts_io_int_
+                         000120 g_time                      tolts_io_int_
+                         000121 longinfo                    tolts_io_int_
+                         000152 shortinfo                   tolts_io_int_
+                         000154 statp                       tolts_io_int_
+                         000156 mca_area_ptr                tolts_io_int_
+                         000160 data_header_ptr             tolts_io_int_
+                         000162 data_size_1                 tolts_io_int_
+                         000163 data_size_2                 tolts_io_int_
+                         000164 io_param_blk_ptr            tolts_io_int_
+                         000166 mca_work_space_ptr          tolts_io_int_
+                         000170 dcwp                        tolts_io_int_
+                         000172 tdcwp                       tolts_io_int_
+                         000174 idcwp                       tolts_io_int_
+                         000176 io_info_ptr                 tolts_io_int_
+                         000200 tolts_rspd_wksp             tolts_io_int_
+                         000202 intercom_mbx_area           tolts_io_int_
+                         000212 direct_channel_pcw_ptr      tolts_io_int_
+                         000214 ioi_wksp                    tolts_io_int_
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+r_e_as              call_ext_out_desc   call_ext_out        return_mac          ext_entry           op_alloc_
+op_freen_
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+com_err_                      com_err_$convert_status_code_ get_system_free_area_         hcs_$wakeup
+ioi_$connect_pcw              ioi_$get_detailed_status      ioi_$release_devices          ipc_$drain_chn
+mca_$process_io_event         rcp_$check_attach             terminate_process_
+timer_manager_$reset_alarm_wakeup                           tolts_alm_util_$enter_ccc_req_
+tolts_init_$gc_tod            tolts_qttyio_$rs
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+tolts_infop
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     44 000231    4   17 000241        99 000243       100 000250       101 000252       103 000256       104 000261
+    105 000275       106 000321       107 000325       108 000330       109 000331       116 000413       120 000464
+    125 000502       126 000503       128 000512       130 000513       133 000530       140 000531       142 000537
+    144 000544       147 000551       148 000553       150 000557       156 000635       158 000641       159 000642
+    160 000646       161 000650       162 000654       163 000655       164 000656       165 000657       167 000660
+    169 000665       171 000671       172 000674       179 000710       183 000716       186 000722       189 000725
+    191 000726       195 000733       196 000735       197 000737       203 000751       207 000757       210 000763
+    214 000766       220 000767       222 000770       223 000774       224 000776       225 001001       227 001011
+    228 001012       229 001013       230 001023       231 001026       232 001033       234 001043       235 001044
+    237 001052       238 001053       239 001054       240 001065       243 001073       244 001077       245 001107
+    246 001112       247 001116       248 001120       249 001122       251 001127       253 001143       254 001145
+    255 001152       258 001160       260 001162       265 001163       267 001164       268 001174       269 001176
+    271 001204       272 001206       274 001212       277 001215       281 001216       283 001217       284 001222
+    285 001225       286 001234       287 001236       288 001237       289 001240       290 001241       291 001242
+    292 001245       294 001251       295 001252       296 001253       297 001254       298 001257       299 001260
+    300 001261       303 001262       309 001263       311 001264       312 001300       313 001324       314 001326
+    315 001331       316 001363       317 001364       318 001366       321 001411       322 001415       323 001420
+    324 001425       325 001440       326 001443       327 001445       329 001446       330 001453       331 001466
+    332 001471       334 001476       335 001504       336 001510       337 001523       338 001525       339 001527
+    340 001537       342 001540       343 001550       344 001557       346 001561       347 001570       348 001577
+    349 001604       350 001614       351 001615       356 001616       358 001617       359 001627       360 001631
+    362 001636       364 001641       367 001644       371 001645       373 001646       375 001705       377 001706
+    378 001710       379 001720       380 001722       381 001723       382 001724       383 001726       384 001727
+    385 001730       388 001731       389 001732       390 001733       391 001734       395 001740       401 001741
+    403 001742       406 002001       407 002011       408 002016       411 002023       412 002027       413 002032
+    414 002036       415 002040       416 002047       417 002054       420 002061       425 002062       427 002063
+    428 002066       432 002067       433 002104       434 002106       435 002127       437 002162       438 002167
+    442 002170       446 002171       448 002172       449 002210       451 002211       452 002214       453 002224
+    454 002227       455 002231       456 002232       457 002233       461 002250       462 002251       463 002252
+    466 002253       472 002254       474 002255       477 002275       478 002277       479 002301       480 002306
+    481 002315       482 002321       483 002330       484 002335       485 002343       486 002356       488 002362
+    489 002400       490 002402       491 002434       492 002435       493 002437       495 002462       500 002463
+    502 002464       503 002466       504 002477       505 002501       506 002522       507 002555       508 002562
+    510 002563       515 002564       517 002565       519 002573       520 002576       522 002603       523 002607
+    524 002612       525 002614       526 002625       528 002632       529 002633       534 002634       535 002635
+    537 002642       538 002645       539 002652       540 002656       541 002661       542 002663       543 002674
+    545 002701       546 002702
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

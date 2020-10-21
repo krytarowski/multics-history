@@ -1,0 +1,602 @@
+	COMPILATION LISTING OF SEGMENT tm_rollback
+	Compiled by: Multics PL/I Compiler, Release 28e, of February 14, 1985
+	Compiled at: Honeywell Multics Op. - System M
+	Compiled on: 03/05/85  0914.1 mst Tue
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        4*   *                                                         *
+        5*   *********************************************************** */
+        6 /* format: style4,ifthenstmt,^indproc,^indcomtxt */
+        7 /*---------------*/
+        8 
+        9 tm_rollback: proc (A_txn_id, A_checkpoint, A_code);
+       10 
+       11 /* DESCRIPTION:
+       12*
+       13*   This procedure implements transaction_manager_$rollback_txn.
+       14*   It calls bjm_$rollback, modifies the TDT entry, and writes a
+       15*   rolled-back mark. This scenario is similar to an abort but leaves
+       16*   the transaction in the IN-PROGRESS state.
+       17**/
+       18 
+       19 /* HISTORY:
+       20*
+       21*Written by Steve Herbst, 08/27/82.
+       22*Modified:
+       23*09/10/82 by Steve Herbst: Changed to eliminate locking.
+       24*09/23/82 by Lindsey Spratt: Changed to use new lock_manager_ calling sequences.
+       25*10/14/82 by Steve Herbst: Changed pfm_ calling sequence and added check for
+       26*	funny states.
+       27*11/01/82 by Steve Herbst: Changed to turn on txn's error_sw for error states.
+       28*11/05/82 by Steve Herbst: Made to set tm_tdt.error_code on error return.
+       29*11/05/82 by Steve Herbst: Changed to work on suspended transactions.
+       30*01/12/83 by Steve Herbst: Made to log its errors.
+       31*01/17/83 by Steve Herbst: Changed to complete previous error rollback, and to
+       32*	call tm_error_state.
+       33*05/27/83 by Steve Herbst: Made to update checkpoint_id & rollback_count in
+       34*	TDT entry.
+       35*03/28/84 by Lee A. Newcomb: Changed tm_get_state_info call to be
+       36*	  transaction_manager_$get_state_info.
+       37*10/18/84 by Steve Herbst: Changed in response to audit comments.
+       38*01/29/85 by Steve Herbst: Fixed to ignore dm_error_$file_was_deleted.
+       39*02/07/85 by S. Cox: Added fm_$post_transaction call (moved from lm_per_system_).
+       40*02/12/85 by Stanford S. Cox:  Removed fm$post_transaction call.
+       41**/
+       42 
+       43 /* DECLARATIONS */
+       44 
+       45 /* Parameters */
+       46 
+       47 dcl  A_txn_id bit (36) aligned parameter;
+       48 dcl  A_checkpoint fixed bin parameter;
+       49 dcl  A_code fixed bin (35) parameter;
+       50 
+       51 /* Constants */
+       52 
+       53 dcl  ME char (32) int static options (constant) init ("tm_rollback");
+       54 
+       55 /* Based */
+       56 
+       57 /* Static */
+       58 
+       59 /* Automatic */
+       60 
+       61 dcl  op_name char (32);
+       62 dcl  txn_id bit (36) aligned;
+       63 dcl  txn_index fixed bin;
+       64 dcl  (code, op_error_code) fixed bin (35);
+       65 
+       66 /* External */
+       67 
+       68 dcl  dm_data_$current_txn_index fixed bin ext;
+       69 dcl  dm_data_$my_process_id bit (36) ext;
+       70 dcl  dm_data_$suspended_txn_index fixed bin ext;
+       71 dcl  dm_data_$tm_tdt_ptr ptr external;
+       72 dcl  dm_error_$file_was_deleted fixed bin (35) ext;
+       73 dcl  dm_error_$invalid_current_txn fixed bin (35) ext;
+       74 dcl  dm_error_$no_current_transaction fixed bin (35) ext;
+       75 dcl  dm_error_$not_own_transaction fixed bin (35) ext;
+       76 dcl  dm_error_$transaction_not_current fixed bin (35) ext;
+       77 dcl  dm_error_$transaction_suspended fixed bin (35) ext;
+       78 dcl  error_table_$unimplemented_version fixed bin (35) ext;
+       79 
+       80 /* Entries */
+       81 
+       82 dcl  before_journal_manager_$flush_transaction entry (bit (36) aligned, fixed bin, fixed bin (35));
+       83 dcl  before_journal_manager_$rollback entry (bit (36) aligned, fixed bin, fixed bin, fixed bin (35));
+       84 dcl  before_journal_manager_$write_rolled_back_mark entry (bit (36) aligned, fixed bin, fixed bin, fixed bin (35));
+       85 dcl  lock_manager_$unlock_to_checkpoint entry (fixed bin, fixed bin (35));
+       86 dcl  lock_manager_$unlock_all entry;
+       87 dcl  file_manager_$flush_modified_ci entry (bit (36) aligned, fixed bin, fixed bin (35));
+       88 dcl  tm_cleanup entry (ptr, fixed bin);
+       89 dcl  tm_cleanup$restart_error entry (ptr, fixed bin);
+       90 dcl  tm_error_state entry (fixed bin, fixed bin, fixed bin (35), char (*), char (*));
+       91 dcl  transaction_manager_$get_state_info entry (fixed bin, char (*), fixed bin (35));
+       92 
+       93 /* Builtins */
+       94 
+       95 /* Conditions */
+       96 
+       97 dcl  cleanup condition;
+       98 
+       99 /* END OF DECLARATIONS */
+      100 
+      101 	A_code = 0;
+      102 
+      103 	tm_tdt_ptr = dm_data_$tm_tdt_ptr;
+      104 
+      105 	if tm_tdt.version ^= TM_TDT_VERSION_3 then call ERROR_RETURN (error_table_$unimplemented_version);
+      106 
+      107 	if dm_data_$current_txn_index = 0 then
+      108 	     if dm_data_$suspended_txn_index ^= 0 then call ERROR_RETURN (dm_error_$transaction_suspended);
+      109 	     else call ERROR_RETURN (dm_error_$no_current_transaction);
+      110 
+      111 	txn_index = dm_data_$current_txn_index;
+      112 
+      113 	if txn_index < 1 | txn_index > tm_tdt.entry_count then call ERROR_RETURN (dm_error_$invalid_current_txn);
+      114 
+      115 	if A_txn_id = "0"b | A_txn_id = tm_tdt.txn_id (txn_index) then
+      116 	     txn_id = tm_tdt.txn_id (txn_index);
+      117 	else call ERROR_RETURN (dm_error_$transaction_not_current);
+      118 
+      119 	if tm_tdt.process_id (txn_index) ^= dm_data_$my_process_id then call ERROR_RETURN (dm_error_$not_own_transaction);
+      120 
+      121 	if tm_tdt.state (txn_index) ^= TM_IN_PROGRESS_STATE then do;
+      122 
+      123 	     call transaction_manager_$get_state_info ((tm_tdt.state (txn_index)), op_name, op_error_code);
+      124 	     if op_name ^= OP_NAME_ROLLBACK then call ERROR_RETURN (op_error_code);
+      125 
+      126 	     call tm_cleanup$restart_error (tm_tdt_ptr, txn_index); /* finishes the commit if possible */
+      127 	     if tm_tdt.error_sw (txn_index) then
+      128 		call ERROR_STATE ((tm_tdt.state (txn_index)), tm_tdt.error_code (txn_index), "tm_cleanup");
+      129 	     return;
+      130 	end;
+      131 
+      132 	on cleanup begin;
+      133 	     call tm_cleanup (tm_tdt_ptr, txn_index);
+      134 	end;
+      135 
+      136 	tm_tdt.state (txn_index) = TM_ROLLBACK_FLUSHING_TXN_STATE;
+      137 
+      138 	call before_journal_manager_$flush_transaction (txn_id, txn_index, code);
+      139 	if code ^= 0 then
+      140 	     call ERROR_STATE (TM_ROLLBACK_FLUSHING_TXN_ERROR, code, "before_journal_manager_$flush_transaction");
+      141 
+      142 	tm_tdt.state (txn_index) = TM_ROLLBACK_ROLLING_BACK_STATE;
+      143 
+      144 	call before_journal_manager_$rollback (txn_id, txn_index, A_checkpoint, code);
+      145 	if code ^= 0 then
+      146 	     call ERROR_STATE (TM_ROLLBACK_ROLLING_BACK_ERROR, code, "before_journal_manager_$rollback");
+      147 
+      148 	tm_tdt.checkpoint_id (txn_index) = 0;
+      149 	tm_tdt.rollback_count (txn_index) = tm_tdt.rollback_count (txn_index) + 1;
+      150 
+      151 	tm_tdt.state (txn_index) = TM_ROLLBACK_FLUSHING_CI_STATE;
+      152 
+      153 	call file_manager_$flush_modified_ci (txn_id, txn_index, code);
+      154 	if code ^= 0 then				/* previous rollback may have deleted the file */
+      155 	     if code = dm_error_$file_was_deleted then code = 0;
+      156 	     else call ERROR_STATE (TM_ROLLBACK_FLUSHING_CI_ERROR, code, "file_manager_$flush_modified_ci");
+      157 
+      158 	tm_tdt.state (txn_index) = TM_ROLLBACK_WRITING_MARK_STATE;
+      159 
+      160 	call before_journal_manager_$write_rolled_back_mark (txn_id, txn_index, A_checkpoint, code);
+      161 	if code ^= 0 then
+      162 	     call ERROR_STATE (TM_ROLLBACK_WRITING_MARK_ERROR, code, "before_journal_manager_$write_rolled_back_mark");
+      163 
+      164 	tm_tdt.state (txn_index) = TM_ROLLBACK_UNLOCKING_STATE;
+      165 
+      166 	call lock_manager_$unlock_all;
+      167 
+      168 
+      169 	tm_tdt.state (txn_index) = TM_ROLLBACK_METERING_STATE;
+      170 
+      171 /* Dump meters here */
+      172 
+      173 	tm_tdt.state (txn_index) = TM_IN_PROGRESS_STATE;	/* nothing to clean up now */
+      174 RETURN:
+      175 	return;
+      176 
+      177 ERROR_RETURN: proc (P_code);
+      178 
+      179 dcl  P_code fixed bin (35);
+      180 
+      181 	A_code = P_code;
+      182 	go to RETURN;
+      183 
+      184      end ERROR_RETURN;
+      185 
+      186 ERROR_STATE: proc (P_state, P_code, P_name);
+      187 
+      188 dcl  P_state fixed bin;
+      189 dcl  P_code fixed bin (35);
+      190 dcl  P_name char (*);
+      191 
+      192 	call tm_error_state (txn_index, P_state, P_code, ME, P_name);
+      193 
+      194 	A_code = P_code;
+      195 
+      196 	go to RETURN;
+      197 
+      198      end ERROR_STATE;
+      199 
+  1     1 /*  START OF:	dm_tm_tdt.incl.pl1		*/
+  1     2 
+  1     3 /* Transaction Definition Table for transaction_manager_ */
+  1     4 /* This structure is used to reference the TDT. The process_id field for the
+  1     5*   i'th TDT entry, for example, is usually referenced as tm_tdt.process_id (i).
+  1     6*   A TDT entry is in use by a process when its process_id field is nonzero.
+  1     7*   An entry is reserved by using the stacq builtin to set process_id, if and
+  1     8*   only if it is already zero. The entry is being used for a transaction when
+  1     9*   tm_tdt.txn_id (i) is nonzero. The possible values of tm_tdt.state (i) are
+  1    10*   listed in dm_tm_states.incl.pl1. If state = 0, no operation has been
+  1    11*   performed yet on the transaction. */
+  1    12 
+  1    13 
+  1    14 /* HISTORY:
+  1    15*Designed by Matt Pierret, 01/26/82.
+  1    16*Coded by Steve Herbst, 07/27/82.
+  1    17*Modified:
+  1    18*08/05/82 by Steve Herbst: Added tm_tdt.operation and padded last_uid to full word.
+  1    19*08/05/82 by Steve Herbst: Changed creator_process_id to bit (36).
+  1    20*08/16/82 by Steve Herbst: Added contents of dm_tm_tdt_entry.incl.pl1.
+  1    21*09/09/82 by Steve Herbst: Removed in_use flag from TDT entry and rearranged fields.
+  1    22*09/20/82 by Steve Herbst: Removed tm_tdt.operation.
+  1    23*11/01/82 by Steve Herbst: Added event_channel and error_sw to tm_tdt_entry.
+  1    24*11/05/82 by Steve Herbst: Added suspended_sw and error_code to tm_tdt_entry.
+  1    25*11/11/82 by Steve Herbst: Deleted tm_tdt_entry.alloc_complete.
+  1    26*11/23/82 by Steve Herbst: Compacted, changed some numbers to unsigned.
+  1    27*12/14/82 by Steve Herbst: Added tm_tdt_entry.daemon_error_sw.
+  1    28*01/11/83 by Steve Herbst: Added owner_name, abandoned_sw & kill_sw to tm_tdt_entry.
+  1    29*01/24/83 by Steve Herbst: Replaced daemon_error_sw with daemon_adjust_count.
+  1    30*01/25/83 by Steve Herbst: Moved abandoned_sw from transaction portion to entry header portion.
+  1    31*05/13/83 by Steve Herbst: Version 3, changed all fixed bin (18) unal uns numbers to fixed bin (17) unaligned.
+  1    32*05/26/83 by Steve Herbst: Added rollback_count and checkpoint_id.
+  1    33**/
+  1    34 
+  1    35 dcl	tm_tdt_ptr	ptr;
+  1    36 dcl	tdt_max_count	fixed bin;
+  1    37 
+  1    38 dcl TM_TDT_VERSION_3 char (8) int static options (constant) init ("TM-TDT 3");
+  1    39 
+  1    40 
+  1    41 dcl  1	tm_tdt		aligned based (tm_tdt_ptr),
+  1    42       2	version char (8),				/* = "TM-TDT 3" */
+  1    43       2	lock fixed bin (71),			/* (currently not used) */
+  1    44       2	last_uid		bit (27) aligned,		/* last transaction uid assigned */
+  1    45       2	flags,
+  1    46        3	no_begins		bit (1) unaligned,		/* ON => only priv process can begin transaction */
+  1    47        3	mbz1		bit (35) unaligned,
+  1    48       2	entry_count	fixed bin,		/* number of slots allocated */
+  1    49       2	mbz2		fixed bin,		/* for even word boundary */
+  1    50       2	entry  (tdt_max_count refer (tm_tdt.entry_count))
+  1    51 			like tm_tdt_entry;
+  1    52 
+  1    53 
+  1    54 
+  1    55 /* TDT entries: */
+  1    56 
+  1    57 dcl	tm_tdt_entry_ptr	ptr;
+  1    58 
+  1    59 dcl  1	tm_tdt_entry	aligned based (tm_tdt_entry_ptr),
+  1    60       2	event_channel	fixed bin (71),		/* for communication with the process */
+  1    61       2	process_id	bit (36) aligned,		/* process for which this entry is reserved */
+  1    62       2	owner_name	char (32),		/* person.project of owner process */
+  1    63       2	entry_flags,
+  1    64        3	abandoned_sw	bit (1) unaligned,		/* ON => owner has called tm_$abandon on this entry */
+  1    65        3	mbz3		bit (35) unaligned,
+  1    66       2	transaction	unaligned,
+  1    67        3	txn_id		bit (36) aligned,		/* unique identifier assigned at begin time */
+  1    68        3	date_time_created	fixed bin (71) aligned,
+  1    69        3	mode		fixed bin (17) unaligned,	/* mode specified with transaction begin */
+  1    70        3	state		fixed bin (17) unaligned,	/* state transaction is currently in */
+  1    71        3  error_code	fixed bin (35) aligned,	/* goes along with error_sw and error state */
+  1    72        3 	checkpoint_id	fixed bin (17) unaligned,	/* identifier of the current rollback checkpoint */
+  1    73        3	rollback_count	fixed bin (17) unaligned,	/* number of times bjm_$rollback has been called */
+  1    74        3	daemon_adjust_count	fixed bin (17) unaligned,	/* number of times daemon has tried to adjust since user */
+  1    75        3	return_idx	fixed bin (17) unaligned,	/* parent transaction, or zero */
+  1    76        3	flags,
+  1    77         4 dead_process_sw	bit (1) unaligned,		/* ON => treat process as dead even if it isn't yet */
+  1    78         4 suspended_sw	bit (1) unaligned,		/* ON => suspended by tm_$suspend_txn */
+  1    79         4 error_sw		bit (1) unaligned,		/* ON => state is one of the error states */
+  1    80         4 kill_sw		bit (1) unaligned,		/* ON => being processed by tm_$kill */
+  1    81         4	mbz4		bit (29) unaligned,
+  1    82        3	post_commit_flags,
+  1    83         4 (fmgr,
+  1    84 	 bjmgr,
+  1    85 	 ajmgr)	 	 bit (1) unaligned,
+  1    86        3	mbz4		fixed bin;
+  1    87 
+  1    88 
+  1    89 /*  END OF:	dm_tm_tdt.incl.pl1		*/
+      200 
+      201 
+  2     1 /*  START OF:	dm_tm_states.incl.pl1	*/
+  2     2 
+  2     3 /* HISTORY:
+  2     4*
+  2     5*Designed by Matthew Pierret, 01/26/82.
+  2     6*Coded by Steve Herbst, 08/05/82.
+  2     7*Modified:
+  2     8*09/20/82 by Steve Herbst: States renames for distinct operations.
+  2     9*10/05/82 by Steve Herbst: Added TM_ABORT_POST_COMMIT_STATE.
+  2    10*01/14/83 by Steve Herbst: Added TM_ERROR_INCREMENT.
+  2    11*01/18/83 by Steve Herbst: Added HIGHEST_ABORT_STATE, etc.
+  2    12*08/23/84 by Steve Herbst: Added OP_NAME... constants.
+  2    13**/
+  2    14 
+  2    15 
+  2    16 /* NOTE: Changing this file necessitates changes tm_cleanup */
+  2    17 
+  2    18 dcl (HIGHEST_STATE init (96),
+  2    19      LOWEST_ABORT_STATE init (21),
+  2    20      HIGHEST_ABORT_STATE init (30),
+  2    21      LOWEST_COMMIT_STATE init (31),
+  2    22      HIGHEST_COMMIT_STATE init (40),
+  2    23      LOWEST_ROLLBACK_STATE init (41),
+  2    24      HIGHEST_ROLLBACK_STATE init (50)) fixed bin int static options (constant);
+  2    25 
+  2    26 dcl TM_ERROR_INCREMENT fixed bin int static options (constant) init (50);
+  2    27 						/* error state = corresponding pre-call state + 50 */
+  2    28 
+  2    29 
+  2    30 dcl (	TM_IN_PROGRESS_STATE		init (1),
+  2    31 
+  2    32 	TM_BEGIN_STARTING_STATE		init (11),
+  2    33 
+  2    34 	TM_ABORT_FLUSHING_TXN_STATE		init (21),
+  2    35 	TM_ABORT_FLUSHING_TXN_ERROR		init (71),
+  2    36 	TM_ABORT_ROLLING_BACK_STATE		init (22),
+  2    37 	TM_ABORT_ROLLING_BACK_ERROR		init (72),
+  2    38 	TM_ABORT_FLUSHING_CI_STATE		init (23),
+  2    39 	TM_ABORT_FLUSHING_CI_ERROR		init (73),
+  2    40 	TM_ABORT_WRITING_MARK_STATE		init (24),
+  2    41 	TM_ABORT_WRITING_MARK_ERROR		init (74),
+  2    42 	TM_ABORT_UNLOCKING_STATE		init (25),
+  2    43 	TM_ABORT_UNLOCKING_ERROR		init (75),
+  2    44 	TM_ABORT_METERING_STATE		init (26),
+  2    45 	TM_ABORT_METERING_ERROR		init (76),
+  2    46 
+  2    47 	TM_COMMIT_FLUSHING_TXN_STATE		init (31),
+  2    48 	TM_COMMIT_FLUSHING_TXN_ERROR		init (81),
+  2    49 	TM_COMMIT_FLUSHING_CI_STATE		init (32),
+  2    50 	TM_COMMIT_FLUSHING_CI_ERROR		init (82),
+  2    51 	TM_COMMIT_WRITING_MARK_STATE		init (33),
+  2    52 	TM_COMMIT_WRITING_MARK_ERROR		init (83),
+  2    53 	TM_COMMIT_POST_COMMIT_STATE		init (34),
+  2    54 	TM_COMMIT_POST_COMMIT_ERROR		init (84),
+  2    55 	TM_COMMIT_UNLOCKING_STATE		init (35),
+  2    56 	TM_COMMIT_UNLOCKING_ERROR		init (85),
+  2    57 	TM_COMMIT_METERING_STATE		init (36),
+  2    58 	TM_COMMIT_METERING_ERROR		init (86),
+  2    59 
+  2    60 	TM_ROLLBACK_FLUSHING_TXN_STATE	init (41),
+  2    61 	TM_ROLLBACK_FLUSHING_TXN_ERROR	init (91),
+  2    62 	TM_ROLLBACK_ROLLING_BACK_STATE	init (42),
+  2    63 	TM_ROLLBACK_ROLLING_BACK_ERROR	init (92),
+  2    64 	TM_ROLLBACK_FLUSHING_CI_STATE		init (43),
+  2    65 	TM_ROLLBACK_FLUSHING_CI_ERROR		init (93),
+  2    66 	TM_ROLLBACK_WRITING_MARK_STATE	init (44),
+  2    67 	TM_ROLLBACK_WRITING_MARK_ERROR	init (94),
+  2    68 	TM_ROLLBACK_UNLOCKING_STATE		init (45),
+  2    69 	TM_ROLLBACK_UNLOCKING_ERROR		init (95),
+  2    70 	TM_ROLLBACK_METERING_STATE		init (46),
+  2    71 	TM_ROLLBACK_METERING_ERROR		init (96))
+  2    72 
+  2    73 			fixed bin int static options (constant);
+  2    74 
+  2    75 dcl (OP_NAME_ABORT init ("abort"),
+  2    76      OP_NAME_COMMIT init ("commit"),
+  2    77      OP_NAME_ROLLBACK init ("rollback")) char (32) int static options (constant);
+  2    78 
+  2    79 /* END OF:	dm_tm_states.incl.pl1	*/
+      202 
+      203 
+      204 
+      205      end tm_rollback;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    03/05/85  0800.0  tm_rollback.pl1                   >spec>on>7138.pbf>tm_rollback.pl1
+200          1    01/07/85  0900.1  dm_tm_tdt.incl.pl1                >ldd>include>dm_tm_tdt.incl.pl1
+202          2    01/07/85  0900.1  dm_tm_states.incl.pl1             >ldd>include>dm_tm_states.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+A_checkpoint                           parameter       fixed bin(17,0)          dcl 48 set ref 9 144* 160*
+A_code                                 parameter       fixed bin(35,0)          dcl 49 set ref 9 101* 181* 194*
+A_txn_id                               parameter       bit(36)                  dcl 47 ref 9 115 115
+ME                              000016 constant        char(32)                 initial unaligned dcl 53 set ref 192*
+OP_NAME_ROLLBACK                000000 constant        char(32)                 initial unaligned dcl 2-75 ref 124
+P_code                                 parameter       fixed bin(35,0)          dcl 179 in procedure "ERROR_RETURN" ref 177 181
+P_code                                 parameter       fixed bin(35,0)          dcl 189 in procedure "ERROR_STATE" set ref 186 192*
+                                                                                  194
+P_name                                 parameter       char                     unaligned dcl 190 set ref 186 192*
+P_state                                parameter       fixed bin(17,0)          dcl 188 set ref 186 192*
+TM_IN_PROGRESS_STATE                   constant        fixed bin(17,0)          initial dcl 2-30 ref 121 173
+TM_ROLLBACK_FLUSHING_CI_ERROR   000011 constant        fixed bin(17,0)          initial dcl 2-30 set ref 156*
+TM_ROLLBACK_FLUSHING_CI_STATE          constant        fixed bin(17,0)          initial dcl 2-30 ref 151
+TM_ROLLBACK_FLUSHING_TXN_ERROR  000013 constant        fixed bin(17,0)          initial dcl 2-30 set ref 139*
+TM_ROLLBACK_FLUSHING_TXN_STATE         constant        fixed bin(17,0)          initial dcl 2-30 ref 136
+TM_ROLLBACK_METERING_STATE             constant        fixed bin(17,0)          initial dcl 2-30 ref 169
+TM_ROLLBACK_ROLLING_BACK_ERROR  000012 constant        fixed bin(17,0)          initial dcl 2-30 set ref 145*
+TM_ROLLBACK_ROLLING_BACK_STATE         constant        fixed bin(17,0)          initial dcl 2-30 ref 142
+TM_ROLLBACK_UNLOCKING_STATE            constant        fixed bin(17,0)          initial dcl 2-30 ref 164
+TM_ROLLBACK_WRITING_MARK_ERROR  000010 constant        fixed bin(17,0)          initial dcl 2-30 set ref 161*
+TM_ROLLBACK_WRITING_MARK_STATE         constant        fixed bin(17,0)          initial dcl 2-30 ref 158
+TM_TDT_VERSION_3                000014 constant        char(8)                  initial unaligned dcl 1-38 ref 105
+before_journal_manager_$flush_transaction
+                                000036 constant        entry                    external dcl 82 ref 138
+before_journal_manager_$rollback
+                                000040 constant        entry                    external dcl 83 ref 144
+before_journal_manager_$write_rolled_back_mark
+                                000042 constant        entry                    external dcl 84 ref 160
+checkpoint_id            32            based           fixed bin(17,0)          array level 4 packed unaligned dcl 1-41 set ref 148*
+cleanup                         000114 stack reference condition                dcl 97 ref 132
+code                            000112 automatic       fixed bin(35,0)          dcl 64 set ref 138* 139 139* 144* 145 145* 153* 154
+                                                                                  154 154* 156* 160* 161 161*
+dm_data_$current_txn_index      000010 external static fixed bin(17,0)          dcl 68 ref 107 111
+dm_data_$my_process_id          000012 external static bit(36)                  unaligned dcl 69 ref 119
+dm_data_$suspended_txn_index    000014 external static fixed bin(17,0)          dcl 70 ref 107
+dm_data_$tm_tdt_ptr             000016 external static pointer                  dcl 71 ref 103
+dm_error_$file_was_deleted      000020 external static fixed bin(35,0)          dcl 72 ref 154
+dm_error_$invalid_current_txn   000022 external static fixed bin(35,0)          dcl 73 set ref 113*
+dm_error_$no_current_transaction
+                                000024 external static fixed bin(35,0)          dcl 74 set ref 109*
+dm_error_$not_own_transaction   000026 external static fixed bin(35,0)          dcl 75 set ref 119*
+dm_error_$transaction_not_current
+                                000030 external static fixed bin(35,0)          dcl 76 set ref 117*
+dm_error_$transaction_suspended 000032 external static fixed bin(35,0)          dcl 77 set ref 107*
+entry                    10            based           structure                array level 2 dcl 1-41
+entry_count               6            based           fixed bin(17,0)          level 2 dcl 1-41 ref 113
+error_code               31            based           fixed bin(35,0)          array level 4 dcl 1-41 set ref 127*
+error_sw                 34(02)        based           bit(1)                   array level 5 packed unaligned dcl 1-41 ref 127
+error_table_$unimplemented_version
+                                000034 external static fixed bin(35,0)          dcl 78 set ref 105*
+file_manager_$flush_modified_ci 000046 constant        entry                    external dcl 87 ref 153
+flags                    34            based           structure                array level 4 packed unaligned dcl 1-41
+lock_manager_$unlock_all        000044 constant        entry                    external dcl 86 ref 166
+op_error_code                   000113 automatic       fixed bin(35,0)          dcl 64 set ref 123* 124*
+op_name                         000100 automatic       char(32)                 unaligned dcl 61 set ref 123* 124
+process_id               12            based           bit(36)                  array level 3 dcl 1-41 ref 119
+rollback_count           32(18)        based           fixed bin(17,0)          array level 4 packed unaligned dcl 1-41 set ref 149*
+                                                                                  149
+state                    30(18)        based           fixed bin(17,0)          array level 4 packed unaligned dcl 1-41 set ref 121
+                                                                                  123 127 136* 142* 151* 158* 164* 169* 173*
+tm_cleanup                      000050 constant        entry                    external dcl 88 ref 133
+tm_cleanup$restart_error        000052 constant        entry                    external dcl 89 ref 126
+tm_error_state                  000054 constant        entry                    external dcl 90 ref 192
+tm_tdt                                 based           structure                level 1 dcl 1-41
+tm_tdt_entry                           based           structure                level 1 dcl 1-59
+tm_tdt_ptr                      000122 automatic       pointer                  dcl 1-35 set ref 103* 105 113 115 115 119 121 123
+                                                                                  126* 127 127 127 133* 136 142 148 149 149 151 158
+                                                                                  164 169 173
+transaction              24            based           structure                array level 3 unaligned dcl 1-41
+transaction_manager_$get_state_info
+                                000056 constant        entry                    external dcl 91 ref 123
+txn_id                          000110 automatic       bit(36)                  dcl 62 in procedure "tm_rollback" set ref 115* 138*
+                                                                                  144* 153* 160*
+txn_id                   24            based           bit(36)                  array level 4 in structure "tm_tdt" dcl 1-41
+                                                                                  in procedure "tm_rollback" ref 115 115
+txn_index                       000111 automatic       fixed bin(17,0)          dcl 63 set ref 111* 113 113 115 115 119 121 123 126*
+                                                                                  127 127 127 133* 136 138* 142 144* 148 149 149 151
+                                                                                  153* 158 160* 164 169 173 192*
+version                                based           char(8)                  level 2 dcl 1-41 ref 105
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+HIGHEST_ABORT_STATE                    internal static fixed bin(17,0)          initial dcl 2-18
+HIGHEST_COMMIT_STATE                   internal static fixed bin(17,0)          initial dcl 2-18
+HIGHEST_ROLLBACK_STATE                 internal static fixed bin(17,0)          initial dcl 2-18
+HIGHEST_STATE                          internal static fixed bin(17,0)          initial dcl 2-18
+LOWEST_ABORT_STATE                     internal static fixed bin(17,0)          initial dcl 2-18
+LOWEST_COMMIT_STATE                    internal static fixed bin(17,0)          initial dcl 2-18
+LOWEST_ROLLBACK_STATE                  internal static fixed bin(17,0)          initial dcl 2-18
+OP_NAME_ABORT                          internal static char(32)                 initial unaligned dcl 2-75
+OP_NAME_COMMIT                         internal static char(32)                 initial unaligned dcl 2-75
+TM_ABORT_FLUSHING_CI_ERROR             internal static fixed bin(17,0)          initial dcl 2-30
+TM_ABORT_FLUSHING_CI_STATE             internal static fixed bin(17,0)          initial dcl 2-30
+TM_ABORT_FLUSHING_TXN_ERROR            internal static fixed bin(17,0)          initial dcl 2-30
+TM_ABORT_FLUSHING_TXN_STATE            internal static fixed bin(17,0)          initial dcl 2-30
+TM_ABORT_METERING_ERROR                internal static fixed bin(17,0)          initial dcl 2-30
+TM_ABORT_METERING_STATE                internal static fixed bin(17,0)          initial dcl 2-30
+TM_ABORT_ROLLING_BACK_ERROR            internal static fixed bin(17,0)          initial dcl 2-30
+TM_ABORT_ROLLING_BACK_STATE            internal static fixed bin(17,0)          initial dcl 2-30
+TM_ABORT_UNLOCKING_ERROR               internal static fixed bin(17,0)          initial dcl 2-30
+TM_ABORT_UNLOCKING_STATE               internal static fixed bin(17,0)          initial dcl 2-30
+TM_ABORT_WRITING_MARK_ERROR            internal static fixed bin(17,0)          initial dcl 2-30
+TM_ABORT_WRITING_MARK_STATE            internal static fixed bin(17,0)          initial dcl 2-30
+TM_BEGIN_STARTING_STATE                internal static fixed bin(17,0)          initial dcl 2-30
+TM_COMMIT_FLUSHING_CI_ERROR            internal static fixed bin(17,0)          initial dcl 2-30
+TM_COMMIT_FLUSHING_CI_STATE            internal static fixed bin(17,0)          initial dcl 2-30
+TM_COMMIT_FLUSHING_TXN_ERROR           internal static fixed bin(17,0)          initial dcl 2-30
+TM_COMMIT_FLUSHING_TXN_STATE           internal static fixed bin(17,0)          initial dcl 2-30
+TM_COMMIT_METERING_ERROR               internal static fixed bin(17,0)          initial dcl 2-30
+TM_COMMIT_METERING_STATE               internal static fixed bin(17,0)          initial dcl 2-30
+TM_COMMIT_POST_COMMIT_ERROR            internal static fixed bin(17,0)          initial dcl 2-30
+TM_COMMIT_POST_COMMIT_STATE            internal static fixed bin(17,0)          initial dcl 2-30
+TM_COMMIT_UNLOCKING_ERROR              internal static fixed bin(17,0)          initial dcl 2-30
+TM_COMMIT_UNLOCKING_STATE              internal static fixed bin(17,0)          initial dcl 2-30
+TM_COMMIT_WRITING_MARK_ERROR           internal static fixed bin(17,0)          initial dcl 2-30
+TM_COMMIT_WRITING_MARK_STATE           internal static fixed bin(17,0)          initial dcl 2-30
+TM_ERROR_INCREMENT                     internal static fixed bin(17,0)          initial dcl 2-26
+TM_ROLLBACK_METERING_ERROR             internal static fixed bin(17,0)          initial dcl 2-30
+TM_ROLLBACK_UNLOCKING_ERROR            internal static fixed bin(17,0)          initial dcl 2-30
+lock_manager_$unlock_to_checkpoint
+                                000000 constant        entry                    external dcl 85
+tdt_max_count                          automatic       fixed bin(17,0)          dcl 1-36
+tm_tdt_entry_ptr                       automatic       pointer                  dcl 1-57
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+ERROR_RETURN                    000626 constant        entry                    internal dcl 177 ref 105 107 109 113 117 119 124
+ERROR_STATE                     000634 constant        entry                    internal dcl 186 ref 127 139 145 156 161
+RETURN                          000625 constant        label                    dcl 174 ref 182 196
+tm_rollback                     000120 constant        entry                    external dcl 9
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      1322        1402    1000        1332
+Length      1642    1000        60         224     321           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+tm_rollback                         160 external procedure  is an external procedure.  
+on unit on line 132                  70 on unit               
+ERROR_RETURN                            internal procedure  shares stack frame of external procedure tm_rollback.  
+ERROR_STATE                             internal procedure  shares stack frame of external procedure tm_rollback.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+tm_rollback              000100 op_name                     tm_rollback
+                         000110 txn_id                      tm_rollback
+                         000111 txn_index                   tm_rollback
+                         000112 code                        tm_rollback
+                         000113 op_error_code               tm_rollback
+                         000122 tm_tdt_ptr                  tm_rollback
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+call_ext_out_desc   call_ext_out        return              enable              ext_entry           int_entry
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+before_journal_manager_$flush_transaction                   before_journal_manager_$rollback
+before_journal_manager_$write_rolled_back_mark              file_manager_$flush_modified_ci
+lock_manager_$unlock_all      tm_cleanup                    tm_cleanup$restart_error      tm_error_state
+transaction_manager_$get_state_info
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+dm_data_$current_txn_index    dm_data_$my_process_id        dm_data_$suspended_txn_index  dm_data_$tm_tdt_ptr
+dm_error_$file_was_deleted    dm_error_$invalid_current_txn dm_error_$no_current_transaction
+dm_error_$not_own_transaction dm_error_$transaction_not_current
+dm_error_$transaction_suspended                             error_table_$unimplemented_version
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+      9 000114       101 000125       103 000127       105 000132       107 000145       109 000161       111 000167
+    113 000172       115 000205       117 000222       119 000231       121 000246       123 000260       124 000302
+    126 000310       127 000321       129 000362       132 000363       133 000377       134 000410       136 000411
+    138 000416       139 000431       142 000441       144 000447       145 000465       148 000475       149 000503
+    151 000512       153 000515       154 000530       156 000537       158 000545       160 000553       161 000571
+    164 000601       166 000607       169 000614       173 000622       174 000625       177 000626       181 000630
+    182 000633       186 000634       192 000645       194 000677       196 000703
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

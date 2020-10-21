@@ -1,0 +1,2387 @@
+	COMPILATION LISTING OF SEGMENT lm_per_system_
+	Compiled by: Multics PL/I Compiler, Release 33e, of October 6, 1992
+	Compiled at: CGI                             
+	Compiled on: 2000-04-17_1940.03_Mon_mdt
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        4*   *                                                         *
+        5*   *********************************************************** */
+        6 /* ***********************************************************
+        7*   *                                                         *
+        8*   * copyright, (C) Honeywell Information Systems Inc., 1983 *
+        9*   *                                                         *
+       10*   *********************************************************** */
+       11 
+       12 /*  DESCRIPTION:
+       13*Data Management Locking
+       14**/
+       15 
+       16 /*  HISTORY:
+       17*
+       18*Written by J. Bongiovanni,  11/01/82.
+       19*Modified:
+       20*12/01/82 by J. Bongiovanni:  For multi-segment lock data.
+       21*01/01/83 by J. Bongiovanni:  For deterministic deadlock detection.
+       22*03/01/83 by Lindsey Spratt to increase the lock_seg_timeout to 5 min.
+       23*04/24/83 by Benson I. Margulies:  To handle mylock more gracefully.
+       24*04/26/83 by Benson I. Margulies:  To log timeouts on the lock_seg lock.
+       25*05/06/83 by Benson I. Margulies:  To not create one ev channel per txn.
+       26*05/10/83 by Benson I. Margulies:  To meter.
+       27*08/05/83 by Lee A. Newcomb to remove obsolete code args. from calls
+       28*	  to dm_per_system_ entries.
+       29*05/01/84 by R. Michael Tague:  Added %include dm_lm_meters.
+       30*07/17/84 by Matthew Pierret:   Changed call to fm_open_$post_txn to
+       31*            file_manager_$post_transaction.
+       32*09/19/84 by Lindsey L. Spratt:  Fixed VALID_TXN to check for the invalid TXID
+       33*            = "0"b and return false.  txnmgr_$get_txn_index will return the
+       34*            idx for the current txn (and a 0 error code) when given "0"b.
+       35*            Fixed CONFLICT(6,6) to equal "1"b, it was "0"b (see MTB514, Fig.
+       36*            1, Compatibility Matrix).  Fixed to call lm_signal_deadlock_ when
+       37*            either returning from ipc_$block with an event_info.message of
+       38*            LOCK_MESSAGE_DEADLOCK, or if waiting on a lock would cause a
+       39*            deadlock (according to CHECK_DEADLOCK).
+       40*09/25/84 by Lindsey L. Spratt:  Removed use of the MAX_WAIT_TIME, the timer in
+       41*            REALLY_WAIT is now set to the give_up_time.
+       42*            Changed to do deadlock detection before waiting on the lock at
+       43*            all, as opposed to only doing deadlock detection after the first
+       44*            wait.  This change is necessary because of the removal of
+       45*            MAX_WAIT_TIME.
+       46*            Fixed to set the Lock_Txn_Table.deadlock_inx to 0 for invalid txns
+       47*            in CHECK_DEADLOCK.
+       48*10/17/84 by Stanford S. Cox:  MAIN: Chg all int proc to have prefix var names
+       49*	  and use ER, chg CONFLICT (6, 6) to "1"b.  ER: Added for common
+       50*	  return.  SETUP_LOCK: Chg RETRY_LOCK_LOOP to use do while.  LOCK_OBJECT:
+       51*	  Chg LOCK_LOOP to use do while.
+       52*01/22/85 by Lindsey L. Spratt:  Added the SETUP_UNLOCK internal proc for use
+       53*            by the $unlock_lock_data entry.  It was just calling UNLOCK, which
+       54*            relied on lock_seg_ptr being set by a previous call to SETUP_LOCK.
+       55*02/07/85 by Stanford S. Cox: unlock_all: Rmvd call to fm$post_transaction,
+       56*   	  LOCK_OBJECT: Added call to lm_signal_$timeout.
+       57*02/26/85 by Lindsey L. Spratt:  Fixed to UNWAIT_ME before signalling deadlock.
+       58*            Fixed to only cause deadlock resolution in CHECK_DEADLOCK when
+       59*            lm_check_for_deadlock_ has found a deadlock.  Fixed to make the
+       60*            deadlock meters consistent with the actual deadlock resolution.
+       61*03/01/85 by Lindsey L. Spratt:  Added the SEND_WAKEUP internal proc, which
+       62*            handles itt overflows and logs other errors encountered when
+       63*            calling hcs_$wakeup.  Changed to wake up and retry the lock very
+       64*	  INTERMEDIATE_WAIT_TIME (30 seconds), in case the wakeup on which
+       65*	  the proc is blocked isn't sent.
+       66*03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+       67**/
+       68 
+       69 /* format: style3,idind30 */
+       70 lm_per_system_$lock:
+       71      proc (p_f_uid, p_ci_number, p_mode_req, p_timeout, p_mode_obtained, p_code);
+       72 
+       73 /*  Parameter  */
+       74 
+       75 dcl	p_ci_number		fixed bin (27) parameter;
+       76 						/* Control Interval Number */
+       77 dcl	p_checkpoint_id		bit (36) aligned parameter;
+       78 						/* Checkpoint Unique ID */
+       79 dcl	p_code			fixed bin (35) parameter;
+       80 						/* Standard Error p_code */
+       81 dcl	p_mode_obtained		fixed bin parameter;/* Lock Mode Obtained */
+       82 dcl	p_mode_req		fixed bin parameter;/* Lock Mode Requested */
+       83 dcl	p_f_uid			bit (36) aligned parameter;
+       84 						/* Page File Unique ID */
+       85 dcl	p_timeout			fixed bin (71) parameter;
+       86 						/* How long to wait */
+       87 
+       88 /*  Automatic  */
+       89 
+       90 dcl	ci_number			fixed bin (27);
+       91 dcl	code			fixed bin (35);
+       92 dcl	give_up_time		fixed bin (71);
+       93 dcl	mode_req			fixed bin;
+       94 dcl	f_uid			bit (36) aligned;
+       95 dcl	error_in_unlock_all		bit (1) aligned;
+       96 
+       97 /*  Static  */
+       98 
+       99 dcl	COMMON_MODE		(2:6, 2:6) fixed bin int static options (constant)
+      100 				init (2, 3, 2, 6, 6, 3, 3, 3, 3, 3, 2, 3, 4, 5, 6, 6, 3, 5, 5, 6, 6, 3, 6, 6, 6);
+      101 
+      102 dcl	CONFLICT			(2:6, 2:6) bit (1) aligned int static options (constant)
+      103 				init ("0"b, "1"b, "0"b, "1"b, "1"b, "1"b, "1"b, "1"b, "1"b, "1"b, "0"b, "1"b,
+      104 				"0"b, "0"b, "0"b, "1"b, "1"b, "0"b, "0"b, "1"b, "1"b, "1"b, "0"b, "1"b, "1"b);
+      105 
+      106 dcl	(
+      107 	YES			init ("1"b),
+      108 	NO			init ("0"b)
+      109 	)			bit (1) aligned internal static options (constant);
+      110 
+      111 dcl	LOCK_SEG_TIMEOUT		fixed bin (71) int static options (constant) init (300000000 /* 5 minutes */);
+      112 dcl	ITT_OVERFLOW_WAIT_TIME	init (1e7 /* 10 seconds */) fixed bin (71) int static options (constant);
+      113 dcl	INTERMEDIATE_WAIT_INTERVAL	init (3e7 /* 30 seconds */) fixed bin (71) int static options (constant);
+      114 dcl	ID_IS_INVALID		init ("0"b) bit (1) aligned internal static options (constant);
+      115 dcl	TIME_IS_ABSOLUTE		init (2) fixed bin (17) int static options (constant);
+      116 dcl	RELATIVE_SECONDS		init ("11"b) bit (2) int static options (constant);
+      117 dcl	MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS
+      118 				init (10) fixed bin internal static options (constant);
+      119 dcl	ME			char (14) int static options (constant) init ("lm_per_system_");
+      120 
+      121 /*  Based  */
+      122 
+      123 dcl	dm_area			area based (dm_data_$inner_ring_areap);
+      124 
+      125 /*  External  */
+      126 
+      127 dcl	dm_system_data_$max_n_transactions
+      128 				fixed bin ext;
+      129 dcl	dm_data_$inner_ring_areap	ptr external;
+      130 dcl	dm_data_$current_txn_id	bit (36) aligned external;
+      131 dcl	lm_data_$ev_channel		fixed bin (71) ext static;
+      132 dcl	lm_data_$txn_table_ptr	pointer ext static;
+      133 dcl	lm_data_$lock_segments_ptr	ptr external;
+      134 dcl	lm_data_$lock_seg_ptr	ptr external;
+      135 dcl	lm_data_$n_lock_segments	fixed bin external;
+      136 dcl	dm_error_$fast_lock_mylock	ext static fixed bin (35);
+      137 dcl	dm_error_$fast_lock_invalid_reset
+      138 				fixed bin (35) external;
+      139 dcl	dm_error_$lock_invalid_mode	fixed bin (35) external;
+      140 dcl	dm_error_$lock_invalid_uid	fixed bin (35) external;
+      141 dcl	dm_error_$lock_not_found	fixed bin (35) external;
+      142 dcl	dm_error_$lock_table_overflow fixed bin (35) external;
+      143 dcl	dm_error_$lock_timeout	fixed bin (35) external;
+      144 dcl	dm_error_$unimplemented_entry fixed bin (35) external;
+      145 dcl	error_table_$unimplemented_version
+      146 				fixed bin (35) ext static;
+      147 dcl	error_table_$itt_overflow	fixed bin (35) ext static;
+      148 dcl	error_table_$process_unknown	fixed bin (35) ext static;
+      149 dcl	dm_system_data_$lock_ips_mask bit (36) aligned external;
+      150 
+      151 /*  Entry  */
+      152 
+      153 dcl	dm_misc_util_$log		entry options (variable);
+      154 dcl	lm_check_for_deadlock_	entry (ptr, ptr, fixed bin, bit (36) aligned, fixed bin (35));
+      155 dcl	lm_signal_$deadlock		entry (bit (36) aligned, bit (36) aligned, fixed bin (35), fixed bin);
+      156 dcl	lm_signal_$timeout		entry (bit (36) aligned, bit (36) aligned, fixed bin (35), fixed bin,
+      157 				fixed bin (71));
+      158 dcl	cu_$level_get		entry (fixed bin);
+      159 dcl	cu_$level_set		entry (fixed bin);
+      160 dcl	dm_per_system_$initiate	entry (char (*), char (*), ptr);
+      161 dcl	lm_expand_lock_seg_		entry (fixed bin (35));
+      162 dcl	get_ring_			entry () returns (fixed bin (3));
+      163 dcl	hcs_$get_alarm_timer	entry (fixed bin (71), fixed bin (71));
+      164 dcl	hcs_$reset_ips_mask		entry (bit (36) aligned, bit (36) aligned);
+      165 dcl	hcs_$set_alarm_timer	entry (fixed bin (71), fixed bin, fixed bin (71));
+      166 dcl	hcs_$set_ips_mask		entry (bit (36) aligned, bit (36) aligned);
+      167 dcl	hcs_$wakeup		entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+      168 dcl	ipc_$block		entry (ptr, ptr, fixed bin (35));
+      169 dcl	ipc_$create_ev_chn		entry (fixed bin (71), fixed bin (35));
+      170 dcl	lm_hash_$hash_in		entry (ptr);
+      171 dcl	lm_hash_$hash_out		entry (ptr);
+      172 dcl	lm_hash_$search		entry (bit (36) aligned, fixed bin (27), ptr);
+      173 dcl	lock_manager_$lock_fast	entry (ptr, fixed bin (71), fixed bin (35));
+      174 dcl	lock_manager_$unlock_fast	entry (ptr, fixed bin (35));
+      175 dcl	lm_salvage_lock_seg_	entry (fixed bin (35));
+      176 dcl	sub_err_			entry () options (variable);
+      177 dcl	timer_manager_$sleep	entry (fixed bin (71), bit (2));
+      178 declare	transaction_manager_$get_txn_index
+      179 				entry (bit (36) aligned, fixed bin (35)) returns (fixed bin);
+      180 
+      181 /*  Builtin  */
+      182 
+      183 dcl	addr			builtin;
+      184 dcl	clock			builtin;
+      185 dcl	null			builtin;
+      186 dcl	ptr			builtin;
+      187 dcl	wordno			builtin;
+      188 dcl	substr			builtin;
+      189 dcl	unspec			builtin;
+      190 
+      191 /*  Condition  */
+      192 
+      193 dcl	cleanup			condition;
+      194 
+      195 
+      196 	f_uid = p_f_uid;
+      197 	ci_number = p_ci_number;
+      198 	mode_req = p_mode_req;
+      199 	give_up_time = p_timeout + clock ();
+      200 
+      201 	if f_uid = ""b
+      202 	then call ERROR_RETURN (dm_error_$lock_invalid_uid);
+      203 
+      204 	call VALIDATE_MODE (mode_req);
+      205 
+      206 	call SETUP_LOCK ();
+      207 
+      208 	on cleanup call CLEAN_LOCK;
+      209 	call LOCK_OBJECT (give_up_time, f_uid, ci_number, mode_req, p_mode_obtained, p_code);
+      210 
+      211 	call UNLOCK;
+      212 MAIN_RETURN:
+      213 	return;
+      214 
+      215 
+      216 
+      217 unlock_all:
+      218      entry;
+      219 
+      220 	call SETUP_LOCK ();
+      221 	error_in_unlock_all = "0"b;
+      222 	on cleanup call CLEAN_LOCK;
+      223 
+      224 	lock_seg.meters.unlock_all_calls = lock_seg.meters.unlock_all_calls + 1;
+      225 
+      226 /**** Note that lm_per_process_ has already made sure that ****/
+      227 /**** lm_data_$txn_table_ptr is correct. ****/
+      228 /**** no need to validate that.  ****/
+      229 
+      230 UNLOCK_ALL_FOR_PROCESS:
+      231 	do while (lock_transaction_table.own_ptr.seg_inx ^= -1);
+      232 	     lock_owner_ptr = PTR (lock_transaction_table.own_ptr);
+      233 	     lock_object_ptr = PTR (lock_owner.lock_ptr);
+      234 	     call UNLOCK_OBJECT (lock_object_ptr, code);
+      235 	     if code ^= 0
+      236 	     then do;
+      237 		     call dm_misc_util_$log (INFORM_SV, code, "lm_per_system_$unlock_all", "Error unlocking ^d ^w ^p",
+      238 			lock_object.seg_inx, lock_object.uid, lock_object.ci_no);
+      239 		     error_in_unlock_all = "1"b;
+      240 		end;
+      241 	end;
+      242 
+      243 /**** if error_in_unlock_all then call lm_salvage_lock_seg_; retry? */
+      244 	lock_transaction_table.txn_id = (36)"0"b;	/* Mark free */
+      245 	call UNLOCK;
+      246 
+      247 	return;
+      248 
+      249 unlock:
+      250      entry (p_f_uid, p_ci_number, p_code);
+      251 
+      252 	f_uid = p_f_uid;
+      253 	ci_number = p_ci_number;
+      254 
+      255 	call SETUP_LOCK ();
+      256 
+      257 	on cleanup call CLEAN_LOCK;
+      258 
+      259 	lock_object_ptr = FIND_LOCK (f_uid, ci_number);
+      260 
+      261 	call UNLOCK_OBJECT (lock_object_ptr, p_code);
+      262 
+      263 	call UNLOCK;
+      264 
+      265 	return;
+      266 
+      267 
+      268 lock_resolve_deadlock:
+      269      entry (p_f_uid, p_ci_number, p_mode_req, p_timeout, p_mode_obtained, p_checkpoint_id, p_code);
+      270 
+      271 	p_code = dm_error_$unimplemented_entry;
+      272 	return;
+      273 
+      274 checkpoint:
+      275      entry (p_checkpoint_id, p_code);
+      276 
+      277 	p_code = dm_error_$unimplemented_entry;
+      278 	return;
+      279 
+      280 unlock_to_checkpoint:
+      281      entry (p_checkpoint_id, p_code);
+      282 
+      283 	p_code = dm_error_$unimplemented_entry;
+      284 	return;
+      285 lock_lock_data:
+      286      entry (p_code);
+      287 
+      288 	call SETUP_LOCK ();
+      289 	return;
+      290 
+      291 unlock_lock_data:
+      292      entry (p_code);
+      293 
+      294 	call SETUP_UNLOCK ();
+      295 	p_code = 0;
+      296 	return;
+      297 
+      298 ERROR_RETURN:
+      299      proc (er_p_code);
+      300 dcl	er_p_code			fixed bin (35);
+      301 
+      302 	call CLEAN_LOCK ();
+      303 	p_code = er_p_code;
+      304 	goto MAIN_RETURN;
+      305      end ERROR_RETURN;
+      306 
+      307 /*  Internal Procedures to lock the lock table and set up pointers, and
+      308*    to unlock it. */
+      309 
+      310 SETUP_LOCK:
+      311      proc ();
+      312 
+      313 dcl	sul_code			fixed bin (35);
+      314 dcl	sul_lock_segs_synchronized	bit (1) aligned init ("0"b);
+      315 
+      316 	lock_seg_ptr = lm_data_$lock_seg_ptr;
+      317 	call CHECK_VERSION (LOCK_SEG_VERSION_1, lock_seg.version, "lock_seg");
+      318 	lock_transaction_table_ptr = lm_data_$txn_table_ptr;
+      319 	lock_segments_ptr = lm_data_$lock_segments_ptr;
+      320 
+      321 LOCK:
+      322      entry ();
+      323 
+      324 RETRY_LOCK_LOOP:
+      325 	do while (^sul_lock_segs_synchronized);
+      326 	     call lock_manager_$lock_fast (addr (lock_seg.lock), LOCK_SEG_TIMEOUT, code);
+      327 	     if code ^= 0
+      328 	     then if code = dm_error_$fast_lock_invalid_reset | code = dm_error_$fast_lock_mylock
+      329 		then do;
+      330 			call dm_misc_util_$log (INFORM_SV, code, "lm_per_system_ SETUP", "locking lock_seg.");
+      331 			call lm_salvage_lock_seg_ (sul_code);
+      332 			if sul_code ^= 0
+      333 			then call ERROR_RETURN (sul_code);
+      334 		     end;
+      335 		else do;
+      336 			call dm_misc_util_$log (INFORM_SV, code, "lm_per_system_ SETUP", "locking lock seg.");
+      337 			call ERROR_RETURN (code);
+      338 		     end;
+      339 
+      340 	     if lm_data_$n_lock_segments ^= lock_seg.n_lock_segments
+      341 	     then do;
+      342 		     call UNLOCK;
+      343 		     call SYNCH_LOCK_SEGMENTS ();
+      344 		end;
+      345 	     else sul_lock_segs_synchronized = "1"b;
+      346 	end RETRY_LOCK_LOOP;
+      347      end SETUP_LOCK;
+      348 
+      349 
+      350 SETUP_UNLOCK:
+      351      proc ();
+      352 
+      353 dcl	ul_code			fixed bin (35);
+      354 
+      355 	lock_seg_ptr = lm_data_$lock_seg_ptr;
+      356 	call CHECK_VERSION (LOCK_SEG_VERSION_1, lock_seg.version, "lock_seg");
+      357 
+      358 UNLOCK:
+      359      entry ();
+      360 
+      361 	call lock_manager_$unlock_fast (addr (lock_seg.lock), ul_code);
+      362 	if ul_code ^= 0
+      363 	then call dm_misc_util_$log (INFORM_SV, ul_code, "lm_per_system_ UNLOCK", "unlocking lock_seg.");
+      364 
+      365      end SETUP_UNLOCK;
+      366 
+      367 /*  Internal Procedure to get per-process table of lock segments into synch
+      368*    with the per-system lock segments. No lock is required (we depend on
+      369*    lock_seg.n_lock_segments monotonicity, and careful ordering of operations). */
+      370 
+      371 SYNCH_LOCK_SEGMENTS:
+      372      proc ();
+      373 
+      374 dcl	sl_lock_segx		fixed bin;
+      375 dcl	sl_new_lock_segments_ptr	ptr;
+      376 dcl	sl_new_n_lock_segments	fixed bin;
+      377 dcl	sl_save_level		fixed bin;
+      378 
+      379 
+      380 /* Note that there's no cleanup handler to restore the level. It would make
+      381*   this procedure non-quick. The level will be restored by ring-alarm. This
+      382*   is OK, since it should happen ra(y. */
+      383 
+      384 	call cu_$level_get (sl_save_level);
+      385 	call cu_$level_set (get_ring_ ());
+      386 
+      387 	sl_new_n_lock_segments = lock_seg.n_lock_segments;
+      388 	allocate lock_segments in (dm_area) set (sl_new_lock_segments_ptr);
+      389 	do sl_lock_segx = 1 to lm_data_$n_lock_segments;
+      390 	     sl_new_lock_segments_ptr -> lock_segments.seg_baseptr (sl_lock_segx) =
+      391 		lock_segments.seg_baseptr (sl_lock_segx);
+      392 	end;
+      393 	free lock_segments;
+      394 	lock_segments_ptr, lm_data_$lock_segments_ptr = sl_new_lock_segments_ptr;
+      395 
+      396 	do sl_lock_segx = lm_data_$n_lock_segments + 1 to sl_new_n_lock_segments;
+      397 	     lock_segno = sl_lock_segx;
+      398 	     call dm_per_system_$initiate (LOCK_SEGNAME || lock_segno, "", lock_aux_seg_ptr);
+      399 	     lock_segments.seg_baseptr (sl_lock_segx) = ptr (lock_aux_seg_ptr, 0);
+      400 	end;
+      401 	lm_data_$n_lock_segments = sl_new_n_lock_segments;
+      402 	call cu_$level_set (sl_save_level);
+      403 
+      404      end SYNCH_LOCK_SEGMENTS;
+      405 
+      406 /*  Internal Procedure to validate a lock mode parameter  */
+      407 
+      408 VALIDATE_MODE:
+      409      proc (vm_p_mode);
+      410 
+      411 dcl	vm_p_mode			fixed bin;
+      412 
+      413 	if vm_p_mode < LOCK_MODE_S | vm_p_mode > LOCK_MODE_SIX
+      414 	then call ERROR_RETURN (dm_error_$lock_invalid_mode);
+      415 
+      416      end VALIDATE_MODE;
+      417 
+      418 /*  Internal Procedure to get a pointer to a lock object, specified by
+      419*    UID and CI number.  */
+      420 
+      421 FIND_LOCK:
+      422      proc (fl_p_f_uid, fl_p_ci_number) returns (ptr);
+      423 
+      424 dcl	fl_p_f_uid		bit (36) aligned;
+      425 dcl	fl_p_ci_number		fixed bin (27);
+      426 
+      427 dcl	fl_lock_object_ptr		ptr;
+      428 
+      429 	call lm_hash_$search (fl_p_f_uid, fl_p_ci_number, fl_lock_object_ptr);
+      430 	if fl_lock_object_ptr = null ()
+      431 	then call ERROR_RETURN (dm_error_$lock_not_found);
+      432 
+      433 	return (fl_lock_object_ptr);
+      434 
+      435      end FIND_LOCK;
+      436 
+      437 
+      438 /*  Internal Procedure to get a pointer to a lock object, specified by PF UID
+      439*    and CI number. One is created if it does not exist.  */
+      440 
+      441 FIND_OR_ALLOCATE_LOCK:
+      442      proc (fal_p_f_uid, fal_p_ci_number) returns (ptr);
+      443 
+      444 dcl	fal_p_f_uid		bit (36) aligned;
+      445 dcl	fal_p_ci_number		fixed bin (27);
+      446 
+      447 dcl	fal_lock_object_ptr		ptr;
+      448 
+      449 dcl	1 fal_lock_object		aligned like lock_object based (fal_lock_object_ptr);
+      450 
+      451 	call lm_hash_$search (fal_p_f_uid, fal_p_ci_number, fal_lock_object_ptr);
+      452 	if fal_lock_object_ptr ^= null ()
+      453 	then return (fal_lock_object_ptr);
+      454 
+      455 	fal_lock_object_ptr = GET_FREE ();
+      456 	if fal_lock_object_ptr = null ()
+      457 	then call ERROR_RETURN (dm_error_$lock_table_overflow);
+      458 
+      459 	fal_lock_object.uid = fal_p_f_uid;
+      460 	fal_lock_object.ci_no = fal_p_ci_number;
+      461 	fal_lock_object.type = TYPE_OBJECT;
+      462 	fal_lock_object.owners_ptr = NULL_VPTR;
+      463 	fal_lock_object.waiters_ptr = NULL_VPTR;
+      464 	call lm_hash_$hash_in (fal_lock_object_ptr);
+      465 
+      466 	return (fal_lock_object_ptr);
+      467 
+      468      end FIND_OR_ALLOCATE_LOCK;
+      469 
+      470 /*  Internal Procedures to allocate and free lock blocks  */
+      471 
+      472 GET_FREE:
+      473      proc returns (ptr);
+      474 
+      475 dcl	gf_code			fixed bin (35);
+      476 
+      477 
+      478 	lock_seg.meters.allocates = lock_seg.meters.allocates + 1;
+      479 	if unspec (lock_seg.free_list_ptr) = unspec (NULL_VPTR)
+      480 	then do;
+      481 		call lm_expand_lock_seg_ (gf_code);
+      482 		if gf_code ^= 0
+      483 		then return (null ());
+      484 		call SYNCH_LOCK_SEGMENTS ();
+      485 		if unspec (lock_seg.free_list_ptr) = unspec (NULL_VPTR)
+      486 		then return (null ());
+      487 	     end;
+      488 
+      489 	lock_free_block_ptr = PTR (lock_seg.free_list_ptr);
+      490 	lock_seg.free_list_ptr = lock_free_block.free_fp;
+      491 	unspec (lock_free_block.pad) = ""b;
+      492 	return (lock_free_block_ptr);
+      493 
+      494 
+      495      end GET_FREE;
+      496 
+      497 
+      498 RETURN_FREE:
+      499      proc (rf_lock_free_block_ptr);
+      500 
+      501 dcl	rf_lock_free_block_ptr	ptr;
+      502 
+      503 dcl	1 rf_lock_free_block	aligned like lock_free_block based (rf_lock_free_block_ptr);
+      504 
+      505 	lock_seg.meters.frees = lock_seg.meters.frees + 1;
+      506 	unspec (rf_lock_free_block.pad) = ""b;
+      507 	rf_lock_free_block.type = TYPE_FREE;
+      508 	rf_lock_free_block.free_fp = lock_seg.free_list_ptr;
+      509 	lock_seg.free_list_ptr = VPTR (rf_lock_free_block_ptr);
+      510 
+      511      end RETURN_FREE;
+      512 
+      513 /*  Internal Procedure to attempt to acquire a lock, waiting if necessary.  */
+      514 
+      515 LOCK_OBJECT:
+      516      proc (lo_p_give_up_time, lo_p_f_uid, lo_p_ci_number, lo_p_mode_req, lo_p_mode_obtained, lo_p_code);
+      517 
+      518 dcl	lo_p_f_uid		bit (36) aligned;
+      519 dcl	lo_p_give_up_time		fixed bin (71);
+      520 dcl	lo_p_ci_number		fixed bin (27);
+      521 dcl	lo_p_mode_req		fixed bin;
+      522 dcl	lo_p_mode_obtained		fixed bin;
+      523 dcl	lo_p_code			fixed bin (35);
+      524 
+      525 dcl	lo_lock_object_ptr		ptr;
+      526 
+      527 dcl	1 lo_lock_object		aligned like lock_object based (lo_lock_object_ptr);
+      528 
+      529 
+      530 
+      531 	lock_seg.meters.lock_calls = lock_seg.meters.lock_calls + 1;
+      532 	if lo_p_ci_number = LOCK_ENTIRE_FILE
+      533 	then lock_seg.meters.file_locks_by_mode (lo_p_mode_req) =
+      534 		lock_seg.meters.file_locks_by_mode (lo_p_mode_req) + 1;
+      535 	else lock_seg.meters.ci_locks_by_mode (lo_p_mode_req) = lock_seg.meters.ci_locks_by_mode (lo_p_mode_req) + 1;
+      536 LOCK_LOOP:
+      537 	do while ("1"b);
+      538 	     lo_lock_object_ptr = FIND_OR_ALLOCATE_LOCK (lo_p_f_uid, lo_p_ci_number);
+      539 
+      540 	     call TRY_TO_LOCK (lo_lock_object_ptr, lo_p_mode_req, lo_p_mode_obtained);
+      541 	     if lo_p_mode_obtained ^= 0
+      542 	     then return;
+      543 
+      544 	     if lo_p_give_up_time < clock ()
+      545 	     then call lm_signal_$timeout (lock_transaction_table.txn_id, lo_p_f_uid, (lo_p_ci_number), lo_p_mode_req,
+      546 		     lo_p_give_up_time);
+      547 
+      548 	     call CHECK_DEADLOCK (lo_lock_object_ptr);
+      549 	     if lo_lock_object.uid ^= lo_p_f_uid | lo_lock_object.ci_no ^= lo_p_ci_number
+      550 	     then lo_lock_object_ptr = FIND_OR_ALLOCATE_LOCK (lo_p_f_uid, lo_p_ci_number);
+      551 						/* CHECK_DEADLOCK unlocks */
+      552 
+      553 	     call WAIT (lo_p_give_up_time, lo_lock_object_ptr, lo_p_mode_req);
+      554 	end LOCK_LOOP;
+      555 
+      556      end LOCK_OBJECT;
+      557 
+      558 /*  Internal Procedure to attempt to obtain a lock without waiting  */
+      559 
+      560 TRY_TO_LOCK:
+      561      proc (tl_p_lock_object_ptr, tl_p_mode_req, tl_p_mode_obtained);
+      562 
+      563 dcl	tl_p_lock_object_ptr	ptr;
+      564 dcl	tl_p_mode_req		fixed bin;
+      565 dcl	tl_p_mode_obtained		fixed bin;
+      566 
+      567 dcl	tl_lock_owner_ptr		ptr;
+      568 dcl	tl_mode_needed		fixed bin;
+      569 dcl	tl_mode_req		fixed bin;
+      570 dcl	tl_my_lock_owner_ptr	ptr;
+      571 dcl	tl_owners_transaction_table_ptr
+      572 				ptr;
+      573 dcl	1 tl_owners_ptr		aligned like lock_virtual_ptr;
+      574 
+      575 dcl	1 tl_lock_object		aligned like lock_object based (tl_p_lock_object_ptr);
+      576 dcl	1 tl_my_lock_owner		aligned like lock_owner based (tl_my_lock_owner_ptr);
+      577 dcl	1 tl_lock_owner		aligned like lock_owner based (tl_lock_owner_ptr);
+      578 
+      579 
+      580 
+      581 	tl_p_mode_obtained = 0;
+      582 	tl_mode_req = tl_p_mode_req;
+      583 
+      584 RETRY:
+      585 	tl_my_lock_owner_ptr = null ();
+      586 	tl_owners_ptr = tl_lock_object.owners_ptr;
+      587 	do while (tl_owners_ptr.seg_inx ^= -1);
+      588 	     tl_lock_owner_ptr = PTR (tl_owners_ptr);
+      589 	     tl_owners_transaction_table_ptr = PTR (tl_lock_owner.transaction_ptr);
+      590 	     if tl_owners_transaction_table_ptr = lock_transaction_table_ptr
+      591 						/* This transaction */
+      592 	     then do;
+      593 		     tl_my_lock_owner_ptr = tl_lock_owner_ptr;
+      594 		     tl_mode_needed = COMMON_MODE (tl_mode_req, tl_lock_owner.mode);
+      595 		     if tl_mode_needed = tl_lock_owner.mode
+      596 		     then do;
+      597 			     tl_p_mode_obtained = tl_mode_needed;
+      598 			     if tl_lock_object.ci_no = LOCK_ENTIRE_FILE
+      599 			     then lock_seg.meters.dup_file_locks_by_mode (tl_mode_needed) =
+      600 				     lock_seg.meters.dup_file_locks_by_mode (tl_mode_req) + 1;
+      601 			     else lock_seg.meters.dup_ci_locks_by_mode (tl_mode_req) =
+      602 				     lock_seg.meters.dup_ci_locks_by_mode (tl_mode_req) + 1;
+      603 			     return;
+      604 			end;
+      605 		     if tl_mode_needed ^= tl_mode_req
+      606 		     then do;
+      607 			     tl_mode_req = tl_mode_needed;
+      608 			     goto RETRY;
+      609 			end;
+      610 		end;
+      611 	     else /* Other transaction */
+      612 		if CONFLICT (tl_mode_req, tl_lock_owner.mode)
+      613 	     then return;
+      614 
+      615 	     tl_owners_ptr = tl_lock_owner.owners_fp;
+      616 	end;
+      617 
+      618 	if tl_my_lock_owner_ptr ^= null ()
+      619 	then do;
+      620 		tl_lock_owner_ptr = tl_my_lock_owner_ptr;
+      621 		tl_lock_owner.mode = tl_mode_req;
+      622 		tl_p_mode_obtained = tl_mode_req;
+      623 		return;
+      624 	     end;
+      625 
+      626 	tl_lock_owner_ptr = GET_FREE ();
+      627 	if tl_lock_owner_ptr = null ()
+      628 	then call ERROR_RETURN (dm_error_$lock_table_overflow);
+      629 
+      630 	tl_lock_owner.type = TYPE_OWNER;
+      631 	tl_lock_owner.lock_ptr = VPTR (tl_p_lock_object_ptr);
+      632 	tl_lock_owner.mode = tl_mode_req;
+      633 	tl_lock_owner.transaction_ptr.seg_inx = 1;
+      634 	tl_lock_owner.transaction_ptr.offset = wordno (lock_transaction_table_ptr);
+      635 	tl_lock_owner.transaction_fp = lock_transaction_table.own_ptr;
+      636 	lock_transaction_table.own_ptr = VPTR (tl_lock_owner_ptr);
+      637 	tl_lock_owner.owners_fp = tl_lock_object.owners_ptr;
+      638 	tl_lock_object.owners_ptr = VPTR (tl_lock_owner_ptr);
+      639 
+      640 	tl_p_mode_obtained = tl_mode_req;
+      641 
+      642 	return;
+      643 
+      644      end TRY_TO_LOCK;
+      645 
+      646 /*  Internal Procedure to wait for a lock. Returns after the lock is
+      647*    notified to this transaction or after a timeout, whichever comes first.
+      648**/
+      649 WAIT:
+      650      proc (w_p_give_up_time, w_p_lock_object_ptr, w_p_mode_req);
+      651 
+      652 dcl	w_p_lock_object_ptr		ptr;
+      653 dcl	w_p_mode_req		fixed bin;
+      654 dcl	w_p_give_up_time		fixed bin (71);
+      655 
+      656 dcl	w_lock_waiter_ptr		ptr;
+      657 dcl	w_prev_lock_waiter_ptr	ptr;
+      658 dcl	1 w_waiters_ptr		aligned like lock_virtual_ptr;
+      659 
+      660 dcl	1 w_lock_object		aligned like lock_object based (w_p_lock_object_ptr);
+      661 dcl	1 w_lock_waiter		aligned like lock_waiter based (w_lock_waiter_ptr);
+      662 dcl	1 w_prev_lock_waiter	aligned like lock_waiter based (w_prev_lock_waiter_ptr);
+      663 
+      664 
+      665 /*  Thread in a wait block for this transaction */
+      666 
+      667 	lock_seg.meters.waits = lock_seg.meters.waits + 1;
+      668 	w_lock_waiter_ptr = GET_FREE ();
+      669 	if w_lock_waiter_ptr = null ()
+      670 	then call ERROR_RETURN (dm_error_$lock_table_overflow);
+      671 
+      672 	w_lock_waiter.type = TYPE_WAITER;
+      673 	w_lock_waiter.lock_ptr = VPTR (w_p_lock_object_ptr);
+      674 	w_lock_waiter.mode = w_p_mode_req;
+      675 	w_lock_waiter.transaction_ptr.seg_inx = 1;
+      676 	w_lock_waiter.transaction_ptr.offset = wordno (lock_transaction_table_ptr);
+      677 	w_lock_waiter.waiters_fp = NULL_VPTR;
+      678 	lock_transaction_table.wait_ptr = VPTR (w_lock_waiter_ptr);
+      679 
+      680 
+      681 /* Thread block to object, FIFO */
+      682 
+      683 	if w_lock_object.waiters_ptr.seg_inx = -1
+      684 	then w_lock_object.waiters_ptr = VPTR (w_lock_waiter_ptr);
+      685 	else do;
+      686 		w_waiters_ptr = w_lock_object.waiters_ptr;
+      687 		do while (w_waiters_ptr.seg_inx ^= -1);
+      688 		     w_prev_lock_waiter_ptr = PTR (w_waiters_ptr);
+      689 		     w_waiters_ptr = w_prev_lock_waiter.waiters_fp;
+      690 		end;
+      691 		w_prev_lock_waiter.waiters_fp = VPTR (w_lock_waiter_ptr);
+      692 	     end;
+      693 
+      694 /*  Unlock and wait for something to happen  */
+      695 
+      696 	call UNLOCK;
+      697 
+      698 	call REALLY_WAIT (w_p_give_up_time);
+      699 
+      700 /*  Relock and unthread the wait block, if it's still here (it will be if
+      701*    we timed out)  */
+      702 
+      703 	call LOCK ();
+      704 
+      705 	call UNWAIT_ME;
+      706 	return;
+      707 
+      708 /*  Internal Procedure to do wait. Separated from WAIT to isolate it from
+      709*    other internal procedures, since this must be non-quick (due to cleanup
+      710*    condition handler).
+      711**/
+      712 
+      713 REALLY_WAIT:
+      714      proc (rw_p_give_up_time);
+      715 
+      716 dcl	rw_p_give_up_time		fixed bin (71) parameter;
+      717 
+      718 dcl	rw_intermediate_give_up_time	fixed bin (71) init (0);
+      719 dcl	1 rw_event_info		aligned,
+      720 	  2 channel_id		fixed bin (71),
+      721 	  2 message		fixed bin (71),
+      722 	  2 sender		bit (36) aligned,
+      723 	  2 origin,
+      724 	    3 dev_signal		bit (18) unaligned,
+      725 	    3 ring		bit (18) unaligned,
+      726 	  2 channel_index		fixed bin;
+      727 dcl	rw_saved_channel		fixed bin (71);
+      728 dcl	rw_saved_ips_mask		bit (36) aligned;
+      729 dcl	rw_saved_timer		fixed bin (71);
+      730 dcl	1 rw_wait_list		aligned,
+      731 	  2 n_chan		fixed bin,
+      732 	  2 pad			fixed bin,
+      733 	  2 channel_id		(1) fixed bin (71);
+      734 
+      735 	rw_saved_ips_mask = ""b;
+      736 	rw_saved_channel = -1;
+      737 
+      738 	on cleanup
+      739 	     begin;
+      740 		if substr (rw_saved_ips_mask, 36, 1) = "1"b
+      741 		then call hcs_$reset_ips_mask (rw_saved_ips_mask, rw_saved_ips_mask);
+      742 		if rw_saved_channel ^= -1
+      743 		then call hcs_$set_alarm_timer (rw_saved_timer, TIME_IS_ABSOLUTE, rw_saved_channel);
+      744 	     end;
+      745 
+      746 	rw_wait_list.n_chan = 1;
+      747 	if lock_transaction_table.ev_channel = 0
+      748 	then do;
+      749 		if lm_data_$ev_channel = 0
+      750 		then call ipc_$create_ev_chn (lm_data_$ev_channel, (0));
+      751 		lock_transaction_table.ev_channel = lm_data_$ev_channel;
+      752 	     end;
+      753 	rw_wait_list.channel_id (1) = lock_transaction_table.ev_channel;
+      754 
+      755 	rw_intermediate_give_up_time = clock () + INTERMEDIATE_WAIT_INTERVAL;
+      756 
+      757 	call hcs_$set_ips_mask (dm_system_data_$lock_ips_mask, rw_saved_ips_mask);
+      758 	call hcs_$get_alarm_timer (rw_saved_timer, rw_saved_channel);
+      759 	call hcs_$set_alarm_timer (min (rw_p_give_up_time, rw_intermediate_give_up_time), TIME_IS_ABSOLUTE,
+      760 	     lock_transaction_table.ev_channel);
+      761 
+      762 	call ipc_$block (addr (rw_wait_list), addr (rw_event_info), (0));
+      763 
+      764 	call hcs_$set_alarm_timer (rw_saved_timer, TIME_IS_ABSOLUTE, rw_saved_channel);
+      765 	call hcs_$reset_ips_mask (rw_saved_ips_mask, rw_saved_ips_mask);
+      766 
+      767 	if rw_event_info.message = LOCK_MESSAGE_DEADLOCK
+      768 	then do;
+      769 		call LOCK ();
+      770 		call UNWAIT_ME ();
+      771 		call UNLOCK ();
+      772 		call lm_signal_$deadlock (lock_transaction_table.txn_id, f_uid, (ci_number), mode_req);
+      773 	     end;
+      774 
+      775      end REALLY_WAIT;
+      776 
+      777      end WAIT;
+      778 
+      779 /*  Internal Procedure to see whether this transaction would cause a deadlock
+      780*    if it waited. This procedure builds the data structure for the external
+      781*    routine which checks for the deadlock.
+      782**/
+      783 
+      784 CHECK_DEADLOCK:
+      785      proc (cd_p_lock_object_ptr);
+      786 
+      787 dcl	cd_p_lock_object_ptr	ptr;
+      788 
+      789 dcl	cd_code			fixed bin (35);
+      790 dcl	cd_lock_txn_table_ptr	ptr;
+      791 dcl	cd_txn_idx		fixed bin;
+      792 
+      793 dcl	1 cd_lock_object		aligned like lock_object based (cd_p_lock_object_ptr);
+      794 dcl	1 cd_lock_txn_table		aligned like lock_transaction_table based (cd_lock_txn_table_ptr);
+      795 dcl	1 cd_lock_deadlock_36	aligned like lock_deadlock_36;
+      796 dcl	1 cd_lock_deadlock_72	aligned like lock_deadlock_72;
+      797 dcl	(cd_call_36, cd_call_72)	bit (1) aligned;
+      798 dcl	cd_small_txn_ids		(72) bit (36) aligned;
+      799 dcl	cd_auto_txn_ids		bit (1) aligned;
+      800 dcl	cd_txn_to_notify		bit (36) aligned;
+      801 
+      802 	p_code = 0;
+      803 	n_lock_deadlock = 1;
+      804 	do cd_txn_idx = 1 to dm_system_data_$max_n_transactions;
+      805 	     cd_lock_txn_table_ptr = addr (lock_seg.transaction_table (cd_txn_idx));
+      806 	     if VALID_TXN (cd_lock_txn_table.txn_id)
+      807 	     then do;
+      808 		     if cd_lock_txn_table_ptr = lock_transaction_table_ptr
+      809 						/* This transaction */
+      810 		     then cd_lock_txn_table.deadlock_inx = 1;
+      811 		     else if cd_lock_txn_table.wait_ptr.seg_inx = -1
+      812 						/* Not waiting */
+      813 		     then cd_lock_txn_table.deadlock_inx = 0;
+      814 		     else do;
+      815 			     n_lock_deadlock = n_lock_deadlock + 1;
+      816 			     cd_lock_txn_table.deadlock_inx = n_lock_deadlock;
+      817 			end;
+      818 		end;
+      819 	     else cd_lock_txn_table.deadlock_inx = 0;
+      820 	end;
+      821 	lock_seg.meters.deadlock_checks = lock_seg.meters.deadlock_checks + 1;
+      822 	if n_lock_deadlock <= 1
+      823 	then return;
+      824 	lock_seg.meters.real_deadlock_checks = lock_seg.meters.real_deadlock_checks + 1;
+      825 
+      826 	cd_call_36, cd_call_72 = "0"b;
+      827 	if n_lock_deadlock <= 36
+      828 	then do;
+      829 		lock_seg.meters.deadlock_checks_36 = lock_seg.meters.deadlock_checks_36 + 1;
+      830 		lock_deadlock_ptr = addr (cd_lock_deadlock_36);
+      831 		n_lock_deadlock = 36;
+      832 		cd_call_36 = "1"b;
+      833 	     end;
+      834 	else if n_lock_deadlock <= 72
+      835 	then do;
+      836 		lock_seg.meters.deadlock_checks_72 = lock_seg.meters.deadlock_checks_72 + 1;
+      837 		lock_deadlock_ptr = addr (cd_lock_deadlock_72);
+      838 		n_lock_deadlock = 72;
+      839 		cd_call_72 = "1"b;
+      840 	     end;
+      841 	else allocate lock_deadlock in (dm_area) set (lock_deadlock_ptr);
+      842 	unspec (lock_deadlock) = ""b;
+      843 	if n_lock_deadlock <= 72
+      844 	then do;
+      845 		cd_auto_txn_ids = "1"b;
+      846 		lock_deadlock_txn_ids_ptr = addr (cd_small_txn_ids);
+      847 	     end;
+      848 	else do;
+      849 		cd_auto_txn_ids = "0"b;
+      850 		allocate lock_deadlock_txn_ids in (dm_area) set (lock_deadlock_txn_ids_ptr);
+      851 	     end;					/* We could use automatic arrays for this as well ... */
+      852 
+      853 	lock_deadlock_txn_ids = ""b;
+      854 	lock_deadlock_txn_ids (1) = dm_data_$current_txn_id;
+      855 	call SET_WAIT_OWN (1, cd_p_lock_object_ptr);
+      856 	do cd_txn_idx = 1 to dm_system_data_$max_n_transactions;
+      857 	     cd_lock_txn_table_ptr = addr (lock_seg.transaction_table (cd_txn_idx));
+      858 	     if cd_lock_txn_table.deadlock_inx > 1
+      859 	     then do;
+      860 		     lock_deadlock_txn_ids (cd_lock_txn_table.deadlock_inx) = cd_lock_txn_table.txn_id;
+      861 		     call SET_WAIT_OWN (cd_lock_txn_table.deadlock_inx,
+      862 			PTR (PTR (cd_lock_txn_table.wait_ptr) -> lock_waiter.lock_ptr));
+      863 		end;
+      864 	end;
+      865 
+      866 	call UNLOCK;
+      867 	call lm_check_for_deadlock_ (lock_deadlock_ptr, lock_deadlock_txn_ids_ptr, n_lock_deadlock, cd_txn_to_notify,
+      868 	     cd_code);				/* This will special case 36 and 72 */
+      869 	if ^(cd_call_36 | cd_call_72)
+      870 	then free lock_deadlock;
+      871 	if ^cd_auto_txn_ids
+      872 	then free lock_deadlock_txn_ids;
+      873 	call LOCK ();
+      874 	if cd_code = 0 & cd_txn_to_notify = ""b
+      875 	then return;				/* No deadlock was found. */
+      876 	else if cd_code ^= 0			/* we are it */
+      877 	then do;
+      878 		lock_seg.meters.deadlock_self_youngest = lock_seg.meters.deadlock_self_youngest + 1;
+      879 		call UNLOCK ();
+      880 		call lm_signal_$deadlock (lock_transaction_table.txn_id, f_uid, (ci_number), mode_req);
+      881 	     end;
+      882 	else /* if cd_txn_to_notify ^= ""b then */
+      883 	     do;
+      884 		lock_seg.meters.deadlock_other_youngest = lock_seg.meters.deadlock_other_youngest + 1;
+      885 		call NOTIFY_TXN (cd_txn_to_notify);
+      886 	     end;
+      887 
+      888 	return;
+      889 
+      890 
+      891 /* Internal Procedure to send a DEADLOCK wakeup to a transaction */
+      892 
+      893 NOTIFY_TXN:
+      894      procedure (nt_p_txn_id);
+      895 
+      896 declare	nt_p_txn_id		bit (36) aligned;
+      897 declare	nt_txn_idx		fixed bin;
+      898 declare	1 nt_lock_txn_table		aligned like lock_transaction_table based (nt_lock_txn_table_ptr);
+      899 declare	nt_lock_txn_table_ptr	ptr;
+      900 declare	nt_code			fixed bin (35);
+      901 declare	transaction_manager_$get_txn_index
+      902 				entry (bit (36) aligned, fixed bin (35)) returns (fixed bin);
+      903 
+      904 	nt_txn_idx = transaction_manager_$get_txn_index (nt_p_txn_id, nt_code);
+      905 	if nt_code ^= 0
+      906 	then return;				/* Something is different, perhaps the transaction has dies and will unlock */
+      907 	nt_lock_txn_table_ptr = addr (lock_seg.transaction_table (nt_txn_idx));
+      908 
+      909 	call SEND_WAKEUP ("a deadlock notification", nt_lock_txn_table.process_id, nt_lock_txn_table.ev_channel,
+      910 	     LOCK_MESSAGE_DEADLOCK);
+      911 
+      912 	return;
+      913      end NOTIFY_TXN;
+      914 
+      915 
+      916 
+      917 
+      918 
+      919 /*  Internal Procedure to set all bits in the lock_deadlock array corresponding
+      920*    to the supplied index and the indices of all waiters for the supplied
+      921*    lock.
+      922**/
+      923 
+      924 SET_WAIT_OWN:
+      925      proc (sw_p_deadlock_inx, sw_p_lock_object_ptr);
+      926 
+      927 dcl	sw_p_deadlock_inx		fixed bin;
+      928 dcl	sw_p_lock_object_ptr	ptr;
+      929 
+      930 dcl	sw_lock_owner_ptr		ptr;
+      931 dcl	1 sw_owners_ptr		aligned like lock_virtual_ptr;
+      932 dcl	sw_owner_deadlock_inx	fixed bin;
+      933 
+      934 dcl	1 sw_lock_object		aligned like lock_object based (sw_p_lock_object_ptr);
+      935 dcl	1 sw_lock_owner		aligned like lock_owner based (sw_lock_owner_ptr);
+      936 
+      937 	sw_owners_ptr = sw_lock_object.owners_ptr;
+      938 	do while (sw_owners_ptr.seg_inx ^= -1);
+      939 	     sw_lock_owner_ptr = PTR (sw_owners_ptr);
+      940 	     sw_owner_deadlock_inx = PTR (sw_lock_owner.transaction_ptr) -> lock_transaction_table.deadlock_inx;
+      941 	     if sw_owner_deadlock_inx > 0
+      942 	     then lock_deadlock.wait_own (sw_p_deadlock_inx, sw_owner_deadlock_inx) = "1"b;
+      943 	     sw_owners_ptr = sw_lock_owner.owners_fp;
+      944 	end;
+      945 
+      946      end SET_WAIT_OWN;
+      947 
+      948 
+      949      end CHECK_DEADLOCK;
+      950 
+      951 /* Internal Procedure to unthread the transaction whose table is defined by 
+      952*   lock_transaction_table_ptr as a waiter for any lock. */
+      953 
+      954 UNWAIT_ME:
+      955      proc;
+      956 
+      957 dcl	um_lock_object_ptr		ptr;
+      958 dcl	um_lock_waiter_ptr		ptr;
+      959 dcl	um_prev_lock_waiter_ptr	ptr;
+      960 dcl	1 um_waiters_ptr		aligned like lock_virtual_ptr;
+      961 
+      962 dcl	1 um_lock_object		aligned like lock_object based (um_lock_object_ptr);
+      963 dcl	1 um_lock_waiter		aligned like lock_waiter based (um_lock_waiter_ptr);
+      964 dcl	1 um_prev_lock_waiter	aligned like lock_waiter based (um_prev_lock_waiter_ptr);
+      965 
+      966 
+      967 
+      968 
+      969 	if lock_transaction_table.wait_ptr.seg_inx ^= -1
+      970 	then do;
+      971 		um_lock_waiter_ptr = PTR (lock_transaction_table.wait_ptr);
+      972 		um_lock_object_ptr = PTR (um_lock_waiter.lock_ptr);
+      973 		if unspec (um_lock_object.waiters_ptr) = unspec (lock_transaction_table.wait_ptr)
+      974 		then um_lock_object.waiters_ptr = um_lock_waiter.waiters_fp;
+      975 		else do;
+      976 			um_waiters_ptr = um_lock_object.waiters_ptr;
+      977 			do while (um_waiters_ptr.seg_inx ^= -1);
+      978 			     um_prev_lock_waiter_ptr = PTR (um_waiters_ptr);
+      979 			     if unspec (um_prev_lock_waiter.waiters_fp) = unspec (lock_transaction_table.wait_ptr)
+      980 			     then do;
+      981 				     um_prev_lock_waiter.waiters_fp = um_lock_waiter.waiters_fp;
+      982 				     um_waiters_ptr = NULL_VPTR;
+      983 				end;
+      984 			     else um_waiters_ptr = um_prev_lock_waiter.waiters_fp;
+      985 			end;
+      986 		     end;
+      987 		call RETURN_FREE (um_lock_waiter_ptr);
+      988 		lock_transaction_table.wait_ptr = NULL_VPTR;
+      989 	     end;
+      990 
+      991      end UNWAIT_ME;
+      992 
+      993 /* Internal Procedure to unlock an object and notify anybody waiting for it,
+      994*   unthreading their wait blocks in the transaction */
+      995 
+      996 UNLOCK_OBJECT:
+      997      proc (uo_p_lock_object_ptr, uo_p_code);
+      998 
+      999 dcl	uo_p_lock_object_ptr	ptr;
+     1000 dcl	uo_p_code			fixed bin (35);
+     1001 
+     1002 dcl	uo_found			bit (1) aligned;
+     1003 dcl	uo_lock_owner_ptr		ptr;
+     1004 dcl	uo_lock_waiter_ptr		ptr;
+     1005 dcl	1 uo_owner_ptr		aligned like lock_virtual_ptr;
+     1006 dcl	uo_prev_lock_owner_ptr	ptr;
+     1007 dcl	1 uo_temp_ptr		aligned like lock_virtual_ptr;
+     1008 						/* Silly compiler */
+     1009 dcl	uo_waiter_transaction_table_ptr
+     1010 				ptr;
+     1011 dcl	1 uo_waiter_ptr		aligned like lock_virtual_ptr;
+     1012 
+     1013 dcl	1 uo_lock_object		aligned like lock_object based (uo_p_lock_object_ptr);
+     1014 dcl	1 uo_lock_owner		aligned like lock_owner based (uo_lock_owner_ptr);
+     1015 dcl	1 uo_lock_waiter		aligned like lock_waiter based (uo_lock_waiter_ptr);
+     1016 dcl	1 uo_prev_lock_owner	aligned like lock_owner based (uo_prev_lock_owner_ptr);
+     1017 dcl	1 uo_waiter_transaction_table aligned like lock_transaction_table based (uo_waiter_transaction_table_ptr);
+     1018 
+     1019 
+     1020 /*  Unthread this transaction from list of owners  */
+     1021 
+     1022 	uo_p_code = 0;
+     1023 	uo_found = "0"b;
+     1024 	uo_prev_lock_owner_ptr = null ();
+     1025 	uo_owner_ptr = uo_lock_object.owners_ptr;
+     1026 	do while (^uo_found & (uo_owner_ptr.seg_inx ^= -1));
+     1027 	     uo_lock_owner_ptr = PTR (uo_owner_ptr);
+     1028 	     if uo_lock_owner.transaction_ptr.offset = wordno (lock_transaction_table_ptr)
+     1029 	     then uo_found = "1"b;
+     1030 	     else uo_prev_lock_owner_ptr = uo_lock_owner_ptr;
+     1031 	     uo_owner_ptr = uo_lock_owner.owners_fp;
+     1032 	end;
+     1033 	if ^uo_found
+     1034 	then do;
+     1035 		uo_p_code = dm_error_$lock_not_found;
+     1036 		return;
+     1037 	     end;
+     1038 
+     1039 	if uo_prev_lock_owner_ptr = null ()
+     1040 	then uo_lock_object.owners_ptr = uo_lock_owner.owners_fp;
+     1041 	else uo_prev_lock_owner.owners_fp = uo_lock_owner.owners_fp;
+     1042 
+     1043 
+     1044 /*  Unthread owner from this transaction list of locks  */
+     1045 
+     1046 	uo_temp_ptr = VPTR (uo_lock_owner_ptr);
+     1047 	if unspec (lock_transaction_table.own_ptr) = unspec (uo_temp_ptr)
+     1048 	then lock_transaction_table.own_ptr = uo_lock_owner.transaction_fp;
+     1049 	else do;
+     1050 		uo_found = "0"b;
+     1051 		uo_owner_ptr = lock_transaction_table.own_ptr;
+     1052 		do while (^uo_found & (uo_owner_ptr.seg_inx ^= -1));
+     1053 		     uo_prev_lock_owner_ptr = PTR (uo_owner_ptr);
+     1054 		     if unspec (uo_prev_lock_owner.transaction_fp) = unspec (uo_temp_ptr)
+     1055 		     then uo_found = "1"b;
+     1056 		     else uo_owner_ptr = uo_prev_lock_owner.transaction_fp;
+     1057 		end;
+     1058 		if ^uo_found
+     1059 		then do;
+     1060 			uo_p_code = dm_error_$lock_not_found;
+     1061 			return;
+     1062 		     end;
+     1063 		uo_prev_lock_owner.transaction_fp = uo_lock_owner.transaction_fp;
+     1064 	     end;
+     1065 
+     1066 	call RETURN_FREE (uo_lock_owner_ptr);
+     1067 
+     1068 /*  Free the lock object if there are no owners or waiters (if there are waiters,
+     1069*    one, at least, will soon become an owner; so it pays to leave the object around).
+     1070*    If there are waiters, notify all of them and remove their wait blocks.
+     1071**/
+     1072 
+     1073 	if uo_lock_object.owners_ptr.seg_inx = -1 & uo_lock_object.waiters_ptr.seg_inx = -1
+     1074 	then do;
+     1075 		call lm_hash_$hash_out (uo_p_lock_object_ptr);
+     1076 		call RETURN_FREE (uo_p_lock_object_ptr);
+     1077 	     end;
+     1078 	else do;
+     1079 		uo_waiter_ptr = uo_lock_object.waiters_ptr;
+     1080 		do while (uo_waiter_ptr.seg_inx ^= -1);
+     1081 		     uo_lock_waiter_ptr = PTR (uo_waiter_ptr);
+     1082 		     uo_waiter_transaction_table_ptr = PTR (uo_lock_waiter.transaction_ptr);
+     1083 		     uo_waiter_transaction_table.wait_ptr = NULL_VPTR;
+     1084 		     call SEND_WAKEUP ("an unlock notification", uo_waiter_transaction_table.process_id,
+     1085 			uo_waiter_transaction_table.ev_channel, 0);
+     1086 		     uo_waiter_ptr = uo_lock_waiter.waiters_fp;
+     1087 		     call RETURN_FREE (uo_lock_waiter_ptr);
+     1088 		end;
+     1089 
+     1090 		uo_lock_object.waiters_ptr = NULL_VPTR;
+     1091 	     end;
+     1092 
+     1093      end UNLOCK_OBJECT;
+     1094 
+     1095 SEND_WAKEUP:
+     1096      proc (sw_p_wakeup_description, sw_p_process_id, sw_p_ev_channel, sw_p_message);
+     1097 dcl	sw_p_wakeup_description	char (*) parm;
+     1098 dcl	sw_p_process_id		bit (36) aligned parm;
+     1099 dcl	sw_p_ev_channel		fixed bin (71) parm;
+     1100 dcl	sw_p_message		fixed bin (71) parm;
+     1101 
+     1102 dcl	sw_code			fixed bin (35) init (0);
+     1103 dcl	sw_try_wakeup		bit (1) aligned init (YES);
+     1104 dcl	sw_wakeup_attempt_count	fixed bin init (0);
+     1105 
+     1106 	do sw_wakeup_attempt_count = 1 to MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS while (sw_try_wakeup = YES);
+     1107 	     call hcs_$wakeup (sw_p_process_id, sw_p_ev_channel, sw_p_message, sw_code);
+     1108 	     if sw_code = 0 | (sw_code = error_table_$process_unknown & sw_p_process_id ^= "0"b)
+     1109 						/* Probably a process_id for a now-dead process. */
+     1110 	     then sw_try_wakeup = NO;
+     1111 	     else if sw_code = error_table_$itt_overflow
+     1112 	     then call timer_manager_$sleep (ITT_OVERFLOW_WAIT_TIME, RELATIVE_SECONDS);
+     1113 	     else do;
+     1114 		     call dm_misc_util_$log (ERROR_SV, sw_code, ME, "^/Unable to send ^a for process ^w on event channel ^o.",
+     1115 			sw_p_wakeup_description, sw_p_process_id, sw_p_ev_channel);
+     1116 		     sw_try_wakeup = NO;
+     1117 		end;
+     1118 	end;
+     1119 	if sw_wakeup_attempt_count > MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS
+     1120 	then call dm_misc_util_$log (ERROR_SV, error_table_$itt_overflow, ME,
+     1121 		"^/Unable to send a ^a for process ^w on event channel ^w, after ^d attempts.",
+     1122 		sw_p_wakeup_description, sw_p_process_id, sw_p_ev_channel, MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS);
+     1123      end SEND_WAKEUP;
+     1124 
+     1125 
+     1126 
+     1127 /*  Internal Procedures to translate between pointers and lock virtual pointers.
+     1128*
+     1129*    PTR - turns a virtual pointer into a pointer
+     1130*
+     1131*    VPTR - turns a pointer to a lock block (only) into a virtual pointer
+     1132**/
+     1133 
+     1134 PTR:
+     1135      proc (ptr_lock_virtual_ptr) returns (ptr);
+     1136 
+     1137 dcl	1 ptr_lock_virtual_ptr	aligned like lock_virtual_ptr;
+     1138 
+     1139 	return (ptr (lock_segments.seg_baseptr (ptr_lock_virtual_ptr.seg_inx), ptr_lock_virtual_ptr.offset));
+     1140 
+     1141      end PTR;
+     1142 
+     1143 
+     1144 
+     1145 
+     1146 
+     1147 VPTR:
+     1148      proc (vptr_lock_block_ptr) returns (1 aligned like lock_virtual_ptr);
+     1149 
+     1150 dcl	vptr_lock_block_ptr		ptr;
+     1151 
+     1152 dcl	1 vptr_lock_virtual_ptr	aligned like lock_virtual_ptr;
+     1153 
+     1154 dcl	1 vptr_lock_block		aligned like lock_block based (vptr_lock_block_ptr);
+     1155 
+     1156 	vptr_lock_virtual_ptr.seg_inx = vptr_lock_block.seg_inx;
+     1157 	vptr_lock_virtual_ptr.offset = wordno (vptr_lock_block_ptr);
+     1158 
+     1159 	return (vptr_lock_virtual_ptr);
+     1160 
+     1161      end VPTR;
+     1162 
+     1163 VALID_TXN:
+     1164      procedure (vt_txid) returns (bit (1) aligned);
+     1165 
+     1166 /* This internal procedure determines if there is an active transaction
+     1167*associated with the identifier TXID.  If the TXID is "0"b, then there is no
+     1168*transaction associated with the transaction_table_entry which the TXID was
+     1169*taken from and a ID_IS_INVALID is returned.  Otherwise, the
+     1170*transaction_manager_ is asked about TXID.
+     1171**/
+     1172 
+     1173 declare	vt_txid			bit (36) aligned;
+     1174 declare	vt_code			fixed bin (35);
+     1175 declare	vt_txix			fixed bin;
+     1176 
+     1177 	if vt_txid = "0"b
+     1178 	then return (ID_IS_INVALID);
+     1179 	else do;
+     1180 		vt_txix = transaction_manager_$get_txn_index (vt_txid, vt_code);
+     1181 		return (vt_code = 0);
+     1182 	     end;
+     1183      end VALID_TXN;
+     1184 
+     1185 
+     1186 CLEAN_LOCK:
+     1187      procedure;
+     1188 
+     1189 	call lock_manager_$unlock_fast (addr (lock_seg.lock), (0));
+     1190      end CLEAN_LOCK;				/* format: off */
+     1191 
+     1192 CHECK_VERSION:
+     1193    proc (cv_p_expected_version, cv_p_received_version, cv_p_structure_name);
+     1194 
+     1195 dcl	cv_p_expected_version
+     1196 			char (8) aligned parameter;
+     1197 dcl	cv_p_received_version
+     1198 			char (8) aligned parameter;
+     1199 dcl	cv_p_structure_name char (32) aligned parameter;
+     1200 
+     1201       if cv_p_expected_version ^= cv_p_received_version
+     1202       then call sub_err_ (error_table_$unimplemented_version, ME, ACTION_CANT_RESTART, null (), 0,
+     1203 	      "^/Expected version ^a of the ^a structure." || "^/Received version ^a instead.", cv_p_expected_version,
+     1204 	      cv_p_structure_name, cv_p_received_version);
+     1205    end CHECK_VERSION;
+     1206 
+     1207 
+     1208   /*  START OF:	dm_lock_modes.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+  1     2 
+  1     3 /* DESCRIPTION:
+  1     4*
+  1     5*     Hierarchical lock modes for Data Management control interval locking.  In
+  1     6*addition to conventional read and write locks, intention locks are provided
+  1     7*for finer locking granularity.
+  1     8**/
+  1     9 
+  1    10 /* HISTORY:
+  1    11*Written by Jeffrey D. Ives, 04/30/82.
+  1    12*Modified:
+  1    13*12/05/84 by Stanford S. Cox: Added Description.
+  1    14**/
+  1    15 /* format: style3,idind25 */
+  1    16 
+  1    17      dcl	   LOCK_MODE_S	      fixed bin static options (constant) init (2);
+  1    18      dcl	   LOCK_MODE_X	      fixed bin static options (constant) init (3);
+  1    19      dcl	   LOCK_MODE_IS	      fixed bin static options (constant) init (4);
+  1    20      dcl	   LOCK_MODE_IX	      fixed bin static options (constant) init (5);
+  1    21      dcl	   LOCK_MODE_SIX	      fixed bin static options (constant) init (6);
+  1    22 
+  1    23      dcl	   LOCK_ENTIRE_FILE	      fixed bin (27) static options (constant) init (-1);
+  1    24 
+  1    25      dcl	   LOCK_MODE_NAMES (2:6)  char (3) int static options (constant)
+  1    26 			      init ("  S", "  X", " IS", " IX", "SIX");
+  1    27 
+  1    28 /*
+  1    29*     S       Share                           Let others read it but not modify it.
+  1    30*     X	   Exclusive		     Let nobody else read or modify it.
+  1    31*     IS	   Intention Share		     I am only using S locks, because I am only reading CIs.
+  1    32*     IX	   Intention Exclusive	     I am using S and X locks, because I am reading and modifying CIs.
+  1    33*     SIX	   Share with Intention Exclusive  I am reading control intervals, but only locking the ones I modify.
+  1    34**/
+  1    35 
+  1    36 /*  END OF:	dm_lock_modes.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+     1208 
+     1209   /* BEGIN INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+  2     2 
+  2     3 /* format: ^indcom */
+  2     4 
+  2     5 /* DESCRIPTION:
+  2     6*   These are the severity codes used by the dms daemon when calling its logger.
+  2     7*   The severity is ranked thusly:
+  2     8*
+  2     9*   severity log write situation
+  2    10*   -------- --- ----- ---------
+  2    11*          0 no  yes   standard output, query, etc.
+  2    12*          1 yes yes   fatal error, terminate dms daemon.
+  2    13*          2 yes yes   nonfatal error.
+  2    14*          3 yes yes   informative message.
+  2    15*          4 yes no    log information only.
+  2    16**/
+  2    17 
+  2    18 /* HISTORY:
+  2    19*
+  2    20*Written by M. Pandolf, 10/06/82.
+  2    21*Modified:
+  2    22*12/10/84 by R. Michael Tague: Rename and reformat description/history.
+  2    23*01/13/85 by Lee A. Newcomb:  Renamed to dm_log_sv_codes from
+  2    24*            dm_daemon_sv_codes as the severity codes for the DM log are not
+  2    25*            restrained to the DM Daemon's use.
+  2    26*01/24/85 by Lee A. Newcomb:  Fixed to say dm_log_sv_codes.incl.pl1 in the
+  2    27*            BEGIN and END INCLUDE comments, instead of dm_daemon_sv_codes.==.
+  2    28**/
+  2    29 
+  2    30 /* format: style5 */
+  2    31 
+  2    32      dcl	   (PRINT_SV, QUERY_SV)    fixed bin internal static
+  2    33 			       options (constant) init (0);
+  2    34      dcl	   (CRASH_SV, FATAL_SV)    fixed bin internal static
+  2    35 			       options (constant) init (1);
+  2    36      dcl	   ERROR_SV	       fixed bin internal static
+  2    37 			       options (constant) init (2);
+  2    38      dcl	   INFORM_SV	       fixed bin internal static
+  2    39 			       options (constant) init (3);
+  2    40      dcl	   LOG_SV		       fixed bin internal static
+  2    41 			       options (constant) init (4);
+  2    42 
+  2    43 /* END INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+     1209 
+     1210   /* BEGIN INCLUDE FILE - dm_lm_system_data.incl.pl1 */
+  3     2 
+  3     3 /* format: style3,idind25 */
+  3     4 /* HISTORY:
+  3     5*
+  3     6*Written by Benson Margulies, 4/83.
+  3     7*Modified:
+  3     8*04/24/84 by R. Michael Tague:  moved the meters structure definition to
+  3     9*   dm_lm_meters.incl.pl1.  Added this history section.
+  3    10*05/01/84 by R. Michael Tague:  removed the %include dm_lm_meters.
+  3    11*10/17/84 by Stanford S. Cox:  Added version constant, and changed 
+  3    12*   transaction_table to use a refer extent (to allow outer ring reference).
+  3    13**/
+  3    14 
+  3    15 dcl	lock_seg_ptr	     ptr;
+  3    16 dcl	lock_transaction_table_ptr
+  3    17 			     ptr;
+  3    18 dcl	lock_hash_table_ptr	     ptr;
+  3    19 dcl	lock_aux_seg_ptr	     ptr;
+  3    20 dcl	lock_block_ptr	     ptr;
+  3    21 dcl	lock_block_array_ptr     ptr;
+  3    22 dcl	lock_free_block_ptr	     ptr;
+  3    23 dcl	lock_object_ptr	     ptr;
+  3    24 dcl	lock_owner_ptr	     ptr;
+  3    25 dcl	lock_segments_ptr	     ptr;
+  3    26 dcl	lock_waiter_ptr	     ptr;
+  3    27 dcl	lock_deadlock_ptr	     ptr;
+  3    28 
+  3    29 dcl	n_lock_blocks	     fixed bin;
+  3    30 dcl	n_lock_deadlock	     fixed bin;
+  3    31 
+  3    32 dcl	LOCK_SEG_VERSION_1	     char (8) aligned init ("locksg 1") int static options (constant);
+  3    33 
+  3    34 dcl	1 lock_seg	     aligned based (lock_seg_ptr),
+  3    35 						/* Per-system lock data */
+  3    36 	  2 version	     char (8) aligned,
+  3    37 	  2 header	     aligned,
+  3    38 	    3 lock	     fixed bin (71),	/* Fast Lock on system lock operations */
+  3    39 	    3 n_lock_segments    fixed bin,		/* Number of segments in system lock data */
+  3    40 	    3 lock_seg_size	     fixed bin (19),	/* Number of words per segment */
+  3    41 	    3 max_lock_segments  fixed bin,		/* Maximum number of segments */
+  3    42 	    3 n_transaction_table_entries
+  3    43 			     fixed bin,		/* Size of transaction table */
+  3    44 	    3 n_hash_table_entries
+  3    45 			     fixed bin,		/* Size of hash table */
+  3    46 	    3 hash_mask	     bit (36) aligned,	/* Used by hashing routine */
+  3    47 	    3 free_list_ptr	     aligned like lock_virtual_ptr,
+  3    48 						/* Thread of free blocks */
+  3    49 	    3 transaction_table_offset
+  3    50 			     fixed bin (18) unsigned aligned,
+  3    51 						/* Offset of transaction table */
+  3    52 	    3 hash_table_offset  fixed bin (18) unsigned aligned,
+  3    53 						/* Offset of hash table */
+  3    54 	    3 n_lock_blocks	     fixed bin,		/* Number of blocks crated */
+  3    55 	    3 lock_array_offset  fixed bin (18) unsigned aligned,
+  3    56 						/* Offset of block array */
+  3    57 	  2 transaction_table    (0 refer (lock_seg.n_transaction_table_entries)) aligned like lock_transaction_table,
+  3    58 	  2 hash_table	     aligned like lock_hash_table,
+  3    59 	  2 meters	     aligned like lock_meters,
+  3    60 	  2 free		     fixed bin (71);	/* Free space */
+  3    61 
+  3    62 dcl	1 lock_aux_seg	     aligned based (lock_aux_seg_ptr),
+  3    63 						/* Other than first segment */
+  3    64 	  2 n_lock_blocks	     fixed bin,		/* Number of blocks in this segment */
+  3    65 	  2 lock_array_offset    fixed bin (18) unsigned aligned,
+  3    66 						/* Offset of block array */
+  3    67 	  2 free		     fixed bin (71);	/* Free space */
+  3    68 
+  3    69 dcl	1 lock_transaction_table aligned based (lock_transaction_table_ptr),
+  3    70 						/* Process table entry */
+  3    71 	  2 deadlock_inx	     fixed bin,		/* Index used for deadlock detection */
+  3    72 	  2 process_id	     bit (36) aligned,	/* Multics process identifier */
+  3    73 	  2 txn_id	     bit (36) aligned,	/* Current transaction ID */
+  3    74 	  2 ev_channel	     fixed bin (71),
+  3    75 	  2 own_ptr	     aligned like lock_virtual_ptr,
+  3    76 						/* First in thread of owning blocks */
+  3    77 	  2 wait_ptr	     aligned like lock_virtual_ptr;
+  3    78 						/* Waiting block */
+  3    79 
+  3    80 dcl	1 lock_hash_table	     aligned based (lock_hash_table_ptr),
+  3    81 	  2 buckets	     (lock_seg.n_hash_table_entries) aligned like lock_virtual_ptr;
+  3    82 
+  3    83 
+  3    84 dcl	1 lock_block	     aligned based (lock_block_ptr),
+  3    85 						/* Generic block */
+  3    86 	  2 seg_inx	     fixed bin unal,
+  3    87 	  2 type		     fixed bin unal,
+  3    88 	  2 pad		     (5) bit (36) aligned;
+  3    89 
+  3    90 dcl	1 lock_block_array	     (n_lock_blocks) aligned like lock_block based (lock_block_array_ptr);
+  3    91 
+  3    92 dcl	1 lock_free_block	     aligned based (lock_free_block_ptr),
+  3    93 						/* Free block */
+  3    94 	  2 seg_inx	     fixed bin unal,
+  3    95 	  2 type		     fixed bin unal,	/* TYPE_FREE */
+  3    96 	  2 free_fp	     aligned like lock_virtual_ptr,
+  3    97 						/* Thread of free blocks */
+  3    98 	  2 pad		     (4) bit (36) aligned;
+  3    99 
+  3   100 dcl	1 lock_object	     aligned based (lock_object_ptr),
+  3   101 						/* That which is locked */
+  3   102 	  2 seg_inx	     fixed bin unal,
+  3   103 	  2 type		     fixed bin unal,	/* TYPE_OBJECT */
+  3   104 	  2 uid		     bit (36) aligned,	/* Page File UID */
+  3   105 	  2 ci_no		     fixed bin (35),	/* Control Interval (-1 => Page File) */
+  3   106 	  2 owners_ptr	     aligned like lock_virtual_ptr,
+  3   107 						/* First in thread of owning blocks */
+  3   108 	  2 waiters_ptr	     aligned like lock_virtual_ptr,
+  3   109 						/* First in thread of waiting blocks */
+  3   110 	  2 ht_fp		     aligned like lock_virtual_ptr;
+  3   111 						/* Hash Table thread */
+  3   112 
+  3   113 dcl	1 lock_owner	     aligned based (lock_owner_ptr),
+  3   114 						/* Owner of a lock */
+  3   115 	  2 seg_inx	     fixed bin unal,
+  3   116 	  2 type		     fixed bin unal,	/* TYPE_OWNER */
+  3   117 	  2 lock_ptr	     aligned like lock_virtual_ptr,
+  3   118 						/* Pointer to lock_object */
+  3   119 	  2 mode		     fixed bin,		/* Type of lock */
+  3   120 	  2 owners_fp	     aligned like lock_virtual_ptr,
+  3   121 						/* Thread of owners */
+  3   122 	  2 transaction_fp	     aligned like lock_virtual_ptr,
+  3   123 						/* Thread of locks owned by this transaction */
+  3   124 	  2 transaction_ptr	     aligned like lock_virtual_ptr;
+  3   125 						/* Pointer to transaction table entry */
+  3   126 
+  3   127 
+  3   128 dcl	1 lock_waiter	     aligned based (lock_waiter_ptr),
+  3   129 						/* Waiter for a lock */
+  3   130 	  2 seg_inx	     fixed bin unal,
+  3   131 	  2 type		     fixed bin unal,	/* TYPE_WAITER */
+  3   132 	  2 lock_ptr	     aligned like lock_virtual_ptr,
+  3   133 						/* Pointer to lock_object */
+  3   134 	  2 mode		     fixed bin,		/* Desired mode */
+  3   135 	  2 waiters_fp	     aligned like lock_virtual_ptr,
+  3   136 						/* Thread of waiters */
+  3   137 	  2 transaction_ptr	     aligned like lock_virtual_ptr,
+  3   138 						/* Process table entry of this proces */
+  3   139 	  2 pad		     bit (36) aligned;
+  3   140 
+  3   141 
+  3   142 dcl	1 lock_segments	     aligned based (lock_segments_ptr),
+  3   143 	  2 seg_baseptr	     (lock_seg.n_lock_segments) ptr unal;
+  3   144 
+  3   145 dcl	1 lock_virtual_ptr	     aligned based,
+  3   146 	  2 seg_inx	     fixed bin unal,
+  3   147 	  2 offset	     fixed bin (18) unsigned unal;
+  3   148 
+  3   149 dcl	1 lock_deadlock	     aligned based (lock_deadlock_ptr),
+  3   150 	  2 wait_own	     (n_lock_deadlock, n_lock_deadlock) bit (1) unaligned;
+  3   151 
+  3   152 declare	1 lock_deadlock_36	     aligned based (lock_deadlock_ptr),
+  3   153 	  2 wait_own	     (36, 36) bit (1) unaligned;
+  3   154 
+  3   155 declare	1 lock_deadlock_72	     aligned based (lock_deadlock_ptr),
+  3   156 	  2 wait_own	     (72, 72) bit (1) unaligned;
+  3   157 						/* (x,y) ON => x waiting for lock owned by y */
+  3   158 
+  3   159 declare	lock_deadlock_txn_ids_ptr
+  3   160 			     pointer;
+  3   161 declare	lock_deadlock_txn_ids    (n_lock_deadlock) bit (36) aligned based (lock_deadlock_txn_ids_ptr);
+  3   162 dcl	(
+  3   163 	TYPE_FREE		     init (1),
+  3   164 	TYPE_OBJECT	     init (2),
+  3   165 	TYPE_OWNER	     init (3),
+  3   166 	TYPE_WAITER	     init (4),
+  3   167 	MAX_TYPE		     init (4)
+  3   168 	)		     fixed bin int static options (constant);
+  3   169 
+  3   170 
+  3   171 dcl	1 NULL_VPTR	     aligned int static options (constant),
+  3   172 	  2 seg_inx	     fixed bin unal init (-1),
+  3   173 	  2 offset	     fixed bin (18) unsigned unal init (0);
+  3   174 
+  3   175 
+  3   176 dcl	LOCK_BLOCK_SIZE	     fixed bin int static options (constant) init (6);
+  3   177 						/* Size of all lock blocks */
+  3   178 
+  3   179 dcl	LOCK_SEGNAME	     char (9) int static options (constant) init ("lock_seg_");
+  3   180 
+  3   181 dcl	lock_segno	     pic "999";
+  3   182 
+  3   183 dcl	(
+  3   184 	LOCK_MESSAGE_DEADLOCK    init (1243657)
+  3   185 	)		     fixed bin (71) int static options (constant);
+  3   186 
+  3   187 
+  3   188 /* END INCLUDE FILE - dm_lm_system_data.incl.pl1 */
+     1210 
+     1211   /* BEGIN INCLUDE FILE - dm_lm_meters.incl.pl1 *
+  4     2*
+  4     3*/* format: style3,idind25 */
+  4     4 
+  4     5 /* DESCRIPTION:
+  4     6*
+  4     7*     This is the lock manager meters structure.
+  4     8**/
+  4     9 /* HISTORY:
+  4    10*Written by R. Michael Tague, 4/24/84.
+  4    11*Modified:
+  4    12*05/01/84 by R. Michael Tague:  Collected all of the meters together into
+  4    13*            the meters structure.
+  4    14**/
+  4    15 
+  4    16 dcl	lock_meters_ptr	     ptr;
+  4    17 dcl	LOCK_METERS_VERSION_1    char (8) aligned int static options (constant)
+  4    18 			     init ("LMMETER1");
+  4    19 
+  4    20 dcl	1 lock_meters	     aligned based (lock_meters_ptr),
+  4    21 	  2 version	     char (8),
+  4    22 	  2 lm_meters	     aligned,
+  4    23 	    3 lock_calls	     fixed bin (35),
+  4    24 	    3 unlock_all_calls   fixed bin (35),
+  4    25 	    3 waits	     fixed bin (35),
+  4    26 	    3 deadlock_checks    fixed bin (35),
+  4    27 	    3 real_deadlock_checks
+  4    28 			     fixed bin (35),
+  4    29 	    3 deadlock_checks_36 fixed bin (35),
+  4    30 	    3 deadlock_checks_72 fixed bin (35),
+  4    31 	    3 deadlock_self_youngest
+  4    32 			     fixed bin (35),
+  4    33 	    3 deadlock_other_youngest
+  4    34 			     fixed bin (35),
+  4    35 	    3 file_locks_by_mode (2:6) fixed bin (35),
+  4    36 	    3 ci_locks_by_mode   (2:3) fixed bin (35),
+  4    37 	    3 allocates	     fixed bin (35),
+  4    38 	    3 frees	     fixed bin (35),
+  4    39 	    3 dup_file_locks_by_mode
+  4    40 			     (2:6) fixed bin (35),
+  4    41 	    3 dup_ci_locks_by_mode
+  4    42 			     (2:3) fixed bin (35),
+  4    43 	    3 pad		     (11) fixed bin (35);
+  4    44 
+  4    45 /* END INCLUDE FILE - dm_lm_meters.incl.pl1 */
+     1211 
+     1212   /* BEGIN INCLUDE FILE sub_err_flags.incl.pl1 BIM 11/81 */
+  5     2 /* format: style3 */
+  5     3 
+  5     4 /* These constants are to be used for the flags argument of sub_err_ */
+  5     5 /* They are just "string (condition_info_header.action_flags)" */
+  5     6 
+  5     7 declare	(
+  5     8 	ACTION_CAN_RESTART	init (""b),
+  5     9 	ACTION_CANT_RESTART init ("1"b),
+  5    10 	ACTION_DEFAULT_RESTART
+  5    11 			init ("01"b),
+  5    12 	ACTION_QUIET_RESTART
+  5    13 			init ("001"b),
+  5    14 	ACTION_SUPPORT_SIGNAL
+  5    15 			init ("0001"b)
+  5    16 	)		bit (36) aligned internal static options (constant);
+  5    17 
+  5    18 /* End include file */
+     1212 
+     1213 
+     1214      end lm_per_system_$lock;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/17/00  1940.0  lm_per_system_.pl1                >udd>sm>ds>w>ml>lm_per_system_.pl1
+1208         1    01/07/85  1001.4  dm_lock_modes.incl.pl1            >ldd>incl>dm_lock_modes.incl.pl1
+1209         2    03/06/85  1131.1  dm_log_sv_codes.incl.pl1          >ldd>incl>dm_log_sv_codes.incl.pl1
+1210         3    01/07/85  0959.2  dm_lm_system_data.incl.pl1        >ldd>incl>dm_lm_system_data.incl.pl1
+1211         4    01/07/85  0959.1  dm_lm_meters.incl.pl1             >ldd>incl>dm_lm_meters.incl.pl1
+1212         5    04/16/82  1058.1  sub_err_flags.incl.pl1            >ldd>incl>sub_err_flags.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+ACTION_CANT_RESTART             000130 constant        bit(36)                  initial dcl 5-7 set ref 1201*
+COMMON_MODE                     000057 constant        fixed bin(17,0)          initial array dcl 99 ref 594
+CONFLICT                        000026 constant        bit(1)                   initial array dcl 102 ref 611
+ERROR_SV                        000057 constant        fixed bin(17,0)          initial dcl 2-36 set ref 1114* 1119*
+ID_IS_INVALID                          constant        bit(1)                   initial dcl 114 ref 1177
+INFORM_SV                       000140 constant        fixed bin(17,0)          initial dcl 2-38 set ref 237* 330* 336* 362*
+INTERMEDIATE_WAIT_INTERVAL      000020 constant        fixed bin(71,0)          initial dcl 113 ref 755
+ITT_OVERFLOW_WAIT_TIME          000022 constant        fixed bin(71,0)          initial dcl 112 set ref 1111*
+LOCK_ENTIRE_FILE                005324 constant        fixed bin(27,0)          initial dcl 1-23 ref 532 598
+LOCK_MESSAGE_DEADLOCK           000002 constant        fixed bin(71,0)          initial dcl 3-183 set ref 767 909*
+LOCK_MODE_S                            constant        fixed bin(17,0)          initial dcl 1-17 ref 413
+LOCK_MODE_SIX                          constant        fixed bin(17,0)          initial dcl 1-21 ref 413
+LOCK_SEGNAME                    000004 constant        char(9)                  initial packed unaligned dcl 3-179 ref 398
+LOCK_SEG_TIMEOUT                000024 constant        fixed bin(71,0)          initial dcl 111 set ref 326*
+LOCK_SEG_VERSION_1              000010 constant        char(8)                  initial dcl 3-32 set ref 317* 356*
+MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS
+                                000016 constant        fixed bin(17,0)          initial dcl 117 set ref 1106 1119 1119*
+ME                              000012 constant        char(14)                 initial packed unaligned dcl 119 set ref 1114* 1119*
+                                                                                  1201*
+NO                                     constant        bit(1)                   initial dcl 106 ref 1108 1116
+NULL_VPTR                       000000 constant        structure                level 1 dcl 3-171 ref 462 463 479 485 677 982 988
+                                                                                  1083 1090
+RELATIVE_SECONDS                000017 constant        bit(2)                   initial packed unaligned dcl 116 set ref 1111*
+TIME_IS_ABSOLUTE                000057 constant        fixed bin(17,0)          initial dcl 115 set ref 742* 759* 764*
+TYPE_FREE                              constant        fixed bin(17,0)          initial dcl 3-162 ref 507
+TYPE_OBJECT                            constant        fixed bin(17,0)          initial dcl 3-162 ref 461
+TYPE_OWNER                             constant        fixed bin(17,0)          initial dcl 3-162 ref 630
+TYPE_WAITER                            constant        fixed bin(17,0)          initial dcl 3-162 ref 672
+YES                                    constant        bit(1)                   initial dcl 106 ref 1103 1106
+addr                                                   builtin function         dcl 183 ref 326 326 361 361 762 762 762 762 805 830
+                                                                                  837 846 857 907 1189 1189
+allocates                              based           fixed bin(35,0)          level 4 dcl 3-34 set ref 478* 478
+cd_auto_txn_ids                 000663 automatic       bit(1)                   dcl 799 set ref 845* 849* 871
+cd_call_36                      000551 automatic       bit(1)                   dcl 797 set ref 826* 832* 869
+cd_call_72                      000552 automatic       bit(1)                   dcl 797 set ref 826* 839* 869
+cd_code                         000260 automatic       fixed bin(35,0)          dcl 789 set ref 867* 874 876
+cd_lock_deadlock_36             000265 automatic       structure                level 1 dcl 795 set ref 830
+cd_lock_deadlock_72             000331 automatic       structure                level 1 dcl 796 set ref 837
+cd_lock_txn_table                      based           structure                level 1 dcl 794
+cd_lock_txn_table_ptr           000262 automatic       pointer                  dcl 790 set ref 805* 806 808 808 811 811 816 819
+                                                                                  857* 858 860 860 861 861 861
+cd_p_lock_object_ptr                   parameter       pointer                  dcl 787 set ref 784 855*
+cd_small_txn_ids                000553 automatic       bit(36)                  array dcl 798 set ref 846
+cd_txn_idx                      000264 automatic       fixed bin(17,0)          dcl 791 set ref 804* 805* 856* 857*
+cd_txn_to_notify                000664 automatic       bit(36)                  dcl 800 set ref 867* 874 885*
+channel_id                2     000120 automatic       fixed bin(71,0)          array level 2 dcl 730 set ref 753*
+ci_locks_by_mode                       based           fixed bin(35,0)          array level 4 dcl 3-34 set ref 535* 535
+ci_no                     2            based           fixed bin(35,0)          level 2 in structure "lo_lock_object" dcl 527
+                                                                                  in procedure "LOCK_OBJECT" ref 549
+ci_no                     2            based           fixed bin(35,0)          level 2 in structure "fal_lock_object" dcl 449
+                                                                                  in procedure "FIND_OR_ALLOCATE_LOCK" set ref 460*
+ci_no                     2            based           fixed bin(35,0)          level 2 in structure "tl_lock_object" dcl 575
+                                                                                  in procedure "TRY_TO_LOCK" ref 598
+ci_no                     2            based           fixed bin(35,0)          level 2 in structure "lock_object" dcl 3-100
+                                                                                  in procedure "lm_per_system_$lock" set ref 237*
+ci_number                       000100 automatic       fixed bin(27,0)          dcl 90 set ref 197* 209* 253* 259* 772 880
+cleanup                         000110 stack reference condition                dcl 193 ref 208 222 257 738
+clock                                                  builtin function         dcl 184 ref 199 544 755
+code                            000101 automatic       fixed bin(35,0)          dcl 91 set ref 234* 235 237* 326* 327 327 327 330*
+                                                                                  336* 337*
+cu_$level_get                   000066 constant        entry                    external dcl 158 ref 384
+cu_$level_set                   000070 constant        entry                    external dcl 159 ref 385 402
+cv_p_expected_version                  parameter       char(8)                  dcl 1195 set ref 1192 1201 1201*
+cv_p_received_version                  parameter       char(8)                  dcl 1197 set ref 1192 1201 1201*
+cv_p_structure_name                    parameter       char(32)                 dcl 1199 set ref 1192 1201*
+deadlock_checks                        based           fixed bin(35,0)          level 4 dcl 3-34 set ref 821* 821
+deadlock_checks_36                     based           fixed bin(35,0)          level 4 dcl 3-34 set ref 829* 829
+deadlock_checks_72                     based           fixed bin(35,0)          level 4 dcl 3-34 set ref 836* 836
+deadlock_inx                           based           fixed bin(17,0)          level 2 in structure "cd_lock_txn_table" dcl 794
+                                                                                  in procedure "CHECK_DEADLOCK" set ref 808* 811*
+                                                                                  816* 819* 858 860 861*
+deadlock_inx                           based           fixed bin(17,0)          level 2 in structure "lock_transaction_table"
+                                                                                  dcl 3-69 in procedure "lm_per_system_$lock" ref
+                                                                                  940
+deadlock_other_youngest                based           fixed bin(35,0)          level 4 dcl 3-34 set ref 884* 884
+deadlock_self_youngest                 based           fixed bin(35,0)          level 4 dcl 3-34 set ref 878* 878
+dm_area                                based           area(1024)               dcl 123 ref 388 841 850
+dm_data_$current_txn_id         000014 external static bit(36)                  dcl 130 ref 854
+dm_data_$inner_ring_areap       000012 external static pointer                  dcl 129 ref 388 841 850
+dm_error_$fast_lock_invalid_reset
+                                000032 external static fixed bin(35,0)          dcl 137 ref 327
+dm_error_$fast_lock_mylock      000030 external static fixed bin(35,0)          dcl 136 ref 327
+dm_error_$lock_invalid_mode     000034 external static fixed bin(35,0)          dcl 139 set ref 413*
+dm_error_$lock_invalid_uid      000036 external static fixed bin(35,0)          dcl 140 set ref 201*
+dm_error_$lock_not_found        000040 external static fixed bin(35,0)          dcl 141 set ref 430* 1035 1060
+dm_error_$lock_table_overflow   000042 external static fixed bin(35,0)          dcl 142 set ref 456* 627* 669*
+dm_error_$unimplemented_entry   000044 external static fixed bin(35,0)          dcl 144 ref 271 277 283
+dm_misc_util_$log               000056 constant        entry                    external dcl 153 ref 237 330 336 362 1114 1119
+dm_per_system_$initiate         000072 constant        entry                    external dcl 160 ref 398
+dm_system_data_$lock_ips_mask   000054 external static bit(36)                  dcl 149 set ref 757*
+dm_system_data_$max_n_transactions
+                                000010 external static fixed bin(17,0)          dcl 127 ref 804 856
+dup_ci_locks_by_mode                   based           fixed bin(35,0)          array level 4 dcl 3-34 set ref 601* 601
+dup_file_locks_by_mode                 based           fixed bin(35,0)          array level 4 dcl 3-34 set ref 598* 598
+er_p_code                              parameter       fixed bin(35,0)          dcl 300 ref 298 303
+error_in_unlock_all             000106 automatic       bit(1)                   dcl 95 set ref 221* 239*
+error_table_$itt_overflow       000050 external static fixed bin(35,0)          dcl 147 set ref 1111 1119*
+error_table_$process_unknown    000052 external static fixed bin(35,0)          dcl 148 ref 1108
+error_table_$unimplemented_version
+                                000046 external static fixed bin(35,0)          dcl 145 set ref 1201*
+ev_channel                4            based           fixed bin(71,0)          level 2 in structure "lock_transaction_table"
+                                                                                  dcl 3-69 in procedure "lm_per_system_$lock" set
+                                                                                  ref 747 751* 753 759*
+ev_channel                4            based           fixed bin(71,0)          level 2 in structure "nt_lock_txn_table" dcl 898
+                                                                                  in procedure "NOTIFY_TXN" set ref 909*
+ev_channel                4            based           fixed bin(71,0)          level 2 in structure "uo_waiter_transaction_table"
+                                                                                  dcl 1017 in procedure "UNLOCK_OBJECT" set ref
+                                                                                  1084*
+f_uid                           000105 automatic       bit(36)                  dcl 94 set ref 196* 201 209* 252* 259* 772* 880*
+fal_lock_object                        based           structure                level 1 dcl 449
+fal_lock_object_ptr             000174 automatic       pointer                  dcl 447 set ref 451* 452 452 455* 456 459 460 461
+                                                                                  462 463 464* 466
+fal_p_ci_number                        parameter       fixed bin(27,0)          dcl 445 set ref 441 451* 460
+fal_p_f_uid                            parameter       bit(36)                  dcl 444 set ref 441 451* 459
+file_locks_by_mode                     based           fixed bin(35,0)          array level 4 dcl 3-34 set ref 532* 532
+fl_lock_object_ptr              000164 automatic       pointer                  dcl 427 set ref 429* 430 433
+fl_p_ci_number                         parameter       fixed bin(27,0)          dcl 425 set ref 421 429*
+fl_p_f_uid                             parameter       bit(36)                  dcl 424 set ref 421 429*
+free_fp                   1            based           structure                level 2 in structure "rf_lock_free_block" dcl 503
+                                                                                  in procedure "RETURN_FREE" set ref 508*
+free_fp                   1            based           structure                level 2 in structure "lock_free_block" dcl 3-92
+                                                                                  in procedure "lm_per_system_$lock" ref 490
+free_list_ptr            12            based           structure                level 3 dcl 3-34 set ref 479 485 489* 490* 508 509*
+frees                                  based           fixed bin(35,0)          level 4 dcl 3-34 set ref 505* 505
+get_ring_                       000076 constant        entry                    external dcl 162 ref 385 385
+gf_code                         000204 automatic       fixed bin(35,0)          dcl 475 set ref 481* 482
+give_up_time                    000102 automatic       fixed bin(71,0)          dcl 92 set ref 199* 209*
+hcs_$get_alarm_timer            000100 constant        entry                    external dcl 163 ref 758
+hcs_$reset_ips_mask             000102 constant        entry                    external dcl 164 ref 740 765
+hcs_$set_alarm_timer            000104 constant        entry                    external dcl 165 ref 742 759 764
+hcs_$set_ips_mask               000106 constant        entry                    external dcl 166 ref 757
+hcs_$wakeup                     000110 constant        entry                    external dcl 167 ref 1107
+header                    2            based           structure                level 2 dcl 3-34
+ipc_$block                      000112 constant        entry                    external dcl 168 ref 762
+ipc_$create_ev_chn              000114 constant        entry                    external dcl 169 ref 749
+lm_check_for_deadlock_          000060 constant        entry                    external dcl 154 ref 867
+lm_data_$ev_channel             000016 external static fixed bin(71,0)          dcl 131 set ref 749 749* 751
+lm_data_$lock_seg_ptr           000024 external static pointer                  dcl 134 ref 316 355
+lm_data_$lock_segments_ptr      000022 external static pointer                  dcl 133 set ref 319 394*
+lm_data_$n_lock_segments        000026 external static fixed bin(17,0)          dcl 135 set ref 340 389 396 401*
+lm_data_$txn_table_ptr          000020 external static pointer                  dcl 132 ref 318
+lm_expand_lock_seg_             000074 constant        entry                    external dcl 161 ref 481
+lm_hash_$hash_in                000116 constant        entry                    external dcl 170 ref 464
+lm_hash_$hash_out               000120 constant        entry                    external dcl 171 ref 1075
+lm_hash_$search                 000122 constant        entry                    external dcl 172 ref 429 451
+lm_meters                              based           structure                level 3 dcl 3-34
+lm_salvage_lock_seg_            000130 constant        entry                    external dcl 175 ref 331
+lm_signal_$deadlock             000062 constant        entry                    external dcl 155 ref 772 880
+lm_signal_$timeout              000064 constant        entry                    external dcl 156 ref 544
+lo_lock_object                         based           structure                level 1 dcl 527
+lo_lock_object_ptr              000214 automatic       pointer                  dcl 525 set ref 538* 540* 548* 549 549 549* 553*
+lo_p_ci_number                         parameter       fixed bin(27,0)          dcl 520 set ref 515 532 538* 544 549 549*
+lo_p_code                              parameter       fixed bin(35,0)          dcl 523 ref 515
+lo_p_f_uid                             parameter       bit(36)                  dcl 518 set ref 515 538* 544* 549 549*
+lo_p_give_up_time                      parameter       fixed bin(71,0)          dcl 519 set ref 515 544 544* 553*
+lo_p_mode_obtained                     parameter       fixed bin(17,0)          dcl 522 set ref 515 540* 541
+lo_p_mode_req                          parameter       fixed bin(17,0)          dcl 521 set ref 515 532 532 535 535 540* 544* 553*
+lock                      2            based           fixed bin(71,0)          level 3 dcl 3-34 set ref 326 326 361 361 1189 1189
+lock_aux_seg_ptr                000122 automatic       pointer                  dcl 3-19 set ref 398* 399
+lock_block                             based           structure                level 1 dcl 3-84
+lock_calls                             based           fixed bin(35,0)          level 4 dcl 3-34 set ref 531* 531
+lock_deadlock                          based           structure                level 1 dcl 3-149 set ref 841 842* 869
+lock_deadlock_36                       based           structure                level 1 dcl 3-152
+lock_deadlock_72                       based           structure                level 1 dcl 3-155
+lock_deadlock_ptr               000134 automatic       pointer                  dcl 3-27 set ref 830* 837* 841* 842 867* 869 941
+lock_deadlock_txn_ids                  based           bit(36)                  array dcl 3-161 set ref 850 853* 854* 860* 871
+lock_deadlock_txn_ids_ptr       000140 automatic       pointer                  dcl 3-159 set ref 846* 850* 853 854 860 867* 871
+lock_free_block                        based           structure                level 1 dcl 3-92
+lock_free_block_ptr             000124 automatic       pointer                  dcl 3-22 set ref 489* 490 491 492
+lock_hash_table                        based           structure                level 1 dcl 3-80
+lock_manager_$lock_fast         000124 constant        entry                    external dcl 173 ref 326
+lock_manager_$unlock_fast       000126 constant        entry                    external dcl 174 ref 361 1189
+lock_meters                            based           structure                level 1 dcl 4-20
+lock_object                            based           structure                level 1 dcl 3-100
+lock_object_ptr                 000126 automatic       pointer                  dcl 3-23 set ref 233* 234* 237 237 237 259* 261*
+lock_owner                             based           structure                level 1 dcl 3-113
+lock_owner_ptr                  000130 automatic       pointer                  dcl 3-24 set ref 232* 233
+lock_ptr                  1            based           structure                level 2 in structure "lock_waiter" dcl 3-128
+                                                                                  in procedure "lm_per_system_$lock" set ref 861*
+                                                                                  861*
+lock_ptr                  1            based           structure                level 2 in structure "w_lock_waiter" dcl 661
+                                                                                  in procedure "WAIT" set ref 673*
+lock_ptr                  1            based           structure                level 2 in structure "tl_lock_owner" dcl 577
+                                                                                  in procedure "TRY_TO_LOCK" set ref 631*
+lock_ptr                  1            based           structure                level 2 in structure "um_lock_waiter" dcl 963
+                                                                                  in procedure "UNWAIT_ME" set ref 972*
+lock_ptr                  1            based           structure                level 2 in structure "lock_owner" dcl 3-113
+                                                                                  in procedure "lm_per_system_$lock" set ref 233*
+lock_seg                               based           structure                level 1 dcl 3-34
+lock_seg_ptr                    000116 automatic       pointer                  dcl 3-15 set ref 224 224 224 224 316* 317 326 326
+                                                                                  340 355* 356 361 361 387 388 393 478 478 478 478
+                                                                                  479 485 489 490 505 505 505 505 508 509 531 531
+                                                                                  531 531 532 532 532 532 535 535 535 535 598 598
+                                                                                  598 598 601 601 601 601 667 667 667 667 805 821
+                                                                                  821 821 821 824 824 824 824 829 829 829 829 836
+                                                                                  836 836 836 857 878 878 878 878 884 884 884 884
+                                                                                  907 1189 1189
+lock_segments                          based           structure                level 1 dcl 3-142 set ref 388 393
+lock_segments_ptr               000132 automatic       pointer                  dcl 3-25 set ref 319* 390 393 394* 399 1139
+lock_segno                      000142 automatic       picture(3)               packed unaligned dcl 3-181 set ref 397* 398
+lock_transaction_table                 based           structure                level 1 dcl 3-69
+lock_transaction_table_ptr      000120 automatic       pointer                  dcl 3-16 set ref 230 232 244 318* 544 590 634 635
+                                                                                  636 676 678 747 751 753 759 772 808 880 969 971
+                                                                                  973 979 988 1028 1047 1047 1051
+lock_virtual_ptr                       based           structure                level 1 dcl 3-145
+lock_waiter                            based           structure                level 1 dcl 3-128
+message                   2     000102 automatic       fixed bin(71,0)          level 2 dcl 719 set ref 767
+meters                                 based           structure                level 2 dcl 3-34
+mode                      2            based           fixed bin(17,0)          level 2 in structure "w_lock_waiter" dcl 661
+                                                                                  in procedure "WAIT" set ref 674*
+mode                      2            based           fixed bin(17,0)          level 2 in structure "tl_lock_owner" dcl 577
+                                                                                  in procedure "TRY_TO_LOCK" set ref 594 595 611
+                                                                                  621* 632*
+mode_req                        000104 automatic       fixed bin(17,0)          dcl 93 set ref 198* 204* 209* 772* 880*
+n_chan                          000120 automatic       fixed bin(17,0)          level 2 dcl 730 set ref 746*
+n_hash_table_entries     10            based           fixed bin(17,0)          level 3 dcl 3-34 ref 224 224 478 478 505 505 531 531
+                                                                                  532 532 535 535 598 598 601 601 667 667 821 821
+                                                                                  824 824 829 829 836 836 878 878 884 884
+n_lock_deadlock                 000136 automatic       fixed bin(17,0)          dcl 3-30 set ref 803* 815* 815 816 822 827 831* 834
+                                                                                  838* 841 841 842 842 843 850 853 867* 869 869 871
+                                                                                  941 941
+n_lock_segments           4            based           fixed bin(17,0)          level 3 dcl 3-34 ref 340 387 388 393
+n_transaction_table_entries
+                          7            based           fixed bin(17,0)          level 3 dcl 3-34 ref 224 224 478 478 505 505 531 531
+                                                                                  532 532 535 535 598 598 601 601 667 667 821 821
+                                                                                  824 824 829 829 836 836 878 878 884 884
+nt_code                         000702 automatic       fixed bin(35,0)          dcl 900 set ref 904* 905
+nt_lock_txn_table                      based           structure                level 1 dcl 898
+nt_lock_txn_table_ptr           000700 automatic       pointer                  dcl 899 set ref 907* 909 909
+nt_p_txn_id                            parameter       bit(36)                  dcl 896 set ref 893 904*
+nt_txn_idx                      000676 automatic       fixed bin(17,0)          dcl 897 set ref 904* 907
+null                                                   builtin function         dcl 185 ref 430 452 456 482 485 584 618 627 669 1024
+                                                                                  1039 1201 1201
+offset                    5(18)        based           fixed bin(18,0)          level 3 in structure "tl_lock_owner" packed packed
+                                                                                  unsigned unaligned dcl 577 in procedure
+                                                                                  "TRY_TO_LOCK" set ref 634*
+offset                    5(18)        based           fixed bin(18,0)          level 3 in structure "uo_lock_owner" packed packed
+                                                                                  unsigned unaligned dcl 1014 in procedure
+                                                                                  "UNLOCK_OBJECT" ref 1028
+offset                    0(18)        parameter       fixed bin(18,0)          level 2 in structure "ptr_lock_virtual_ptr" packed
+                                                                                  packed unsigned unaligned dcl 1137 in procedure
+                                                                                  "PTR" ref 1139
+offset                    0(18) 000100 automatic       fixed bin(18,0)          level 2 in structure "vptr_lock_virtual_ptr" packed
+                                                                                  packed unsigned unaligned dcl 1152 in procedure
+                                                                                  "VPTR" set ref 1157*
+offset                    4(18)        based           fixed bin(18,0)          level 3 in structure "w_lock_waiter" packed packed
+                                                                                  unsigned unaligned dcl 661 in procedure "WAIT" set
+                                                                                  ref 676*
+own_ptr                   6            based           structure                level 2 dcl 3-69 set ref 232* 635 636* 1047 1047*
+                                                                                  1051
+owners_fp                 3            based           structure                level 2 in structure "sw_lock_owner" dcl 935
+                                                                                  in procedure "SET_WAIT_OWN" ref 943
+owners_fp                 3            based           structure                level 2 in structure "uo_prev_lock_owner" dcl 1016
+                                                                                  in procedure "UNLOCK_OBJECT" set ref 1041*
+owners_fp                 3            based           structure                level 2 in structure "tl_lock_owner" dcl 577
+                                                                                  in procedure "TRY_TO_LOCK" set ref 615 637*
+owners_fp                 3            based           structure                level 2 in structure "uo_lock_owner" dcl 1014
+                                                                                  in procedure "UNLOCK_OBJECT" ref 1031 1039 1041
+owners_ptr                3            based           structure                level 2 in structure "sw_lock_object" dcl 934
+                                                                                  in procedure "SET_WAIT_OWN" ref 937
+owners_ptr                3            based           structure                level 2 in structure "fal_lock_object" dcl 449
+                                                                                  in procedure "FIND_OR_ALLOCATE_LOCK" set ref 462*
+owners_ptr                3            based           structure                level 2 in structure "tl_lock_object" dcl 575
+                                                                                  in procedure "TRY_TO_LOCK" set ref 586 637 638*
+owners_ptr                3            based           structure                level 2 in structure "uo_lock_object" dcl 1013
+                                                                                  in procedure "UNLOCK_OBJECT" set ref 1025 1039*
+p_checkpoint_id                        parameter       bit(36)                  dcl 77 ref 268 274 280
+p_ci_number                            parameter       fixed bin(27,0)          dcl 75 ref 70 197 249 253 268
+p_code                                 parameter       fixed bin(35,0)          dcl 79 set ref 70 209* 249 261* 268 271* 274 277*
+                                                                                  280 283* 285 291 295* 303* 802*
+p_f_uid                                parameter       bit(36)                  dcl 83 ref 70 196 249 252 268
+p_mode_obtained                        parameter       fixed bin(17,0)          dcl 81 set ref 70 209* 268
+p_mode_req                             parameter       fixed bin(17,0)          dcl 82 ref 70 198 268
+p_timeout                              parameter       fixed bin(71,0)          dcl 85 ref 70 199 268
+pad                       2            based           bit(36)                  array level 2 in structure "rf_lock_free_block"
+                                                                                  dcl 503 in procedure "RETURN_FREE" set ref 506*
+pad                       2            based           bit(36)                  array level 2 in structure "lock_free_block"
+                                                                                  dcl 3-92 in procedure "lm_per_system_$lock" set
+                                                                                  ref 491*
+process_id                1            based           bit(36)                  level 2 in structure "uo_waiter_transaction_table"
+                                                                                  dcl 1017 in procedure "UNLOCK_OBJECT" set ref
+                                                                                  1084*
+process_id                1            based           bit(36)                  level 2 in structure "nt_lock_txn_table" dcl 898
+                                                                                  in procedure "NOTIFY_TXN" set ref 909*
+ptr                                                    builtin function         dcl 186 ref 399 1139
+ptr_lock_virtual_ptr                   parameter       structure                level 1 dcl 1137 ref 1134
+real_deadlock_checks                   based           fixed bin(35,0)          level 4 dcl 3-34 set ref 824* 824
+rf_lock_free_block                     based           structure                level 1 dcl 503
+rf_lock_free_block_ptr                 parameter       pointer                  dcl 501 set ref 498 506 507 508 509*
+rw_event_info                   000102 automatic       structure                level 1 dcl 719 set ref 762 762
+rw_intermediate_give_up_time    000100 automatic       fixed bin(71,0)          initial dcl 718 set ref 718* 755* 759 759
+rw_p_give_up_time                      parameter       fixed bin(71,0)          dcl 716 ref 713 759 759
+rw_saved_channel                000112 automatic       fixed bin(71,0)          dcl 727 set ref 736* 742 742* 758* 764*
+rw_saved_ips_mask               000114 automatic       bit(36)                  dcl 728 set ref 735* 740 740* 740* 757* 765* 765*
+rw_saved_timer                  000116 automatic       fixed bin(71,0)          dcl 729 set ref 742* 758* 764*
+rw_wait_list                    000120 automatic       structure                level 1 dcl 730 set ref 762 762
+seg_baseptr                            based           pointer                  array level 2 packed packed unaligned dcl 3-142 set
+                                                                                  ref 390* 390 399* 1139
+seg_inx                         000106 automatic       fixed bin(17,0)          level 2 in structure "um_waiters_ptr" packed packed
+                                                                                  unaligned dcl 960 in procedure "UNWAIT_ME" set ref
+                                                                                  977
+seg_inx                         000742 automatic       fixed bin(17,0)          level 2 in structure "uo_waiter_ptr" packed packed
+                                                                                  unaligned dcl 1011 in procedure "UNLOCK_OBJECT"
+                                                                                  set ref 1080
+seg_inx                         000250 automatic       fixed bin(17,0)          level 2 in structure "w_waiters_ptr" packed packed
+                                                                                  unaligned dcl 658 in procedure "WAIT" set ref 687
+seg_inx                         000732 automatic       fixed bin(17,0)          level 2 in structure "uo_owner_ptr" packed packed
+                                                                                  unaligned dcl 1005 in procedure "UNLOCK_OBJECT"
+                                                                                  set ref 1026 1052
+seg_inx                   4            based           fixed bin(17,0)          level 3 in structure "w_lock_waiter" packed packed
+                                                                                  unaligned dcl 661 in procedure "WAIT" set ref 675*
+seg_inx                   7            based           fixed bin(17,0)          level 3 in structure "lock_transaction_table" packed
+                                                                                  packed unaligned dcl 3-69 in procedure
+                                                                                  "lm_per_system_$lock" set ref 969
+seg_inx                   6            based           fixed bin(17,0)          level 3 in structure "lock_transaction_table" packed
+                                                                                  packed unaligned dcl 3-69 in procedure
+                                                                                  "lm_per_system_$lock" set ref 230
+seg_inx                   3            based           fixed bin(17,0)          level 3 in structure "uo_lock_object" packed packed
+                                                                                  unaligned dcl 1013 in procedure "UNLOCK_OBJECT"
+                                                                                  set ref 1073
+seg_inx                   4            based           fixed bin(17,0)          level 3 in structure "uo_lock_object" packed packed
+                                                                                  unaligned dcl 1013 in procedure "UNLOCK_OBJECT"
+                                                                                  set ref 1073
+seg_inx                                parameter       fixed bin(17,0)          level 2 in structure "ptr_lock_virtual_ptr" packed
+                                                                                  packed unaligned dcl 1137 in procedure "PTR" ref
+                                                                                  1139
+seg_inx                                based           fixed bin(17,0)          level 2 in structure "lock_object" packed packed
+                                                                                  unaligned dcl 3-100 in procedure
+                                                                                  "lm_per_system_$lock" set ref 237*
+seg_inx                         000714 automatic       fixed bin(17,0)          level 2 in structure "sw_owners_ptr" packed packed
+                                                                                  unaligned dcl 931 in procedure "SET_WAIT_OWN" set
+                                                                                  ref 938
+seg_inx                         000234 automatic       fixed bin(17,0)          level 2 in structure "tl_owners_ptr" packed packed
+                                                                                  unaligned dcl 573 in procedure "TRY_TO_LOCK" set
+                                                                                  ref 587
+seg_inx                         000100 automatic       fixed bin(17,0)          level 2 in structure "vptr_lock_virtual_ptr" packed
+                                                                                  packed unaligned dcl 1152 in procedure "VPTR" set
+                                                                                  ref 1156*
+seg_inx                   5            based           fixed bin(17,0)          level 3 in structure "tl_lock_owner" packed packed
+                                                                                  unaligned dcl 577 in procedure "TRY_TO_LOCK" set
+                                                                                  ref 633*
+seg_inx                   7            based           fixed bin(17,0)          level 3 in structure "cd_lock_txn_table" packed
+                                                                                  packed unaligned dcl 794 in procedure
+                                                                                  "CHECK_DEADLOCK" set ref 811
+seg_inx                   4            based           fixed bin(17,0)          level 3 in structure "w_lock_object" packed packed
+                                                                                  unaligned dcl 660 in procedure "WAIT" set ref 683
+sl_lock_segx                    000100 automatic       fixed bin(17,0)          dcl 374 set ref 389* 390 390* 396* 397 399*
+sl_new_lock_segments_ptr        000102 automatic       pointer                  dcl 375 set ref 388* 390 394
+sl_new_n_lock_segments          000104 automatic       fixed bin(17,0)          dcl 376 set ref 387* 396 401
+sl_save_level                   000105 automatic       fixed bin(17,0)          dcl 377 set ref 384* 402*
+sub_err_                        000132 constant        entry                    external dcl 176 ref 1201
+substr                                                 builtin function         dcl 188 ref 740
+sul_code                        000100 automatic       fixed bin(35,0)          dcl 313 set ref 331* 332 332*
+sul_lock_segs_synchronized      000101 automatic       bit(1)                   initial dcl 314 set ref 314* 324 345*
+sw_code                         000752 automatic       fixed bin(35,0)          initial dcl 1102 set ref 1102* 1107* 1108 1108 1111
+                                                                                  1114*
+sw_lock_object                         based           structure                level 1 dcl 934
+sw_lock_owner                          based           structure                level 1 dcl 935
+sw_lock_owner_ptr               000712 automatic       pointer                  dcl 930 set ref 939* 940 943
+sw_owner_deadlock_inx           000715 automatic       fixed bin(17,0)          dcl 932 set ref 940* 941 941
+sw_owners_ptr                   000714 automatic       structure                level 1 dcl 931 set ref 937* 939* 943*
+sw_p_deadlock_inx                      parameter       fixed bin(17,0)          dcl 927 ref 924 941
+sw_p_ev_channel                        parameter       fixed bin(71,0)          dcl 1099 set ref 1095 1107* 1114* 1119*
+sw_p_lock_object_ptr                   parameter       pointer                  dcl 928 ref 924 937
+sw_p_message                           parameter       fixed bin(71,0)          dcl 1100 set ref 1095 1107*
+sw_p_process_id                        parameter       bit(36)                  dcl 1098 set ref 1095 1107* 1108 1114* 1119*
+sw_p_wakeup_description                parameter       char                     packed unaligned dcl 1097 set ref 1095 1114* 1119*
+sw_try_wakeup                   000753 automatic       bit(1)                   initial dcl 1103 set ref 1103* 1106 1108* 1116*
+sw_wakeup_attempt_count         000754 automatic       fixed bin(17,0)          initial dcl 1104 set ref 1104* 1106* 1119
+timer_manager_$sleep            000134 constant        entry                    external dcl 177 ref 1111
+tl_lock_object                         based           structure                level 1 dcl 575
+tl_lock_owner                          based           structure                level 1 dcl 577
+tl_lock_owner_ptr               000224 automatic       pointer                  dcl 567 set ref 588* 589 593 594 595 611 615 620*
+                                                                                  621 626* 627 630 631 632 633 634 635 636* 637 638*
+tl_mode_needed                  000226 automatic       fixed bin(17,0)          dcl 568 set ref 594* 595 597 598 605 607
+tl_mode_req                     000227 automatic       fixed bin(17,0)          dcl 569 set ref 582* 594 598 601 601 605 607* 611
+                                                                                  621 622 632 640
+tl_my_lock_owner_ptr            000230 automatic       pointer                  dcl 570 set ref 584* 593* 618 620
+tl_owners_ptr                   000234 automatic       structure                level 1 dcl 573 set ref 586* 588* 615*
+tl_owners_transaction_table_ptr 000232 automatic       pointer                  dcl 571 set ref 589* 590
+tl_p_lock_object_ptr                   parameter       pointer                  dcl 563 set ref 560 586 598 631* 637 638
+tl_p_mode_obtained                     parameter       fixed bin(17,0)          dcl 565 set ref 560 581* 597* 622* 640*
+tl_p_mode_req                          parameter       fixed bin(17,0)          dcl 564 ref 560 582
+transaction_fp            4            based           structure                level 2 in structure "uo_lock_owner" dcl 1014
+                                                                                  in procedure "UNLOCK_OBJECT" ref 1047 1063
+transaction_fp            4            based           structure                level 2 in structure "uo_prev_lock_owner" dcl 1016
+                                                                                  in procedure "UNLOCK_OBJECT" set ref 1054 1056
+                                                                                  1063*
+transaction_fp            4            based           structure                level 2 in structure "tl_lock_owner" dcl 577
+                                                                                  in procedure "TRY_TO_LOCK" set ref 635*
+transaction_manager_$get_txn_index
+                                000136 constant        entry                    external dcl 178 in procedure "lm_per_system_$lock"
+                                                                                  ref 1180
+transaction_manager_$get_txn_index
+                                000140 constant        entry                    external dcl 901 in procedure "NOTIFY_TXN" ref 904
+transaction_ptr           5            based           structure                level 2 in structure "tl_lock_owner" dcl 577
+                                                                                  in procedure "TRY_TO_LOCK" set ref 589*
+transaction_ptr           5            based           structure                level 2 in structure "sw_lock_owner" dcl 935
+                                                                                  in procedure "SET_WAIT_OWN" set ref 940*
+transaction_ptr           5            based           structure                level 2 in structure "uo_lock_owner" dcl 1014
+                                                                                  in procedure "UNLOCK_OBJECT"
+transaction_ptr           4            based           structure                level 2 in structure "uo_lock_waiter" dcl 1015
+                                                                                  in procedure "UNLOCK_OBJECT" set ref 1082*
+transaction_ptr           4            based           structure                level 2 in structure "w_lock_waiter" dcl 661
+                                                                                  in procedure "WAIT"
+transaction_table        20            based           structure                array level 2 dcl 3-34 set ref 805 857 907
+txn_id                    2            based           bit(36)                  level 2 in structure "lock_transaction_table"
+                                                                                  dcl 3-69 in procedure "lm_per_system_$lock" set
+                                                                                  ref 244* 544* 772* 880*
+txn_id                    2            based           bit(36)                  level 2 in structure "cd_lock_txn_table" dcl 794
+                                                                                  in procedure "CHECK_DEADLOCK" set ref 806* 860
+type                      0(18)        based           fixed bin(17,0)          level 2 in structure "fal_lock_object" packed packed
+                                                                                  unaligned dcl 449 in procedure
+                                                                                  "FIND_OR_ALLOCATE_LOCK" set ref 461*
+type                      0(18)        based           fixed bin(17,0)          level 2 in structure "rf_lock_free_block" packed
+                                                                                  packed unaligned dcl 503 in procedure
+                                                                                  "RETURN_FREE" set ref 507*
+type                      0(18)        based           fixed bin(17,0)          level 2 in structure "tl_lock_owner" packed packed
+                                                                                  unaligned dcl 577 in procedure "TRY_TO_LOCK" set
+                                                                                  ref 630*
+type                      0(18)        based           fixed bin(17,0)          level 2 in structure "w_lock_waiter" packed packed
+                                                                                  unaligned dcl 661 in procedure "WAIT" set ref 672*
+uid                       1            based           bit(36)                  level 2 in structure "fal_lock_object" dcl 449
+                                                                                  in procedure "FIND_OR_ALLOCATE_LOCK" set ref 459*
+uid                       1            based           bit(36)                  level 2 in structure "lock_object" dcl 3-100
+                                                                                  in procedure "lm_per_system_$lock" set ref 237*
+uid                       1            based           bit(36)                  level 2 in structure "lo_lock_object" dcl 527
+                                                                                  in procedure "LOCK_OBJECT" ref 549
+ul_code                         000100 automatic       fixed bin(35,0)          dcl 353 set ref 361* 362 362*
+um_lock_object                         based           structure                level 1 dcl 962
+um_lock_object_ptr              000100 automatic       pointer                  dcl 957 set ref 972* 973 973 976
+um_lock_waiter                         based           structure                level 1 dcl 963
+um_lock_waiter_ptr              000102 automatic       pointer                  dcl 958 set ref 971* 972 973 981 987*
+um_prev_lock_waiter                    based           structure                level 1 dcl 964
+um_prev_lock_waiter_ptr         000104 automatic       pointer                  dcl 959 set ref 978* 979 981 984
+um_waiters_ptr                  000106 automatic       structure                level 1 dcl 960 set ref 976* 978* 982* 984*
+unlock_all_calls                       based           fixed bin(35,0)          level 4 dcl 3-34 set ref 224* 224
+unspec                                                 builtin function         dcl 189 set ref 479 479 485 485 491* 506* 842* 973
+                                                                                  973 979 979 1047 1047 1054 1054
+uo_found                        000724 automatic       bit(1)                   dcl 1002 set ref 1023* 1026 1028* 1033 1050* 1052
+                                                                                  1054* 1058
+uo_lock_object                         based           structure                level 1 dcl 1013
+uo_lock_owner                          based           structure                level 1 dcl 1014
+uo_lock_owner_ptr               000726 automatic       pointer                  dcl 1003 set ref 1027* 1028 1030 1031 1039 1041
+                                                                                  1046* 1047 1063 1066*
+uo_lock_waiter                         based           structure                level 1 dcl 1015
+uo_lock_waiter_ptr              000730 automatic       pointer                  dcl 1004 set ref 1081* 1082 1086 1087*
+uo_owner_ptr                    000732 automatic       structure                level 1 dcl 1005 set ref 1025* 1027* 1031* 1051*
+                                                                                  1053* 1056*
+uo_p_code                              parameter       fixed bin(35,0)          dcl 1000 set ref 996 1022* 1035* 1060*
+uo_p_lock_object_ptr                   parameter       pointer                  dcl 999 set ref 996 1025 1039 1073 1073 1075* 1076*
+                                                                                  1079 1090
+uo_prev_lock_owner                     based           structure                level 1 dcl 1016
+uo_prev_lock_owner_ptr          000734 automatic       pointer                  dcl 1006 set ref 1024* 1030* 1039 1041 1053* 1054
+                                                                                  1056 1063
+uo_temp_ptr                     000736 automatic       structure                level 1 dcl 1007 set ref 1046* 1047 1054
+uo_waiter_ptr                   000742 automatic       structure                level 1 dcl 1011 set ref 1079* 1081* 1086*
+uo_waiter_transaction_table            based           structure                level 1 dcl 1017
+uo_waiter_transaction_table_ptr 000740 automatic       pointer                  dcl 1009 set ref 1082* 1083 1084 1084
+version                                based           char(8)                  level 2 dcl 3-34 set ref 317* 356*
+vm_p_mode                              parameter       fixed bin(17,0)          dcl 411 ref 408 413 413
+vptr_lock_block                        based           structure                level 1 dcl 1154
+vptr_lock_block_ptr                    parameter       pointer                  dcl 1150 ref 1147 1156 1157
+vptr_lock_virtual_ptr           000100 automatic       structure                level 1 dcl 1152 set ref 1159
+vt_code                         000764 automatic       fixed bin(35,0)          dcl 1174 set ref 1180* 1181
+vt_txid                                parameter       bit(36)                  dcl 1173 set ref 1163 1177 1180*
+vt_txix                         000765 automatic       fixed bin(17,0)          dcl 1175 set ref 1180*
+w_lock_object                          based           structure                level 1 dcl 660
+w_lock_waiter                          based           structure                level 1 dcl 661
+w_lock_waiter_ptr               000244 automatic       pointer                  dcl 656 set ref 668* 669 672 673 674 675 676 677
+                                                                                  678* 683* 691*
+w_p_give_up_time                       parameter       fixed bin(71,0)          dcl 654 set ref 649 698*
+w_p_lock_object_ptr                    parameter       pointer                  dcl 652 set ref 649 673* 683 683 686
+w_p_mode_req                           parameter       fixed bin(17,0)          dcl 653 ref 649 674
+w_prev_lock_waiter                     based           structure                level 1 dcl 662
+w_prev_lock_waiter_ptr          000246 automatic       pointer                  dcl 657 set ref 688* 689 691
+w_waiters_ptr                   000250 automatic       structure                level 1 dcl 658 set ref 686* 688* 689*
+wait_own                               based           bit(1)                   array level 2 packed packed unaligned dcl 3-149 set
+                                                                                  ref 941*
+wait_ptr                  7            based           structure                level 2 in structure "lock_transaction_table"
+                                                                                  dcl 3-69 in procedure "lm_per_system_$lock" set
+                                                                                  ref 678* 971* 973 979 988*
+wait_ptr                  7            based           structure                level 2 in structure "cd_lock_txn_table" dcl 794
+                                                                                  in procedure "CHECK_DEADLOCK" set ref 861* 861*
+wait_ptr                  7            based           structure                level 2 in structure "uo_waiter_transaction_table"
+                                                                                  dcl 1017 in procedure "UNLOCK_OBJECT" set ref
+                                                                                  1083*
+waiters_fp                3            based           structure                level 2 in structure "um_lock_waiter" dcl 963
+                                                                                  in procedure "UNWAIT_ME" ref 973 981
+waiters_fp                3            based           structure                level 2 in structure "um_prev_lock_waiter" dcl 964
+                                                                                  in procedure "UNWAIT_ME" set ref 979 981* 984
+waiters_fp                3            based           structure                level 2 in structure "uo_lock_waiter" dcl 1015
+                                                                                  in procedure "UNLOCK_OBJECT" ref 1086
+waiters_fp                3            based           structure                level 2 in structure "w_lock_waiter" dcl 661
+                                                                                  in procedure "WAIT" set ref 677*
+waiters_fp                3            based           structure                level 2 in structure "w_prev_lock_waiter" dcl 662
+                                                                                  in procedure "WAIT" set ref 689 691*
+waiters_ptr               4            based           structure                level 2 in structure "um_lock_object" dcl 962
+                                                                                  in procedure "UNWAIT_ME" set ref 973 973* 976
+waiters_ptr               4            based           structure                level 2 in structure "w_lock_object" dcl 660
+                                                                                  in procedure "WAIT" set ref 683* 686
+waiters_ptr               4            based           structure                level 2 in structure "fal_lock_object" dcl 449
+                                                                                  in procedure "FIND_OR_ALLOCATE_LOCK" set ref 463*
+waiters_ptr               4            based           structure                level 2 in structure "uo_lock_object" dcl 1013
+                                                                                  in procedure "UNLOCK_OBJECT" set ref 1079 1090*
+waits                                  based           fixed bin(35,0)          level 4 dcl 3-34 set ref 667* 667
+wordno                                                 builtin function         dcl 187 ref 634 676 1028 1157
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+ACTION_CAN_RESTART                     internal static bit(36)                  initial dcl 5-7
+ACTION_DEFAULT_RESTART                 internal static bit(36)                  initial dcl 5-7
+ACTION_QUIET_RESTART                   internal static bit(36)                  initial dcl 5-7
+ACTION_SUPPORT_SIGNAL                  internal static bit(36)                  initial dcl 5-7
+CRASH_SV                               internal static fixed bin(17,0)          initial dcl 2-34
+FATAL_SV                               internal static fixed bin(17,0)          initial dcl 2-34
+LOCK_BLOCK_SIZE                        internal static fixed bin(17,0)          initial dcl 3-176
+LOCK_METERS_VERSION_1                  internal static char(8)                  initial dcl 4-17
+LOCK_MODE_IS                           internal static fixed bin(17,0)          initial dcl 1-19
+LOCK_MODE_IX                           internal static fixed bin(17,0)          initial dcl 1-20
+LOCK_MODE_NAMES                        internal static char(3)                  initial array packed unaligned dcl 1-25
+LOCK_MODE_X                            internal static fixed bin(17,0)          initial dcl 1-18
+LOG_SV                                 internal static fixed bin(17,0)          initial dcl 2-40
+MAX_TYPE                               internal static fixed bin(17,0)          initial dcl 3-162
+PRINT_SV                               internal static fixed bin(17,0)          initial dcl 2-32
+QUERY_SV                               internal static fixed bin(17,0)          initial dcl 2-32
+cd_lock_object                         based           structure                level 1 dcl 793
+dm_error_$lock_timeout                 external static fixed bin(35,0)          dcl 143
+lock_aux_seg                           based           structure                level 1 dcl 3-62
+lock_block_array                       based           structure                array level 1 dcl 3-90
+lock_block_array_ptr                   automatic       pointer                  dcl 3-21
+lock_block_ptr                         automatic       pointer                  dcl 3-20
+lock_hash_table_ptr                    automatic       pointer                  dcl 3-18
+lock_meters_ptr                        automatic       pointer                  dcl 4-16
+lock_waiter_ptr                        automatic       pointer                  dcl 3-26
+n_lock_blocks                          automatic       fixed bin(17,0)          dcl 3-29
+tl_my_lock_owner                       based           structure                level 1 dcl 576
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+CHECK_DEADLOCK                  003352 constant        entry                    internal dcl 784 ref 548
+CHECK_VERSION                   005157 constant        entry                    internal dcl 1192 ref 317 356
+CLEAN_LOCK                      005133 constant        entry                    internal dcl 1186 ref 208 222 257 302
+ERROR_RETURN                    001055 constant        entry                    internal dcl 298 ref 201 332 337 413 430 456 627 669
+FIND_LOCK                       001705 constant        entry                    internal dcl 421 ref 259
+FIND_OR_ALLOCATE_LOCK           001742 constant        entry                    internal dcl 441 ref 538 549
+GET_FREE                        002034 constant        entry                    internal dcl 472 ref 455 626 668
+LOCK                            001146 constant        entry                    internal dcl 321 ref 703 769 873
+LOCK_LOOP                       002242 constant        label                    dcl 536
+LOCK_OBJECT                     002177 constant        entry                    internal dcl 515 ref 209
+MAIN_RETURN                     000455 constant        label                    dcl 212 ref 304
+NOTIFY_TXN                      004012 constant        entry                    internal dcl 893 ref 885
+PTR                             005042 constant        entry                    internal dcl 1134 ref 232 233 489 588 589 688 861
+                                                                                  861 861 861 939 940 971 972 978 1027 1053 1081
+                                                                                  1082
+REALLY_WAIT                     003056 constant        entry                    internal dcl 713 ref 698
+RETRY                           002370 constant        label                    dcl 584 ref 608
+RETRY_LOCK_LOOP                 001154 constant        label                    dcl 324
+RETURN_FREE                     002127 constant        entry                    internal dcl 498 ref 987 1066 1076 1087
+SEND_WAKEUP                     004622 constant        entry                    internal dcl 1095 ref 909 1084
+SETUP_LOCK                      001103 constant        entry                    internal dcl 310 ref 206 220 255 288
+SETUP_UNLOCK                    001362 constant        entry                    internal dcl 350 ref 294
+SET_WAIT_OWN                    004066 constant        entry                    internal dcl 924 ref 855 861
+SYNCH_LOCK_SEGMENTS             001474 constant        entry                    internal dcl 371 ref 343 484
+TRY_TO_LOCK                     002363 constant        entry                    internal dcl 560 ref 540
+UNLOCK                          001413 constant        entry                    internal dcl 358 ref 211 245 263 342 696 771 866 879
+UNLOCK_ALL_FOR_PROCESS          000525 constant        label                    dcl 230
+UNLOCK_OBJECT                   004266 constant        entry                    internal dcl 996 ref 234 261
+UNWAIT_ME                       004143 constant        entry                    internal dcl 954 ref 705 770
+VALIDATE_MODE                   001666 constant        entry                    internal dcl 408 ref 204
+VALID_TXN                       005104 constant        entry                    internal dcl 1163 ref 806
+VPTR                            005063 constant        entry                    internal dcl 1147 ref 509 631 636 638 673 678 683
+                                                                                  691 1046
+WAIT                            002652 constant        entry                    internal dcl 649 ref 553
+checkpoint                      000756 constant        entry                    external dcl 274
+lm_per_system_$lock             000345 constant        entry                    external dcl 70
+lock_lock_data                  001017 constant        entry                    external dcl 285
+lock_resolve_deadlock           000734 constant        entry                    external dcl 268
+unlock                          000644 constant        entry                    external dcl 249
+unlock_all                      000457 constant        entry                    external dcl 217
+unlock_lock_data                001036 constant        entry                    external dcl 291
+unlock_to_checkpoint            000776 constant        entry                    external dcl 280
+
+NAME DECLARED BY CONTEXT OR IMPLICATION.
+min                                                    builtin function         ref 759 759
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      6356        6520    5325        6366
+Length      7154    5325       142         420    1030           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+lm_per_system_$lock                 836 external procedure  is an external procedure.  
+on unit on line 208                  64 on unit               
+on unit on line 222                  64 on unit               
+on unit on line 257                  64 on unit               
+ERROR_RETURN                         64 internal procedure  is called by several nonquick procedures.  
+SETUP_LOCK                          106 internal procedure  is called by several nonquick procedures.  
+SETUP_UNLOCK                        104 internal procedure  is called by several nonquick procedures.  
+SYNCH_LOCK_SEGMENTS                  94 internal procedure  is called by several nonquick procedures.  
+VALIDATE_MODE                           internal procedure  shares stack frame of external procedure lm_per_system_$lock.  
+FIND_LOCK                               internal procedure  shares stack frame of external procedure lm_per_system_$lock.  
+FIND_OR_ALLOCATE_LOCK                   internal procedure  shares stack frame of external procedure lm_per_system_$lock.  
+GET_FREE                                internal procedure  shares stack frame of external procedure lm_per_system_$lock.  
+RETURN_FREE                          74 internal procedure  is called by several nonquick procedures.  
+LOCK_OBJECT                             internal procedure  shares stack frame of external procedure lm_per_system_$lock.  
+TRY_TO_LOCK                             internal procedure  shares stack frame of external procedure lm_per_system_$lock.  
+WAIT                                    internal procedure  shares stack frame of external procedure lm_per_system_$lock.  
+REALLY_WAIT                         120 internal procedure  enables or reverts conditions.  
+on unit on line 738                  78 on unit               
+CHECK_DEADLOCK                          internal procedure  shares stack frame of external procedure lm_per_system_$lock.  
+NOTIFY_TXN                              internal procedure  shares stack frame of external procedure lm_per_system_$lock.  
+SET_WAIT_OWN                            internal procedure  shares stack frame of external procedure lm_per_system_$lock.  
+UNWAIT_ME                            80 internal procedure  is called by several nonquick procedures.  
+UNLOCK_OBJECT                           internal procedure  shares stack frame of external procedure lm_per_system_$lock.  
+SEND_WAKEUP                             internal procedure  shares stack frame of external procedure lm_per_system_$lock.  
+PTR                                  66 internal procedure  is called by several nonquick procedures.  
+VPTR                                 66 internal procedure  is called by several nonquick procedures.  
+VALID_TXN                               internal procedure  shares stack frame of external procedure lm_per_system_$lock.  
+CLEAN_LOCK                           74 internal procedure  is called by several nonquick procedures.  
+CHECK_VERSION                       124 internal procedure  is called by several nonquick procedures.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+REALLY_WAIT              000100 rw_intermediate_give_up_time
+                                                            REALLY_WAIT
+                         000102 rw_event_info               REALLY_WAIT
+                         000112 rw_saved_channel            REALLY_WAIT
+                         000114 rw_saved_ips_mask           REALLY_WAIT
+                         000116 rw_saved_timer              REALLY_WAIT
+                         000120 rw_wait_list                REALLY_WAIT
+SETUP_LOCK               000100 sul_code                    SETUP_LOCK
+                         000101 sul_lock_segs_synchronized  SETUP_LOCK
+SETUP_UNLOCK             000100 ul_code                     SETUP_UNLOCK
+SYNCH_LOCK_SEGMENTS      000100 sl_lock_segx                SYNCH_LOCK_SEGMENTS
+                         000102 sl_new_lock_segments_ptr    SYNCH_LOCK_SEGMENTS
+                         000104 sl_new_n_lock_segments      SYNCH_LOCK_SEGMENTS
+                         000105 sl_save_level               SYNCH_LOCK_SEGMENTS
+UNWAIT_ME                000100 um_lock_object_ptr          UNWAIT_ME
+                         000102 um_lock_waiter_ptr          UNWAIT_ME
+                         000104 um_prev_lock_waiter_ptr     UNWAIT_ME
+                         000106 um_waiters_ptr              UNWAIT_ME
+VPTR                     000100 vptr_lock_virtual_ptr       VPTR
+lm_per_system_$lock      000100 ci_number                   lm_per_system_$lock
+                         000101 code                        lm_per_system_$lock
+                         000102 give_up_time                lm_per_system_$lock
+                         000104 mode_req                    lm_per_system_$lock
+                         000105 f_uid                       lm_per_system_$lock
+                         000106 error_in_unlock_all         lm_per_system_$lock
+                         000116 lock_seg_ptr                lm_per_system_$lock
+                         000120 lock_transaction_table_ptr  lm_per_system_$lock
+                         000122 lock_aux_seg_ptr            lm_per_system_$lock
+                         000124 lock_free_block_ptr         lm_per_system_$lock
+                         000126 lock_object_ptr             lm_per_system_$lock
+                         000130 lock_owner_ptr              lm_per_system_$lock
+                         000132 lock_segments_ptr           lm_per_system_$lock
+                         000134 lock_deadlock_ptr           lm_per_system_$lock
+                         000136 n_lock_deadlock             lm_per_system_$lock
+                         000140 lock_deadlock_txn_ids_ptr   lm_per_system_$lock
+                         000142 lock_segno                  lm_per_system_$lock
+                         000164 fl_lock_object_ptr          FIND_LOCK
+                         000174 fal_lock_object_ptr         FIND_OR_ALLOCATE_LOCK
+                         000204 gf_code                     GET_FREE
+                         000214 lo_lock_object_ptr          LOCK_OBJECT
+                         000224 tl_lock_owner_ptr           TRY_TO_LOCK
+                         000226 tl_mode_needed              TRY_TO_LOCK
+                         000227 tl_mode_req                 TRY_TO_LOCK
+                         000230 tl_my_lock_owner_ptr        TRY_TO_LOCK
+                         000232 tl_owners_transaction_table_ptr
+                                                            TRY_TO_LOCK
+                         000234 tl_owners_ptr               TRY_TO_LOCK
+                         000244 w_lock_waiter_ptr           WAIT
+                         000246 w_prev_lock_waiter_ptr      WAIT
+                         000250 w_waiters_ptr               WAIT
+                         000260 cd_code                     CHECK_DEADLOCK
+                         000262 cd_lock_txn_table_ptr       CHECK_DEADLOCK
+                         000264 cd_txn_idx                  CHECK_DEADLOCK
+                         000265 cd_lock_deadlock_36         CHECK_DEADLOCK
+                         000331 cd_lock_deadlock_72         CHECK_DEADLOCK
+                         000551 cd_call_36                  CHECK_DEADLOCK
+                         000552 cd_call_72                  CHECK_DEADLOCK
+                         000553 cd_small_txn_ids            CHECK_DEADLOCK
+                         000663 cd_auto_txn_ids             CHECK_DEADLOCK
+                         000664 cd_txn_to_notify            CHECK_DEADLOCK
+                         000676 nt_txn_idx                  NOTIFY_TXN
+                         000700 nt_lock_txn_table_ptr       NOTIFY_TXN
+                         000702 nt_code                     NOTIFY_TXN
+                         000712 sw_lock_owner_ptr           SET_WAIT_OWN
+                         000714 sw_owners_ptr               SET_WAIT_OWN
+                         000715 sw_owner_deadlock_inx       SET_WAIT_OWN
+                         000724 uo_found                    UNLOCK_OBJECT
+                         000726 uo_lock_owner_ptr           UNLOCK_OBJECT
+                         000730 uo_lock_waiter_ptr          UNLOCK_OBJECT
+                         000732 uo_owner_ptr                UNLOCK_OBJECT
+                         000734 uo_prev_lock_owner_ptr      UNLOCK_OBJECT
+                         000736 uo_temp_ptr                 UNLOCK_OBJECT
+                         000740 uo_waiter_transaction_table_ptr
+                                                            UNLOCK_OBJECT
+                         000742 uo_waiter_ptr               UNLOCK_OBJECT
+                         000752 sw_code                     SEND_WAKEUP
+                         000753 sw_try_wakeup               SEND_WAKEUP
+                         000754 sw_wakeup_attempt_count     SEND_WAKEUP
+                         000764 vt_code                     VALID_TXN
+                         000765 vt_txix                     VALID_TXN
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+r_e_as              call_ext_out_desc   call_ext_out        call_int_this       call_int_other      return_mac
+tra_ext_1           enable_op           ext_entry           int_entry           op_alloc_           op_freen_
+clock_mac
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+cu_$level_get                 cu_$level_set                 dm_misc_util_$log             dm_per_system_$initiate
+get_ring_                     hcs_$get_alarm_timer          hcs_$reset_ips_mask           hcs_$set_alarm_timer
+hcs_$set_ips_mask             hcs_$wakeup                   ipc_$block                    ipc_$create_ev_chn
+lm_check_for_deadlock_        lm_expand_lock_seg_           lm_hash_$hash_in              lm_hash_$hash_out
+lm_hash_$search               lm_salvage_lock_seg_          lm_signal_$deadlock           lm_signal_$timeout
+lock_manager_$lock_fast       lock_manager_$unlock_fast     sub_err_                      timer_manager_$sleep
+transaction_manager_$get_txn_index                          transaction_manager_$get_txn_index
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+dm_data_$current_txn_id       dm_data_$inner_ring_areap     dm_error_$fast_lock_invalid_reset
+dm_error_$fast_lock_mylock    dm_error_$lock_invalid_mode   dm_error_$lock_invalid_uid    dm_error_$lock_not_found
+dm_error_$lock_table_overflow dm_error_$unimplemented_entry dm_system_data_$lock_ips_mask
+dm_system_data_$max_n_transactions                          error_table_$itt_overflow     error_table_$process_unknown
+error_table_$unimplemented_version                          lm_data_$ev_channel           lm_data_$lock_seg_ptr
+lm_data_$lock_segments_ptr    lm_data_$n_lock_segments      lm_data_$txn_table_ptr
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     70 000337       196 000355       197 000357       198 000361       199 000363       201 000367       204 000400
+    206 000402       208 000406       209 000430       211 000451       212 000455       217 000456       220 000464
+    221 000470       222 000471       224 000513       230 000525       232 000533       233 000543       234 000554
+    235 000556       237 000560       239 000627       241 000631       244 000632       245 000633       247 000637
+    249 000640       252 000654       253 000657       255 000661       257 000665       259 000707       261 000711
+    263 000721       265 000725       268 000726       271 000746       272 000751       274 000752       277 000770
+    278 000773       280 000774       283 001010       284 001013       285 001014       288 001027       289 001033
+    291 001034       294 001046       295 001052       296 001053       298 001054       302 001062       303 001067
+    304 001073       314 001077       310 001102       316 001111       317 001116       318 001134       319 001141
+    321 001144       324 001154       326 001156       327 001176       330 001206       331 001243       332 001252
+    334 001263       336 001264       337 001324       340 001334       342 001342       343 001347       344 001354
+    345 001355       346 001357       347 001360       350 001361       355 001367       356 001373       358 001411
+    361 001420       362 001435       365 001472       371 001473       384 001501       385 001507       387 001527
+    388 001533       389 001544       390 001555       392 001563       393 001565       394 001570       396 001575
+    397 001605       398 001616       399 001645       400 001652       401 001654       402 001657       404 001665
+    408 001666       413 001670       416 001704       421 001705       429 001707       430 001723       433 001736
+    441 001742       451 001744       452 001760       455 001770       456 001772       459 002005       460 002011
+    461 002013       462 002015       463 002017       464 002021       466 002030       472 002034       478 002036
+    479 002050       481 002053       482 002062       484 002070       485 002074       489 002104       490 002114
+    491 002120       492 002123       498 002126       505 002134       506 002147       507 002155       508 002157
+    509 002161       511 002176       515 002177       531 002201       532 002213       535 002231       538 002242
+    540 002255       541 002270       544 002274       548 002322       549 002324       553 002346       554 002361
+    556 002362       560 002363       581 002365       582 002366       584 002370       586 002372       587 002377
+    588 002404       589 002414       590 002425       593 002431       594 002433       595 002440       597 002442
+    598 002444       601 002471       603 002505       605 002506       607 002510       608 002511       610 002512
+    611 002513       615 002523       616 002526       618 002527       620 002533       621 002535       622 002540
+    623 002542       626 002543       627 002545       630 002560       631 002563       632 002577       633 002601
+    634 002603       635 002606       636 002611       637 002624       638 002632       640 002647       642 002651
+    649 002652       667 002654       668 002666       669 002670       672 002703       673 002706       674 002722
+    675 002725       676 002727       677 002732       678 002734       683 002747       686 002774       687 002776
+    688 003002       689 003012       690 003015       691 003016       696 003031       698 003035       703 003044
+    705 003050       706 003054       713 003055       718 003063       735 003065       736 003066       738 003070
+    740 003104       742 003120       744 003141       746 003142       747 003144       749 003150       751 003164
+    753 003171       755 003173       757 003176       758 003207       759 003220       762 003243       764 003263
+    765 003276       767 003306       769 003311       770 003316       771 003323       772 003330       775 003351
+    784 003352       802 003354       803 003355       804 003357       805 003367       806 003373       808 003406
+    811 003415       815 003424       816 003425       818 003427       819 003430       820 003431       821 003433
+    822 003445       824 003452       826 003456       827 003460       829 003463       830 003467       831 003471
+    832 003473       833 003475       834 003476       836 003500       837 003504       838 003506       839 003510
+    840 003512       841 003513       842 003525       843 003535       845 003540       846 003542       847 003544
+    849 003545       850 003546       853 003555       854 003567       855 003572       856 003605       857 003615
+    858 003621       860 003624       861 003627       864 003660       866 003662       867 003666       869 003705
+    871 003717       873 003723       874 003727       876 003734       878 003736       879 003750       880 003754
+    881 003774       884 003775       885 004007       888 004011       893 004012       904 004014       905 004027
+    907 004032       909 004037       912 004065       924 004066       937 004070       938 004074       939 004100
+    940 004110       941 004123       943 004135       944 004140       946 004141       954 004142       969 004150
+    971 004156       972 004167       973 004201       976 004213       977 004215       978 004222       979 004233
+    981 004241       982 004244       983 004246       984 004247       985 004251       987 004252       988 004261
+    991 004265       996 004266      1022 004270      1023 004271      1024 004272      1025 004274      1026 004300
+   1027 004310      1028 004320      1030 004333      1031 004334      1032 004336      1033 004337      1035 004341
+   1036 004345      1039 004346      1041 004361      1046 004365      1047 004377      1050 004407      1051 004410
+   1052 004412      1053 004422      1054 004432      1056 004441      1057 004443      1058 004444      1060 004446
+   1061 004452      1063 004453      1066 004457      1073 004465      1075 004500      1076 004507      1077 004516
+   1079 004517      1080 004521      1081 004526      1082 004536      1083 004547      1084 004552      1086 004602
+   1087 004605      1088 004613      1090 004614      1093 004621      1095 004622      1102 004633      1103 004634
+   1104 004636      1106 004637      1107 004652      1108 004670      1111 004702      1114 004715      1116 004762
+   1118 004763      1119 004765      1123 005040      1134 005041      1139 005047      1147 005062      1156 005070
+   1157 005074      1159 005077      1163 005104      1177 005106      1180 005112      1181 005125      1186 005132
+   1189 005140      1190 005155      1192 005156      1201 005164      1205 005252
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

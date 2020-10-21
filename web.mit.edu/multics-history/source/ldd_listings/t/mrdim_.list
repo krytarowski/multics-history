@@ -1,0 +1,1323 @@
+	COMPILATION LISTING OF SEGMENT mrdim_
+	Compiled by: Multics PL/I Compiler, Release 29, of July 28, 1986
+	Compiled at: Honeywell Bull, Phoenix AZ, SysM
+	Compiled on: 09/21/87  1957.1 mst Mon
+	    Options: optimize map
+
+        1 /****^  ***********************************************************
+        2*        *                                                         *
+        3*        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        4*        *                                                         *
+        5*        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        6*        *                                                         *
+        7*        * Copyright (c) 1972 by Massachusetts Institute of        *
+        8*        * Technology and Honeywell Information Systems, Inc.      *
+        9*        *                                                         *
+       10*        *********************************************************** */
+       11 
+       12 
+       13 
+       14 /****^  HISTORY COMMENTS:
+       15*  1) change(87-06-10,Parisek), approve(87-06-12,MCR7690),
+       16*     audit(87-06-12,Martinson), install(87-09-10,MR12.1-1104):
+       17*     Corrected a stringsize problem.
+       18*  2) change(87-09-08,Parisek), approve(87-09-08,MECR0005),
+       19*     audit(87-09-09,GDixon), install(87-09-10,MR12.1-1104):
+       20*     Expand "quit_mask" field to 504 bits from 72 bits for supporting QUITs to
+       21*     a larger array of daemons.
+       22*  3) change(87-09-17,Parisek), approve(87-09-21,MECR0008),
+       23*     audit(87-09-21,GDixon), install(87-09-21,MR12.1-1114):
+       24*     Return with error if status code equals error_table_$unable_to_do_io from
+       25*     calling mrd_util_.  This status code represents a condition error
+       26*     signalled from mrd_util_. (phx20928)
+       27*                                                   END HISTORY COMMENTS */
+       28 
+       29 mrdim_: proc;
+       30 	return;					/* this is an undefined entry */
+       31 
+       32 /* MRDIM_ - message routing DIM.
+       33*
+       34*   This module replaces "ttydim_" for daemon processes which do not have stream terminals.
+       35*   It sends messages to and gets messages from a message coordinator which is part of the
+       36*   system control process group.
+       37*   The initializer may operate several consoles and route messages to them as it pleases.
+       38*
+       39*   Coded by THVV from Feiertag's "ttydim_"
+       40*   Modified by Dennis Capps
+       41*   Attach entry modified for the access isolation mechanism on 10/16/74 - J. Whitmore
+       42*   Modified by J. C. Whitmore, 10/78, to zero words on first attach instead of calling hcs_$truncate_seg (BUG writearound)
+       43*   Modified by B. Margulies 11/81 for -login_channel.
+       44*   */
+       45 
+       46 dcl (addr, index, length, null, size, string, substr, rtrim) builtin;
+       47 
+       48 dcl (tp, sp, vp, p) ptr,				/* temporary storage */
+       49     (state, n, nt, k, rw) fixed bin init (0),
+       50      code fixed bin (35),
+       51      em (4) fixed bin (71);
+       52 
+       53 dcl  sysdir char (168) int static init (">system_control_1"), /* The directory in which to find the tables */
+       54      RINGS (3) fixed bin (6) int static options (constant) init (4, 4, 4),
+       55      OWAIT fixed bin static options (constant) init (123),	/* err code from mrdi_util_ */
+       56      pigeon_hole char (32) init (""),
+       57      USERID char (32),
+       58      message char (132);
+       59 
+       60 dcl  ourmp ptr,					/* Pointer to mseg for this function */
+       61      mcmp ptr int static,				/* pointer to mseg for message coord'r */
+       62      messp ptr int static init (null);			/* Periferal info on read. */
+       63 
+       64 dcl
+       65      need_priv bit (1) int static init ("0"b),		/* switch for using privileges */
+       66      mask bit (36) aligned init ("0"b),			/* ips mask temporary */
+       67      created_seg bit (1) init ("0"b),
+       68      init bit (1) int static init ("0"b),
+       69      leave_locked bit (1) init ("0"b),
+       70      quit_mask bit (504)int static init ("0"b),
+       71      source_init bit (1) init ("0"b),
+       72      testing bit (1) int static init ("0"b),
+       73      wrote_sentinel bit (1) init ("0"b);
+       74 
+       75 dcl  lock_wait_time fixed bin init (300),
+       76      i fixed bin,
+       77      lcode fixed bin (35) init (0),
+       78      level fixed bin,
+       79      reset_priv fixed bin (35);
+       80 
+       81 dcl 1 based_mrt_index based (p),
+       82     2 dummy fixed bin (71),
+       83     2 mrt_source fixed bin (35),
+       84     2 mrt_stream fixed bin (35);
+       85 
+       86 declare 1 dump int static aligned like message_block;
+       87 
+       88 dcl 1 first_SDB int static aligned,			/* The first stream data block in the stream
+       89*						   data list for this process. */
+       90     2 dim_name char (32),				/* the name of this DIM */
+       91     2 device_name_list ptr,				/* threaded list of device id's */
+       92     2 next_device ptr,				/* pointer to next entry in threaded list */
+       93     2 device_name_size fixed bin,			/* number of chars in device name */
+       94     2 device_name char (32),				/* device id */
+       95     2 pad1 fixed bin,
+       96     2 ipc_ep ptr,					/* to event list for block in read */
+       97     2 proto_ep ptr,					/* to event list for block in att & det */
+       98     2 nextp ptr init (null),				/* pointer to next stream block in chain */
+       99     2 ourmess ptr,					/* Pointer to mseg for this function */
+      100     2 hismess ptr,					/* Pointer to mseg for message coord'r */
+      101     2 source char (32),				/* symbolic name of I/O source  */
+      102     2 stream char (32),				/* symbolic name of I/O stream  */
+      103     2 source_index fixed bin,				/* in MRT  */
+      104     2 stream_index fixed bin,
+      105     2 flags,
+      106       3 valid bit (1) unal init ("0"b),			/* "1"b = entry-in-use, "0"b = not_in_use */
+      107       3 read bit (1) unal,				/* "1"b = stream attached for reading. */
+      108       3 write bit (1) unal,				/* "1"b = stream attached for writing. */
+      109       3 active bit (1) unal,				/* For compatibility with message_coordr_ */
+      110       3 more bit (1) unal,				/* "1"b = More text in this message than we've given */
+      111       3 unused bit (31)unal,
+      112     2 prev_trans,
+      113       3 first_block fixed bin,
+      114       3 end_block fixed bin,
+      115       3 current_block fixed bin,
+      116       3 offset fixed bin;
+      117 
+      118 dcl 1 SDB based (tp) aligned,				/* one entry in list of stream control blocks */
+      119     2 dim_name char (32),				/* the name of this DIM */
+      120     2 device_name_list ptr,				/* threaded list of device id's */
+      121     2 next_device ptr,				/* pointer to next entry in threaded list */
+      122     2 device_name_size fixed bin,			/* number of chars in device name */
+      123     2 device_name char (32),				/* device id */
+      124     2 pad1 fixed bin,
+      125     2 ipc_ep ptr,					/* to event list for block in read */
+      126     2 proto_ep ptr,					/* to event list for block in att & det */
+      127     2 nextp ptr,					/* pointer to next stream block in chain */
+      128     2 ourmess ptr,					/* Pointer to mseg for this function */
+      129     2 hismess ptr,					/* Pointer to mseg for message coord'r */
+      130     2 source char (32),				/* symbolic name of I/O source  */
+      131     2 stream char (32),				/* symbolic name of I/O stream  */
+      132     2 source_index fixed bin,				/* in MRT  */
+      133     2 stream_index fixed bin,
+      134     2 flags,
+      135       3 valid bit (1) unal,				/* "1"b = entry-in-use, "0"b = not_in_use */
+      136       3 read bit (1) unal,				/* "1"b = stream attached for reading. */
+      137       3 write bit (1) unal,				/* "1"b = stream attached for writing. */
+      138       3 active bit (1) unal,				/* For compatibility with message_coordr_ */
+      139       3 more bit (1) unal,				/* "1"b = More text in this message than we've given */
+      140       3 unused bit (31)unal,
+      141     2 prev_trans,
+      142       3 first_block fixed bin,
+      143       3 end_block fixed bin,
+      144       3 current_block fixed bin,
+      145       3 offset fixed bin;
+      146 
+  1     1 /* BEGIN INCLUDE FILE ... line_types.incl.pl1  */
+  1     2 
+  1     3 /* Written  November 10 1975 by Paul Green */
+  1     4 /* Modified October 1978 by Larry Johnson to include line_type_names */
+  1     5 /* Modified 12/19/78 by J. Stern to add POLLED_VIP line type */
+  1     6 /* Modified 9/27/79 by J. Stern to add X25LAP line type */
+  1     7 /* Modified Spring 1981 by Charles Hornig to add HDLC line type */
+  1     8 /* Modified May 1981 by Robert Coren to add COLTS line type */
+  1     9 /* Modified September 1984 by Robert Coren to correctly count VIP as a synchronous line type */
+  1    10 
+  1    11 
+  1    12 /****^  HISTORY COMMENTS:
+  1    13*  1) change(86-02-25,Negaret), approve(87-07-13,MCR7679),
+  1    14*     audit(87-07-16,Brunelle), install(87-08-04,MR12.1-1056):
+  1    15*     Add a DSA line type.
+  1    16*  2) change(87-03-17,Beattie), approve(87-07-13,MCR7656),
+  1    17*     audit(87-07-16,Brunelle), install(87-08-04,MR12.1-1056):
+  1    18*     Add HASP_OPR to identify HASP workstation consoles with login service.
+  1    19*                                                   END HISTORY COMMENTS */
+  1    20 
+  1    21 
+  1    22 declare   (LINE_MC            initial (-2),
+  1    23        	 LINE_TELNET	initial (-1),
+  1    24            LINE_UNKNOWN       initial (0),
+  1    25 	 LINE_ASCII	initial (1),
+  1    26 	 LINE_1050	initial (2),
+  1    27 	 LINE_2741	initial (3),
+  1    28 	 LINE_ARDS	initial (4),
+  1    29 	 LINE_SYNCH	initial (5),
+  1    30 	 LINE_G115	initial (6),
+  1    31 	 LINE_BSC		initial (7),
+  1    32 	 LINE_ETX		initial (8),
+  1    33 	 LINE_VIP		initial (9),
+  1    34 	 LINE_ASYNC1	initial (10),
+  1    35 	 LINE_ASYNC2	initial (11),
+  1    36 	 LINE_ASYNC3	initial (12),
+  1    37 	 LINE_SYNC1	initial (13),
+  1    38 	 LINE_SYNC2	initial (14),
+  1    39 	 LINE_SYNC3	initial (15),
+  1    40 	 LINE_POLLED_VIP	initial (16),
+  1    41 	 LINE_X25LAP	initial (17),
+  1    42 	 LINE_HDLC	initial (18),
+  1    43 	 LINE_COLTS	initial (19),
+  1    44 	 LINE_DSA           initial (20),
+  1    45 	 LINE_HASP_OPR	initial (21)
+  1    46 	) fixed bin internal static options (constant);
+  1    47 
+  1    48 dcl  max_line_type fixed bin int static options (constant) init (21);
+  1    49 
+  1    50 declare  n_sync_line_types fixed bin int static options (constant) init (10);
+  1    51 
+  1    52 declare  sync_line_type (10) fixed bin int static options (constant) init (5, 6, 7, 9, 13, 14, 15, 16, 17, 18);
+  1    53 
+  1    54 dcl  line_types (-2:21) char (16) int static options (constant) init (
+  1    55      "MC",                                                  /* -2 */
+  1    56      "TELNET",					/* -1 */
+  1    57      "none",					/* 0 */
+  1    58      "ASCII",					/* 1 */
+  1    59      "1050",					/* 2 */
+  1    60      "2741",					/* 3 */
+  1    61      "ARDS",					/* 4 */
+  1    62      "Sync",					/* 5 */
+  1    63      "G115",					/* 6 */
+  1    64      "BSC",					/* 7 */
+  1    65      "202ETX",					/* 8 */
+  1    66      "VIP",					/* 9 */
+  1    67      "ASYNC1",					/* 10 */
+  1    68      "ASYNC2",					/* 11 */
+  1    69      "ASYNC3",					/* 12 */
+  1    70      "SYNC1",					/* 13 */
+  1    71      "SYNC2",					/* 14 */
+  1    72      "SYNC3",					/* 15 */
+  1    73      "POLLED_VIP",					/* 16 */
+  1    74      "X25LAP",					/* 17 */
+  1    75      "HDLC",					/* 18 */
+  1    76      "COLTS",					/* 19 */
+  1    77      "DSA",					/* 20 */
+  1    78      "HASP_OPR");					/* 21 */
+  1    79 
+  1    80 /* END INCLUDE FILE ... line_types.incl.pl1  */
+      147 
+  2     1 /* ====== BEGIN INCLUDE SEGMENT	syscon_mseg.incl.pl1 ====================================== */
+  2     2 
+  2     3 
+  2     4 
+  2     5 /****^  HISTORY COMMENTS:
+  2     6*  1) change(87-09-02,Parisek), approve(87-09-03,MECR0005),
+  2     7*     audit(87-09-02,GDixon), install(87-09-03,MR12.1-1098):
+  2     8*     Increase quit_bits from 72 bits to 504 bits so more than 72 sources
+  2     9*     may enable quit without error. (phx20974)
+  2    10*                                                   END HISTORY COMMENTS */
+  2    11 
+  2    12 
+  2    13 /* Message Coordinator message segment declaration.  Each daemon process
+  2    14*   enqueues its messages in a segment like this one.
+  2    15*
+  2    16*   The segment consists of a header followed by many message blocks,
+  2    17*   each  capable  of  holding  a  message  of  132  characters  plus
+  2    18*   information  on  when  the  message was sent, who it's from, etc.
+  2    19*   These blocks are "allocated" only as needed and placed on a  free
+  2    20*   storage list when freed.  Blocks in use are chained together in a
+  2    21*   first-in-first-out queue.   */
+  2    22 
+  2    23 dcl  buff_len fixed bin init (132) internal static;
+  2    24 
+  2    25 dcl 1 syscon_mseg aligned based,			/* This header is of length 24 dec 30 oct words */
+  2    26     2 mlock bit (36) aligned,
+  2    27     2 current_process_id bit (36),
+  2    28     2 ipc_el,					/* mrdim_ blocks on this list for normal reads */
+  2    29       3 n fixed bin,
+  2    30       3 pad fixed bin,
+  2    31       3 channel fixed bin (71),
+  2    32     2 proto_el,					/* mrdim_ blocks on this list for attach and detach */
+  2    33       3 n fixed bin,
+  2    34       3 pad fixed bin,
+  2    35       3 channel fixed bin (71),
+  2    36     2 flags unaligned,
+  2    37       3 test_mode bit (1),				/* ON if running in test environment */
+  2    38       3 receiver_woken bit (1),			/* ON if wakeup sent but not received yet */
+  2    39       3 unused bit (34),
+  2    40     2 first_message fixed bin,			/* index of head of message chain */
+  2    41     2 last_message fixed bin,				/* index of tail of message chain */
+  2    42     2 first_proto fixed bin,				/* index of head of protocol chain */
+  2    43     2 last_proto fixed bin,				/* index of tail of protocol chain */
+  2    44     2 first_free_buffer fixed bin,			/* head of free chain */
+  2    45     2 last_assigned_buffer fixed bin,			/* high water mark of buffers ever used */
+  2    46     2 no_of_streams fixed bin,
+  2    47     2 quit_bits bit (504),				/* used in mc.message to mark a source waiting to be quit */
+  2    48     2 locked_by_pid bit (36),				/* process id of locker */
+  2    49     2 mescount fixed bin,				/* Count of unprinted messages */
+  2    50     2 output_wait bit (1),				/* TRUE if in output wait - mc_wakeups resets */
+  2    51     2 pad fixed bin,
+  2    52     2 message (1) like message_block aligned;		/* the array of messages */
+  2    53 
+  2    54 dcl 1 message_block aligned based (messp),		/* 56 dec 70 oct words */
+  2    55     2 time_sent fixed bin (71),
+  2    56     2 from_source char (32),
+  2    57     2 from_stream char (32),
+  2    58     2 source_index fixed bin,				/* index in MRT */
+  2    59     2 stream_index fixed bin,				/* .. */
+  2    60     2 next_message fixed bin,				/* foward pointer of message chain */
+  2    61     2 flags unal,
+  2    62       3 continue bit (1),				/* ON if message continued in next block */
+  2    63       3 introduction bit (1),				/* ON if message is an introduction */
+  2    64       3 farewell bit (1),				/* ON if message is farewell */
+  2    65       3 sentinel bit (1),				/* ON if special formatting wanted */
+  2    66       3 trace bit (1),				/* used only by dump_msg */
+  2    67       3 unused bit (31) unal,
+  2    68     2 length fixed bin,				/* number of characters in body */
+  2    69     2 message_body char (132);			/* text of message */
+  2    70 
+  2    71 dcl 1 debug_info based aligned,
+  2    72     2 flag fixed bin (71),
+  2    73     2 time fixed bin (71),
+  2    74     2 last_pid bit (36),
+  2    75     2 first_msg fixed bin,
+  2    76     2 last_msg fixed bin,
+  2    77     2 first_pro fixed bin,
+  2    78     2 last_pro fixed bin,
+  2    79     2 free_chain fixed bin;
+  2    80 
+  2    81 /* ------ END INCLUDE SEGMENT		syscon_mseg.incl.pl1 -------------------------------------- */
+      148 
+  3     1 /* BEGIN INCLUDE FILE ... tty_types.incl.pl1 ... Written 750415 by Paul Green */
+  3     2 
+  3     3 dcl (TYPE_UNKNOWN   initial (0),
+  3     4      TYPE_1050	initial (1),
+  3     5      TYPE_2741	initial (2),
+  3     6      TYPE_TTY37	initial (3),
+  3     7      TYPE_TN300	initial (4),
+  3     8      TYPE_ARDS	initial (5),
+  3     9      TYPE_CORR	initial (6),
+  3    10      TYPE_TTY33	initial (7),
+  3    11      TYPE_TTY38	initial (8),
+  3    12      TYPE_G115	initial (9),
+  3    13      TYPE_ASCII	initial (11)
+  3    14      ) fixed bin internal static options (constant);
+  3    15 
+  3    16 /* END INCLUDE FILE ... tty_types.incl.pl1 */
+      149 
+      150 
+      151 dcl 1 st based (sp) aligned,				/* breakdown of I/O system status word */
+      152     2 code fixed bin (35),				/* error status code (0 = OK) */
+      153     2 comp bit (4) unaligned,				/* completion status, LI, LC, PI, PC */
+      154     2 eof bit (1) unaligned,				/* end-of-file */
+      155     2 pad1 bit (4) unaligned,
+      156     2 eod bit (1) unaligned,				/* end of physical data */
+      157     2 pad2 bit (4) unaligned,
+      158     2 abs bit (1) unaligned,
+      159     2 det bit (1) unaligned,				/* detach flag */
+      160     2 quit bit (1) unaligned,				/* quit flag */
+      161     2 abort bit (1) unaligned,			/* abort flag */
+      162     2 callx bit (18) unaligned;			/* rel pointer to last transaction */
+      163 
+      164 dcl  acc_mode fixed bin (35);				/* mode to satisfy the compiler */
+      165 
+      166 dcl 1 syscon_template aligned based,			/* overlay for xxx.message to truncate above system_low AIM */
+      167     2 lock_word fixed bin (35),
+      168     2 words (2047) fixed bin (35);			/* two pages worth of stuff to zero out */
+      169 
+      170 dcl 1 access based (addr (acc_mode)),
+      171     2 access_pad bit (32) unaligned,
+      172     2 R bit (1) unaligned,				/* the READ bit for the access mode */
+      173     2 E bit (1) unaligned,				/* the EXECUTE bit... */
+      174     2 W bit (1) unaligned,				/* the WRITE bit.... */
+      175     2 A bit (1) unaligned;				/* the APPEND bit (obsolete for segs)... */
+      176 
+      177 dcl
+      178      com_err_ ext entry options (variable),
+      179      continue_to_signal_ entry (fixed bin (35)),
+      180      cu_$cl ext entry,
+      181      cu_$level_get entry () returns (fixed bin),
+      182      get_process_id_ ext entry returns (bit (36) aligned),
+      183      ioa_$rs ext entry options (variable),
+      184      get_group_id_$tag_star ext entry () returns (char (32)),
+      185      ipc_$create_ev_chn ext entry (fixed bin (71), fixed bin (35)),
+      186      ipc_$block ext entry (ptr, ptr, fixed bin (35)),
+      187      ipc_$mask_ev_calls ext entry (fixed bin (35)),
+      188      ipc_$unmask_ev_calls ext entry (fixed bin (35)),
+      189      hcs_$append_branchx ext entry (char (*), char (*), fixed bin (5), (3) fixed bin (6),
+      190      char (*), fixed bin (1), fixed bin (1), fixed bin (24), fixed bin (35)),
+      191      hcs_$assign_linkage ext entry (fixed bin, ptr, fixed bin (35)),
+      192      hcs_$fs_get_mode entry (ptr, fixed bin (35), fixed bin (35)),
+      193      hcs_$initiate ext entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35)),
+      194      hcs_$set_ips_mask entry (bit (36) aligned, bit (36) aligned),
+      195      mrd_util_$abort ext entry (ptr, fixed bin, fixed bin, fixed bin (35)),
+      196      mrd_util_$discard_remainder ext entry (ptr, fixed bin, fixed bin (35)),
+      197      mrd_util_$protocol ext entry (ptr, ptr, fixed bin, fixed bin, fixed bin, char (*), fixed bin (35)),
+      198      mrd_util_$read ext entry (ptr, ptr, fixed bin, fixed bin, fixed bin, char (*), ptr, fixed bin, fixed bin (35)),
+      199      mrd_util_$write ext entry (ptr, ptr, fixed bin, fixed bin, fixed bin, fixed bin, fixed bin (35)),
+      200      mrd_util_$write_dont_flood ext entry (ptr, ptr, fixed bin, fixed bin, fixed bin, fixed bin, fixed bin (35)),
+      201      mrd_util_$read_status ext entry (ptr, ptr, fixed bin (35)),
+      202      phcs_$ring_0_message ext entry (char (*)),
+      203      set_lock_$lock ext entry (bit (36) aligned, fixed bin, fixed bin (35)),
+      204      set_lock_$unlock ext entry (bit (36) aligned, fixed bin (35)),
+      205      system_privilege_$dir_priv_off entry (fixed bin (35)),
+      206      system_privilege_$dir_priv_on entry (fixed bin (35)),
+      207      system_privilege_$initiate entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35));
+      208 dcl  user_info_$terminal_data entry options (variable);
+      209 
+      210 dcl  error_table_$invalid_lock_reset ext fixed bin,
+      211      error_table_$ionmat ext fixed bin,			/* stream already attached */
+      212      error_table_$lock_wait_time_exceeded ext fixed bin,
+      213      error_table_$locked_by_this_process ext fixed bin,
+      214      error_table_$noentry ext fixed bin,
+      215      error_table_$moderr ext fixed bin (35),
+      216      error_table_$unable_to_do_io ext fixed bin (35),
+      217      error_table_$undefined_order_request ext fixed bin;
+      218 
+      219 dcl (any_other, linkage_error) condition;
+      220 
+      221 /*  */
+      222 /* ===================================================== */
+      223 
+      224 mrd_attach: entry (attname, attype, attchan, mode, attstat, attptr); /* entry to attach stream */
+      225 
+      226 dcl  attname char (*),				/* stream name (e.g. user_i/o) */
+      227      attype char (*),				/* device type name ("mrd") */
+      228      attchan char (*),				/* stream channel name */
+      229      mode char (*),					/* attachment mode */
+      230      attstat bit (72) aligned,			/* I/O system status code (returned) */
+      231      attptr ptr;					/* device attachment pointer (returned) */
+      232 
+      233 dcl  mode_bits bit (36) init ("0"b);			/* For call to parse_mode */
+      234 
+      235 declare  attach_channel_name character (32);
+      236 
+      237 	attach_channel_name = attchan;
+      238 	if attach_channel_name = "-login_channel"
+      239 	then call user_info_$terminal_data ("", "", attach_channel_name);
+      240 
+      241 	attstat = "0"b;				/* clear status code */
+      242 	sp = addr (attstat);			/* pick up pointer to status code argument */
+      243 	if attptr ^= null then do;			/* this is a multiple attachment, no good */
+      244 	     st.code = error_table_$ionmat;		/* return error code */
+      245 	     return;				/* return */
+      246 	end;
+      247 
+      248 	if ^init then do;				/* be sure we are initialized */
+      249 
+      250 	     USERID = get_group_id_$tag_star ();	/* get process name */
+      251 	     level = cu_$level_get ();		/* get validation level of process */
+      252 						/* see if process has access to coord message seg */
+      253 	     pigeon_hole = "mc.message";		/* name of message seg */
+      254 
+      255 	     call hcs_$initiate (sysdir, pigeon_hole, "", 0, 1, mcmp, code); /* get the pointer */
+      256 	     if mcmp = null then go to check_priv;	/* we should have had access, try for priv initiate. */
+      257 						/* mc.message is assumed to be at the */
+      258 						/* lowest access class in the system.  */
+      259 
+      260 	     call hcs_$fs_get_mode (mcmp, acc_mode, code); /* check real effective access */
+      261 	     if code ^= 0 then go to atterr;		/* bad news */
+      262 
+      263 	     if ^(access.R & access.W) then do;		/*  are we restricted by access isolation? */
+      264 						/* yes, see if priv initiate is possible */
+      265 
+      266 check_priv:	on linkage_error begin;		/* in case we don't have access to gate */
+      267 		     code = error_table_$moderr;	/* tell caller  he has no access */
+      268 		     go to atterr;			/* and return; */
+      269 		end;
+      270 
+      271 		call system_privilege_$initiate (sysdir, pigeon_hole, "", 0, 1, mcmp, code);
+      272 		if mcmp = null then go to atterr;	/* this should never happen */
+      273 		revert linkage_error;		/* this must be off for the next part */
+      274 		need_priv = "1"b;			/* if we needed priv here, we will need it later */
+      275 	     end;
+      276 	     init = "1"b;				/* Let's not go through this again */
+      277 	     messp = addr (dump);			/* last item to initialize */
+      278 
+      279 	end;
+      280 
+      281 /* Search stream data list to see if this attachment is already made. */
+      282 	tp = addr (first_SDB);			/* get pointer to first entry in stream list */
+      283 	vp = null;				/* use vp to record first vacant entry (if any) */
+      284 	do while (tp ^= null);			/* search entire stream list */
+      285 	     p = tp;				/* keep track of last entry in p */
+      286 	     if ^SDB.flags.valid then do;		/* is this entry an unused (^valid) entry? */
+      287 		if vp = null then vp = tp;		/* record first vacant entry found in list */
+      288 	     end;
+      289 	     else if SDB.source = attach_channel_name then /* not vacant, is attach_channel_name-attname already attached? */
+      290 		do;
+      291 		if ^source_init then
+      292 		     do;
+      293 		     source_init = "1"b;
+      294 		     ourmp = SDB.ourmess;		/* So we don't have to initiate > once */
+      295 		end;
+      296 		if SDB.stream = attname then
+      297 		     do;
+      298 		     attptr = tp;			/* if so, return attachment ptr to this entry */
+      299 		     go to attrtn;			/* and return to caller */
+      300 		end;
+      301 	     end;
+      302 	     tp = SDB.nextp;			/* get pointer to next entry (if any) in list */
+      303 	end;
+      304 	if vp = null then do;			/* if no vacant entry found in stream list, */
+      305 	     i = size (SDB);
+      306 	     call hcs_$assign_linkage (i, vp, code);	/* then we must allocate space for a new entry */
+      307 	     string (vp -> SDB.flags) = "0"b;		/* initialize new stream list entry */
+      308 	     vp -> SDB.nextp = null;			/* indicate new entry is last entry in list */
+      309 	     p -> SDB.nextp = vp;			/* thread new entry into stream list */
+      310 	end;
+      311 	tp, attptr = vp;				/* set caller's attachment pointer */
+      312 
+      313 
+      314 /* Fill in SDB */
+      315 	SDB.dim_name = "mrd_";
+      316 	SDB.device_name_list = addr (SDB.next_device);	/* Pointer to list of device names. */
+      317 	SDB.next_device = null;			/* This is last entry in list of device names. */
+      318 	i = index (attach_channel_name, " ");
+      319 	if i = 0 then
+      320 	     SDB.device_name_size = length (attach_channel_name);
+      321 	else
+      322 	SDB.device_name_size = i - 1;
+      323 	SDB.device_name = attach_channel_name;
+      324 	SDB.source = attach_channel_name;
+      325 	SDB.stream = attname;
+      326 	SDB.hismess = mcmp;
+      327 
+      328 
+      329 	if ^source_init then
+      330 	     do;
+      331 						/* Initiate the message segment for this source */
+      332 	     pigeon_hole = substr (attach_channel_name, 1, SDB.device_name_size) || ".message";
+      333 	     if need_priv then
+      334 		call system_privilege_$initiate (sysdir, pigeon_hole, "", 0, 1, ourmp, code);
+      335 	     else call hcs_$initiate (sysdir, pigeon_hole, "", 0, 1, ourmp, code);
+      336 	     if ourmp = null then
+      337 		do;
+      338 		if code = error_table_$noentry then	/* see if we can create the message seg */
+      339 		     do;
+      340 		     USERID = get_group_id_$tag_star ();
+      341 		     if need_priv then do;		/* we can and need to use system priv */
+      342 			reset_priv = 1;		/* if this is 0, we set the priv */
+      343 			mask = "0"b;		/* old ips mask to be reset if not null */
+      344 
+      345 			on any_other begin;		/* be sure we cleanup if an error occurs */
+      346 			     if reset_priv = 0 then
+      347 				call system_privilege_$dir_priv_off (reset_priv);
+      348 			     reset_priv = 0;
+      349 			     if mask then
+      350 				call hcs_$set_ips_mask (mask, ("0"b));
+      351 			     mask = "0"b;
+      352 			     call continue_to_signal_ ((0));
+      353 			end;
+      354 
+      355 			call hcs_$set_ips_mask ((36)"0"b, mask); /* don't want to be interrupted */
+      356 			call system_privilege_$dir_priv_on (reset_priv); /* get dir priv */
+      357 
+      358 			call hcs_$append_branchx (sysdir, pigeon_hole, 1011b, RINGS, USERID, 0, 0, 0, code);
+      359 
+      360 			if reset_priv = 0 then
+      361 			     call system_privilege_$dir_priv_off (reset_priv);
+      362 			reset_priv = 1;		/* don't reset it twice */
+      363 			call hcs_$set_ips_mask (mask, ("0"b)); /* reset the old mask */
+      364 			mask = "0"b;		/* clear it out */
+      365 			revert any_other;
+      366 		     end;
+      367 		     else call hcs_$append_branchx (sysdir, pigeon_hole, 1011b, RINGS, USERID, 0, 0, 0, code);
+      368 		     if code ^= 0 then go to atterr;
+      369 		     if need_priv then
+      370 			call system_privilege_$initiate (sysdir, pigeon_hole, "", 0, 1, ourmp, code);
+      371 		     else call hcs_$initiate (sysdir, pigeon_hole, "", 0, 1, ourmp, code);
+      372 		     if ourmp = null then goto atterr;
+      373 		     created_seg = "1"b;		/* So we can mention it later */
+      374 		end;
+      375 		else goto atterr;
+      376 	     end;
+      377 
+      378 /* Initialize our message segment */
+      379 	     call ipc_$mask_ev_calls (code);
+      380 lock_loop:
+      381 	     call set_lock_$lock (ourmp -> syscon_mseg.mlock, lock_wait_time, code);
+      382 	     if code ^= 0 then if code = error_table_$lock_wait_time_exceeded then
+      383 		     do;
+      384 		     if testing then
+      385 			do;
+      386 			call com_err_ (code, "mrdim_");
+      387 			call cu_$cl;
+      388 		     end;
+      389 		     else call phcs_$ring_0_message ("Unable to lock daemon message segment");
+      390 		     goto lock_loop;
+      391 		end;
+      392 		else if code = error_table_$locked_by_this_process then leave_locked = "1"b;
+      393 		else if code ^= error_table_$invalid_lock_reset then goto atterr;
+      394 
+      395 	     ourmp -> syscon_template.words (*) = 0;	/* Zero all but the lock word */
+      396 						/* to get around hcs_$truncate bug for sys priv initiate */
+      397 
+      398 	     ourmp -> syscon_mseg.current_process_id = get_process_id_ ();
+      399 						/* Fill in event lists */
+      400 	     ourmp -> syscon_mseg.ipc_el.n = 1;
+      401 	     ourmp -> syscon_mseg.proto_el.n = 1;
+      402 	     call ipc_$create_ev_chn (ourmp -> syscon_mseg.ipc_el.channel, code);
+      403 	     if code ^= 0 then goto latterr;
+      404 	     call ipc_$create_ev_chn (ourmp -> syscon_mseg.proto_el.channel, code);
+      405 	     if code ^= 0 then go to latterr;
+      406 	     ourmp -> syscon_mseg.flags.test_mode = testing;
+      407 
+      408 	     if ^leave_locked then call set_lock_$unlock (ourmp -> syscon_mseg.mlock, lcode);
+      409 	     call ipc_$unmask_ev_calls (code);
+      410 
+      411 	end;
+      412 
+      413 	SDB.ipc_ep = addr (ourmp -> syscon_mseg.ipc_el);
+      414 	SDB.proto_ep = addr (ourmp -> syscon_mseg.proto_el);
+      415 	SDB.ourmess = ourmp;
+      416 
+      417 /* Now let's introduce ourself to the message coordinator.  */
+      418 /* Construct a message. */
+      419 	call ioa_$rs ("^a function attaching ^a stream.",
+      420 	     message, i, attach_channel_name, attname);
+      421 
+      422 	p = addr (em);				/* Preparation for reciept of acknowledgement */
+      423 
+      424 /* Send introduction.  (This entry to mrd_util_ is really mrd_util_$write
+      425*   except that it wakes up a different channel & puts messages in a different chain.)  */
+      426 	call mrd_util_$protocol (tp, addr (message), 0, i, nt, "attach", code);
+      427 	if code ^= 0 then goto atterr;
+      428 
+      429 /* Wait for acknowledgement. */
+      430 	call ipc_$block (SDB.proto_ep, p, code);
+      431 	SDB.source_index = based_mrt_index.mrt_source;
+      432 						/* All future correspondence must */
+      433 	SDB.stream_index = based_mrt_index.mrt_stream;	/* refer to these invoice numbers */
+      434 	substr (quit_mask, SDB.source_index, 1) = "1"b;
+      435 	ourmp -> syscon_mseg.no_of_streams = ourmp -> syscon_mseg.no_of_streams + 1;
+      436 
+      437 	if created_seg then
+      438 	     do;
+      439 	     call ioa_$rs ("Created ^a>^a.message", message, i, sysdir, attach_channel_name);
+      440 	     call mrd_util_$write (tp, addr (message), 0, i, nt, state, code);
+      441 	     if code = error_table_$unable_to_do_io then goto atterr;
+      442 						/* Condition error */
+      443 	end;
+      444 
+      445 	SDB.flags.valid = "1"b;			/* This SDB is being used. */
+      446 	SDB.flags.more = "0"b;
+      447 attrtn:
+      448 	st.eof = "1"b;				/* indicate stream at "end of file" */
+      449 	return;					/* and return to caller */
+      450 
+      451 latterr:	if ^leave_locked then call set_lock_$unlock (ourmp -> syscon_mseg.mlock, lcode);
+      452 	call ipc_$unmask_ev_calls (lcode);
+      453 
+      454 atterr:	st.code = code;				/* here on error, return status code to caller */
+      455 	st.det = "1"b;				/* indicate stream not attached */
+      456 	return;
+      457 
+      458 /*  */
+      459 /* ===================================================== */
+      460 
+      461 mrd_write: entry (SDBptr, wp, offset, ne, net, rwstat);	/* entry to write on stream */
+      462 
+      463 dcl  SDBptr ptr,					/* attachment pointer to entry in stream list */
+      464      wp ptr,					/* pointer to base of user's workspace */
+      465      offset fixed bin,				/* character offset from wp */
+      466      ne fixed bin,					/* number of elements (characters) to write (or read) */
+      467      net fixed bin,					/* number of elements actually written (or read) */
+      468      rwstat bit (72) aligned;				/* I/O system status code */
+      469 
+      470 	tp = SDBptr;				/* get pointer to entry for this stream */
+      471 	rwstat = "0"b;				/* initialize status code to zero */
+      472 	sp = addr (rwstat);				/* get pointer to status code argument */
+      473 	if ne = 0 then go to wrtn;			/* skip to return if nothing to write */
+      474 	nt = 0;					/* initialize elements-written to zero */
+      475 	n = ne;					/* pick up number of elements to write */
+      476 	k = offset;				/* pick up element offset from wp */
+      477 wloop:	call mrd_util_$write_dont_flood (tp, wp, k, n, nt, state, code);
+      478 	if code = OWAIT then do;
+      479 	     call ipc_$block (SDB.ipc_ep, addr (em), code);
+      480 	     go to wloop;
+      481 	end;
+      482 	else if code = error_table_$unable_to_do_io then goto wrerr;
+      483 						/* Condition error */
+      484 	if n ^= nt then				/* if elements-written < elements-requested, */
+      485 	     do;
+      486 	     k = k + nt;				/* adjust element offset by elements transferred */
+      487 	     n = n - nt;				/* adjust element count to elements remaining */
+      488 	     nt = 0;				/* reset  elements transferred to zero and */
+      489 	     if n ^= 0 then go to wloop;		/* if elements remaining > 0, try again to write */
+      490 	end;
+      491 
+      492 wrtn:	st.eof = "1"b;				/* indicate stream at "end-of-file" */
+      493 	st.comp = "1110"b;				/* return I/O completion indicators */
+      494 	net = ne;					/* indicate that all elements were transferred */
+      495 	return;
+      496 wrerr:    st.code = code;
+      497 	return;
+      498 
+      499 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+      500 
+      501 mrd_read:	entry (SDBptr, wp, offset, ne, net, rwstat);	/* entry to read from stream */
+      502 
+      503 	tp = SDBptr;				/* get pointer to entry for this stream */
+      504 	rwstat = "0"b;				/* initialize status code to zero */
+      505 	sp = addr (rwstat);				/* get pointer to status code argument */
+      506 	if ne = 0 then go to rdrtn;			/* skip to return if zero elements requested */
+      507 	net = 0;					/* initialize elements transferred to zero */
+      508 	p = addr (em);				/* get pointer to event message for call to block */
+      509 rdloop:	call mrd_util_$read (tp, wp, offset, ne, net, "normal", messp, state, code);
+      510 	if code = error_table_$unable_to_do_io then goto rdrtn;
+      511 						/* Condition error */
+      512 	if net = 0 then do;				/* if no elements read from console */
+      513 	     if ^wrote_sentinel then			/* Send one reminder to operator */
+      514 		do;
+      515 		call ioa_$rs ("-->  ^a", message, i, SDB.source);
+      516 		call mrd_util_$protocol (tp, addr (message), 0, i, nt, "sentinel", code);
+      517 		if code = error_table_$unable_to_do_io then goto rdrtn;
+      518 						/* Condition error */
+      519 		wrote_sentinel = "1"b;
+      520 	     end;
+      521 	     call ipc_$block (SDB.ipc_ep, p, code);	/* call block to await signal from message coord'r */
+      522 	     go to rdloop;				/* and try again to read from console */
+      523 	end;
+      524 
+      525 rdrtn:	st.eof = "0"b;				/* not at end-of-file when in read-ahead mode */
+      526 	st.comp = "1111"b;				/* return I/O completion indicators */
+      527 	if state = 0 then st.eod = "1"b;
+      528 	return;					/* and return control to caller */
+      529 
+      530 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+      531 
+      532 mrd_resetread: entry (SDBptr, stat2);			/* entry to reset read-ahead data */
+      533 
+      534 dcl  stat2 bit (72) aligned;				/* I/O system status code (returned) */
+      535 
+      536 	rw = 1;					/* set code to reset read-ahead only */
+      537 	go to reset;				/* join with code for resetwrite */
+      538 
+      539 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+      540 
+      541 mrd_resetwrite: entry (SDBptr, stat2);			/* entry to reset write-behind buffers */
+      542 
+      543 	rw = 2;					/* set code to reset write-behind only */
+      544 
+      545 reset:	stat2 = "0"b;				/* initialize status code to zero */
+      546 	sp = addr (stat2);				/* get pointer to status code argument */
+      547 	go to rwabort;				/* join with code for abort */
+      548 
+      549 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+      550 
+      551 mrd_abort: entry (SDBptr, stat2, stat3);		/* entry to reset read, write and quit condition */
+      552 
+      553 dcl  stat3 bit (72) aligned;				/* I/O system status code (returned) */
+      554 
+      555 	rw = 3;					/* set code to reset everything */
+      556 	stat3 = "0"b;				/* initialize status code to zero */
+      557 	sp = addr (stat3);				/* get pointer to status code argument */
+      558 
+      559 rwabort:	tp = SDBptr;				/* get pointer to entry for this stream */
+      560 	call mrd_util_$abort (tp, rw, state, st.code);
+      561 	return;					/* and return */
+      562 
+      563 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+      564 
+      565 mrd_order: entry (SDBptr, request, argptr, stat4);	/* entry to handle stream orders */
+      566 
+      567 dcl  request char (*),				/* symbol stream request order code */
+      568      argptr ptr,					/* pointer to additional arguments (if any) */
+      569      stat4 bit (72) aligned;				/* I/O system status code (returned) */
+      570 
+      571 dcl 1 info_struc aligned based (argptr),
+      572     2 id char (4),
+      573     2 flags aligned,
+      574       3 bps_rate fixed binary (17) unaligned,
+      575       3 line_type fixed binary (17) unaligned,
+      576       3 pad bit (36) unaligned,
+      577     2 tw_type fixed bin;
+      578 
+      579 	string (stat4) = "0"b;
+      580 	tp = SDBptr;
+      581 
+      582 	if request = "hangup" then return;
+      583 	if request = "listen" then return;
+      584 	if request = "line_length" then return;
+      585 	if request = "quit_enable" then
+      586 	     do;
+      587 	     mcmp -> syscon_mseg.quit_bits = mcmp -> syscon_mseg.quit_bits | quit_mask;
+      588 	     return;
+      589 	end;
+      590 	if request = "quit_disable" then
+      591 	     do;
+      592 	     mcmp -> syscon_mseg.quit_bits = mcmp -> syscon_mseg.quit_bits & ^quit_mask;
+      593 	     return;
+      594 	end;
+      595 	if request = "start" then return;
+      596 	if request = "printer_off" then return;
+      597 	if request = "printer_on" then return;
+      598 
+      599 	if request = "info" then
+      600 	     do;
+      601 	     info_struc.id = rtrim(SDB.source);
+      602 	     info_struc.bps_rate = 0;
+      603 	     info_struc.line_type = LINE_MC;
+      604 	     info_struc.pad = ""b;
+      605 	     info_struc.tw_type = TYPE_UNKNOWN;
+      606 	     return;
+      607 	end;
+      608 
+      609 	if request = "discard_remainder" then
+      610 	     do;
+      611 	     call mrd_util_$discard_remainder (tp, state, code);
+      612 	     return;
+      613 	end;
+      614 
+      615 	if request = "read_status" then do;		/* request to look at read ahead */
+      616 	     call mrd_util_$read_status (tp, argptr, code);
+      617 	     return;
+      618 	end;
+      619 
+      620 /* Any others are in error */
+      621 	addr (stat4) -> st.code = error_table_$undefined_order_request;
+      622 	return;
+      623 
+      624 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+      625 
+      626 mrd_getsize: entry (SDBptr, elsize, stat3);		/* entry to return current element size */
+      627 
+      628 dcl  elsize fixed bin;				/* current element size (returned) */
+      629 
+      630 	elsize = 9;				/* element size for consoles is always 9 */
+      631 	return;					/* so return the constant 9 to the caller */
+      632 
+      633 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+      634 
+      635 mrd_changemode: entry (SDBptr, mode, omode, stat4);	/* entry to modify the stream mode */
+      636 
+      637 dcl  omode char (*);				/* returned mode prior to this call */
+      638 
+      639 dcl 1 modes aligned,				/* structure for order call */
+      640     2 len fixed bin,				/* length of mode string */
+      641     2 mode_string char (128);				/* mode string */
+      642 
+      643 	tp = SDBptr;				/* get pointer to SDB for this stream */
+      644 	stat4 = ""b;				/* initialize status to OK */
+      645 	sp = addr (stat4);				/* pick up pointer to status argument */
+      646 	modes.mode_string = mode;			/* copy mode string */
+      647 	omode = "";
+      648 	return;
+      649 
+      650 
+      651 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+      652 
+      653 mrd_detach: entry (SDBptr, ch2, disposal, stat4);		/* entry to detach a currently attached stream */
+      654 
+      655 dcl (ch2, disposal) char (*);				/* these arguments ignored in this implementation */
+      656 
+      657 	tp = SDBptr;				/* get pointer to entry for this stream */
+      658 	stat4 = "0"b;				/* initialize status code to zero */
+      659 	sp = addr (stat4);				/* get pointer to status code argument */
+      660 	ourmp = SDB.ourmess;
+      661 	st.det = "1"b;				/* set code to detach this ioname */
+      662 	if ^SDB.valid then return;
+      663 	SDB.valid = "0"b;				/* indicate stream list entry no longer in use */
+      664 	ourmp -> syscon_mseg.no_of_streams = ourmp -> syscon_mseg.no_of_streams - 1;
+      665 	if ourmp -> syscon_mseg.no_of_streams = 0 then
+      666 	     substr (quit_mask, SDB.source_index, 1) = "0"b;
+      667 
+      668 /* Say goodbye to message coordinator */
+      669 	p = addr (em);				/* Preparation for reciept of acknowledgement. */
+      670 
+      671 /* Construct a message */
+      672 	call ioa_$rs ("^a function detaching ^a stream. ", message, i, SDB.source, SDB.stream);
+      673 
+      674 /* Send it */
+      675 	call mrd_util_$protocol (tp, addr (message), 0, i, nt, "detach", code);
+      676 
+      677 /* Wait for acknowledgement */
+      678 	call ipc_$block (SDB.proto_ep, p, code);
+      679 
+      680 	return;					/* and return */
+      681 
+      682 
+      683 
+      684 /* =================================================== */
+      685 
+      686 test_mrd:	entry (system_dir);
+      687 
+      688 dcl  system_dir char (*);
+      689 
+      690 	sysdir = system_dir;
+      691 	init = "0"b;
+      692 	need_priv = "0"b;				/* this will be determined later */
+      693 	testing = "1"b;
+      694 	return;
+      695 
+      696      end mrdim_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    09/21/87  1954.7  mrdim_.pl1                        >spec>install>1114>mrdim_.pl1
+147          1    08/06/87  0913.4  line_types.incl.pl1               >ldd>include>line_types.incl.pl1
+148          2    09/04/87  2012.1  syscon_mseg.incl.pl1              >ldd>include>syscon_mseg.incl.pl1
+149          3    05/18/77  1734.5  tty_types.incl.pl1                >ldd>include>tty_types.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+LINE_MC                                constant        fixed bin(17,0)          initial dcl 1-22 ref 603
+OWAIT                                  constant        fixed bin(17,0)          initial dcl 53 ref 478
+R                         0(32)        based           bit(1)                   level 2 packed unaligned dcl 170 ref 263
+RINGS                           000000 constant        fixed bin(6,0)           initial array dcl 53 set ref 358* 367*
+SDB                                    based           structure                level 1 dcl 118 set ref 305
+SDBptr                                 parameter       pointer                  dcl 463 ref 461 470 501 503 532 541 551 559 565 580
+                                                                                  626 635 643 653 657
+TYPE_UNKNOWN                           constant        fixed bin(17,0)          initial dcl 3-3 ref 605
+USERID                          000136 automatic       char(32)                 unaligned dcl 53 set ref 250* 340* 358* 367*
+W                         0(34)        based           bit(1)                   level 2 packed unaligned dcl 170 ref 263
+acc_mode                        000224 automatic       fixed bin(35,0)          dcl 164 set ref 260* 263 263
+access                                 based           structure                level 1 packed unaligned dcl 170
+addr                                                   builtin function         dcl 46 ref 242 263 263 277 282 316 413 414 422 426
+                                                                                  426 440 440 472 479 479 505 508 516 516 546 557
+                                                                                  621 645 659 669 675 675
+any_other                       000226 stack reference condition                dcl 219 ref 345 365
+argptr                                 parameter       pointer                  dcl 567 set ref 565 601 602 603 604 605 616*
+attach_channel_name             000243 automatic       char(32)                 unaligned dcl 235 set ref 237* 238 238* 289 318 319
+                                                                                  323 324 332 419* 439*
+attchan                                parameter       char                     unaligned dcl 226 ref 224 237
+attname                                parameter       char                     unaligned dcl 226 set ref 224 296 325 419*
+attptr                                 parameter       pointer                  dcl 226 set ref 224 243 298* 311*
+attstat                                parameter       bit(72)                  dcl 226 set ref 224 241* 242
+attype                                 parameter       char                     unaligned dcl 226 ref 224
+based_mrt_index                        based           structure                level 1 unaligned dcl 81
+bps_rate                  1            based           fixed bin(17,0)          level 3 packed unaligned dcl 571 set ref 602*
+ch2                                    parameter       char                     unaligned dcl 655 ref 653
+channel                   4            based           fixed bin(71,0)          level 3 in structure "syscon_mseg" dcl 2-25
+                                                                                  in procedure "mrdim_" set ref 402*
+channel                  10            based           fixed bin(71,0)          level 3 in structure "syscon_mseg" dcl 2-25
+                                                                                  in procedure "mrdim_" set ref 404*
+code                                   based           fixed bin(35,0)          level 2 in structure "st" dcl 151 in procedure
+                                                                                  "mrdim_" set ref 244* 454* 496* 560* 621*
+code                            000115 automatic       fixed bin(35,0)          dcl 48 in procedure "mrdim_" set ref 255* 260* 261
+                                                                                  267* 271* 306* 333* 335* 338 358* 367* 368 369*
+                                                                                  371* 379* 380* 382 382 386* 392 393 402* 403 404*
+                                                                                  405 409* 426* 427 430* 440* 441 454 477* 478 479*
+                                                                                  482 496 509* 510 516* 517 521* 611* 616* 675* 678*
+com_err_                        000270 constant        entry                    external dcl 177 ref 386
+comp                      1            based           bit(4)                   level 2 packed unaligned dcl 151 set ref 493* 526*
+continue_to_signal_             000272 constant        entry                    external dcl 177 ref 352
+created_seg                     000213 automatic       bit(1)                   initial unaligned dcl 64 set ref 64* 373* 437
+cu_$cl                          000274 constant        entry                    external dcl 177 ref 387
+cu_$level_get                   000276 constant        entry                    external dcl 177 ref 251
+current_process_id        1            based           bit(36)                  level 2 dcl 2-25 set ref 398*
+det                       1(15)        based           bit(1)                   level 2 packed unaligned dcl 151 set ref 455* 661*
+device_name              15            based           char(32)                 level 2 dcl 118 set ref 323*
+device_name_list         10            based           pointer                  level 2 dcl 118 set ref 316*
+device_name_size         14            based           fixed bin(17,0)          level 2 dcl 118 set ref 319* 321* 332
+dim_name                               based           char(32)                 level 2 dcl 118 set ref 315*
+disposal                               parameter       char                     unaligned dcl 655 ref 653
+dump                            000110 internal static structure                level 1 dcl 86 set ref 277
+elsize                                 parameter       fixed bin(17,0)          dcl 628 set ref 626 630*
+em                              000116 automatic       fixed bin(71,0)          array dcl 48 set ref 422 479 479 508 669
+eod                       1(09)        based           bit(1)                   level 2 packed unaligned dcl 151 set ref 527*
+eof                       1(04)        based           bit(1)                   level 2 packed unaligned dcl 151 set ref 447* 492*
+                                                                                  525*
+error_table_$invalid_lock_reset 000364 external static fixed bin(17,0)          dcl 210 ref 393
+error_table_$ionmat             000366 external static fixed bin(17,0)          dcl 210 ref 244
+error_table_$lock_wait_time_exceeded
+                                000370 external static fixed bin(17,0)          dcl 210 ref 382
+error_table_$locked_by_this_process
+                                000372 external static fixed bin(17,0)          dcl 210 ref 392
+error_table_$moderr             000376 external static fixed bin(35,0)          dcl 210 ref 267
+error_table_$noentry            000374 external static fixed bin(17,0)          dcl 210 ref 338
+error_table_$unable_to_do_io    000400 external static fixed bin(35,0)          dcl 210 ref 441 482 510 517
+error_table_$undefined_order_request
+                                000402 external static fixed bin(17,0)          dcl 210 ref 621
+first_SDB                       000200 internal static structure                level 1 dcl 88 set ref 282
+flags                     1            based           structure                level 2 in structure "info_struc" dcl 571
+                                                                                  in procedure "mrdim_"
+flags                    62            based           structure                level 2 in structure "SDB" dcl 118 in procedure
+                                                                                  "mrdim_" set ref 307*
+flags                    12            based           structure                level 2 in structure "syscon_mseg" packed unaligned
+                                                                                  dcl 2-25 in procedure "mrdim_"
+get_group_id_$tag_star          000304 constant        entry                    external dcl 177 ref 250 340
+get_process_id_                 000300 constant        entry                    external dcl 177 ref 398
+hcs_$append_branchx             000316 constant        entry                    external dcl 177 ref 358 367
+hcs_$assign_linkage             000320 constant        entry                    external dcl 177 ref 306
+hcs_$fs_get_mode                000322 constant        entry                    external dcl 177 ref 260
+hcs_$initiate                   000324 constant        entry                    external dcl 177 ref 255 335 371
+hcs_$set_ips_mask               000326 constant        entry                    external dcl 177 ref 349 355 363
+hismess                  36            based           pointer                  level 2 dcl 118 set ref 326*
+i                               000220 automatic       fixed bin(17,0)          dcl 75 set ref 305* 306* 318* 319 321 419* 426* 439*
+                                                                                  440* 515* 516* 672* 675*
+id                                     based           char(4)                  level 2 dcl 571 set ref 601*
+index                                                  builtin function         dcl 46 ref 318
+info_struc                             based           structure                level 1 dcl 571
+init                            000067 internal static bit(1)                   initial unaligned dcl 64 set ref 248 276* 691*
+ioa_$rs                         000302 constant        entry                    external dcl 177 ref 419 439 515 672
+ipc_$block                      000310 constant        entry                    external dcl 177 ref 430 479 521 678
+ipc_$create_ev_chn              000306 constant        entry                    external dcl 177 ref 402 404
+ipc_$mask_ev_calls              000312 constant        entry                    external dcl 177 ref 379
+ipc_$unmask_ev_calls            000314 constant        entry                    external dcl 177 ref 409 452
+ipc_el                    2            based           structure                level 2 dcl 2-25 set ref 413
+ipc_ep                   26            based           pointer                  level 2 dcl 118 set ref 413* 479* 521*
+k                               000113 automatic       fixed bin(17,0)          initial dcl 48 set ref 48* 476* 477* 486* 486
+lcode                           000221 automatic       fixed bin(35,0)          initial dcl 75 set ref 75* 408* 451* 452*
+leave_locked                    000214 automatic       bit(1)                   initial unaligned dcl 64 set ref 64* 392* 408 451
+length                                                 builtin function         dcl 46 ref 319
+level                           000222 automatic       fixed bin(17,0)          dcl 75 set ref 251*
+line_type                 1(18)        based           fixed bin(17,0)          level 3 packed unaligned dcl 571 set ref 603*
+linkage_error                   000234 stack reference condition                dcl 219 ref 266 273
+lock_wait_time                  000217 automatic       fixed bin(17,0)          initial dcl 75 set ref 75* 380*
+mask                            000212 automatic       bit(36)                  initial dcl 64 set ref 64* 343* 349 349* 351* 355*
+                                                                                  363* 364*
+mcmp                            000062 internal static pointer                  dcl 60 set ref 255* 256 260* 271* 272 326 587 587
+                                                                                  592 592
+message                         000146 automatic       char(132)                unaligned dcl 53 set ref 419* 426 426 439* 440 440
+                                                                                  515* 516 516 672* 675 675
+message_block                          based           structure                level 1 dcl 2-54
+messp                           000064 internal static pointer                  initial dcl 60 set ref 277* 509*
+mlock                                  based           bit(36)                  level 2 dcl 2-25 set ref 380* 408* 451*
+mode                                   parameter       char                     unaligned dcl 226 ref 224 635 646
+mode_bits                       000242 automatic       bit(36)                  initial unaligned dcl 233 set ref 233*
+mode_string               1     000253 automatic       char(128)                level 2 dcl 639 set ref 646*
+modes                           000253 automatic       structure                level 1 dcl 639
+more                     62(04)        based           bit(1)                   level 3 packed unaligned dcl 118 set ref 446*
+mrd_util_$abort                 000330 constant        entry                    external dcl 177 ref 560
+mrd_util_$discard_remainder     000332 constant        entry                    external dcl 177 ref 611
+mrd_util_$protocol              000334 constant        entry                    external dcl 177 ref 426 516 675
+mrd_util_$read                  000336 constant        entry                    external dcl 177 ref 509
+mrd_util_$read_status           000344 constant        entry                    external dcl 177 ref 616
+mrd_util_$write                 000340 constant        entry                    external dcl 177 ref 440
+mrd_util_$write_dont_flood      000342 constant        entry                    external dcl 177 ref 477
+mrt_source                2            based           fixed bin(35,0)          level 2 dcl 81 ref 431
+mrt_stream                3            based           fixed bin(35,0)          level 2 dcl 81 ref 433
+n                         6            based           fixed bin(17,0)          level 3 in structure "syscon_mseg" dcl 2-25
+                                                                                  in procedure "mrdim_" set ref 401*
+n                               000111 automatic       fixed bin(17,0)          initial dcl 48 in procedure "mrdim_" set ref 48*
+                                                                                  475* 477* 484 487* 487 489
+n                         2            based           fixed bin(17,0)          level 3 in structure "syscon_mseg" dcl 2-25
+                                                                                  in procedure "mrdim_" set ref 400*
+ne                                     parameter       fixed bin(17,0)          dcl 463 set ref 461 473 475 494 501 506 509*
+need_priv                       000066 internal static bit(1)                   initial unaligned dcl 64 set ref 274* 333 341 369
+                                                                                  692*
+net                                    parameter       fixed bin(17,0)          dcl 463 set ref 461 494* 501 507* 509* 512
+next_device              12            based           pointer                  level 2 dcl 118 set ref 316 317*
+nextp                    32            based           pointer                  level 2 dcl 118 set ref 302 308* 309*
+no_of_streams            21            based           fixed bin(17,0)          level 2 dcl 2-25 set ref 435* 435 664* 664 665
+nt                              000112 automatic       fixed bin(17,0)          initial dcl 48 set ref 48* 426* 440* 474* 477* 484
+                                                                                  486 487 488* 516* 675*
+null                                                   builtin function         dcl 46 ref 243 256 272 283 284 287 304 308 317 336
+                                                                                  372
+offset                                 parameter       fixed bin(17,0)          dcl 463 set ref 461 476 501 509*
+omode                                  parameter       char                     unaligned dcl 637 set ref 635 647*
+ourmess                  34            based           pointer                  level 2 dcl 118 set ref 294 415* 660
+ourmp                           000210 automatic       pointer                  dcl 60 set ref 294* 333* 335* 336 369* 371* 372 380
+                                                                                  395 398 400 401 402 404 406 408 413 414 415 435
+                                                                                  435 451 660* 664 664 665
+p                               000106 automatic       pointer                  dcl 48 set ref 285* 309 422* 430* 431 433 508* 521*
+                                                                                  669* 678*
+pad                       2            based           bit(36)                  level 3 packed unaligned dcl 571 set ref 604*
+phcs_$ring_0_message            000346 constant        entry                    external dcl 177 ref 389
+pigeon_hole                     000126 automatic       char(32)                 initial unaligned dcl 53 set ref 53* 253* 255* 271*
+                                                                                  332* 333* 335* 358* 367* 369* 371*
+proto_el                  6            based           structure                level 2 dcl 2-25 set ref 414
+proto_ep                 30            based           pointer                  level 2 dcl 118 set ref 414* 430* 678*
+quit_bits                22            based           bit(504)                 level 2 dcl 2-25 set ref 587* 587 592* 592
+quit_mask                       000070 internal static bit(504)                 initial unaligned dcl 64 set ref 434* 587 592 665*
+request                                parameter       char                     unaligned dcl 567 ref 565 582 583 584 585 590 595
+                                                                                  596 597 599 609 615
+reset_priv                      000223 automatic       fixed bin(35,0)          dcl 75 set ref 342* 346 346* 348* 356* 360 360* 362*
+rtrim                                                  builtin function         dcl 46 ref 601
+rw                              000114 automatic       fixed bin(17,0)          initial dcl 48 set ref 48* 536* 543* 555* 560*
+rwstat                                 parameter       bit(72)                  dcl 463 set ref 461 471* 472 501 504* 505
+set_lock_$lock                  000350 constant        entry                    external dcl 177 ref 380
+set_lock_$unlock                000352 constant        entry                    external dcl 177 ref 408 451
+size                                                   builtin function         dcl 46 ref 305
+source                   40            based           char(32)                 level 2 dcl 118 set ref 289 324* 515* 601 672*
+source_index             60            based           fixed bin(17,0)          level 2 dcl 118 set ref 431* 434 665
+source_init                     000215 automatic       bit(1)                   initial unaligned dcl 64 set ref 64* 291 293* 329
+sp                              000102 automatic       pointer                  dcl 48 set ref 242* 244 447 454 455 472* 492 493 496
+                                                                                  505* 525 526 527 546* 557* 560 645* 659* 661
+st                                     based           structure                level 1 dcl 151
+stat2                                  parameter       bit(72)                  dcl 534 set ref 532 541 545* 546 551
+stat3                                  parameter       bit(72)                  dcl 553 set ref 551 556* 557 626
+stat4                                  parameter       bit(72)                  dcl 567 set ref 565 579* 621 635 644* 645 653 658*
+                                                                                  659
+state                           000110 automatic       fixed bin(17,0)          initial dcl 48 set ref 48* 440* 477* 509* 527 560*
+                                                                                  611*
+stream                   50            based           char(32)                 level 2 dcl 118 set ref 296 325* 672*
+stream_index             61            based           fixed bin(17,0)          level 2 dcl 118 set ref 433*
+string                                                 builtin function         dcl 46 set ref 307* 579*
+substr                                                 builtin function         dcl 46 set ref 332 434* 665*
+syscon_mseg                            based           structure                level 1 dcl 2-25
+syscon_template                        based           structure                level 1 dcl 166
+sysdir                          000010 internal static char(168)                initial unaligned dcl 53 set ref 255* 271* 333* 335*
+                                                                                  358* 367* 369* 371* 439* 690*
+system_dir                             parameter       char                     unaligned dcl 688 ref 686 690
+system_privilege_$dir_priv_off  000354 constant        entry                    external dcl 177 ref 346 360
+system_privilege_$dir_priv_on   000356 constant        entry                    external dcl 177 ref 356
+system_privilege_$initiate      000360 constant        entry                    external dcl 177 ref 271 333 369
+test_mode                12            based           bit(1)                   level 3 packed unaligned dcl 2-25 set ref 406*
+testing                         000106 internal static bit(1)                   initial unaligned dcl 64 set ref 384 406 693*
+tp                              000100 automatic       pointer                  dcl 48 set ref 282* 284 285 286 287 289 294 296 298
+                                                                                  302* 302 305 311* 315 316 316 317 319 321 323 324
+                                                                                  325 326 332 413 414 415 426* 430 431 433 434 440*
+                                                                                  445 446 470* 477* 479 503* 509* 515 516* 521 559*
+                                                                                  560* 580* 601 611* 616* 643* 657* 660 662 663 665
+                                                                                  672 672 675* 678
+tw_type                   3            based           fixed bin(17,0)          level 2 dcl 571 set ref 605*
+user_info_$terminal_data        000362 constant        entry                    external dcl 208 ref 238
+valid                    62            based           bit(1)                   level 3 packed unaligned dcl 118 set ref 286 445*
+                                                                                  662 663*
+vp                              000104 automatic       pointer                  dcl 48 set ref 283* 287 287* 304 306* 307 308 309
+                                                                                  311
+words                     1            based           fixed bin(35,0)          array level 2 dcl 166 set ref 395*
+wp                                     parameter       pointer                  dcl 463 set ref 461 477* 501 509*
+wrote_sentinel                  000216 automatic       bit(1)                   initial unaligned dcl 64 set ref 64* 513 519*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+LINE_1050                              internal static fixed bin(17,0)          initial dcl 1-22
+LINE_2741                              internal static fixed bin(17,0)          initial dcl 1-22
+LINE_ARDS                              internal static fixed bin(17,0)          initial dcl 1-22
+LINE_ASCII                             internal static fixed bin(17,0)          initial dcl 1-22
+LINE_ASYNC1                            internal static fixed bin(17,0)          initial dcl 1-22
+LINE_ASYNC2                            internal static fixed bin(17,0)          initial dcl 1-22
+LINE_ASYNC3                            internal static fixed bin(17,0)          initial dcl 1-22
+LINE_BSC                               internal static fixed bin(17,0)          initial dcl 1-22
+LINE_COLTS                             internal static fixed bin(17,0)          initial dcl 1-22
+LINE_DSA                               internal static fixed bin(17,0)          initial dcl 1-22
+LINE_ETX                               internal static fixed bin(17,0)          initial dcl 1-22
+LINE_G115                              internal static fixed bin(17,0)          initial dcl 1-22
+LINE_HASP_OPR                          internal static fixed bin(17,0)          initial dcl 1-22
+LINE_HDLC                              internal static fixed bin(17,0)          initial dcl 1-22
+LINE_POLLED_VIP                        internal static fixed bin(17,0)          initial dcl 1-22
+LINE_SYNC1                             internal static fixed bin(17,0)          initial dcl 1-22
+LINE_SYNC2                             internal static fixed bin(17,0)          initial dcl 1-22
+LINE_SYNC3                             internal static fixed bin(17,0)          initial dcl 1-22
+LINE_SYNCH                             internal static fixed bin(17,0)          initial dcl 1-22
+LINE_TELNET                            internal static fixed bin(17,0)          initial dcl 1-22
+LINE_UNKNOWN                           internal static fixed bin(17,0)          initial dcl 1-22
+LINE_VIP                               internal static fixed bin(17,0)          initial dcl 1-22
+LINE_X25LAP                            internal static fixed bin(17,0)          initial dcl 1-22
+TYPE_1050                              internal static fixed bin(17,0)          initial dcl 3-3
+TYPE_2741                              internal static fixed bin(17,0)          initial dcl 3-3
+TYPE_ARDS                              internal static fixed bin(17,0)          initial dcl 3-3
+TYPE_ASCII                             internal static fixed bin(17,0)          initial dcl 3-3
+TYPE_CORR                              internal static fixed bin(17,0)          initial dcl 3-3
+TYPE_G115                              internal static fixed bin(17,0)          initial dcl 3-3
+TYPE_TN300                             internal static fixed bin(17,0)          initial dcl 3-3
+TYPE_TTY33                             internal static fixed bin(17,0)          initial dcl 3-3
+TYPE_TTY37                             internal static fixed bin(17,0)          initial dcl 3-3
+TYPE_TTY38                             internal static fixed bin(17,0)          initial dcl 3-3
+buff_len                               internal static fixed bin(17,0)          initial dcl 2-23
+debug_info                             based           structure                level 1 dcl 2-71
+line_types                             internal static char(16)                 initial array unaligned dcl 1-54
+max_line_type                          internal static fixed bin(17,0)          initial dcl 1-48
+n_sync_line_types                      internal static fixed bin(17,0)          initial dcl 1-50
+sync_line_type                         internal static fixed bin(17,0)          initial array dcl 1-52
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+atterr                          002207 constant        label                    dcl 454 ref 261 268 272 338 368 372 393 427 441
+attrtn                          002161 constant        label                    dcl 447 ref 299
+check_priv                      000457 constant        label                    dcl 266 ref 256
+latterr                         002165 constant        label                    dcl 451 ref 403 405
+lock_loop                       001522 constant        label                    dcl 380 ref 390
+mrd_abort                       002651 constant        entry                    external dcl 551
+mrd_attach                      000236 constant        entry                    external dcl 224
+mrd_changemode                  003141 constant        entry                    external dcl 635
+mrd_detach                      003214 constant        entry                    external dcl 653
+mrd_getsize                     003122 constant        entry                    external dcl 626
+mrd_order                       002716 constant        entry                    external dcl 565
+mrd_read                        002353 constant        entry                    external dcl 501
+mrd_resetread                   002612 constant        entry                    external dcl 532
+mrd_resetwrite                  002625 constant        entry                    external dcl 541
+mrd_write                       002223 constant        entry                    external dcl 461
+mrdim_                          000221 constant        entry                    external dcl 29
+rdloop                          002400 constant        label                    dcl 509 ref 522
+rdrtn                           002574 constant        label                    dcl 525 ref 506 510 517
+reset                           002635 constant        label                    dcl 545 ref 537
+rwabort                         002670 constant        label                    dcl 559 ref 547
+test_mrd                        003411 constant        entry                    external dcl 686
+wloop                           002251 constant        label                    dcl 477 ref 480 489
+wrerr                           002347 constant        label                    dcl 496 ref 482
+wrtn                            002334 constant        label                    dcl 492 ref 473
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      4230        4634    3443        4240
+Length      5214    3443       404         344     564         260
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+mrdim_                              304 external procedure  is an external procedure.  
+on unit on line 266                  64 on unit               
+on unit on line 345                  76 on unit               
+
+STORAGE FOR INTERNAL STATIC VARIABLES.
+
+   LOC IDENTIFIER                  BLOCK NAME
+000010 sysdir                      mrdim_
+000062 mcmp                        mrdim_
+000064 messp                       mrdim_
+000066 need_priv                   mrdim_
+000067 init                        mrdim_
+000070 quit_mask                   mrdim_
+000106 testing                     mrdim_
+000110 dump                        mrdim_
+000200 first_SDB                   mrdim_
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+mrdim_                   000100 tp                          mrdim_
+                         000102 sp                          mrdim_
+                         000104 vp                          mrdim_
+                         000106 p                           mrdim_
+                         000110 state                       mrdim_
+                         000111 n                           mrdim_
+                         000112 nt                          mrdim_
+                         000113 k                           mrdim_
+                         000114 rw                          mrdim_
+                         000115 code                        mrdim_
+                         000116 em                          mrdim_
+                         000126 pigeon_hole                 mrdim_
+                         000136 USERID                      mrdim_
+                         000146 message                     mrdim_
+                         000210 ourmp                       mrdim_
+                         000212 mask                        mrdim_
+                         000213 created_seg                 mrdim_
+                         000214 leave_locked                mrdim_
+                         000215 source_init                 mrdim_
+                         000216 wrote_sentinel              mrdim_
+                         000217 lock_wait_time              mrdim_
+                         000220 i                           mrdim_
+                         000221 lcode                       mrdim_
+                         000222 level                       mrdim_
+                         000223 reset_priv                  mrdim_
+                         000224 acc_mode                    mrdim_
+                         000242 mode_bits                   mrdim_
+                         000243 attach_channel_name         mrdim_
+                         000253 modes                       mrdim_
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+alloc_char_temp     call_ext_out_desc   call_ext_out        return_mac          tra_ext_1           enable_op
+shorten_stack       ext_entry           ext_entry_desc      int_entry
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+com_err_                      continue_to_signal_           cu_$cl                        cu_$level_get
+get_group_id_$tag_star        get_process_id_               hcs_$append_branchx           hcs_$assign_linkage
+hcs_$fs_get_mode              hcs_$initiate                 hcs_$set_ips_mask             ioa_$rs
+ipc_$block                    ipc_$create_ev_chn            ipc_$mask_ev_calls            ipc_$unmask_ev_calls
+mrd_util_$abort               mrd_util_$discard_remainder   mrd_util_$protocol            mrd_util_$read
+mrd_util_$read_status         mrd_util_$write               mrd_util_$write_dont_flood    phcs_$ring_0_message
+set_lock_$lock                set_lock_$unlock              system_privilege_$dir_priv_off
+system_privilege_$dir_priv_on system_privilege_$initiate    user_info_$terminal_data
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$invalid_lock_reset                             error_table_$ionmat
+error_table_$lock_wait_time_exceeded                        error_table_$locked_by_this_process
+error_table_$moderr           error_table_$noentry          error_table_$unable_to_do_io
+error_table_$undefined_order_request
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     48 000175        53 000202        64 000205        75 000212       233 000215        29 000220        30 000227
+    224 000230       237 000271       238 000277       241 000323       242 000330       243 000332       244 000336
+    245 000341       248 000342       250 000345       251 000353       253 000362       255 000365       256 000431
+    260 000436       261 000450       263 000452       266 000457       267 000473       268 000476       271 000501
+    272 000545       273 000552       274 000553       276 000555       277 000560       282 000562       283 000564
+    284 000566       285 000572       286 000574       287 000577       288 000604       289 000605       291 000611
+    293 000613       294 000615       296 000617       298 000626       299 000627       302 000630       303 000632
+    304 000633       305 000637       306 000641       307 000654       308 000656       309 000660       311 000662
+    315 000666       316 000672       317 000674       318 000676       319 000707       321 000713       323 000715
+    324 000720       325 000723       326 000730       329 000733       332 000735       333 000752       335 001021
+    336 001064       338 001070       340 001074       341 001102       342 001105       343 001107       345 001110
+    346 001124       348 001135       349 001137       351 001154       352 001156       353 001166       355 001167
+    356 001202       358 001211       360 001265       362 001276       363 001300       364 001313       365 001314
+    366 001315       367 001316       368 001371       369 001373       371 001442       372 001505       373 001511
+    379 001513       380 001522       382 001535       384 001542       386 001544       387 001562       388 001567
+    389 001570       390 001603       392 001604       393 001611       395 001613       398 001624       400 001634
+    401 001637       402 001640       403 001651       404 001653       405 001665       406 001667       408 001675
+    409 001707       413 001716       414 001722       415 001725       419 001727       422 001765       426 001767
+    427 002032       430 002034       431 002050       433 002054       434 002056       435 002063       437 002065
+    439 002067       440 002122       441 002150       445 002154       446 002157       447 002161       449 002164
+    451 002165       452 002200       454 002207       455 002211       456 002214       461 002215       470 002231
+    471 002235       472 002241       473 002243       474 002245       475 002246       476 002247       477 002251
+    478 002275       479 002300       480 002316       482 002317       484 002322       486 002325       487 002327
+    488 002331       489 002332       492 002334       493 002337       494 002343       495 002346       496 002347
+    497 002350       501 002351       503 002361       504 002365       505 002371       506 002373       507 002375
+    508 002376       509 002400       510 002447       512 002453       513 002456       515 002460       516 002507
+    517 002552       519 002556       521 002560       522 002573       525 002574       526 002577       527 002601
+    528 002605       532 002606       536 002620       537 002622       541 002623       543 002633       545 002635
+    546 002642       547 002644       551 002645       555 002657       556 002661       557 002666       559 002670
+    560 002673       561 002710       565 002711       579 002732       580 002737       582 002742       583 002750
+    584 002754       585 002760       587 002764       588 002771       590 002772       592 002776       593 003003
+    595 003004       596 003010       597 003014       599 003020       601 003024       602 003042       603 003044
+    604 003046       605 003047       606 003051       609 003052       611 003056       612 003071       615 003072
+    616 003076       617 003111       621 003112       622 003115       626 003116       630 003130       631 003133
+    635 003134       643 003162       644 003166       645 003172       646 003174       647 003204       648 003211
+    653 003212       657 003235       658 003241       659 003245       660 003247       661 003251       662 003253
+    663 003256       664 003260       665 003262       669 003271       672 003273       675 003326       678 003371
+    680 003405       686 003406       690 003425       691 003434       692 003435       693 003436       694 003440
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

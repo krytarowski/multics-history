@@ -1,0 +1,4779 @@
+
+
+
+
+		    reload_volume_.pl1              10/14/90  1045.2rew 10/14/90  1043.2      119520
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1990   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(88-10-05,GWMay), approve(88-10-05,MCR8005), audit(88-10-12,Farley),
+     install(88-10-17,MR12.2-1173):
+     Rewrote the paged read mechanism to read an entire object from a dump
+     tape, then write it a page at a time.  When a short segment is read from
+     tape, the routine will now deposit any unused pages.
+  2) change(90-10-04,WAAnderson), approve(90-10-04,MCR8207),
+     audit(90-10-10,Schroth), install(90-10-14,MR12.4-1042):
+     Fix duplicate record bug. The vtoce buffer was not being updated after the
+     local copy of the vtoce was modified.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+reload_volume_: proc (rldr_datap, code);
+
+/* This routine is the main driving program for the reload of a physical volume. We read a object from the dump
+   volume, check to see if it's already there, and if so we free the pages already allocated. We then withdraw the
+   necessary pages and write the new vtoce and the non-null pages of the object. If a page can not be written
+   we mark the page as unusable, allocate a new one and rewrite the page. If this operation bears
+   any resemlance to the way the hardcore behaves to a physical volume, the resemlance is intentional. */
+/* Modified 5/79 by D. Vinograd to correct calling sequence to rldr_input_$read_page
+   so that variable already_there is passed as arg and that a clumulative count
+   of elements read is maintained such that non-null pages of all zeros are
+   treated correctly. */
+/* Modified:     3/1/83 by GA Texada to allow multiple physical volume reloading.	         */
+
+dcl code		     fixed bin (35);
+dcl (csl, bad_pages, object_pgx, pgx, pvindex, vtocx) fixed bin;
+dcl (new_vtocep, old_vtocep) ptr;
+dcl (Swritten, already_there, new_volume, skip_next_header_check) bit (1);
+dcl pages_returned	     fixed bin;
+
+dcl 1 new_local_vtoce    like vtoce aligned;
+dcl 1 old_local_vtoce    like vtoce aligned;
+
+dcl myname	     char (32) int static init ("reload_volume_") options (constant);
+
+dcl error_table_$end_of_info ext fixed bin (35);
+
+dcl rldr_input_$collect_stats entry (ptr, fixed bin);
+dcl rldr_input_$get_object entry (ptr, bit (1), ptr, fixed bin, bit (1), fixed bin, fixed bin (35));
+dcl rldr_input_$read_object entry (ptr, fixed bin, bit (1), bit (1), fixed bin, fixed bin (35));
+dcl rldr_report_$error_output entry options (variable);
+dcl rldr_vtoc_buffer_$get entry (ptr, fixed bin, ptr, fixed bin, fixed bin (35));
+dcl rldr_vtoc_buffer_$put entry (ptr, fixed bin, ptr, fixed bin, fixed bin (35));
+dcl rldr_output_$write_page entry (ptr, fixed bin, ptr, bit (18), fixed bin (35));
+dcl rldr_volume_map_$deposit entry (ptr, fixed bin, ptr, fixed bin, fixed bin (35));
+dcl rldr_volume_map_$withdraw entry (ptr, fixed bin, ptr, fixed bin, fixed bin (35));
+
+dcl (addr, bit, divide, fixed, pointer, substr, unspec) builtin;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+/* Initialize local variables and structures */
+    code = 0;
+    skip_next_header_check = "0"b;
+    new_vtocep = addr (new_local_vtoce);
+    old_vtocep = addr (old_local_vtoce);
+    unspec (new_local_vtoce) = "0"b;
+    unspec (old_local_vtoce) = "0"b;
+						/* Read through all the dump volumes on the list  */
+    do while ("1"b);				/* pvindex will be returned if code = 0, to show  */
+restart: call rldr_input_$get_object (rldr_datap, skip_next_header_check, new_vtocep, vtocx, already_there, pvindex, code);
+						/* which physical volume the object belongs to	*/
+      if code ^= 0 then do;
+	if code = error_table_$end_of_info then do;
+	    code = 0;
+	    return;
+	  end;
+	call rldr_report_$error_output (rldr_datap, code, myname, "Error reading input");
+	return;
+        end;
+      vtoc_headerp = rldr_data_.vtoc_headerp (pvindex);
+						/* If already there free allocated pages */
+      if already_there then do;
+	call rldr_vtoc_buffer_$get (rldr_datap, pvindex, old_vtocep, vtocx, code);
+	if code ^= 0 then do;
+	    call rldr_report_$error_output (rldr_datap, code, myname, "Error reading old vtoce ^o for pv ^a", vtocx,
+	         rldr_data_.pvname (pvindex));
+	    goto skip_this_pv;
+	  end;
+	if old_vtocep -> vtoce.uid ^= "0"b then do;
+	    call rldr_volume_map_$deposit (rldr_datap, pvindex, old_vtocep, -1, code);
+	    if code ^= 0 then do;
+	        call rldr_report_$error_output (rldr_datap, code, myname, "Error depositing old vtoce ^o for pv ^a", vtocx,
+		   rldr_data_.pvname (pvindex));
+	        goto skip_this_pv;
+	      end;
+	  end;
+        end;
+						/* Allocate new pages */
+      if new_vtocep -> vtoce.uid ^= "0"b then
+        call rldr_volume_map_$withdraw (rldr_datap, pvindex, new_vtocep, -1, code);
+      if code ^= 0 then do;
+	call rldr_report_$error_output (rldr_datap, code, myname, "Unable to withdraw for new vtoce ^o for pv ^a", vtocx,
+	     rldr_data_.pvname (pvindex));
+	goto skip_this_pv;
+        end;
+						/* Write out vtoce  */
+      call rldr_vtoc_buffer_$put (rldr_datap, pvindex, new_vtocep, vtocx, code);
+      if code ^= 0 then do;
+	call rldr_report_$error_output (rldr_datap, code, myname, "Error writing new vtoce ^o for pv ^a", vtocx,
+	     rldr_data_.pvname (pvindex));
+	goto skip_this_pv;
+        end;
+
+
+      if new_vtocep -> vtoce.uid ^= "0"b & ^rldr_data_.no_object then do;
+	csl = fixed (new_vtocep -> vtoce.csl);
+	call rldr_input_$read_object (rldr_datap, pvindex, new_volume,
+	     skip_next_header_check, pages_returned, code);
+	if new_volume then goto restart;
+	if code ^= 0 then
+	  new_vtocep -> vtoce.damaged = "1"b;
+
+/* Write out each non null page. If the write fails log the bad address, withdraw an other page and try again */
+
+
+	object_pgx = 0;
+	do pgx = 0 to csl - 1 while (divide (object_pgx, WORDS_PER_PAGE, 17) < pages_returned);
+	  if ^substr (new_vtocep -> vtoce.fm (pgx), 1, 1) then do;
+	      Swritten = "0"b;
+	      do while (^Swritten);
+	        call rldr_output_$write_page (rldr_datap, pvindex,
+		   pointer (rldr_data_.data_object_bp, object_pgx),
+		   new_vtocep -> vtoce.fm (pgx), code);
+	        if code ^= 0 then do;
+		  call log_bad_addr (new_vtocep -> vtoce.fm (pgx));
+		  call rldr_volume_map_$withdraw (rldr_datap,
+		       pvindex, new_vtocep, pgx, code);
+		  if code ^= 0 then do;
+		      call rldr_report_$error_output (rldr_datap, code, myname,
+			 "Unable to withdraw for bad page on pv ^a", rldr_data_.pvname (pvindex));
+		      goto skip_this_pv;
+		    end;
+                      call rldr_vtoc_buffer_$put (rldr_datap, pvindex, new_vtocep, vtocx, code);
+                      if code ^= 0 then do;
+                          call rldr_report_$error_output (rldr_datap, code, myname, "Error writing new vtoce ^o for pv ^a", vtocx,  rldr_data_.pvname (pvindex));
+        	                goto skip_this_pv;
+                        end;
+		end;
+	        else do;
+		  Swritten = "1"b;
+		  object_pgx = object_pgx + WORDS_PER_PAGE;
+		end;
+	      end;
+	    end;
+	end;
+
+	bad_pages = 0;
+	do pgx = pgx to csl - 1;			/* incomplete object */
+	  call rldr_volume_map_$deposit (rldr_datap, pvindex,
+	       new_vtocep, pgx, code);
+	  if code ^= 0 then
+	    call rldr_report_$error_output (rldr_datap, code, myname, "Error depositing page ^d of vtoce ^o for pv ^a",
+	         pgx, vtocx, rldr_data_.pvname (pvindex));
+	  bad_pages = bad_pages + 1;
+	end;
+
+	if bad_pages > 0 then do;
+            call rldr_vtoc_buffer_$put (rldr_datap, pvindex, new_vtocep, vtocx, code);
+            if code ^= 0 then do;
+                call rldr_report_$error_output (rldr_datap, code, myname, "Error writing new vtoce ^o for pv ^a", vtocx,  rldr_data_.pvname (pvindex));
+	      goto skip_this_pv;
+	    end;
+            end;
+
+	if new_vtocep -> vtoce.damaged then do;
+	    new_vtocep -> vtoce.csl = bit (fixed (csl - bad_pages, 9), 9);
+	    new_vtocep -> vtoce.records = bit (fixed (fixed (new_vtocep -> vtoce.records) - bad_pages, 9), 9);
+	    call rldr_vtoc_buffer_$put (rldr_datap, pvindex, new_vtocep,
+	         vtocx, code);
+	    if code ^= 0 then
+	      call rldr_report_$error_output (rldr_datap, code, myname,
+		 "Unable to set damaged switch for vtoce ^o on pv ^a", vtocx, rldr_data_.pvname (pvindex));
+	  end;
+        end;
+
+
+      if ^already_there then call rldr_input_$collect_stats (rldr_datap, pvindex);
+    end;
+
+    return;
+skip_this_pv:
+    call rldr_report_$error_output (rldr_datap, 0, myname,	/* well, let the user know			*/
+         "Abandoning the reload of pv ^a", rldr_data_.pvname (pvindex));
+    rldr_data_.abandoned (pvindex) = "1"b;		/* mark as abandoned			*/
+    rldr_data_.num_abandoned = rldr_data_.num_abandoned + 1;
+    if rldr_data_.num_abandoned = rldr_data_.npvs then do;
+        call rldr_report_$error_output (rldr_datap, 0, myname,
+	   "All physical volumes to be reloaded have been abandoned.");
+        return;
+      end;
+
+    goto restart;					/* and press-on				*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+log_bad_addr: proc (add);
+
+/* This proc logs the bad address of a failed write request */
+
+
+dcl add		     bit (18);
+
+    call rldr_report_$error_output (rldr_datap, 0, myname, "Bad disk page ^o for pv ^a", add, rldr_data_.pvname (pvindex));
+    return;
+  end log_bad_addr;
+
+%include rldr_data_;
+
+%include vtoc_header;
+
+%include vtoce;
+
+%include system_constants;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   reload_volume_: Abandoning the reload of pv PVNAME
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	Some fatal error has occurred during the reload of the specified
+   physical volume.
+
+   A:	Take the action required by the error just previous to this one and 
+   retry the reload of the physical volume.
+
+
+   Message:
+   reload_volume_: All physical volumes to be reloaded have been abandoned.
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	Some fatal error has occurred during the reload of ALL the
+   specified physical volumes.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Bad disk page PAGE_ADDRESS for pv PVNAME
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An I/O error occurred during a reload.
+   This message indicates the bad disk address on the volume being reloaded.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Error reading input: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred while reading input.
+   The input medium is abandoned.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Error reading old vtoce VTOCX for pv PVNAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An I/O error occurred during a reload. The input medium is abandoned.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Error depositing old vtoce VTOCX for pv PVNAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	The reloader was unable to release pages of an old object.
+   $err
+   The input medium is abandoned.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Error depositing page PAGENO of vtoce VTOCX for pv PVNAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	The reloader was unable to release page PAGENO (decimal) of the
+   new object. This is only done when an incomplete object is detected.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Error writing new vtoce VTOCX for pv PVNAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An I/O error occurred during a reload. The input medium is abandoned.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Unable to set damaged switch for vtoce VTOCX on pv PVNAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An I/O error has occured while attempting to write out the
+   new vtoce, which has the damaged switch turned on.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume_: Unable to withdraw for bad page on pv PVNAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	After an I/O error, the reloader attempted to allocate a new page,
+   and failed. The volume may be full.
+
+   A:	If the volume is full, it may be necessary to
+   clean it up with sweep_pv -gc before restarting the reload.
+
+
+   Message:
+   reload_volume_: Unable to withdraw for new vtoce VTOCX for pv PVNAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	The reloader is unable to allocate a new VTOCE.
+   The volume may be full. The input medium is abandoned.
+
+   A:	$ignore
+   If the volume is full, it may be necessary to clean it up with
+   sweep_pv with the -gc option and then to continue reloading.
+
+
+   END MESSAGE DOCUMENTATION */
+
+  end reload_volume_;
+
+
+
+
+		    reloader.pl1                    11/11/89  1129.2rew 11/11/89  0851.2      301500
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1989   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-01-15,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-06-03,GWMay), install(86-07-17,MR12.0-1097):
+     Add support for 512_WORD_IO devices.
+  2) change(88-10-05,GWMay), approve(88-10-05,MCR8005), audit(88-10-12,Farley),
+     install(88-10-17,MR12.2-1173):
+     Added administrative calls to support one additional temporary work
+     segment. Changed the call to reload_volume_ to used the correct number of
+     parameters.
+  3) change(89-08-31,GWMay), approve(89-10-03,MCR8135),
+     audit(89-10-04,Beattie), install(89-10-10,MR12.3-1089):
+     Updated to process version 3 for backup_volume_log.incl.pl1 structures.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+reloader: proc;
+
+/* This routine is the main control program of the volume reloader. We initialize  the control
+   structure, and read and process the control arguments. We then get info about the physical volume to
+   be reloaded and calculate some parameters that are used to convert disk sector address
+   to Multics record numbers.  We then create the needed temp segs and set the external pointers.
+   We then create the control seg which will be used to restart the reload if it should be interrupted. Next we
+   determine the list of dump volumes that must be read and in what order to recreate the logical image the
+   the physical volume to be reloaded. We then initialize the output attachment and initialize the label,
+   volume map, and vtoc header data bases. Finally we compare the label info in the volume log with that on the
+   pre-initialized output medium and if we find a problems we query the operator as to whether he wants
+   to proceed. If so we reload the physical volume, build the VTOC map, and update
+   the vtoc header, the volume map, and the label. Just a nice straigth foward program. */
+
+/*
+   Modified April 1982 by J. Bongiovanni for new pack layout
+   Modified Feburary 1983 by E. N. Kittlitz for 256K segments.
+   Modified 3/1/83 by GA Texada for multiple physical volume reloading.     
+   Modified 3/5/84 by GA Texada to fix hardcore 630, which simply deletes the 
+	  control seg when no -restart specified and one exisites. Changed 
+	  to continue the reload and make restart a per pv attribute.
+   Modified 3/6/84 by GA Texada to allow for reloading of 'stranger' physical volumes.
+
+*/
+
+reload_volume: entry;
+
+dcl Area		     area based (areap);
+dcl (areap, argp)	     ptr;
+dcl (code, ignore)	     fixed bin (35);
+dcl dev_idx	     fixed bin;
+dcl lvname	     char (32) aligned;
+dcl time_string	     char (24);
+dcl (ename, control_name) char (32);
+dcl (cln, enl, i, pvindex, vtocx) fixed bin;
+dcl mounted_rpv_pvid     bit (36);
+dcl time_unmounted	     fixed bin (71);
+dcl (YES, found_restart, dont_query_restart, pvid_missing, version_1_found, volog_missing) bit (1);
+
+dcl 1 local_vtoce	     like vtoce aligned;
+
+dcl tp2		     (2) ptr;
+dcl tp6		     (6) ptr;
+
+dcl error_table_$entlong fixed bin (35) ext;
+dcl error_table_$improper_data_format ext fixed bin (35);
+dcl error_table_$namedup ext fixed bin (35);
+dcl error_table_$segknown ext fixed bin (35);
+dcl sys_info$seg_size_256K fixed bin (19) ext static;
+dcl myname	     char (32) static int init ("reload_volume") options (constant);
+
+dcl hcs_$initiate	     entry (char (*), char (*), char (*), fixed bin, fixed bin, ptr, fixed bin (35));
+dcl hcs_$set_max_length_seg entry (ptr, fixed bin (19), fixed bin (35));
+dcl ioa_$rsnnl	     entry options (variable);
+dcl hcs_$level_get	     entry returns (fixed bin);
+dcl get_group_id_	     entry returns (char (32));
+dcl get_system_free_area_ entry () returns (ptr);
+dcl hcs_$delentry_seg    entry (ptr, fixed bin (35));
+dcl hcs_$make_seg	     entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35));
+dcl hcs_$fs_search_get_wdir entry (ptr, fixed bin (35));
+dcl hcs_$set_256K_switch entry (bit (2) aligned, bit (2) aligned, fixed bin (35));
+dcl cu_$arg_list_ptr     entry (ptr);
+dcl command_query_$yes_no entry options (variable);
+dcl mdc_$pvname_info     entry (char (*) aligned, bit (36) aligned, char (*) aligned, bit (36) aligned,
+		     fixed bin, fixed bin (35));
+dcl rldr_arg_reader_     entry (ptr, ptr, fixed bin (35));
+dcl rldr_check_pvol_     entry (ptr, fixed bin, fixed bin (35));
+dcl rldr_label_$open     entry (ptr, fixed bin, fixed bin (35));
+dcl rldr_label_$close    entry (ptr, fixed bin, fixed bin (35));
+dcl get_temp_segments_   entry (char (*), (*) ptr, fixed bin (35));
+dcl date_time_	     entry (fixed bin (71), char (*));
+dcl rldr_input_$init_volume_list entry (ptr, fixed bin (35));
+dcl rldr_output_$init    entry (ptr, fixed bin, fixed bin (35));
+dcl reload_volume_	     entry (ptr, fixed bin (35));
+dcl rldr_vtoc_header_$open entry (ptr, fixed bin, fixed bin (35));
+dcl rldr_vtoc_header_$close entry (ptr, fixed bin, fixed bin (35));
+dcl rldr_vtoc_header_$build_vtoc_map entry (ptr, fixed bin, fixed bin (35));
+dcl rldr_volume_map_$open entry (ptr, fixed bin, fixed bin (35));
+dcl rldr_volume_map_$close entry (ptr, fixed bin, fixed bin (35));
+dcl rldr_finish_	     entry (ptr, ptr, fixed bin (35));
+dcl rldr_report_$error_output entry options (variable);
+dcl rldr_report_$online_output entry options (variable);
+dcl rldr_output_$read_vtoce entry (ptr, fixed bin, ptr, fixed bin, fixed bin, fixed bin (35));
+
+dcl (cleanup, seg_fault_error) condition;
+
+dcl (addr, clock, divide, null, search, substr) builtin;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+/* init control structure */
+    areap, rldr_datap = null ();
+						/* setup cleanup handler */
+    on cleanup call rldr_finish_ (rldr_datap, areap, ignore);
+						/* init local variables */
+    call get_max_pvs (rldr_data_max_pvs, code);		/* get the pvt and set up for allocation	*/
+    if code ^= 0 then rldr_data_max_pvs = 100;		/* just in case				*/
+    areap = get_system_free_area_ ();
+    allocate rldr_data_ in (Area) set (rldr_datap);
+    rldr_data_.ptrs = null ();
+    rldr_data_.bits = "0"b;
+    rldr_data_.fixed = 0;
+    rldr_data_.chars = "";
+    rldr_data_.detach = "1"b;
+    rldr_data_.first_volume = "1"b;
+    rldr_data_.sys_dir,
+         rldr_data_.default_sys_dir = ">daemon_dir_dir>volume_backup";
+    rldr_data_.io_module = "tape_mult_";
+    rldr_data_.old_256K_switch = ""b;
+
+    do pvindex = 1 to rldr_data_max_pvs;		/* initialize the per pv info			*/
+      rldr_data_.per_pv (pvindex) = rldr_data_nulled_pv;
+      rldr_data_.prev_wordx (pvindex) = 1;
+      rldr_data_.prev_bitx (pvindex) = 2;
+    end;
+    call hcs_$set_256K_switch ("11"b, rldr_data_.old_256K_switch, code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Could not enable 256KW segments.");
+        goto err;
+      end;
+    rldr_data_.data_init = "1"b;
+    code = 0;
+    query_info.version = query_info_version_5;
+    call cu_$arg_list_ptr (argp);
+    if argp = null () then do;			/* no, no, no, we need something!		*/
+        call rldr_report_$error_output (rldr_datap, 0, myname, "This command requires arguments, please consult AM81 (MOH) for information.");
+        goto err;
+      end;
+    call rldr_arg_reader_ (rldr_datap, argp, code);
+    if code ^= 0 then goto err;
+    rldr_data_.arg_init = "1"b;
+    if rldr_data_.operator = "" | rldr_data_.npvs <= 0 then do;
+        if ((rldr_data_.operator = "") & (rldr_data_.npvs <= 0)) then
+	call rldr_report_$error_output (rldr_datap, 0, myname, "Operator name and physical volume name not specified");
+        else if (rldr_data_.operator = "") then
+	call rldr_report_$error_output (rldr_datap, 0, myname, "Operator name not specified");
+        else call rldr_report_$error_output (rldr_datap, 0, myname, "Physical volume name not specified.");
+        goto err;
+      end;
+    found_restart, volog_missing, version_1_found = "0"b;
+    do i = 1 to rldr_data_.npvs;			/* just do this all at once			*/
+      call find_volog (i);				/* or else we could have many many vologs missing */
+    end;						/* user would have to reinvoke reload_volume once for each*/
+    if volog_missing then do;				/* this is set by find_volog if it can't find	*/
+        call rldr_report_$online_output (rldr_datap, 0, myname, "Please start volume log recovery procedure");
+        goto finish;
+      end;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+/*									*/
+/* Here, if we have found any version 1 vologs, then everything MUST belong to the	*/
+/* mounted RPV, except if we are reloading an rpv. In that case, it must be the only pv	*/
+/* being reloaded. This is exactly a'la MR10.2. This support of version 1 volume logs	*/
+/* will disappear in MR12.							*/
+/*									*/
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+
+    if version_1_found then do;
+        call mdc_$pvname_info ("rpv", rldr_data_.rpv_pvid, lvname, rldr_data_.rpv_lvid,
+	   rldr_data_.rpv_disk_type, code);
+        if code ^= 0 then do;
+	  call rldr_report_$error_output (rldr_datap, code, myname, "Unable to get info about rpv");
+	  goto err;
+	end;
+        mounted_rpv_pvid = rldr_data_.rpv_pvid;
+        if rldr_data_.rpv then do;			/* ok if rpv being reloaded, be sure he's alone	*/
+	  if rldr_data_.npvs > 1 then do;
+	      call rldr_report_$error_output (rldr_datap, 0, myname,
+		 "An implementation restriction when using version 1 volume logs.
+This requires that the RPV be reloaded separately from other volumes.");
+	      goto err;
+	    end;
+	  bvlp = rldr_data_.per_pv (1).bvlp;		/* if RPV then this is his volume log		*/
+	  rldr_data_.rpv_pvid = backup_volume_log.info.pvid;
+	  rldr_data_.rpv_lvid = backup_volume_log.info.lvid;
+	  rldr_data_.disk_type (1) = rldr_data_.rpv_disk_type;
+	  rldr_data_.lvname (1) = lvname;
+	end;
+        else do;					/* ok, not doing the RPV, all must belong to mounted RPV*/
+	  do pvindex = 1 to rldr_data_.npvs;
+	    pvid_missing = "0"b;			/* check if pvname registered and get type and pvid */
+	    do i = 1 to rldr_data_.npvs;		/* do this once for the entire list		*/
+	      call mdc_$pvname_info (rldr_data_.pvname (i), rldr_data_.pvid (i),
+		 rldr_data_.lvname (i), rldr_data_.lvid (i), rldr_data_.disk_type (i), code);
+	      if code ^= 0 then do;
+		call rldr_report_$error_output (rldr_datap, code, myname, "Unable to determine pvid for ^a",
+		     rldr_data_.pvname (i));
+		pvid_missing = "1"b;
+	        end;
+	    end;
+	    if pvid_missing then goto err;
+	  end;
+	end;
+        rldr_data_.stranger = ^(rldr_data_.rpv_pvid = mounted_rpv_pvid);
+						/* do rldr_input_ knows			*/
+      end;					/* end version 1 stuff			*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+/*									*/
+/* This is the section that allows for 'stranger' physical volume reloading. It is	*/
+/* executed only if all volume logs were version 2.				*/
+/*									*/
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+    else do;
+        call mdc_$pvname_info ("rpv", rldr_data_.rpv_pvid, lvname, rldr_data_.rpv_lvid, rldr_data_.rpv_disk_type, code);
+        if code ^= 0 then do;
+	  call rldr_report_$error_output (rldr_datap, code, myname, "Unable to get info about rpv");
+	  goto err;
+	end;
+        mounted_rpv_pvid = rldr_data_.rpv_pvid;
+        rldr_data_.rpv_pvid = "0"b;
+        if rldr_data_.sys_dir ^= rldr_data_.default_sys_dir then do; /* -working_dir specified			*/
+	  if rldr_data_.rpv then do;			/* find the RPV				*/
+	      do i = 1 to rldr_data_.npvs while (rldr_data_.per_pv (i).pvname ^= "rpv");
+	      end;
+	      bvlp = rldr_data_.per_pv (i).bvlp;	/* point to his volume log			*/
+	      rldr_data_.rpv_pvid = backup_volume_log.pvid;
+	      rldr_data_.rpv_lvid = backup_volume_log.info.lvid;
+	      goto got_rpvid;
+	    end;
+	  else do;				/* RPV not in he list, pick the first		*/
+	      bvlp = rldr_data_.per_pv (1).bvlp;	/* point to the volume log			*/
+	      rldr_data_.rpv_pvid = backup_volume_log.rpv_pvid;
+	    end;
+	end;					/* end wd mode				*/
+        if rldr_data_.rpv_pvid = "0"b then		/* must belong to mounted RPV			*/
+	rldr_data_.rpv_pvid = mounted_rpv_pvid;
+got_rpvid:
+        if (validate_all_vologs ()) then ;		/* make sure all rpv_pvid's match in the vologs	*/
+        else do;					/* forget it...				*/
+	  call rldr_report_$error_output (rldr_datap, 0, myname, "The reload will be aborted.");
+	  goto err;
+	end;
+        call fill_from_volog ();			/* puts in the necessary per pv info		*/
+        rldr_data_.stranger = ^(rldr_data_.rpv_pvid = mounted_rpv_pvid);
+						/* for rldr_input_				*/
+      end;					/* end the version 2 stuff			*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+/*      Back to common code...								*/
+
+    call get_temp_segments_ (myname, tp2, code);		/* create temp segs */
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Error creating temp segs ");
+        goto err;
+      end;
+    dont_query_restart = "0"b;
+    do pvindex = 1 to rldr_data_.npvs;
+      if rldr_data_.disk_model (pvindex) = "" then do;	/* if caller did not specify use registration info */
+	dev_idx = rldr_data_.disk_type (pvindex);
+	rldr_data_.usable_sectors (pvindex) = divide (sect_per_cyl (dev_idx), sect_per_rec (dev_idx), 17, 0) * sect_per_rec (dev_idx);
+	rldr_data_.unusable_sectors (pvindex) =
+	     sect_per_cyl (dev_idx) - rldr_data_.usable_sectors (pvindex);
+        end;
+      rldr_data_.vtocbp (pvindex) = tp2 (1);
+      rldr_data_.labelp (pvindex) = tp2 (2);
+      cln = search (rldr_data_.pvname (pvindex), " ") - 1;	/* create control seg to allow restart */
+      if cln < 1 | cln > 24 then cln = 24;
+      control_name = substr (rldr_data_.pvname (pvindex), 1, cln) || ".control";
+remake_control_seg:
+      call hcs_$make_seg (wdir_ (), control_name, "", 01010b, rldr_data_.controlp (pvindex), code);
+      if code ^= 0 then do;
+	if rldr_data_.common.restart & (code = error_table_$segknown | code = error_table_$namedup) then code = 0;
+	else do;
+	    call command_query_$yes_no (YES, 0, myname,
+	         "A control segment was found for the specified physical volume, but -restart was not specified. 
+Do you wish a restart on the specified physical volume?",
+	         "Control segment ^a exists but -restart not specified. Do you want a restart on the physical volume? ",
+	         control_name);
+	    if YES then found_restart, rldr_data_.per_pv (pvindex).restart = "1"b;
+	    else do;				/* ok, delete the old one, and make a new one	*/
+	        dont_query_restart = "1"b;
+	        call hcs_$delentry_seg (rldr_data_.controlp (pvindex), ignore);
+	        goto remake_control_seg;
+	      end;
+	  end;
+        end;					/* end each pv				*/
+      if ((rldr_data_.common.restart) & (^found_restart) & (^dont_query_restart)) then do;
+						/* -restart specified, but didn't find a control seg.*/
+	call command_query_$yes_no (YES, 0, myname,
+	     "The -restart control argument was specified, but no control segment was found.
+A ""yes"" answer will continue with the reload, whereas a ""no"" answer will abort it. Continue the reload?",
+	     "No control seg found for -restart control arg. Do you wish to continue with the reload?");
+	if YES then rldr_data_.common.restart = "0"b;	/* turn this off for rldr_input_		*/
+	else goto err;
+        end;
+    end;
+    do pvindex = 1 to rldr_data_.npvs;			/* ok, let's go...				*/
+      controlp = rldr_data_.controlp (pvindex);
+      rldr_data_.vol_mapp (pvindex) = addr (rldr_control.vol_map);
+      rldr_data_.vtoc_headerp (pvindex) = addr (rldr_control.vtoc_header);
+      rldr_data_.labelp (pvindex) = addr (rldr_control.label);
+      call rldr_output_$init (rldr_datap, pvindex, code);	/* initialize output attachment */
+      if code ^= 0 then do;
+	call rldr_report_$error_output (rldr_datap, code, myname, "Error initializing output medium, pv ^a",
+	     rldr_data_.pvname (pvindex));
+	goto err;
+        end;
+      if ^rldr_data_.per_pv.restart (pvindex) then do;	/* initialize physical volume label data base */
+	call rldr_label_$open (rldr_datap, pvindex, code);
+	if code ^= 0 then do;
+	    call rldr_report_$error_output (rldr_datap, code, myname, "Label check failed for pv ^a",
+	         rldr_data_.pvname (pvindex));
+	    goto err;
+	  end;
+	call rldr_volume_map_$open (rldr_datap, pvindex, code); /* initialize volume map data base */
+	if code ^= 0 then do;
+	    call rldr_report_$error_output (rldr_datap, code, myname, "Error opening volume map for pv ^a",
+	         rldr_data_.pvname (pvindex));
+	    goto err;
+	  end;
+	call rldr_vtoc_header_$open (rldr_datap, pvindex, code); /* initialize vtoc header data base */
+	if code ^= 0 then do;
+	    call rldr_report_$error_output (rldr_datap, code, myname, "Unable to open vtoc header for pv ^a",
+	         rldr_data_.pvname (pvindex));
+	    goto err;
+	  end;
+	call rldr_check_pvol_ (rldr_datap, pvindex, code);/* cross check volume log and physical volume label */
+	if code ^= 0 then do;
+	    if code > 2 then do;
+	        call rldr_report_$error_output (rldr_datap, 0, myname,
+		   "Unable to reload volume ^a. Volog and volume label have fatal mismatch",
+		   rldr_data_.pvname (pvindex));
+	        goto err;
+	      end;
+	    else do;
+	        call command_query_$yes_no (YES, 0, myname, "",
+		   "Initialized physical volume ^a does not match online logical image. Do you wish to proceed",
+		   rldr_data_.pvname (pvindex));
+	        if ^YES then goto err;
+	      end;
+	  end;
+	if rldr_data_.save then call update_control_seg ();
+        end;
+    end;						/* <- each physical volume			*/
+    call get_temp_segments_ (myname, tp6, code);		/* a few more of these and we can start		*/
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Error creating temp segs ");
+        goto err;
+      end;
+    rldr_data_.volume_record_bp = tp6 (1);
+    rldr_data_.data_object_bp = tp6 (2);
+    rldr_data_.input_vol_lstp = tp6 (3);
+    rldr_data_.infop = tp6 (4);
+    rldr_data_.skip = tp6 (5);
+    rldr_data_.input_buffer_ptr = tp6 (6);
+    rldr_data_.input_buffer_len = 0;
+    call hcs_$set_max_length_seg (rldr_data_.data_object_bp, sys_info$seg_size_256K, code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Could not create 256KW temporary segment.");
+        goto err;
+      end;
+
+    call hcs_$set_max_length_seg (rldr_data_.input_buffer_ptr,
+         sys_info$seg_size_256K, code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Could not create 256KW temporary segment.");
+        goto err;
+      end;
+
+    call rldr_input_$init_volume_list (rldr_datap, code);	/* generate list of dump volumes */
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Error initializing input volume list ");
+        goto err;
+      end;
+						/* Inform the user */
+    call rldr_report_$online_output (rldr_datap, 0, myname, "Begin reload of volume^[s^] ^v(^a ^) at ^a",
+         (rldr_data_.npvs > 1), rldr_data_.npvs, rldr_data_.pvname (*), time_now_ ());
+						/* do the actual job */
+    call reload_volume_ (rldr_datap, code);		/* reload them all				*/
+    if code ^= 0 then				/* if code ^=0 then pvindex is one who failed.	*/
+      call rldr_report_$error_output (rldr_datap, code, myname, "Error reloading volume ^a", rldr_data_.pvname (pvindex));
+    do pvindex = 1 to rldr_data_.npvs;			/* Build the VTOC Map, as init_vol set it to all-free */
+      call rldr_vtoc_header_$build_vtoc_map (rldr_datap, pvindex, code);
+      if code ^= 0 then
+        call rldr_report_$error_output (rldr_datap, code, myname, "Unable to build VTOC map for pv ^a",
+	   rldr_data_.pvname (pvindex));
+						/* Update the vtoc header */
+      call rldr_vtoc_header_$close (rldr_datap, pvindex, code);
+      if code ^= 0 then
+        call rldr_report_$error_output (rldr_datap, code, myname, "Error closing vtoc header for pv ^a",
+	   rldr_data_.pvname (pvindex));
+						/* Update the volume map */
+      call rldr_volume_map_$close (rldr_datap, pvindex, code);
+      if code ^= 0 then
+        call rldr_report_$error_output (rldr_datap, code, myname, "Error closing volume map for pv ^a",
+	   rldr_data_.pvname (pvindex));
+						/* Update the label */
+      call rldr_label_$close (rldr_datap, pvindex, code);
+      if code ^= 0 then
+        call rldr_report_$error_output (rldr_datap, code, myname, "Error closing volume label for pv ^a",
+	   rldr_data_.pvname (pvindex));
+						/* Inform the user */
+      call rldr_report_$online_output (rldr_datap, 0, myname, "End reload of volume ^a at ^a",
+	 rldr_data_.pvname (pvindex), time_now_ ());
+      controlp = rldr_data_.controlp (pvindex);
+      call rldr_report_$online_output (rldr_datap, 0, myname,
+	 "Reloaded on volume ^a ^d records of ^d directories and  ^d records of ^d segments and ^d null vtoces",
+	 rldr_data_.pvname (pvindex), rldr_control.dir_rec, rldr_control.dir_num, rldr_control.seg_rec,
+	 rldr_control.seg_num, rldr_control.num_null_vtoce);
+
+      call hcs_$delentry_seg (rldr_data_.controlp (pvindex), ignore); /* all done so delete control seg */
+      if hcs_$level_get () = 1 & get_group_id_ () = "Initializer.SysDaemon.z"
+	 & rldr_data_.default_sys_dir ^= rldr_data_.sys_dir
+      then do;
+	call hcs_$delentry_seg (rldr_data_.bvlp (pvindex), ignore); /* delete temp volog */
+	rldr_data_.bvlp (pvindex) = null ();		/* and set for finish_			*/
+        end;
+    end;						/* for each physical volume			*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+end_reload_volume: entry;
+finish:
+						/* clean up */
+    call rldr_finish_ (rldr_datap, areap, ignore);	/* releases temp segs and frees as required	*/
+    return;
+
+err:
+    do pvindex = 1 to rldr_data_.npvs;
+      if rldr_data_.controlp (pvindex) ^= null then call hcs_$delentry_seg (rldr_data_.controlp (pvindex), ignore);
+    end;
+    goto finish;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+time_now_: proc returns (char (6));
+
+/* This proc returns a time string in a printable form */
+
+    call date_time_ (clock (), time_string);
+    return (substr (time_string, 11, 6));
+  end time_now_;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+wdir_: proc returns (char (168) aligned);
+
+/* This proc returns the working directory */
+
+dcl wdir		     char (168) aligned;
+    call hcs_$fs_search_get_wdir (addr (wdir), ignore);
+    return (wdir);
+  end wdir_;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+update_control_seg: proc;
+
+/* This proc updates the control seg look aside memory as if the data had been loaded from an input
+   volume via rldr_input_. Thus before the reload begins the control segment is up-to-date with
+   the data on the pack */
+
+    vtocep = addr (local_vtoce);
+    labelp, old_labelp = rldr_data_.labelp (pvindex);
+    if label.volmap_version = 1 | label.volmap_version = 2
+         then time_unmounted = label.time_unmounted;
+    else time_unmounted = old_label.time_unmounted;
+    controlp = rldr_data_.controlp (pvindex);
+    vtoc_headerp = rldr_data_.vtoc_headerp (pvindex);
+    do vtocx = 0 to vtoc_header.n_vtoce - 1;
+      call rldr_output_$read_vtoce (rldr_datap, pvindex, vtocep, vtocx, 1, code);
+      if code ^= 0 then do;
+	call rldr_report_$online_output (rldr_datap, 0, code, myname, "Unable to read VTOCE ^o on pv ^a", vtocx,
+	     rldr_data_.pvname (pvindex));
+	goto err;
+        end;
+      rldr_control (vtocx).uid = vtoce.uid;
+      rldr_control (vtocx).time_dumped = time_unmounted;
+    end;
+
+  end update_control_seg;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+find_volog: proc (i);
+
+/* This proc attempts to locate the volog for the volume to be reloaded */
+dcl i		     fixed bin;
+
+/* create volume log name */
+    call ioa_$rsnnl ("^a.^a", ename, enl, rldr_data_.pvname (i), "volog");
+    if enl > 32 then do;
+        code = error_table_$entlong;
+        goto vol_err;
+      end;
+						/* get ptr to volume log */
+    call hcs_$initiate ((rldr_data_.sys_dir), ename, "", 0, 1, bvlp, code);
+    if bvlp = null then do;
+vol_err: call rldr_report_$online_output (rldr_datap, code, myname, "Unable to locate valid volume log ^a^[>^]^a",
+	   rldr_data_.sys_dir, rldr_data_.sys_dir ^= ">", ename);
+        volog_missing = "1"b;				/* set for caller to check			*/
+        return;
+      end;
+						/* check if object is a log */
+    on seg_fault_error goto vol_err;
+    if (backup_volume_log.pvname = rldr_data_.pvname (i)) & ((backup_volume_log.version = backup_volume_log_version_1)
+         | (backup_volume_log.version = backup_volume_log_version_2)
+         | (backup_volume_log.version = backup_volume_log_version_3)) then
+      if ^version_1_found then version_1_found = /* if its been set once, leave it alone		*/
+	   (backup_volume_log.version = backup_volume_log_version_1);
+      else do;
+	code = error_table_$improper_data_format;
+	goto vol_err;
+        end;
+    revert seg_fault_error;
+						/* clear code and set ext ptr */
+    code = 0;
+    rldr_data_.bvlp (i) = bvlp;
+  end find_volog;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+get_max_pvs: proc (maxpvs, ec);
+
+dcl ec		     fixed bin (35),
+  maxpvs		     fixed bin;
+
+    ec = -1;					/* just for now				*/
+  end get_max_pvs;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+fill_from_volog:
+  proc ();
+
+dcl i		     fixed bin;
+
+    do i = 1 to rldr_data_.npvs;
+      bvlp = rldr_data_.per_pv (i).bvlp;		/* point to the volume log			*/
+      rldr_data_.per_pv (i).pvid = backup_volume_log.pvid;
+      rldr_data_.per_pv (i).disk_type = backup_volume_log.disk_type;
+      rldr_data_.per_pv (i).lvid = backup_volume_log.info.lvid;
+      rldr_data_.per_pv (i).lvname = backup_volume_log.info.lv_name;
+    end;
+
+  end fill_from_volog;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+validate_all_vologs:
+  proc () returns (bit (1));
+
+dcl i		     fixed bin;
+dcl mismatch	     bit (1) init ("0"b);
+
+
+    do i = 1 to rldr_data_.npvs;
+      bvlp = rldr_data_.per_pv (i).bvlp;		/* point at the volog			*/
+      if backup_volume_log.rpv_pvid ^= rldr_data_.rpv_pvid then do;
+	mismatch = "1"b;				/* flag to return				*/
+	call rldr_report_$error_output (rldr_datap, 0, myname,
+	     "The RPV pvid for physical volume ^a does not match the determined RPV pvid.",
+	     rldr_data_.per_pv (i).pvname);
+        end;
+    end;
+    return (^mismatch);
+  end validate_all_vologs;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+%include rldr_data_;
+
+%include backup_volume_log;
+
+%include backup_volume_header;
+
+%include backup_pvol_info;
+%include rldr_control;
+
+%include fs_dev_types;
+
+%include fs_vol_label;
+
+%include old_fs_vol_label;
+
+%include vtoc_header;
+%include vol_map;
+
+%include vtoce;
+
+%include query_info;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+
+   Message:
+   reload_volume: Unable to locate a valid volume log for PATH: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M: The volue log at PATH was not found.  This message will always cause the
+reload to be aborted.
+
+   A:	$tryagn
+
+   Message:
+   reload_volume: Please start volume log recovery procedure.
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M: Use the recover_volume_log command to recover the specified physical
+volumes volume log.
+
+   A:	$tryagn
+
+   Message:
+   reload_volume: The RPV pvid for physical volume NAME does not match the
+determined RPV pvid.
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M: The backup_volume_log.rpv_pvid for NAME does not match the reloader
+determined RPV pvid.  This could be an invalid attempt to reload a stranger
+physical volume.
+
+   A:	$inform
+
+
+   Message:
+   reload_volume: An implementation restriction when using version 1 volume logs.
+This requires that the RPV be reloaded separately from other volumes.
+
+   S:     $rld_out
+
+   T:	$reload
+
+   M:     Using version 1 volume logs, all physical volumes must belong to the mounted RPV. An exception is when reloading the RPV itself, it must be reloaded separately, then a re-boot on the new RPV will allow the other volumes to be reloaded.
+
+   A:	$tryagn
+
+
+   Message:
+   reload_volume: Operator name not specified.
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	Missing input.
+
+   A:	$tryagn
+
+
+   Message:
+   reload_volume: Physical volume name not specified.
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	Missing input.
+
+   A:	$tryagn
+
+   Message:
+   reload_volume: Could not enable 256KW segments: ERORR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	The call to hcs_$set_256K_switch failed.
+
+   A:	$inform
+
+
+   Message:
+   reload_volume: Begin reload of volume NAME at TIME
+
+   S:	$rld_on
+
+   T:	$reload
+
+   M:	A volume reload is beginning.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume: End reload of volume NAME at TIME
+   .br
+   reload_volume: Reloaded on volume NAME XX records of XX directories and XX records of XX segments and XX null vtoces
+
+   S:	$rld_on
+
+   T:	$reload
+
+   M:	A volume reload has completed.
+   The statistics printed indicate how many records were reloaded.
+
+   A:	$ignore
+
+
+   Message:
+   reload_volume: arg err: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	Invalid input was given.
+
+   A:	$tryagn
+
+
+   Message:
+   reload_volume: error closing volume label: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred while reloading.
+
+   A:	$inform
+
+
+   Message:
+   reload_volume: error closing volume map: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred while reloading.
+
+   A:	$inform
+
+
+   Message:
+   reload_volume: error closing vtoc header: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred while reloading.
+
+   A:	$inform
+
+
+   Message:
+   reload_volume: error creating control seg: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred while reloading.
+
+   A:	$inform
+
+
+   Message:
+   reload_volume: error creating temp segs: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred while reloading.
+
+   A:	$inform
+
+
+   Message:
+   reload_volume: error initializing input volume list: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred while reloading.
+
+   A:	$inform
+
+
+   Message:
+   reload_volume: error initializing output medium: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred while reloading.
+
+   A:	$inform
+
+
+   Message:
+   reload_volume: error opening volume map: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred while reloading.
+
+   A:	$inform
+
+
+   Message:
+   reload_volume: error reloading volume NAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred while reloading.
+
+   A:	$inform
+
+
+   Message:
+   reload_volume: label check failed: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred while reloading.
+
+   A:	$inform
+
+
+   Message:
+   reload_volume: Operator name and physical volume name not specified
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	Invalid input was typed.
+
+   A:	$tryagn
+
+
+   Message:
+   reload_volume: unable to determine pvid for NAME: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M: The volume registration information does not contain the physical volume
+NAME.  This could be an invalid attempt to reload a stranger physical volume.
+
+   A:	$inform
+
+
+   Message:
+   reload_volume: unable to get info about rpv: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred while reloading.
+
+   A:	$inform
+
+
+   Message:
+   reload_volume: unable to open vtoc header: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred while reloading.
+
+   A:	$inform
+
+
+   Message:
+   reload_volume: unable to build VTOC map: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred while reloading.
+
+   A:	$inform
+
+
+   END MESSAGE DOCUMENTATION */
+
+  end reloader;
+
+
+
+
+		    rldr_arg_reader_.pl1            10/21/92  1624.5rew 10/21/92  1623.5      113535
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1992   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+rldr_arg_reader_: proc (rldr_datap, a_alp, a_code);
+
+/* This routine reads and handles the arguments
+   *   for the reloader.
+   *
+   *  Usage:  dcl rldr_arg_reader_ entry ( pointer, pointer, fixed bin (35));
+   *
+   *	call rldr_arg_reader_ (rldr_datap, a_alp, a_code);
+   *
+   *	where
+   *
+   *      1) rldr_datap       is a pointer to the reloader data structure (Input).
+   *
+   *	2) a_alp		is a pointer to the argument list (Input).
+   *
+   *	3) a_code		is a standard status code (Output).
+   *
+   *	Modified 2/79 by Michael R. Jordan for MSS0500 support.
+   *	Modified 3/1/83 by GA Texada for multiple physical volume reloading.
+   *	Modified 3/6/84 by GA Texada for 'stranger' pv reloading.
+
+*/
+
+/****^  HISTORY COMMENTS:
+  1) change(86-01-15,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-06-03,GWMay), install(86-07-17,MR12.0-1097):
+     Add support for subvolumes by implementing the -pvname_device argument.
+  2) change(86-02-25,Lippard), approve(86-04-11,MCR7383),
+     audit(86-06-03,GWMay), install(86-07-17,MR12.0-1097):
+     Initialize lmpvi to 0 at the beginning.
+  3) change(86-10-23,Fawcett), approve(86-10-23,MCR7517),
+     audit(86-10-30,Beattie), install(86-11-03,MR12.0-1206):
+     Changed to remove the word BOS from message.
+  4) change(92-09-14,WAAnderson), approve(92-09-14,MECR0017),
+     audit(92-09-22,Vu), install(92-09-25,MR12.5-1018):
+     The value of rldr_data_.usable_sectors is not being calculated properly
+     for FIPS disks.  The constant 16 is being used instead of the appropriate
+     value in sect_per_rec (declard in fs_dev_types_sector.incl.pl1). The
+     result is a corrupted disk.  This fix replaces 16 with sect_per_rec.
+  5) change(92-10-02,WAAnderson), approve(92-10-02,MCR8272),
+     audit(92-10-13,Vu), install(92-10-21,MR12.5-1039):
+     This MCR closes MECR0017.
+                                                   END HISTORY COMMENTS */
+
+
+dcl YES		     bit (1);
+dcl (ignore, a_code, code) fixed bin (35);
+dcl (a_alp, alp, ap, lmpvsp) ptr;
+dcl (ac, al, nargs, i, j, lmpvi, mpvs) fixed bin;
+dcl arg		     char (al) based (ap);
+dcl 1 local_mpvs	     (mpvs) based (lmpvsp),
+    2 pv		     char (32),
+    2 dv		     char (8);
+
+
+dcl myname	     char (16) int static init ("rldr_arg_reader_") options (constant);
+
+dcl error_table_$bad_arg ext fixed bin (35);
+dcl error_table_$namedup ext fixed bin (35);
+dcl error_table_$noarg   ext fixed bin (35);
+dcl error_table_$badopt  ext fixed bin (35);
+dcl error_table_$inconsistent ext fixed bin (35);
+
+dcl command_query_$yes_no entry () options (variable);
+dcl hcs_$fs_search_get_wdir entry (ptr, fixed bin (35));
+dcl rldr_report_$error_output entry options (variable);
+dcl cu_$arg_ptr_rel	     entry (fixed bin, ptr, fixed bin, fixed bin (35), ptr);
+dcl cu_$arg_count_rel    entry (fixed bin, ptr, fixed bin (35));
+
+dcl (addr, divide, hbound, null, search, substr) builtin;
+dcl cleanup	     condition;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+    code = 0;					/* set up and copy args */
+    ac = 0;					/* first arg to fetch */
+    alp = a_alp;					/* arg list pointer */
+    lmpvsp = null ();
+    lmpvi = 0;
+    mpvs = 0;
+    call cu_$arg_count_rel (nargs, alp, code);		/* find out how many for later.		*/
+    do ac = 1 to nargs by 1;				/* scan the arg list */
+      call cu_$arg_ptr_rel (ac, ap, al, code, alp);
+      if code ^= 0 then do;
+	if code = error_table_$noarg then return;
+	else goto err;
+        end;
+continue_with_args:
+      if arg = "-working_dir" | arg = "-wd" then
+        rldr_data_.sys_dir = wdir_ ();
+      else if arg = "-operator" then do;		/* this must be operator name */
+	ac = ac + 1;
+	call cu_$arg_ptr_rel (ac, ap, al, code, alp);
+	if code ^= 0 then goto err;
+	rldr_data_.operator = arg;
+        end;
+      else if arg = "-output_volume_desc" then do;	/* this must be attach description  */
+	ac = ac + 1;
+	call cu_$arg_ptr_rel (ac, ap, al, code, alp);
+	if code ^= 0 then goto err;
+	rldr_data_.output_volume_desc = arg;
+        end;
+      else if arg = "-input_volume_desc" then do;		/* this must be attach description  */
+	ac = ac + 1;
+	call cu_$arg_ptr_rel (ac, ap, al, code, alp);
+	if code ^= 0 then goto err;
+	rldr_data_.input_volume_desc = arg;
+	rldr_data_.io_module = substr (arg, 1, search (arg, " ") - 1);
+        end;
+      else if arg = "-pvname_device" | arg = "-pvdv" then do;
+	if (nargs - ac) <= 0 then do;			/* must have a physical volume name left	*/
+	    goto no_pv_specified;
+	  end;
+	if lmpvsp = null () then do;
+	    mpvs = nargs - ac;
+	    allocate local_mpvs set (lmpvsp);
+	    on cleanup begin;
+	        if lmpvsp ^= null () then free local_mpvs;
+	      end;
+	  end;
+get_next_pv_dev:
+	ac = ac + 1;
+	if ac > nargs then do;
+	    if lmpvi > 0 then goto check_consistency_args;
+	    else goto no_pv_specified;
+	  end;
+	call cu_$arg_ptr_rel (ac, ap, al, code, alp);
+	if code ^= 0 then goto err;
+	if substr (arg, 1, 1) = "-" then do;		/* this is the next ctl arg			*/
+	    if lmpvi = 0 then do;			/* if we didn't get a pv name then		*/
+	        call rldr_report_$error_output (rldr_datap, error_table_$noarg, myname,
+						/* its an error				*/
+		   "Expected physical volume name(s), found ^a", arg);
+	        goto clean_up;
+	      end;
+	    else goto continue_with_args;
+	  end;
+	do j = 1 to lmpvi;				/* check for duplicate pv names now		*/
+	  if local_mpvs (j).pv = arg then do;
+	      code = error_table_$namedup;		/* make it meaninful			*/
+	      call rldr_report_$error_output (rldr_datap, code, myname, "Physical volume ^a specified more than once",
+		 arg);
+	      goto clean_up;
+	    end;
+	end;
+	lmpvi = lmpvi + 1;
+	local_mpvs (lmpvi).pv = arg;
+	ac = ac + 1;
+	call cu_$arg_ptr_rel (ac, ap, al, code, alp);
+	if code ^= 0 then goto err;
+	if substr (arg, 1, 1) = "-" then do;
+no_val_dev:
+	    call rldr_report_$error_output (rldr_datap, error_table_$noarg, myname,
+						/* its an error				*/
+	         "Expected device name, found ^a", arg);
+	    goto clean_up;
+	  end;
+	if al > 8 then goto no_val_dev;
+	if substr (arg, 1, 3) ^= "dsk" then goto no_val_dev;
+	local_mpvs (lmpvi).dv = arg;
+	if local_mpvs (lmpvi).pv = "rpv" then rldr_data_.rpv = "1"b;
+	goto get_next_pv_dev;
+        end;
+
+      else if arg = "-pvname" then do;
+	if lmpvsp = null () then do;
+	    mpvs = nargs - ac;
+	    if mpvs <= 0 then do;			/* must have a physical volume name left	*/
+no_pv_specified:
+	        code = error_table_$noarg;
+	        call rldr_report_$error_output (rldr_datap, code, myname, "Expected a physical volume name");
+	        goto clean_up;
+	      end;
+
+	    allocate local_mpvs set (lmpvsp);
+	    on cleanup begin;
+	        if lmpvsp ^= null () then free local_mpvs;
+	      end;
+
+	  end;
+get_next_pvname:
+	ac = ac + 1;
+	if ac > nargs then do;
+	    if lmpvi > 0 then goto check_consistency_args;
+	    else goto no_pv_specified;
+	  end;
+	call cu_$arg_ptr_rel (ac, ap, al, code, alp);
+	if code ^= 0 then goto err;
+	if substr (arg, 1, 1) = "-" then do;		/* this is the next ctl arg			*/
+	    if lmpvi = 0 then do;			/* if we didn't get a pv name then		*/
+	        call rldr_report_$error_output (rldr_datap, error_table_$noarg, myname,
+						/* its an error				*/
+		   "Expected physical volume name(s), found ^a", arg);
+	        goto clean_up;
+	      end;
+	    else goto continue_with_args;
+	  end;
+	do j = 1 to lmpvi;				/* check for duplicate pv names now		*/
+	  if local_mpvs (j).pv = arg then do;
+	      code = error_table_$namedup;		/* make it meaninful			*/
+	      call rldr_report_$error_output (rldr_datap, code, myname, "Physical volume ^a specified more than once",
+		 arg);
+	      goto clean_up;
+	    end;
+	end;
+	lmpvi = lmpvi + 1;
+	local_mpvs (lmpvi).pv = arg;
+	local_mpvs (lmpvi).dv = "";
+	if local_mpvs (lmpvi).pv = "rpv" then rldr_data_.rpv = "1"b;
+	goto get_next_pvname;
+        end;
+
+      else if arg = "-disk_model" then do;		/* we will only use rldr_data_.disk_model(1)	*/
+	ac = ac + 1;				/* because -disk_model is NOT allowed		*/
+	call cu_$arg_ptr_rel (ac, ap, al, code, alp);	/* when multiple physical volumes are		*/
+	if code ^= 0 then goto err;			/* to be reloaded, so it doesn't hurt		*/
+	rldr_data_.disk_model (1) = arg;
+	if rldr_data_.disk_model (1) = "m400" then rldr_data_.disk_model (1) = "d400"; /* For MR7.0 only */
+	else if rldr_data_.disk_model (1) = "m450" then rldr_data_.disk_model (1) = "d450"; /* For MR7.0 only */
+	do i = 1 to hbound (device_names, 1) while (device_names (i) ^= rldr_data_.disk_model (1));
+	end;
+	if i > hbound (device_names, 1) then goto bad_arg;
+	rldr_data_.usable_sectors (1) = divide (sect_per_cyl (i), sect_per_rec (i), 17, 0) * sect_per_rec (i);
+	rldr_data_.unusable_sectors (1) = sect_per_cyl (i) - rldr_data_.usable_sectors (1);
+        end;
+      else if arg = "-save" then rldr_data_.save = "1"b;
+      else if arg = "-no_detach" then rldr_data_.detach = ""b; /* don't detach */
+      else if arg = "-no_object" then rldr_data_.no_object = "1"b; /* don't write object */
+      else if arg = "-manual" then rldr_data_.manual = "1"b;
+      else if arg = "-restart" then rldr_data_.common.restart = "1"b;
+      else if arg = "-error_on" then rldr_data_.err_online = "1"b;
+      else do;
+	code = error_table_$badopt;
+	goto err;
+        end;
+    end;
+check_consistency_args:				/* Check consistency of args			*/
+    rldr_data_.npvs = lmpvi;				/* set the bounds				*/
+    do lmpvi = 1 to rldr_data_.npvs;
+      rldr_data_.pvname (lmpvi) = local_mpvs (lmpvi).pv;
+      rldr_data_.device_name (lmpvi) = local_mpvs (lmpvi).dv;
+    end;
+    free local_mpvs;				/* finished with this now, so			*/
+    lmpvsp = null ();				/* and set for clean_up			*/
+
+    if rldr_data_.npvs > 1 then do;
+        if ((rldr_data_.detach = ""b) | (rldr_data_.disk_model (1) ^= "")) then do;
+	  code = error_table_$inconsistent;
+	  call rldr_report_$error_output (rldr_datap, code, myname,
+	       "^[-no_detach^] ^[-disk_model^] not allowed when reloading multiple physical volumes",
+	       (rldr_data_.detach = ""b), (rldr_data_.disk_model (1) ^= ""));
+	  goto clean_up;
+	end;
+        if rldr_data_.save then do;
+	  call command_query_$yes_no (YES, 0, myname,
+	       "The use of -save and more than one physical volume implies that all pv's named have been restored at BCE",
+	       "Have all pv's named been restored at BCE");
+	  if ^YES then do;
+	      code = error_table_$bad_arg;
+	      goto clean_up;
+	    end;
+	end;
+      end;
+    goto clean_up;					/* get around this old stuff			*/
+bad_arg: code = error_table_$bad_arg;
+err: call rldr_report_$error_output (rldr_datap, code, myname, "^a", arg);
+clean_up:
+    if lmpvsp ^= null () then free local_mpvs;
+    a_code = code;
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+wdir_: proc returns (char (168) aligned);
+
+/* This proc returns the working directory */
+
+dcl wdir		     char (168) aligned;
+    call hcs_$fs_search_get_wdir (addr (wdir), ignore);
+    return (wdir);
+  end wdir_;
+
+%include rldr_data_;
+
+%include backup_static_variables;
+%include fs_dev_types;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   rldr_arg_reader_: ARG: ERROR_MESS
+
+   S:	$info
+
+   T:	$run
+
+   M:	Invalid arguments were given to the reloader.
+
+   A:	$tryagn
+
+   Message:
+ rldr_arg_reader_: Implementation Restriction, the RPV must be reloaded
+ separately to obtain the required physical volume information.
+
+   S:	$info
+
+   T:	$run
+
+   M:	Due to an implementation restriction, the RPV must be reloaded
+	separately from the other physical volumes. Reload the RPV first,
+	then re-invoke the reload_volue command with the other physical
+	volume names to be reloaded.
+
+   A:	$tryagn
+
+
+   END MESSAGE DOCUMENTATION */
+
+  end rldr_arg_reader_;
+ 
+
+
+
+		    rldr_check_pvol_.pl1            11/11/89  1129.2r w 11/11/89  0851.2       81774
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+rldr_check_pvol_: proc (rldr_datap, pvindex, code);
+
+/* This routine cross checks the label info in the volume log with that on the physical volume in an
+   attempt to predict if the physical volume is big enough to contain the reloaded information or will be usable
+   after it is reloaded. Checks are made for  record number, vtoce number, min and max access class, and partition match. */
+/* Written: In antiquity by Dave Vinograd.					  */
+/* Modified: 3/1/83 by GA Texada to allow multiple physical volume reloading.		  */
+
+dcl code		     fixed bin (35);
+dcl (lidx, vidx, pvindex) fixed bin;
+dcl match		     bit (1);
+
+dcl myname	     char (16) int static init ("rldr_check_pvol_") options (constant);
+dcl fatal		     fixed bin int static init (3) options (constant);
+dcl unusable	     fixed bin int static init (1) options (constant);
+dcl non_completion	     fixed bin int static init (2) options (constant);
+
+dcl rldr_report_$online_output entry options (variable);
+dcl convert_aim_attributes_ entry (bit (72) aligned, char (32));
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+/* initialize local variables */
+    code = 0;
+    labelp = rldr_data_.labelp (pvindex);
+    bvlp = rldr_data_.bvlp (pvindex);
+    vtoc_headerp = rldr_data_.vtoc_headerp (pvindex);
+    vol_mapp = rldr_data_.vol_mapp (pvindex);
+						/* check if volume initialized */
+    if label.Multics ^= Multics_ID_String
+      | label.version ^= 1 then do;
+        code = fatal;
+        call rldr_report_$online_output (rldr_datap, 0, myname, "Unitialized output volume, pv ^a",
+	rldr_data_.pvname (pvindex));
+        return;
+      end;
+    if ^rldr_data_.save then do;
+        if vol_map.n_rec ^= vol_map.n_free_rec
+	& vtoc_header.n_vtoce ^= vtoc_header.n_free_vtoce then do;
+	  code = fatal;
+	  call rldr_report_$online_output (rldr_datap, 0, myname, "Uninitialized output volume, pv ^a",
+	    rldr_data_.pvname (pvindex));
+	  return;
+	end;
+      end;
+						/* check to see if whats to be reloaded will fit */
+
+    if backup_volume_log.n_rec > vol_map.n_rec then do;
+        call rldr_report_$online_output (rldr_datap, 0, myname, "Reload may overflow volume ");
+        call rldr_report_$online_output (rldr_datap, 0, myname,
+	"Disk label requires ^d records; Volog label requires ^d records on pv ^a",
+	vol_map.n_rec, backup_volume_log.n_rec, rldr_data_.pvname (pvindex));
+        code = non_completion;
+      end;
+
+    if backup_volume_log.n_vtoce > vtoc_header.n_vtoce then do;
+        call rldr_report_$online_output (rldr_datap, 0, myname, "Reload may overflow vtoc");
+        call rldr_report_$online_output (rldr_datap, 0, myname,
+	"Disk label requires ^d vtoce; Volog label requires ^d vtoce on pv ^a",
+	vtoc_header.n_vtoce, backup_volume_log.n_vtoce, rldr_data_.pvname (pvindex));
+        code = non_completion;
+      end;
+
+/* Check if preinitialized volume is what was requested. We must special case the rpv since we have cold booted
+   onto a temp pack thus the rpv uid will have changed. */
+
+    if ^(rldr_data_.pvname (pvindex) = "rpv") then
+         if backup_volume_log.pvid ^= label.pvid
+	 | backup_volume_log.pv_name ^= label.pv_name then do;
+	   code = unusable;
+	   call rldr_report_$online_output (rldr_datap, 0, myname, "Volume mismatch");
+	   call rldr_report_$online_output (rldr_datap, 0, myname,
+	     "Disk label says name = ^a,pvid = ^w; Volog label says name = ^a,pvid = ^w",
+	     label.pv_name, label.pvid, backup_volume_log.pv_name, backup_volume_log.pvid);
+	   return;
+	 end;
+						/* cross check max access class */
+    if backup_volume_log.max_access_class ^= label.max_access_class then do;
+        call rldr_report_$online_output (rldr_datap, 0, myname, "Maximum access class mismatch");
+        call rldr_report_$online_output (rldr_datap, 0, myname, "Disk label says: ^a; Volog label says: ^a for pv ^a",
+	get_aim_access_ (label.max_access_class),
+	get_aim_access_ (backup_volume_log.max_access_class),
+	rldr_data_.pvname (pvindex));
+        code = unusable;
+
+      end;
+						/* and min access class */
+    if backup_volume_log.min_access_class ^= label.min_access_class then do;
+        call rldr_report_$online_output (rldr_datap, 0, myname, "Minimum access class mismatch");
+        call rldr_report_$online_output (rldr_datap, 0, myname, "Disk label says: ^a; Volog label says ^a for pv ^a",
+	get_aim_access_ (label.min_access_class),
+	get_aim_access_ (backup_volume_log.min_access_class),
+	rldr_data_.pvname (pvindex));
+        code = unusable;
+      end;
+						/* cross check partition names and extents */
+    do vidx = 1 to backup_volume_log.nparts;
+      match = "0"b;
+      do lidx = 1 to label.nparts;
+        if label.parts (lidx).part = backup_volume_log.parts (vidx).part then do;
+	  match = "1"b;
+	  if label.parts (lidx).nrec < backup_volume_log.parts (vidx).nrec then do;
+	      code = unusable;
+	      call rldr_report_$online_output (rldr_datap, 0, myname, "Partition ^a size mismatch",
+	        label.parts (lidx).part);
+	      call rldr_report_$online_output (rldr_datap, 0, myname,
+	        "Disk label requires ^d records; Volog label requires ^d for pv ^a",
+	        label.parts (lidx).nrec, backup_volume_log.parts (vidx).nrec, rldr_data_.pvname (pvindex));
+	    end;
+	end;
+      end;
+      if ^match then do;
+	code = unusable;
+	call rldr_report_$online_output (rldr_datap, 0, myname, "Partition ^a not found on physical volume ^a",
+	  backup_volume_log.parts (vidx).part, rldr_data_.pvname (pvindex));
+        end;
+    end;
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+get_aim_access_: proc (access) returns (char (32));
+
+/* This proc returns an AIM access class in a printable form. */
+
+dcl access	     bit (72) aligned;
+dcl aim_access	     char (32);
+    call convert_aim_attributes_ (access, aim_access);
+    return (aim_access);
+
+  end get_aim_access_;
+
+%include rldr_data_;
+
+%include backup_volume_log;
+
+%include backup_volume_header;
+%include backup_pvol_info;
+
+%include fs_vol_label;
+
+%include vtoc_header;
+%include vol_map;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   rldr_check_pvol_: Unitialized output volume
+
+   S:	$rld_on
+
+   T:	$reload
+
+   M:	The output volume must be initialized with init_vol before use.
+
+   A:	Switch the output volume to storage-system status
+   with the sdu command and then use init_vol to set it up.
+
+
+   Message:
+   rldr_check_pvol_: Reload may overflow volume
+   .br
+   rldr_check_pvol_: Have NN records; Volog label requires NN records
+
+   S:	$rld_on
+
+   T:	$reload
+
+   M:	The output volume is too small.
+
+   A:	Reinitialize it correctly with init_vol.
+
+
+   Message:
+   rldr_check_pvol_: Reload may overflow vtoc
+   .br
+   rldr_check_pvol_: Have NN vtoce; Volog label requires NN vtoce
+
+   S:	$rld_on
+
+   T:	$reload
+
+   M:	The output volume has too small a VTOC.
+
+   A:	Reinitialize the output volume with init_vol.
+
+
+   Message:
+   rldr_check_pvol_: Volume mismatch
+   .br
+   rldr_check_pvol_: Have PVNAME,pvid = WWW; Volog label requires PVNAME,pvid = WWW
+
+   S:	$rld_on
+
+   T:	$reload
+
+   M:	The output volume label disagrees with the volume log.
+
+   A:	Reinitialize the output volume correctly with init_vol.
+
+
+   Message:
+   rldr_check_pvol_: Maximum access class mismatch
+   .br
+   rldr_check_pvol_: Have ACCESS_CLASS; Volog label requires ACCESS_CLASS
+
+   S:	$rld_on
+
+   T:	$reload
+
+   M:	The maximum access class for the volume does not match the volume log.
+
+   A:	$tryagn
+
+
+   Message:
+   rldr_check_pvol_: Minimum access class mismatch
+   .br
+   rldr_check_pvol_: Have ACCESS_CLASS; Volog label requires ACCESS_CLASS
+
+   S:	$rld_on
+
+   T:	$reload
+
+   M:	The minimum access class for the volume does not match the volume log.
+
+   A:	$tryagn
+
+
+   Message:
+   rldr_check_pvol_: Partition NAME size mismatch
+   .br
+   rldr_check_pvol_: Have NN records; Volog label requires MM
+
+   S:	$rld_on
+
+   T:	$reload
+
+   M:	The size for partition NAME does not match.
+
+   A:	Reinitialize the volume correctly.
+
+
+   Message:
+   rldr_check_pvol_: Partition NAME not found on physical volume
+
+   S:	$rld_on
+
+   T:	$reload
+
+   M:	The partition NAME is missing from the volume label.
+
+   A:	Reinitialize the volume correctly.
+
+
+   END MESSAGE DOCUMENTATION */
+
+  end rldr_check_pvol_;
+  
+
+
+
+		    rldr_finish_.pl1                11/11/89  1129.2r w 11/11/89  0851.4       44577
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(88-10-05,GWMay), approve(88-10-05,MCR8005), audit(88-10-12,Farley),
+     install(88-10-17,MR12.2-1173):
+     Changed to include administration of one additional temporary work file.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+rldr_finish_: proc (rldr_datap, areap, code);
+
+/* This routine provides the cleanup function for the volume reloader subsystem. It detaches any
+   switches still attached, releases the temp segs, and unlocks the  volume log. */
+/* Written: In antiquity by Dave Vinograd.				 */
+/* Modified: March 1983 by E. N. Kittlitz for 256K segments.	    */
+/* Modified: 03/04/83 by GA Texada to support multiple physical volume reloading.*/
+
+dcl Area		     area based (areap);
+dcl areap		     ptr;
+dcl i		     fixed bin;
+dcl (ignore, code)	     fixed bin (35);
+dcl tp		     (6) ptr;
+
+dcl release_temp_segment_ entry (char (*), ptr, fixed bin (35));
+dcl release_temp_segments_ entry (char (*), (*) ptr, fixed bin (35));
+dcl set_lock_$unlock     entry (bit (36) aligned, fixed bin (35));
+dcl hcs_$set_256K_switch entry (bit (2) aligned, bit (2) aligned, fixed bin (35));
+dcl hcs_$set_max_length_seg entry (ptr, fixed bin (19), fixed bin (35));
+dcl hcs_$truncate_seg    entry (ptr, fixed bin (19), fixed bin (35));
+dcl iox_$close	     entry (ptr, fixed bin (35));
+dcl iox_$detach_iocb     entry (ptr, fixed bin (35));
+dcl sys_info$max_seg_size fixed bin (35) ext static;
+dcl null		     builtin;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+    code = 0;
+
+    if areap = null () then return;
+    if rldr_datap = null () then return;
+    if ^rldr_data_.data_init then do;			/* if data not initialized then don't trust */
+        free rldr_data_ in (Area);			/* get rid of this			   */
+        return;
+      end;
+						/* detach switches still attached as required */
+    call detach (rldr_data_.error_iocbp);
+    if rldr_data_.detach then do;
+        call detach (rldr_data_.inputvol_iocbp);
+        do i = 1 to rldr_data_.npvs;
+	call detach (rldr_data_.outputvol_iocbp (i));
+        end;
+      end;
+    tp (1) = rldr_data_.volume_record_bp;
+    tp (2) = rldr_data_.data_object_bp;
+    tp (3) = rldr_data_.input_vol_lstp;
+    tp (4) = rldr_data_.skip;
+    tp (5) = rldr_data_.infop;
+    tp (6) = rldr_data_.input_buffer_ptr;
+
+    call hcs_$truncate_seg (rldr_data_.data_object_bp, 0, ignore);
+    call hcs_$set_max_length_seg (rldr_data_.data_object_bp, (sys_info$max_seg_size), ignore);
+    call hcs_$truncate_seg (rldr_data_.input_buffer_ptr, 0, ignore);
+    call hcs_$set_max_length_seg (rldr_data_.input_buffer_ptr, (sys_info$max_seg_size), ignore);
+
+    call release_temp_segments_ ("reload_volume", tp, ignore);
+
+    do i = 1 to rldr_data_.npvs;			/* get all the temp segs and 			*/
+						/* unlock log if required */
+      if rldr_data_.vtocbp (i) ^= null () then
+        call release_temp_segment_ ("reload_volume", rldr_data_.vtocbp (i), ignore);
+      if rldr_data_.bvlp (i) ^= null then do;
+	bvlp = rldr_data_.bvlp (i);
+	call unlock_log;
+        end;
+    end;
+    call hcs_$set_256K_switch (rldr_data_.old_256K_switch, (""b), (0));
+    free rldr_data_ in (Area);
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+detach: proc (iocbp);
+
+/* This proc detaches the specified iocb. It ignores all errors. */
+
+dcl iocbp		     ptr;
+
+    if iocbp ^= null () then do;
+        call iox_$close (iocbp, ignore);
+        call iox_$detach_iocb (iocbp, ignore);
+        iocbp = null;
+      end;
+    return;
+
+  end detach;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+unlock_log: proc;
+
+/* This proc unlocks the volume log */
+
+    call set_lock_$unlock (backup_volume_log.lock, ignore);
+    return;
+  end unlock_log;
+
+%include rldr_data_;
+
+%include backup_volume_log;
+%include backup_pvol_info;
+
+%include backup_volume_header;
+
+%include fs_vol_label;
+
+  end rldr_finish_;
+   
+
+
+
+		    rldr_input_.pl1                 10/17/90  1139.1rew 10/17/90  1136.5      422136
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1990   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-02-11,GWMay), approve(), audit(), install():
+     old history comments:
+         Modified 5/79 by D. Vinograd to correct calling sequence to read_page
+                       so that variable already_there is passed as arg, and to
+                       correctly handle pages which are non null but contain all
+                       zeros. These are not writen out by the dumper and so must be
+                       fabricated by the reloader.
+         Modified April 1982 by J. Bongiovanni for new label.
+         Modified June 1982 by GA Texada to report read errors.
+         Modified July 1982 by GA Texada to fix phx13000 and fix a bug
+                       introduced above.
+         Modified Sept 1982 by Texada to get volume names via command_query_.
+         Modified: 12/2/82 by GAT for emergency MR10.1 fix for phx14335.
+         Modified Nov. 1982 by GAT to provide the pv name of last object read
+                       sucessfully when skipping objects due to tape problems.
+         Modified 03/01/83 by GA Texada for multiple physical volume reloading.
+     DONT FORGET TO REMOVE THE pvolid CODE!!!
+         Modified 03/12/85 by Greg Texada to fix phx19165, don't give up so
+                       soon when resynching (D. Kitson).
+  2) change(86-02-11,GWMay), approve(86-07-10,MCR7445), audit(86-11-19,GDixon),
+     install(86-11-21,MR12.0-1223):
+     changed position of call to rldr_vtoc_buffer_$write before do loop to
+     support changes in the subroutine.  Removed all error message
+     documentation.  This module is not covered by the policy for error
+     message doc.
+  3) change(86-05-13,GJohnson), approve(86-05-13,MCR7387),
+     audit(86-05-13,Martinson), install(86-05-14,MR12.0-1056):
+     Correct error message documentation.
+  4) change(88-10-05,GWMay), approve(88-10-05,MCR8005), audit(88-10-12,Farley),
+     install(88-10-17,MR12.2-1173):
+     Changed the routine read_page to be read_object.  Because of changes to
+     the format of volume dump tapes, entire segments are read from the tape
+     with null pages handled when writing to disk.
+     
+     Installed a completely new read routine to handle tapes which contain
+     incomplete data.
+  5) change(90-02-06,Farley), approve(90-05-09,MCR8174),
+     audit(90-04-02,WAAnderson), install(90-06-12,MR12.4-1014):
+     Modified skip_chars procedure to account for times when the data is
+     "DELIMITED", when calling the read procedure.
+  6) change(90-10-12,WAAnderson), approve(90-10-12,MCR8214),
+     audit(90-10-15,Schroth), install(90-10-17,MR12.4-1047):
+     The volume reloader may fail when skipping over segments not pertaining to
+     the physical volume being loaded.
+                                                   END HISTORY COMMENTS */
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+
+rldr_input_: proc;
+
+/* This routine provides  all necessary input functions for the volume reloader. It
+   generates the list of dump volumes  necessary to recreate the physical volume, and then reads them
+   in the correct order(reverse chronological). It uses the control seg as a look aside memory to determine if a
+   vtoce has already been reloaded from a newer dump volume. If so we skip the older copy. We return to the
+   caller only when a new object has been found. If the object supeerceeds an existant object we set a flag. */
+
+dcl (pattern_match_label, retry_attach_label) label;
+dcl avolname	     char (32) var;
+dcl (already_there, resynching_completed, resynching, new_volume, YES, a_new_volume, new_info, skip_next_header_check, ring_1) bit (1);
+dcl (code, ignore, words_skipped) fixed bin (35);
+dcl att_desc	     char (256);
+dcl resynch_retry_count  fixed bin;
+dcl rets		     char (79) varying;
+dcl rets_len	     fixed bin (21);
+dcl (incr_open_time, cons_open_time, comp_open_time, time_unmounted) fixed bin (71);
+dcl (comp_cycle_uid, cons_cycle_uid, volid) bit (36);
+dcl (entry, vtocx, vlx, a_pvindex, pvindex, idx, sortx, num_pos) fixed bin;
+dcl (nel, nelt)	     fixed bin (21);
+dcl char_buf	     char (256 * CHARS_PER_PAGE) based (rldr_data_.data_object_bp);
+dcl word		     (size (backup_volume_header)) bit (36) based (recordp);
+dcl input_buf	     (divide (nelt, CHARS_PER_WORD, 17, 0)) bit (36) based (recordp);
+dcl string	     bit (BITS_PER_WORD * size (backup_volume_header)) based (recordp);
+dcl (char_num, pvname, lvname, volname) char (32);
+
+dcl warning_printed	     bit (1) static init ("0"b);
+dcl get_object	     fixed bin static init (1) options (constant);
+dcl read_object	     fixed bin static init (2) options (constant);
+dcl init		     fixed bin static init (3) options (constant);
+dcl collect_stats	     fixed bin static init (4) options (constant);
+dcl myname	     char (32) var int static init ("rldr_input_") options (constant);
+dcl DELIMITED	     bit (1) aligned internal static options (constant)
+		     init ("1"b);
+dcl DELIM_LEN	     fixed bin (21) internal static options (constant) init (8);
+dcl rldr_vtoc_buffer_$write entry (ptr, fixed bin (35));
+dcl hc_backup_$decode_uidpath entry ((0:15) bit (36) aligned, char (*), char (*), fixed bin (35));
+dcl get_group_id_	     entry returns (char (32));
+dcl hcs_$level_get	     entry returns (fixed bin);
+dcl timer_manager_$alarm_call entry (fixed bin (71), bit (2), entry);
+dcl timer_manager_$reset_alarm_call entry (entry);
+dcl mdc_$find_volname    entry (bit (36), char (*), char (*), fixed bin (35));
+dcl cv_dec_check_	     entry (char (*), fixed bin (35)) returns (fixed bin);
+dcl ioa_		     entry options (variable);
+dcl ioa_$rsnnl	     entry () options (variable);
+dcl command_query_	     entry options (variable);
+dcl command_query_$yes_no entry () options (variable);
+dcl set_lock_$lock	     entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl set_lock_$unlock     entry (bit (36) aligned, fixed bin (35));
+dcl rldr_vtoc_header_$update entry (ptr, fixed bin, fixed bin (35));
+dcl rldr_volume_map_$update entry (ptr, fixed bin, fixed bin (35));
+dcl rldr_report_$error_output entry options (variable);
+dcl rldr_report_$online_output entry options (variable);
+
+dcl error_table_$action_not_performed fixed bin (35) ext static;
+dcl error_table_$data_loss fixed bin (35) ext static;
+dcl error_table_$device_end fixed bin (35) ext static;
+dcl error_table_$root    fixed bin (35) ext static;
+dcl error_table_$resource_unavailable ext fixed bin (35);
+dcl error_table_$end_of_info ext fixed bin (35);
+dcl error_table_$bad_volid ext fixed bin (35);
+
+dcl seg_fault_error	     condition;
+
+dcl (addcharno, addr, fixed, index, size, null, unspec, bin,
+  divide, length, maxlength, min, mod, rtrim, search, ptr, substr) builtin;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+get_object: entry (rldr_datap, skip_next_header_check, vtocep, vtocx, already_there, a_pvindex, code);
+
+/* This entry reads dump volumes until it encounters a vtoce that either has not been read or is newer
+   then the already read.  It returns to the caller with this info. The parameter pvindex is output
+ index into rldr_data_.pvname on which the object belongs.
+*/
+
+/* set local variables */
+    entry = get_object;
+    a_pvindex, vtocx = -1;
+    code = 0;
+    already_there = "0"b;
+    recordp = rldr_data_.volume_record_bp;
+
+/* if switch not attached do so */
+    if rldr_data_.inputvol_iocbp = null then call attach;	/*  return label for int proc if errors */
+search_loop:
+						/* set flags */
+    resynching_completed = "0"b;
+    resynching = "0"b;
+    new_info = "0"b;
+						/* read till we fail or find new data */
+    do while (^new_info & code = 0);
+      call read_volume_record;
+    end;
+						/* copy vtoc entry */
+    if pvindex >= 1 then do;
+        controlp = rldr_data_.controlp (pvindex);
+        vtocep -> vtoce = backup_volume_record.vtoce;
+        a_pvindex = pvindex;
+      end;
+get_object_ret:
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+read_object: entry (rldr_datap, a_pvindex, a_new_volume, skip_next_header_check, pages_returned, code);
+
+dcl (pad_chars, pages_returned) fixed bin;
+
+    entry = read_object;
+    pvindex = a_pvindex;
+    a_new_volume = "0"b;
+    resynching_completed = "0"b;
+    resynching = "0"b;
+    skip_next_header_check = "0"b;
+    pages_returned, nelt, code = 0;
+    recordp = rldr_data_.volume_record_bp;
+    controlp = rldr_data_.controlp (pvindex);
+    nel = backup_volume_record.rec2_len;
+
+    call read (rldr_data_.data_object_bp, nel, nelt,
+         (backup_volume_record.version > 1), code);
+
+    pages_returned = divide (nelt + CHARS_PER_PAGE - 1, CHARS_PER_PAGE, 17);
+    pad_chars = CHARS_PER_PAGE - mod (nelt, CHARS_PER_PAGE);
+    if pad_chars < CHARS_PER_PAGE then
+      unspec (substr (char_buf, nelt + 1, pad_chars)) = "0"b;
+
+    call check_input_error;
+
+    if new_volume then do;
+        rldr_control (backup_volume_record.vtocx).uid = "0"b; /* clean up */
+        rldr_control (backup_volume_record.vtocx).volid = "0"b;
+        a_new_volume = new_volume;
+        return;
+      end;
+
+    skip_next_header_check = resynching_completed;
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+init_volume_list: entry (rldr_datap, code);
+
+/* This entry scans the volume log and builds the list of dump volumes required to recreate the
+   physical volume(s). This list is referred to as a reload group. */
+
+    entry = init;
+    code = 0;
+    skip = rldr_data_.skip;
+
+    vlx = 0;
+    do pvindex = 1 to rldr_data_.npvs;
+      labelp, old_labelp = rldr_data_.labelp (pvindex);
+      bvlp = rldr_data_.bvlp (pvindex);
+      if label.volmap_version = 1 | label.volmap_version = 2
+	 then time_unmounted = label.time_unmounted;
+      else time_unmounted = old_label.time_unmounted;
+      if rldr_data_.manual then return;			/* if manual mode don't need volume list */
+      call lock_volume_log;				/* lock volume log for scan */
+      if code ^= 0 then return;
+
+/* Back scan the volume log to develop the list of dump volumes necessary to recreate the physical volume. This
+   list is referred to as a reload group. The basic scheme is touse incremental duymp volumes until they are superceeded
+   by consolidated dump volumes and consolidated dump volumes until a complete dump volume is found. Care must
+   be taken for the case where the dumping process overlapped, as well as for the multi volume consolidated
+   or complete dump. Dump volumes not closed are not used, else we might try to use a still mounted incremental dump
+   volume. */
+
+      incr_open_time = 0;
+      cons_open_time = 0;
+      comp_open_time = 0;
+      comp_cycle_uid = "0"b;
+      cons_cycle_uid = "0"b;
+      do idx = backup_volume_log.next to 1 by -1;
+        bvlep = addr (backup_volume_log.array (idx));
+        if bvle.dump_type = incr then do;
+	  if cons_open_time ^= 0 | comp_open_time ^= 0 then do;
+	      if (cons_open_time ^= 0 & cons_open_time < bvle.close_time)
+		 | (comp_open_time ^= 0 & comp_open_time < bvle.close_time)
+		 then call log_volume_name;
+	    end;
+	  else do;
+	      call log_volume_name;
+	      incr_open_time = open_time ();
+	    end;
+	end;
+        else if bvle.dump_type = cons then do;
+	  if comp_open_time ^= 0 then do;
+	      if comp_open_time < bvle.close_time
+		 | cons_cycle_uid = bvle.cycle_uid then call log_volume_name;
+	    end;
+	  else do;
+	      call log_volume_name;
+	      cons_open_time = open_time ();
+	      cons_cycle_uid = bvle.cycle_uid;
+	    end;
+	end;
+        else if bvle.dump_type = comp then do;
+	  if comp_cycle_uid ^= "0"b then do;
+	      if comp_cycle_uid = bvle.cycle_uid then call log_volume_name;
+	      comp_open_time = open_time ();
+	    end;
+	  else do;
+	      comp_cycle_uid = bvle.cycle_uid;
+	      comp_open_time = open_time ();
+	      call log_volume_name;
+	    end;
+	end;
+      end;
+      call unlock_volume_log;				/* all done so unlock */
+    end;
+    rldr_input_volume_list.num_entries = vlx;
+    rldr_input_volume_list.curn_entry = 0;
+
+/* If we are restarting search the control seg for the volume name/position in the list			*/
+/*   of dump volumes to be read.								*/
+/* If we ARE restarting, then we only need to look at ONE control because we forced them all to be the same	*/
+    if rldr_data_.common.restart then do;		/* find out where we were */
+        controlp = rldr_data_.controlp (1);
+        do idx = rldr_input_volume_list.curn_entry + 1 to rldr_input_volume_list.num_entries
+	   while (rldr_input_volume_list (idx).volname ^= rldr_control.curn_volname);
+        end;
+        if idx > rldr_input_volume_list.num_entries then do;
+	  code = error_table_$bad_volid;
+	  call rldr_report_$error_output (rldr_datap, code, myname, "Error locating restart volume");
+	  return;
+	end;
+        rldr_input_volume_list.curn_entry = idx - 1;
+      end;
+    if rldr_input_volume_list.num_entries <= 0 then do;	/* check for null list			*/
+        call rldr_report_$error_output (rldr_datap, 0, myname,
+	   "No dump volumes selected for this reload.");	/* see error message doc at end		*/
+        code = error_table_$action_not_performed;
+      end;
+    else do;
+        if ^rldr_data_.brief then do;			/* Tell operator ahead of time what dump volumes we want */
+	  call rldr_report_$online_output (rldr_datap, 0, myname, "Please get the following input volumes");
+	  rets = "";
+	  do idx = rldr_input_volume_list.curn_entry + 1 to rldr_input_volume_list.num_entries;
+	    call ioa_$rsnnl ("^(^a,^)", rets, rets_len, (rets) || " " || rldr_input_volume_list (idx).volname);
+	    if idx ^= rldr_input_volume_list.num_entries then
+	      if (rets_len + (length (rtrim (rldr_input_volume_list (idx + 1).volname))) + 2
+		 > maxlength (rets)) then do;
+						/* avoid problems if writing to the Operator Console*/
+		call rldr_report_$online_output (rldr_datap, 0, "", "^a", rtrim (rets, ","));
+		rets = "";
+	        end;
+	  end;
+	  if rets ^= "" then call rldr_report_$online_output (rldr_datap, 0, "", "^a", rtrim (rets, ","));
+	end;
+      end;
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+collect_stats: entry (rldr_datap, a_pvindex);
+
+/* This entry collects statistics about what is being reloaded. We collect statistics on a per dump volume
+   read basis as well as summary statistics about the entire reload. */
+
+    entry = collect_stats;
+    pvindex = a_pvindex;
+    recordp = rldr_data_.volume_record_bp;
+    controlp = rldr_data_.controlp (pvindex);
+
+
+/* if non-null object */
+    if backup_volume_record.uid ^= "0"b then do;
+						/* if directory */
+        if backup_volume_record.dirsw then do;
+	  rldr_control.dir_num = rldr_control.dir_num + 1;
+	  rldr_control.dir_rec = rldr_control.dir_rec + fixed (backup_volume_record.records);
+	  rldr_control.input_vol_dir_num = rldr_control.input_vol_dir_num + 1;
+	  rldr_control.input_vol_dir_rec = rldr_control.input_vol_dir_rec +
+	       fixed (backup_volume_record.records);
+	end;
+        else do;					/* or segment */
+	  rldr_control.seg_num = rldr_control.seg_num + 1;
+	  rldr_control.input_vol_seg_num = rldr_control.input_vol_seg_num + 1;
+	  rldr_control.input_vol_seg_rec = rldr_control.input_vol_seg_rec +
+	       fixed (backup_volume_record.records);
+	  rldr_control.seg_rec = rldr_control.seg_rec + fixed (backup_volume_record.records);
+	end;
+      end;
+    else rldr_control.num_null_vtoce = rldr_control.num_null_vtoce + 1;
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+log_volume_name: proc;
+
+/* This proc is called to add a dump volume to the volume list of a reload group. It is added to the list
+   if it has segments or directories from this volume and if it not already part
+   of the list. If the dump volume was created with a different io module then the one
+   that will be used to read it, the operator is queried as to whether he wants to use it. */
+
+    if bvle.dir_num = 0 & bvle.seg_num = 0 then return;
+    if rldr_data_.save & bvle.open_time < time_unmounted then return;
+
+    do sortx = 1 to vlx;
+      if rldr_input_volume_list (sortx).volname = bvle.volname
+	 & rldr_input_volume_list (sortx).volid = bvle.volid then return; /* already in list */
+    end;
+
+    do sortx = 1 to rldr_skip_list.next;
+      if rldr_skip_list (sortx).volname = bvle.volname then return;
+    end;
+
+    if bvle.io_module ^= rldr_data_.io_module then do;
+        query_info.version = query_info_version_5;
+        call command_query_$yes_no (YES, 0, myname, "",
+	   "io outer module ^a which wrote volume ^a is different than that specified to read the volume.
+ Do you wish to use the volume ?", bvle.io_module, bvle.volname);
+        if ^YES then do;
+	  rldr_skip_list.next = rldr_skip_list.next + 1;
+	  rldr_skip_list (rldr_skip_list.next).volname = bvle.volname;
+	  return;
+	end;
+      end;
+
+    vlx = vlx + 1;
+    rldr_input_volume_list (vlx).volname = bvle.volname;
+    rldr_input_volume_list (vlx).volid = bvle.volid;
+
+  end log_volume_name;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+read_volume_record: proc;
+
+/* This proc reads a logical record from a dump volume and determines if the object is newer
+   then the one previously found(if any). It does this by using a look aside memory stored in the control seg,
+   indexed by vtoc index, with the dump volume id as the field. */
+
+/* set non-local retrun label */
+    pattern_match_label = pattern_match;
+    new_volume = "0"b;
+						/* read logical record header */
+    if skip_next_header_check then do;
+        skip_next_header_check = "0"b;
+        goto pattern_match_label;
+      end;
+    nel = CHARS_PER_WORD * size (backup_volume_header);
+    call read (recordp, nel, nelt, ^DELIMITED, code);
+    call check_input_error;
+    if new_volume then return;
+						/* check record header */
+    if backup_volume_record.pattern1 ^= pattern1
+         | backup_volume_record.pattern2 ^= pattern2
+         | backup_volume_record.pattern3 ^= pattern3 then do;
+        code = -1;
+        call check_input_error;			/* treat as bad read */
+        if new_volume then return;
+      end;
+
+pattern_match:
+    new_volume = "0"b;
+						/* read rest of header */
+    nel = backup_volume_record.rec1_len - size (backup_volume_header) * CHARS_PER_WORD;
+    call read (ptr (recordp, size (backup_volume_header)),
+         nel, nelt, ^DELIMITED, code);
+    call check_input_error;
+    if new_volume then return;
+						/* if info data then safe store */
+    if backup_volume_record.rec1_type = info_type then do;
+        call record_info;
+        if code ^= 0 then return;
+      end;
+						/* otherwise if not object then skip */
+    if backup_volume_record.rec1_type ^= vtoce_type then do;
+        nel = backup_volume_record.rec2_len;
+        if nel ^= 0 then call skip_chars;
+        return;
+      end;
+						/* skip if version is different */
+    if backup_volume_record.version ^= backup_volume_record_version_1 &
+         backup_volume_record.version ^= backup_volume_record_version_2 then do;
+bad_record: call rldr_report_$error_output (rldr_datap, 0, myname, "Invalid volume record on dump volume",
+	   volname);
+        nel = backup_volume_record.rec2_len;
+        if nel ^= 0 then call skip_chars;
+        return;
+      end;
+						/* record last valid uid */
+    if backup_volume_record.uid ^= "0"b then do;
+        rldr_data_.last_valid_puid = backup_volume_record.uid_path;
+        rldr_data_.last_valid_vtoce_ename = backup_volume_record.primary_name;
+        rldr_data_.last_pvid = backup_volume_record.pvid;
+        rldr_data_.last_vtocx = backup_volume_record.vtocx;
+      end;
+						/* inform operator of last valid object read */
+    if resynching_completed & backup_volume_record.uid ^= "0"b then do;
+        resynching_completed = "0"b;
+        call find_volname ((backup_volume_record.pvid), pvname, lvname, code);
+        if code = 0 then
+	call rldr_report_$error_output (rldr_datap, 0, myname,
+	     "first object after resynching ^a on pv ^a ^[(vtocx = ^d)^;^s^] of logical volume ^a",
+	     convert_puid_ (), pvname, (backup_volume_record.pvid ^= (36)"0"b),
+	     backup_volume_record.vtocx, lvname);
+        else call rldr_report_$error_output (rldr_datap, 0, myname,
+	        "first object after resynching ^a", convert_puid_ ());
+      end;
+    do pvindex = 1 to rldr_data_.npvs;
+						/* if this object was from any physical volumes */
+      if backup_volume_record.pvid = rldr_data_.pvid (pvindex) then do;
+						/* on our list				*/
+	if rldr_data_.abandoned (pvindex) then goto exit_pvid_check;
+						/* but not these				*/
+	controlp = rldr_data_.controlp (pvindex);
+	vtocx = backup_volume_record.vtocx;		/* pick up index */
+	if vtocx > rldr_control.n_vtoce - 1 then do;
+	    call rldr_report_$error_output (rldr_datap, 0, myname, "VTOCE index out of range on pv ^a",
+	         rldr_data_.pvname (pvindex));
+	    nel = backup_volume_record.rec2_len;
+	    if nel ^= 0 then call skip_chars;
+	    return;
+	  end;
+
+/* Check to see if this vtocx has already been encountered. If so
+   then skip it. If its a null vtoce then flag it as seen but don't treat it as new info.  If encountered
+   but the time_dumped is latter then this copy is newer so its new info. If never encountered its new info. */
+
+	already_there = "0"b;
+	if rldr_control (vtocx).time_dumped < bin (backup_volume_record.time_dumped || (16)"0"b, 52) then do;
+	    already_there = (rldr_control (vtocx).uid ^= "0"b & rldr_control (vtocx).time_dumped ^= 0);
+	    rldr_control (vtocx).time_dumped = bin (backup_volume_record.time_dumped || (16)"0"b, 52);
+	    rldr_control (vtocx).uid = backup_volume_record.uid;
+	    new_info = "1"b;
+	    return;
+	  end;
+	goto exit_pvid_check;
+        end;
+    end;
+exit_pvid_check:
+    do pvindex = 1 to rldr_data_.npvs;			/* make them all look alike			*/
+      controlp = rldr_data_.controlp (pvindex);
+      rldr_control.num_rejected = rldr_control.num_rejected + 1;
+    end;
+    pvindex = 0;					/* flag					*/
+    nel = backup_volume_record.rec2_len;
+    call skip_chars;
+    return;
+
+  end read_volume_record;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+skip_chars: proc;
+
+/* This proc  skips forward on the dump volume the number of characters specified by nel.
+*/
+
+    nelt = nel;
+    call read (recordp, nel, nelt, (backup_volume_record.rec1_type = vtoce_type & backup_volume_record.version > backup_volume_record_version_1), code);
+    call check_input_error;
+    if entry = get_object & new_volume then goto search_loop;
+
+  end skip_chars;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+check_input_error: proc;
+
+/* This proc checks for error after a read of a dump volume. If we have reached the end of the dump volume then
+   we detach the volume, update the volume map and vtoc header on the physical volume and attach a new dump
+   volume.  If an error has occurred we attemp to recover by repositioning the dump volume at the beginning
+   of the next logical dump record. If we are already recovering we pretend the error never happened.
+   Of course if no error has occured we return. */
+
+dcl i		     fixed bin;
+
+    new_volume = "0"b;
+    if code ^= 0 | nel ^= nelt then do;
+        if (code = error_table_$end_of_info | code = error_table_$device_end) then do;
+	  if resynching then do;
+	      call rldr_report_$error_output (rldr_datap, 0, myname, "Resynchronization terminated by end of volume");
+	      call rldr_report_$error_output (rldr_datap, 0, myname, "^d words skipped", words_skipped);
+	    end;
+detach_and_continue:
+	  call detach;
+	  do i = 1 to rldr_data_.npvs;		/* for each pv that had something on this dump volume*/
+	    controlp = rldr_data_.controlp (i);
+	    if (rldr_control.dir_rec ^= 0 | rldr_control.seg_rec ^= 0
+	         | rldr_control.num_null_vtoce ^= 0) then do;
+	        call rldr_vtoc_header_$update (rldr_datap, i, code);
+	        if code ^= 0 then
+		call rldr_report_$error_output (rldr_datap, code, myname, "Error updating vtoc header on pv ^a",
+		     rldr_data_.pvname (i));
+	        call rldr_volume_map_$update (rldr_datap, i, code);
+	        if code ^= 0 then
+		call rldr_report_$error_output (rldr_datap, code, myname, "Error updating volume map on pv ^a",
+		     rldr_data_.pvname (i));
+	      end;
+	  end;
+	  call attach;
+	  new_volume = "1"b;
+	  return;
+	end;
+        else do;
+	  if ^resynching then do;
+	      if nel ^= nelt then
+	        call rldr_report_$error_output (rldr_datap, 0, myname, "Read did not complete on ^a",
+		   rldr_data_.controlp (1) -> rldr_control.curn_volname);
+	      if code = -1 then
+	        call rldr_report_$error_output (rldr_datap, 0, myname, "Invalid dump record header on ^a",
+		   rldr_data_.controlp (1) -> rldr_control.curn_volname);
+	      else call rldr_report_$error_output (rldr_datap, code, myname, "I/O error reading input volume ^a",
+		      rldr_data_.controlp (1) -> rldr_control.curn_volname);
+	      call find_volname ((rldr_data_.last_pvid), pvname, lvname, code);
+	      if code ^= 0 then
+	        call rldr_report_$error_output (rldr_datap, 0, myname, "bad input record after ^a - resynching started",
+		   convert_puid_ ());
+	      else call rldr_report_$error_output (rldr_datap, 0, myname,
+		      "bad input record after ^a on pv ^a ^[(vtocx = ^d)^;^s^] of logical volume ^a - resynching started",
+		      convert_puid_ (), pvname, (rldr_data_.last_pvid ^= (36)"0"b),
+		      rldr_data_.last_vtocx, lvname);
+	      resynch_retry_count = 0;
+	      call resynch_input_volume;
+
+	      if entry = get_object then do;
+		if resynching_completed then goto pattern_match_label;
+		else if new_volume then goto search_loop;
+	        end;
+	      else if entry = read_object then do;
+		code = -1;
+		return;
+	        end;
+	    end;
+	  else do;				/* already had an error			*/
+	      resynch_retry_count = resynch_retry_count + 1;
+						/* keep track so we don't try this forever	*/
+	      if resynch_retry_count > 64 then do;
+		call rldr_report_$error_output (rldr_datap, code, myname,
+		     "Resynchronization failed due to I/O error during resynching on volume ^a.",
+		     rldr_data_.controlp (1) -> rldr_control.curn_volname);
+		goto detach_and_continue;
+	        end;
+	    end;
+	end;
+      end;
+
+  end check_input_error;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+attach: proc;
+
+/* This proc attaches the next dump volume either on the list or as specified by the operator. If we are
+   in the manual mode we treat each dump volume as coming from a list of one item. If the operator has specified
+   an alternate input attach description then we use it, else we use the default. We also initialize some per dump
+   volume counters. */
+
+dcl i		     fixed bin;
+
+retry_attach:
+    retry_attach_label = retry_attach;
+						/* use dump volume list */
+    if ^rldr_data_.manual then do;
+        rldr_input_volume_list.curn_entry = rldr_input_volume_list.curn_entry + 1;
+        if rldr_input_volume_list.curn_entry > rldr_input_volume_list.num_entries then do;
+no_more:	  code = error_table_$end_of_info;
+	  goto get_object_ret;
+	end;
+        volid = rldr_input_volume_list (rldr_input_volume_list.curn_entry).volid;
+        volname = rldr_input_volume_list (rldr_input_volume_list.curn_entry).volname;
+
+        do i = 1 to rldr_data_.npvs;			/* make all controls look the same		*/
+	controlp = rldr_data_.controlp (i);
+	rldr_control.curn_volname = volname;
+	rldr_control.curn_volid = volid;
+        end;
+      end;
+    else do;					/* operator will tell us which to use */
+        query_info.yes_or_no_sw = "0"b;			/* query_info is ok, except for this		*/
+request: call command_query_ (addr (query_info), avolname, myname, "Type input volume name: ");
+        volname = avolname;				/* make it the right type			*/
+        if volname = "" then goto request;
+        if volname = "." then goto no_more;
+        volid = get_volid_ (volname);
+        if code ^= 0 then do;
+	  call ioa_ ("invalid volume identifier ^a", volname);
+	  goto request;
+	end;
+        query_info.yes_or_no_sw = "1"b;			/* back to normal				*/
+        do i = 1 to rldr_data_.npvs;			/* make them all look the same		*/
+	controlp = rldr_data_.controlp (i);
+	rldr_control.curn_volname = volname;
+	rldr_control.curn_volid = volid;
+        end;
+        rldr_input_volume_list.curn_entry = 1;
+        rldr_input_volume_list (rldr_input_volume_list.curn_entry).volname = volname;
+        rldr_input_volume_list (rldr_input_volume_list.curn_entry).volid = volid;
+      end;
+						/* use supplied attach description if it exists */
+    if rldr_data_.input_volume_desc ^= "" then
+      call ioa_$rsnnl (rldr_data_.input_volume_desc, att_desc, (0), volname);
+    else call ioa_$rsnnl ("tape_mult_ ^a -system", att_desc, (0), volname);
+						/* attach dump volume */
+    if get_group_id_ () = "Initializer.SysDaemon.z" & hcs_$level_get () = 1 then ring_1 = "1"b;
+    else ring_1 = "0"b;
+retry: if ring_1 then call timer_manager_$alarm_call (180, "11"b, attach_timer);
+    call iox_$attach_name ("input_volume", rldr_data_.inputvol_iocbp, att_desc, null, code);
+    if ring_1 then call timer_manager_$reset_alarm_call (attach_timer);
+    if code ^= 0 then do;
+        if code = error_table_$resource_unavailable then do;
+	  query_info.version = query_info_version_5;
+	  call command_query_$yes_no (YES, 0, myname, "", "
+The physical drive or dump volume is not available or is in use by an other process.
+Do you wish to retry the attachment");
+	  if YES then goto retry;
+	end;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Unable to attach dump volume ^a", volname);
+        goto retry_attach_label;
+      end;
+						/* open switch for reading */
+    call iox_$open (rldr_data_.inputvol_iocbp, Stream_input, "0"b, code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Error on opening dump volume ^a", volname);
+        call iox_$detach_iocb (rldr_data_.inputvol_iocbp, ignore);
+        goto retry_attach;
+      end;
+    do i = 1 to rldr_data_.npvs;			/* again, make them all look the same		*/
+      controlp = rldr_data_.controlp (i);		/* reset per dump volume counters */
+      rldr_control.input_vol_seg_num = 0;
+      rldr_control.input_vol_seg_rec = 0;
+      rldr_control.input_vol_dir_num = 0;
+      rldr_control.input_vol_dir_rec = 0;
+    end;
+    return;
+
+  end attach;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+detach: proc;
+
+/* This proc detaches a dump volume and reports what infomation on it was reloaded */
+dcl i		     fixed bin;
+						/* close dump volume */
+    call iox_$close (rldr_data_.inputvol_iocbp, code);
+    if code ^= 0 then
+      call rldr_report_$error_output (rldr_datap, code, myname, "Unable to close dump volume ^a", volname);
+						/* and detach */
+    call iox_$detach_iocb (rldr_data_.inputvol_iocbp, code);
+    if code ^= 0 then
+      call rldr_report_$error_output (rldr_datap, code, myname, "Unable to detach dump volume ^a", volname);
+    rldr_data_.inputvol_iocbp = null;			/* be sure */
+						/* tell operator what we did */
+    call rldr_vtoc_buffer_$write (rldr_datap, ignore);
+    do i = 1 to rldr_data_.npvs;
+      controlp = rldr_data_.controlp (i);
+      if (rldr_control.input_vol_dir_rec ^= 0 | rldr_control.input_vol_seg_rec ^= 0) then do;
+	call rldr_report_$online_output (rldr_datap, 0, myname,
+	     "reloaded from input volume ^a ^d records of ^d directories and ^d records of ^d segments on pv ^a",
+	     rldr_control.curn_volname, rldr_control.input_vol_dir_rec, rldr_control.input_vol_dir_num,
+	     rldr_control.input_vol_seg_rec, rldr_control.input_vol_seg_num, rldr_data_.pvname (i));
+						/* reset per dump volume counters */
+
+	rldr_control.input_vol_seg_num = 0;
+	rldr_control.input_vol_seg_rec = 0;
+	rldr_control.input_vol_dir_num = 0;
+	rldr_control.input_vol_dir_rec = 0;
+        end;
+    end;
+
+    return;
+
+  end detach;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+lock_volume_log: proc;
+
+/* This proc locks the volume log */
+
+    call set_lock_$lock (backup_volume_log.lock, -1, code);
+    if code ^= 0 then
+      call rldr_report_$error_output (rldr_datap, code, myname, "Error locking volume log ^a.volog",
+	 rldr_data_.pvname (pvindex));
+    return;
+
+  end lock_volume_log;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+resynch_input_volume: proc;
+
+/* This proc  resynchronizes a dump volume by stepping through the input one word at a time until it
+   recognizes the volume header unique pattern or until we get to the end of the volume. An upper
+   bound of one million words is placed on the loop so it will finish */
+
+/* set flag */
+    resynching = "1"b;
+    resynching_completed = "0"b;
+						/* clear buffer and set flag */
+    input_buf (*) = "0"b;
+    new_volume = "0"b;
+						/* read logical record header */
+    nel = CHARS_PER_WORD * size (backup_volume_header);
+    call read (recordp, nel, nelt, ^DELIMITED, code);
+    call check_input_error;
+						/* if end of dump volume we are done */
+    if new_volume then return;
+						/* count words skipped */
+    words_skipped = 0;
+						/* test for pattern match */
+test: if word (1) = pattern1 & word (4) = pattern2 & word (7) = pattern3 then do;
+        call rldr_report_$error_output (rldr_datap, 0, myname, "Synchronization completed ^d words skipped on dump volume ^a",
+	   words_skipped, rldr_data_.controlp (1) -> rldr_control.curn_volname);
+        resynching = "0"b;
+        resynching_completed = "1"b;
+        return;
+      end;
+						/* shift buffer right 1 word and read next word */
+    string = substr (string, 37, (size (backup_volume_header) - 1) * BITS_PER_WORD);
+    new_volume = "0"b;
+    nel = CHARS_PER_WORD;
+    call read (addr (word (size (backup_volume_header))),
+         nel, nelt, ^DELIMITED, code);
+    call check_input_error;
+    if new_volume then return;
+						/* count words skipped and test for limit */
+    words_skipped = words_skipped + 1;
+    if words_skipped > 256 * WORDS_PER_PAGE then do;	/* put a limit on it */
+        call rldr_report_$error_output (rldr_datap, 0, myname, "Resynchronization failed on dump volume ^a",
+	   rldr_data_.controlp (1) -> rldr_control.curn_volname);
+        code = error_table_$end_of_info;
+        call check_input_error;
+        return;
+      end;
+    goto test;
+
+  end resynch_input_volume;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+unlock_volume_log: proc;
+
+/* This proc unlocks the volume log */
+
+    call set_lock_$unlock (backup_volume_log.lock, code);
+    if code ^= 0 then
+      call rldr_report_$error_output (rldr_datap, code, myname, "Error unlocking volume log ^a.volog",
+	 rldr_data_.pvname (pvindex));
+  end unlock_volume_log;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+record_info: proc;
+dcl reattach	     bit (1);
+
+/* This proc picks up data stored in the info record on the dump volume. For the first dump volume
+   we just collect the info. For subsequent dump volumes checks are made to see that the
+   dump volume comes from this site or  is not out of chronological order. In addition we check for disk type
+   conversion. */
+
+    reattach = "0"b;
+    infop = rldr_data_.infop;
+    infop -> backup_info = recordp -> backup_info;
+    if backup_info.version = backup_info_version_2 &
+         rldr_data_.controlp (1) -> rldr_control.curn_volname ^= backup_info.dump_volname
+    then do;
+        call rldr_report_$error_output (rldr_datap, 0, myname, "Attempt to mount unrequested dump volume ^a",
+	   backup_info.dump_volname);
+        reattach = "1"b;
+        rldr_input_volume_list.curn_entry = rldr_input_volume_list.curn_entry - 1;
+      end;
+    if rldr_data_.rpv then do;
+        if (rldr_data_.rpv_disk_type ^= backup_info.rpv_disk_type) & ^warning_printed then do;
+	  warning_printed = "1"b;
+	  call rldr_report_$online_output (rldr_datap, 0, myname, "Warning - new disk type for rpv");
+	end;
+      end;
+    else do;					/* ensure same system for now...		*/
+        if (rldr_data_.rpv_pvid ^= backup_info.rpv_pvid) then do;
+	  call rldr_report_$error_output (rldr_datap, 0, myname,
+	       "Attempt to use non local site dump volume ^a", backup_info.dump_volname);
+	  reattach = "1"b;
+	end;
+      end;
+    if reattach then do;
+        call detach;				/* get rid of bad dump volume */
+        call attach;				/* get new one */
+        goto search_loop;
+      end;
+    return;
+  end record_info;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+get_volid_: proc (name) returns (bit (36));
+
+/* This proc constructs a volume id from a volume name. This is a interim measure until all dump volume are registered
+   and have a unique id. This construction restricts the volume name to two or less non numeric characters followed
+   by any numeric value less then 262144. */
+
+dcl name		     char (32);
+dcl 1 volid	     aligned,
+    2 char	     char (2) unaligned,
+    2 num		     fixed bin unaligned;
+
+/* util rcp_ interface defined
+   call rcp_$volname_info (volname, volid, code);
+   if code ^= 0 then do;
+   call rldr_report_$error_output (rldr_datap, code, myname, "Unknown volname specified");
+
+   we' fudge it */
+
+    volid.char = "";
+    num_pos = search (name, "0123456789");
+    if num_pos > 3 | num_pos = 0 then do;
+bad_volid: code = error_table_$bad_volid;
+        return (""b);
+      end;
+    else do;
+        if num_pos = 2 then substr (volid.char, 2, 1) = substr (name, 1, 1);
+        else volid.char = substr (name, 1, 2);
+        char_num = substr (name, num_pos, length (name) - num_pos);
+        num = cv_dec_check_ (char_num, code);
+        if code ^= 0 then goto bad_volid;
+        volid.num = num;
+      end;
+    return (unspec (volid));
+
+  end get_volid_;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+open_time: proc returns (fixed bin (71));
+
+/* This proc retruns the open(start) time of a single or multi volume dump volume */
+
+dcl temp		     fixed bin (71);
+dcl jdx		     fixed bin;
+    if bvle.dump_type = incr then return (bvle.open_time);
+    do jdx = idx to 1 by -1;
+      if backup_volume_log.array (jdx).cycle_uid = bvle.cycle_uid then
+        temp = backup_volume_log.array (jdx).open_time;
+    end;
+    return (temp);
+
+  end open_time;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+attach_timer: proc;
+
+/* This proc is the query portion of the remount/refusal mechanism described above */
+
+    call command_query_$yes_no (YES, 0, myname, "", "Attachment of dump volume ^a not completed. Do you wish to retry ?",
+         rldr_control.curn_volname);
+    if YES then rldr_input_volume_list.curn_entry = rldr_input_volume_list.curn_entry - 1;
+    goto retry_attach_label;
+  end attach_timer;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+convert_puid_: proc returns (char (168));
+
+/* This proc is used to convert a unique id pathname to an ascii pathname  */
+
+dcl dn		     char (168);
+dcl en		     char (32);
+dcl ret_dn	     char (168);
+dcl ec		     fixed bin (35);
+
+    if rldr_data_.stranger then goto ret_unk;		/* can't possible tell him this		*/
+    on seg_fault_error goto ret_unk;
+    call hc_backup_$decode_uidpath (rldr_data_.last_valid_puid, dn, en, ec);
+    if ec = error_table_$root then ;
+    else if ec ^= 0 then
+ret_unk: return ("UNKNOWN");
+    call ioa_$rsnnl ("^a^[>^]^[^a>^;^s^]^a", ret_dn, (0), dn, dn ^= ">", en ^= "", en, rldr_data_.last_valid_vtoce_ename);
+    revert seg_fault_error;
+    return (ret_dn);
+  end convert_puid_;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+find_volname:
+  proc (apvid, apvname, alvname, acode);
+dcl acode		     fixed bin (35),
+  (apvname, alvname)     char (32),
+  apvid		     bit (36);
+
+    acode = 0;
+    apvname, alvname = "UNKNOWN";
+    if rldr_data_.stranger then acode = -1;		/* can't possibly help			*/
+    else call mdc_$find_volname (apvid, apvname, alvname, acode);
+
+  end find_volname;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+read: proc (return_buffer_ptr,
+       Nrequested_chars,
+       Nreturned_chars,
+       Sdelimited,
+       code);
+
+dcl return_buffer_ptr    ptr,
+  Nrequested_chars	     fixed bin (21),
+  Nreturned_chars	     fixed bin (21),
+  Sdelimited	     bit (1) aligned,
+  code		     fixed bin (35);
+
+dcl input_buffer	     char (256 * CHARS_PER_PAGE)
+		     based (rldr_data_.input_buffer_ptr);
+
+dcl return_string	     char (Nrequested_chars)
+		     based (return_buffer_ptr);
+
+dcl Nassign_chars	     fixed bin (21),
+  Nread_chars	     fixed bin (21),
+  end_of_record	     fixed bin,
+  tape_check1 /* bit (72) */ char (DELIM_LEN),
+  tape_check2 /* bit (72) */ char (DELIM_LEN);
+
+    Nreturned_chars, Nread_chars, code = 0;
+
+    do while (Nreturned_chars < Nrequested_chars & code = 0);
+      if rldr_data_.input_buffer_len = 0 then do;
+	rldr_data_.input_buffer_start = 1;
+
+	if Sdelimited & Nreturned_chars = 0 then do;
+	    call iox_$get_chars (rldr_data_.inputvol_iocbp,
+	         addr (tape_check1), DELIM_LEN, Nread_chars, code);
+	    if code ^= 0 then return;
+	  end;
+
+	call iox_$get_chars (rldr_data_.inputvol_iocbp,
+	     addcharno (return_buffer_ptr, Nreturned_chars),
+	     Nrequested_chars - Nreturned_chars, Nread_chars, code);
+	Nreturned_chars = Nreturned_chars + Nread_chars;
+	if code ^= 0 then return;
+
+	if Sdelimited then do;
+	    call iox_$get_chars (rldr_data_.inputvol_iocbp,
+	         addr (tape_check2), DELIM_LEN, Nread_chars, code);
+	    if code ^= 0 then
+	      return;
+
+	    if tape_check1 ^= tape_check2 then do;
+						/* found a short segment, move       */
+						/* return string into the temp input */
+						/* buffer and start parsing          */
+	        rldr_data_.input_buffer_len = Nreturned_chars + DELIM_LEN;
+	        substr (input_buffer, 1, Nreturned_chars) = return_string;
+	        substr (input_buffer, Nreturned_chars + 1, DELIM_LEN) = tape_check2;
+	      end;
+	  end;
+        end;
+
+      else
+	 if Sdelimited then do;
+	tape_check1 = substr (input_buffer,
+	     rldr_data_.input_buffer_start, DELIM_LEN);
+	tape_check2 = "";
+	rldr_data_.input_buffer_start =
+	     rldr_data_.input_buffer_start + DELIM_LEN;
+	rldr_data_.input_buffer_len =
+	     rldr_data_.input_buffer_len - DELIM_LEN;
+        end;
+
+      if rldr_data_.input_buffer_len > 0 then do;
+	Nassign_chars =
+	     min (rldr_data_.input_buffer_len, Nrequested_chars);
+
+	if Sdelimited then do;
+	    if tape_check1 ^= tape_check2 then do;
+	        end_of_record = index (substr (input_buffer, rldr_data_.input_buffer_start,
+		   rldr_data_.input_buffer_len), tape_check1);
+	        if end_of_record > 0 then do;
+		  Nassign_chars = end_of_record - 1;
+		  if Nrequested_chars ^= Nassign_chars then
+		    code = error_table_$data_loss;
+		end;
+	      end;
+	  end;
+
+	return_string = substr (input_buffer,
+	     rldr_data_.input_buffer_start, Nassign_chars);
+	Nreturned_chars = Nassign_chars;
+
+	rldr_data_.input_buffer_start =
+	     rldr_data_.input_buffer_start + Nassign_chars;
+	rldr_data_.input_buffer_len =
+	     rldr_data_.input_buffer_len - Nassign_chars;
+
+	if Sdelimited & rldr_data_.input_buffer_len > 0 then do;
+   	    rldr_data_.input_buffer_start =
+	          rldr_data_.input_buffer_start + DELIM_LEN;
+	    rldr_data_.input_buffer_len =
+	         rldr_data_.input_buffer_len - DELIM_LEN;
+	    substr (input_buffer, 1, rldr_data_.input_buffer_len) =
+	         substr (input_buffer, rldr_data_.input_buffer_start,
+	         rldr_data_.input_buffer_len);
+	    rldr_data_.input_buffer_start = 1;
+	  end;
+        end;
+    end;
+
+    return;
+  end read;
+
+%include rldr_input_volume_list;
+%include backup_info;
+
+%include backup_volume_log;
+%include backup_pvol_info;
+
+%include fs_vol_label;
+
+%include old_fs_vol_label;
+
+%include backup_static_variables;
+%include backup_volume_header;
+%include backup_volume_record;
+
+%include rldr_data_;
+
+%include vtoce;
+
+%include rldr_control;
+
+%include vol_map;
+%include vtoc_header;
+
+%include iox_modes;
+
+%include iox_dcls;
+
+%include rldr_skip_list;
+%include query_info;
+
+%include system_constants;
+
+  end rldr_input_;
+
+
+
+
+		    rldr_label_.pl1                 10/21/92  1624.5rew 10/21/92  1623.8       70182
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1992   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-01-15,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-06-03,GWMay), install(86-07-17,MR12.0-1097):
+     Add support for 512_WORD_IO devices.
+  2) change(88-10-05,GWMay), approve(88-10-05,MCR8005), audit(88-10-12,Farley),
+     install(88-10-17,MR12.2-1173):
+     Changed to turn the inconsistent dumper bit map on in the disk label after
+     a sucessful reload.
+  3) change(92-08-24,Schroth), approve(92-10-15,MCR8265),
+     audit(92-10-15,Zimmerman), install(92-10-21,MR12.5-1039):
+     To correct the online PVID reported when a PVID mismatch occurs when
+     reloading multiple volumes.  Add message documentation for PVID mismatch
+     message.  phx21270
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+rldr_label_: proc;
+
+/* This routine maintains the data base that will be the new label for the volume being reloaded. */
+/* Written in antiquity by Dave Vinograd.					        */
+/* Modified: 03/83 by GA Texada for multiple physical volume reloading.		        */
+
+dcl code		     fixed bin (35);
+dcl pvindex	     fixed bin;
+dcl myname	     char (32) static init ("rldr_label_") options (constant);
+
+dcl error_table_$bad_volid ext fixed bin (35);
+
+dcl rldr_report_$error_output entry options (variable);
+dcl iox_$position	     entry (ptr, fixed bin, fixed bin, fixed bin (35));
+dcl iox_$get_chars	     entry (ptr, ptr, fixed bin, fixed bin, fixed bin (35));
+dcl iox_$put_chars	     entry (ptr, ptr, fixed bin, fixed bin (35));
+
+dcl (size, divide, clock) builtin;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+open: entry (rldr_datap, pvindex, code);
+
+/* This entry positions to and reads the label from the physical volume.  It also cross checks
+   to see if the correct physical volume has been mounted. */
+
+    code = 0;
+						/* position to sector */
+    call iox_$position (rldr_data_.outputvol_iocbp (pvindex), 2, sector (LABEL_ADDR), code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Label position failed for pv ^a",
+	   rldr_data_.pvname (pvindex));
+        return;
+      end;
+						/* read label into temp seg */
+    call iox_$get_chars (rldr_data_.outputvol_iocbp (pvindex), rldr_data_.labelp (pvindex), size (label) * 4, (0), code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Label read failed for pv ^a",
+	   rldr_data_.pvname (pvindex));
+        return;
+      end;
+						/* cross check label info against registration info */
+    labelp = rldr_data_.labelp (pvindex);
+    if ^(rldr_data_.pvname (pvindex) = "rpv") then
+      if label.pvid ^= rldr_data_.pvid (pvindex) then do;
+	code = error_table_$bad_volid;
+	call rldr_report_$error_output (rldr_datap, code, myname,
+	     "Output volume pvid ^o not equal to online pvid ^o for pv ^a",
+	     label.pvid, rldr_data_.pvid (pvindex), rldr_data_.pvname (pvindex));
+        end;
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+close: entry (rldr_datap, pvindex, code);
+
+/* This entry updates the physical volume label with the results of the reload. */
+
+    code = 0;
+    labelp = rldr_data_.labelp (pvindex);
+						/* special case rpv */
+    if (rldr_data_.rpv & rldr_data_.pvname (pvindex) = "rpv") then do;
+        label.pv_name = "rpv";
+        label.lv_name = "root";
+        infop = rldr_data_.infop;
+        label.pvid = backup_info.rpv_pvid;
+        label.lvid = backup_info.rpv_lvid;
+        label.root.here = "1"b;
+        label.root.shutdown_state = 4;
+      end;
+						/* set time */
+    label.time_last_reloaded = clock;
+
+/* The dumper bit map has not been reloaded. Set the inconsistent flag so    */
+/* that the dumper will use seg dtms and automatically build a valid map.    */
+
+    label.inconsistent_dbm = "1"b;
+						/* position to sector */
+    call iox_$position (rldr_data_.outputvol_iocbp (pvindex), 2, sector (LABEL_ADDR), code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Label position failed for pv ^a",
+	   rldr_data_.pvname (pvindex));
+        return;
+      end;
+						/* write label to physical volume */
+    call iox_$put_chars (rldr_data_.outputvol_iocbp (pvindex), labelp, size (label) * 4, code);
+    if code ^= 0 then
+      call rldr_report_$error_output (rldr_datap, code, myname, "Label write failed on pv ^a",
+	 rldr_data_.pvname (pvindex));
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+sector: proc (add) returns (fixed bin);
+
+/* This proc converts Multics record numbers to  sector numbers */
+
+dcl add		     fixed bin;
+dcl (dev_idx, sector)    fixed bin;
+
+    dev_idx = rldr_data_.disk_type (pvindex);
+    sector = add * SECTORS_PER_RECORD (dev_idx);
+    sector = sector + divide (sector, rldr_data_.usable_sectors (pvindex), 17, 0) * rldr_data_.unusable_sectors (pvindex);
+    return (sector * words_per_sect (dev_idx) * 4);
+
+  end sector;
+
+%include rldr_data_;
+
+%include backup_info;
+%include backup_volume_header;
+
+%include disk_pack;
+
+%include fs_dev_types_sector;
+
+%include fs_vol_label;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   rldr_label_: Label position failed: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	Someting is wrong with a reloader output volume.
+
+   A:	Mount a correct volume and try again.
+
+
+   Message:
+   rldr_label_: Label read failed: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	Someting is wrong with a reloader output volume.
+
+   A:	Mount a correct volume and try again.
+
+
+   Message:
+   rldr_label_: Incorrect output medium mounted: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	Someting is wrong with a reloader output volume.
+
+   A:	Mount a correct volume and try again.
+
+
+   Message:
+   rldr_label_: Output volume pvid MMMMMMMMMMMM not equal to online 
+	      pvid NNNNNNNNNNNN for pv PPPPPPPP. Invalid volume identifier.
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	The PVID on the output disk volume does not match the PVID as
+          recorded in the pvolog for the disk volume.  This indicates that
+	either the label on the PV is incorrect or the pvolog segment
+	is corrupted.
+
+   A:	Verify the PVID using output from the display_disk_label command.
+	If the PVID from ddl output is differnet from that reported for the
+	output volume, use change_volume_registration and init_vol to
+	correct the disk label.  If the online PVID does not match, use the
+	recover_volume_log command to retrieve a correct pvolog segment.
+	Retry the reload.
+
+
+   Message:
+   rldr_label_: Label write failed: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	Someting is wrong with a reloader output volume.
+
+   A:	Mount a correct volume and try again.
+
+
+   END MESSAGE DOCUMENTATION */
+
+  end rldr_label_;
+  
+
+
+
+		    rldr_output_.pl1                11/11/89  1129.2r w 11/11/89  0851.4       85167
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-01-16,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-06-03,GWMay), install(86-07-17,MR12.0-1097):
+     Add support for subvolumes, and 512_WORD_IO, 3380 and 3390.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+rldr_output_: proc;
+
+/* This routine provides read and write functions for pages and vtoces on the physical volume being reloaded. */
+
+/* Modified 5/79 by D. Vinograd to change attach description for disk, so
+   that rdisk_ will use less wired buffer */
+/* Modified: 03/83 by GA Texada to support multiple physical volume reloading.			 */
+
+dcl att_desc	     char (256);
+dcl code		     fixed bin (35);
+dcl (idx, parts, csl, last_page_writ, pages_to_write, n_read, vtocx, record, pvindex) fixed bin;
+dcl (datap, pagep)	     ptr;
+dcl add		     bit (18);
+
+dcl myname	     char (32) int static init ("rldr_output_") options (constant);
+
+dcl vtoce_part_size	     (3) fixed bin int static init (64, 128, 192);
+dcl sys_info$page_size   fixed bin ext;
+
+dcl ioa_$rsnnl	     entry options (variable);
+dcl iox_$attach_ioname   entry (char (*), ptr, char (*), fixed bin (35));
+dcl iox_$position	     entry (ptr, fixed bin, fixed bin, fixed bin (35));
+dcl iox_$get_chars	     entry (ptr, ptr, fixed bin, fixed bin, fixed bin (35));
+dcl iox_$put_chars	     entry (ptr, ptr, fixed bin, fixed bin (35));
+dcl iox_$open	     entry (ptr, fixed bin, bit (36), fixed bin (35));
+dcl rldr_report_$error_output entry options (variable);
+dcl unique_chars_	     entry (bit (*)) returns (char (15));
+
+
+dcl (fixed, divide, mod, ptr) builtin;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+read_vtoce: entry (rldr_datap, pvindex, vtocep, vtocx, parts, code);
+
+/* This entry reads a vtoc entry given its index. Parts 1, 1 and 2 or 1, 2 and 3  can be read. */
+
+/* position to sector */
+    call iox_$position (rldr_data_.outputvol_iocbp (pvindex), 2, vtoce_sector (vtocx), code);
+    if code ^= 0 then return;
+						/* read vtoce */
+    call iox_$get_chars (rldr_data_.outputvol_iocbp (pvindex), vtocep, vtoce_part_size (parts) * 4, n_read, code);
+
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+write_vtoce: entry (rldr_datap, pvindex, vtocep, vtocx, parts, code);
+
+/* This entry writes a vtoce given its index. Parts 1, 1 and 2, or 1, 2, and 3 can be written. */
+
+/* position to sector */
+    call iox_$position (rldr_data_.outputvol_iocbp (pvindex), 2, vtoce_sector (vtocx), code);
+    if code ^= 0 then return;
+						/* write vtoce */
+    call iox_$put_chars (rldr_data_.outputvol_iocbp (pvindex), vtocep, vtoce_part_size (parts) * 4, code);
+
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+read_page: entry (rldr_datap, pvindex, pagep, add, code);
+
+/* This entry reads a page given its Multics address. */
+
+/* position to sector */
+    call iox_$position (rldr_data_.outputvol_iocbp (pvindex), 2, sector (add), code);
+    if code ^= 0 then return;
+						/* read page */
+    call iox_$get_chars (rldr_data_.outputvol_iocbp (pvindex), pagep, sys_info$page_size * 4, n_read, code);
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+write_page: entry (rldr_datap, pvindex, pagep, add, code);
+
+/* This entry writes a page given its Multics address */
+/* position to sector */
+    call iox_$position (rldr_data_.outputvol_iocbp (pvindex), 2, sector (add), code);
+    if code ^= 0 then return;
+						/* write page */
+    call iox_$put_chars (rldr_data_.outputvol_iocbp (pvindex), pagep, sys_info$page_size * 4, code);
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+write_seg: entry (rldr_datap, pvindex, vtocep, code);
+    datap = rldr_data_.data_object_bp;
+    csl = fixed (vtoce.csl);
+    last_page_writ = -1;
+    do while (last_page_writ < csl - 1);
+      pages_to_write = 0;
+      do idx = last_page_writ + 1 to csl - 1 while (sector (vtoce.fm (idx + 1)) = sector (vtoce.fm (idx)) + 16);
+        pages_to_write = pages_to_write + 1;
+      end;
+      if pages_to_write = 0 then pages_to_write = 1;
+      call iox_$position (rldr_data_.outputvol_iocbp (pvindex), 2, sector (vtoce.fm (last_page_writ + 1)), code);
+      if code ^= 0 then return;
+      call iox_$put_chars (rldr_data_.outputvol_iocbp (pvindex), datap, 4096 * pages_to_write, code);
+      if code ^= 0 then return;
+      last_page_writ = last_page_writ + pages_to_write;
+      datap = ptr (datap, (last_page_writ + 1) * 1024);
+    end;
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+init: entry (rldr_datap, pvindex, code);
+
+/* This entry attaches and opens the output switch */
+
+    code = 0;
+						/* set up attach description for output */
+    if rldr_data_.output_volume_desc ^= "" then
+      call ioa_$rsnnl (rldr_data_.output_volume_desc, att_desc, (0), rldr_data_.pvname (pvindex));
+
+    else if rldr_data_.device_name (pvindex) = "" then
+      call ioa_$rsnnl ("rdisk_ ^a ^a -write -size 20480 -system",
+	 att_desc, (0), device_type_ (), rldr_data_.pvname (pvindex));
+
+    else call ioa_$rsnnl ("rdisk_ ^a ^a -dv ^a -write -size 20480 -system",
+	    att_desc, (0), device_type_ (), rldr_data_.pvname (pvindex),
+	    rldr_data_.device_name (pvindex));
+						/* setup attachment and open output */
+    call iox_$attach_ioname (unique_chars_ ("0"b), rldr_data_.outputvol_iocbp (pvindex), att_desc, code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Output volume attachment failed for pv ^a",
+	   rldr_data_.pvname (pvindex));
+        return;
+      end;
+
+    call iox_$open (rldr_data_.outputvol_iocbp (pvindex), Stream_input_output, "0"b, code);
+    if code ^= 0 then
+      call rldr_report_$error_output (rldr_datap, code, myname, "Output volume opening failed fpr pv ^a",
+	 rldr_data_.pvname (pvindex));
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+device_type_: proc returns (char (32));
+
+/* This proc returns the device type of physical volume being reloaded */
+
+    if rldr_data_.disk_model (pvindex) ^= "" then return (rldr_data_.disk_model (pvindex));
+    else return (device_names (rldr_data_.disk_type (pvindex)));
+  end device_type_;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+vtoce_sector: proc (vtocx) returns (fixed bin);
+
+/* This proc converts a vtoc index into a sector number */
+
+dcl (dev_idx, sector, vtocx) fixed bin;
+    dev_idx = rldr_data_.disk_type (pvindex);
+    record = VTOC_ORIGIN + divide (vtocx, VTOCES_PER_RECORD (dev_idx), 17, 0);
+    sector = record * SECTORS_PER_RECORD (dev_idx);
+    sector = sector + divide (sector, rldr_data_.usable_sectors (pvindex), 17, 0)
+         * rldr_data_.unusable_sectors (pvindex);
+    sector = sector + mod (vtocx, VTOCES_PER_RECORD (dev_idx)) * SECTORS_PER_VTOCE (dev_idx);
+    return (sector * words_per_sect (dev_idx) * 4);
+  end vtoce_sector;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+sector: proc (add) returns (fixed bin);
+
+/* This proc converts a Multics record number into a sector number */
+
+dcl add		     bit (18);
+dcl (dev_idx, sector)    fixed bin;
+
+    dev_idx = rldr_data_.disk_type (pvindex);
+    sector = fixed (add, 18) * SECTORS_PER_RECORD (dev_idx);
+    sector = sector + divide (sector, rldr_data_.usable_sectors (pvindex), 17, 0)
+         * rldr_data_.unusable_sectors (pvindex);
+    return (sector * words_per_sect (dev_idx) * 4);
+  end sector;
+
+%include rldr_data_;
+
+%include vtoce;
+
+%include disk_pack;
+
+%include fs_dev_types;
+
+%include iox_modes;
+%include backup_static_variables;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   rldr_output_: Output volume attachment failed: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	$err
+
+   A:	Mount a different output volume and try again.
+
+
+   Message:
+   rldr_output_: Output volume opening failed: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	$err
+
+   A:	Mount a different output volume and try again.
+
+
+   END MESSAGE DOCUMENTATION */
+
+  end rldr_output_;
+ 
+
+
+
+		    rldr_report_.pl1                11/11/89  1129.2r w 11/11/89  0851.4       48771
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+rldr_report_: proc;
+
+/* This routine is used by the volume reloader to report and log error and status
+   messages. It is modled after the system routine com_err_. When called for the first time in a volume reloader
+   invocation, it creates, in the working directory, an error file, in which it logs all error and status messages.
+   If requested it also writes error messages on the stream error_output. */
+/* Written in antiquity by Dave Vinograd.					 */
+/* Modified: 03/83 by GA Texada to receive rldr_datap as an argument instead of using external static. */
+
+dcl (code, icode)	     fixed bin (35);
+dcl tstring	     char (24);
+dcl uname		     char (32);
+dcl (caller, message)    char (*);
+dcl argp		     ptr;
+dcl ret_string	     char (168);
+dcl control_string	     char (32) aligned;
+dcl len		     fixed bin;
+dcl error_output	     bit (1);
+dcl short		     char (8) aligned;
+dcl long		     char (100) aligned;
+
+dcl iox_$error_output    ptr ext;
+
+dcl error_file_attach_ok bit (1) int static init ("1"b);
+dcl myname	     char (32) static init ("rldr_report_") options (constant);
+
+dcl hcs_$level_get	     entry returns (fixed bin);
+dcl get_group_id_	     entry returns (char (32));
+dcl date_time_	     entry (fixed bin (71), char (*));
+dcl cu_$arg_list_ptr     entry (ptr);
+dcl ioa_$general_rs	     entry (ptr, fixed bin, fixed bin, char (*), fixed bin, bit (1) aligned, bit (1) aligned);
+dcl iox_$attach_ioname   entry (char (*), ptr, char (*), fixed bin (35));
+dcl iox_$open	     entry (ptr, fixed bin, bit (36), fixed bin (35));
+dcl convert_status_code_ entry (fixed bin (35), char (8) aligned, char (100) aligned);
+dcl ioa_$ioa_switch	     entry options (variable);
+dcl rldr_report_$online_output entry options (variable);
+
+dcl (null, clock, substr) builtin;
+
+error_output: entry (rldr_datap, icode, caller, message);
+
+/* If an error file is not attached then fabricate a name with a data/time stamp, attach and open it. If
+   successsful then report via online mechanism. */
+
+    if rldr_data_.disable_error_report then return;
+    error_output = "1"b;
+
+    if error_file_attach_ok & hcs_$level_get () = 1 & get_group_id_ () = "Initializer.SysDaemon.z" then
+         error_file_attach_ok = "0"b;			/* don`t even try in ring 1 */
+    if rldr_data_.error_iocbp = null & error_file_attach_ok then do; /* error file not attached */
+
+        call date_time_ (clock, tstring);
+        uname = "rldr_err." || substr (tstring, 1, 8) || "." || substr (tstring, 11, 4);
+        call iox_$attach_ioname ("error_file", rldr_data_.error_iocbp, "vfile_ " || uname, code);
+        if code ^= 0 then do;
+	  call rldr_report_$online_output ((rldr_datap), code, myname, "Unable to attach error file");
+	  error_file_attach_ok = "0"b;
+	  goto common;
+	end;
+        call iox_$open (rldr_data_.error_iocbp, Stream_output, ""b, code);
+        if code ^= 0 then do;
+	  call rldr_report_$online_output ((rldr_datap), code, myname, "Error opening error file");
+	  error_file_attach_ok = "0"b;
+	  goto common;
+	end;
+        call rldr_report_$online_output ((rldr_datap), 0, myname, "Error file ^a created", uname);
+      end;
+
+common:
+    if icode ^= 0 then do;
+        call convert_status_code_ (icode, short, long);
+        control_string = "^a:^x^a:^x^a";
+      end;
+    else do;
+        short, long = "";
+        control_string = "^a:^x^a";
+      end;
+    call cu_$arg_list_ptr (argp);
+    call ioa_$general_rs (argp, 4, 5, ret_string, len, "0"b, "0"b);
+    if error_output & error_file_attach_ok then
+         call ioa_$ioa_switch (rldr_data_.error_iocbp, control_string, caller, substr (ret_string, 1, len), long);
+
+/* Write online if requested, if args not initialized yet, or if online entry */
+
+    if (error_output & rldr_data_.err_online) | ^error_output | ^rldr_data_.arg_init | ^error_file_attach_ok then
+         call ioa_$ioa_switch (iox_$error_output, control_string, caller, substr (ret_string, 1, len), long);
+
+    return;
+
+online_output: entry (rldr_datap, icode, caller, message);
+
+    error_output = "0"b;
+    goto common;
+
+%include rldr_data_;
+
+%include iox_modes;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   rldr_report_: Unable to attach error file: ERROR_MESS
+
+   S:	$rld_on
+
+   T:	$reload
+
+   M:	The reloader attempted to create an error file.
+
+   A:	$ignore
+
+
+   Message:
+   rldr_report_: Error opening error file: ERROR_MESS
+
+   S:	$rld_on
+
+   T:	$reload
+
+   M:	The reloader attempted to create an error file.
+
+   A:	$ignore
+
+
+   Message:
+   rldr_report_: Error file NAME created
+
+   S:	$rld_on
+
+   T:	$reload
+
+   M:	The reloader attempted to create an error file.
+
+   A:	$ignore
+
+
+   END MESSAGE DOCUMENTATION */
+
+  end rldr_report_;
+ 
+
+
+
+		    rldr_volume_map_.pl1            04/27/92  1330.9r w 04/27/92  1329.6      105696
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1991   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-01-15,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-06-03,GWMay), install(86-07-17,MR12.0-1097):
+     Add support for 512_WORD_IO devices.
+  2) change(91-11-12,Schroth), approve(91-12-02,MCR8253),
+     audit(92-04-27,WAAnderson), install(92-04-27,MR12.5-1015):
+     Corrected call to rldr_report_$error_output that failed to pass rldr_datap
+     as first argument.  Change rldr_volume_map_$deposit entrypoint to check
+     for nulled file map entries in all cases.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+rldr_volume_map_: proc;
+
+/* This routine manages the volume map data base for the  volume  reloader. It provides a deposit and withdraw
+   function and tries to follow the same withdrawal rules as does the system. */
+/* Written in antiquity by Dave Vinograd.
+   Modified: 03/83 by GA Texada to support multiple physical volume reloading.
+*/
+
+dcl code		     fixed bin (35);
+dcl (wordx, bitx, ctl, n_read, i, pvindex) fixed bin;
+
+dcl myname	     char (32) static init ("rldr_volume_map_") options (constant);
+
+dcl error_table_$end_of_info ext fixed bin (35);
+
+dcl iox_$position	     entry (ptr, fixed bin, fixed bin, fixed bin (35));
+dcl iox_$get_chars	     entry (ptr, ptr, fixed bin, fixed bin, fixed bin (35));
+dcl iox_$put_chars	     entry (ptr, ptr, fixed bin, fixed bin (35));
+dcl rldr_report_$error_output entry options (variable);
+
+dcl (size, bit, fixed, addr, divide, mod, substr) builtin;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+open: entry (rldr_datap, pvindex, code);
+
+/* This entry initializes the volume map data base from the volume map on the physical volume. */
+
+    code = 0;
+						/* position to sector */
+    call iox_$position (rldr_data_.outputvol_iocbp (pvindex), 2, sector (VOLMAP_ADDR), code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Map position failed on pv ^a",
+	   rldr_data_.pvname (pvindex));
+        return;
+      end;
+						/* read volume map */
+    call iox_$get_chars (rldr_data_.outputvol_iocbp (pvindex), rldr_data_.vol_mapp (pvindex), size (vol_map) * 4,
+         n_read, code);
+    if code ^= 0 then
+      call rldr_report_$error_output (rldr_datap, code, myname, "Error reading volume map on pv ^a",
+	 rldr_data_.pvname (pvindex));
+						/* set static position indicators */
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+update: entry (rldr_datap, pvindex, code);
+close: entry (rldr_datap, pvindex, code);
+
+/* This entry updates the volume map data base onto the physical volume */
+
+    code = 0;
+						/* position to sector */
+    call iox_$position (rldr_data_.outputvol_iocbp (pvindex), 2, sector (VOLMAP_ADDR), code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "Map position failed on pv ^a",
+	   rldr_data_.pvname (pvindex));
+        return;
+      end;
+						/* write volume map */
+    call iox_$put_chars (rldr_data_.outputvol_iocbp (pvindex), rldr_data_.vol_mapp (pvindex),
+         size (vol_map) * 4, code);
+    if code ^= 0 then
+      call rldr_report_$error_output (rldr_datap, code, myname, "Error writing volume map on pv ^a",
+	 rldr_data_.pvname (pvindex));
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+withdraw: entry (rldr_datap, pvindex, vtocep, ctl, code);
+
+/* This entry withdraws pages from the volume map. If ctl is not -1 then only the ctl page is withdrawn. Otherwise
+   sufficient pages to contain the entire object are withdrawn. */
+
+    code = 0;
+						/* get ptr to volume map */
+    vol_mapp = rldr_data_.vol_mapp (pvindex);
+    mapp = addr (vol_map.bit_map);
+						/* if single page withdraw */
+    if ctl ^= -1 then do;
+        vtoce.fm (ctl) = mark_used_ ();
+        return;
+      end;
+						/* else withdraw for non-null pages */
+    do i = 0 to 255;
+      if ^substr (vtoce.fm (i), 1, 1) then
+        vtoce.fm (i) = mark_used_ ();
+      else vtoce.fm (i) = volume_reloader_null_addr;
+      if code ^= 0 then return;
+    end;
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+deposit: entry (rldr_datap, pvindex, vtocep, ctl, code);
+
+/* This entry deposits pages into the volume map data base */
+
+    code = 0;
+						/* get ptr to volume map */
+    vol_mapp = rldr_data_.vol_mapp (pvindex);
+    mapp = addr (vol_map.bit_map);
+						/* if single page deposit */
+    if ctl ^= -1 then do;
+        if ^substr (vtoce.fm (ctl), 1, 1) then
+	vtoce.fm (ctl) = mark_unused_ (vtoce.fm (ctl));
+        return;
+      end;
+						/* else deposit all non-null pages */
+    do i = 0 to 255;
+      if ^substr (vtoce.fm (i), 1, 1) then
+        vtoce.fm (i) = mark_unused_ (vtoce.fm (i));
+    end;
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+mark_used_: proc returns (bit (18));
+
+/* This proc scans the volume map from the last withdrawn address for the next withdrawn address. If there
+   are nomore addresses to be found we return an error. If we get to the end of the volume map we start
+   from the beginning. */
+
+dcl add		     bit (18);
+dcl rescan	     bit (1);
+						/* set flag */
+    rescan = "0"b;
+						/* decrement number of records left and check if all gone */
+    vol_map.n_free_rec = vol_map.n_free_rec - 1;
+    if vol_map.n_free_rec < 0 then do;
+        vol_map.n_free_rec = 0;
+        code = error_table_$end_of_info;
+        return ("0"b);
+      end;
+
+/* Scan the map from previous withdrawn record. Map words are 32 bits wide starting from bit 2. Take care
+   not to run over the absolute record bound. */
+
+scan: do wordx = rldr_data_.prev_wordx (pvindex) to vol_map.bit_map_n_words;
+      do bitx = rldr_data_.prev_bitx (pvindex) to 33;
+        if substr (fsmap.table (wordx), bitx, 1) then do;	/* an unused page */
+	  add = bit (fixed ((wordx - 1) * 32 + (bitx - 2) + vol_map.base_add, 18), 18);
+	  substr (fsmap.table (wordx), bitx, 1) = "0"b;
+	  if fixed (add, 18) > vol_map.n_rec + vol_map.base_add then goto again;
+	  rldr_data_.prev_wordx (pvindex) = wordx;
+	  rldr_data_.prev_bitx (pvindex) = bitx;
+	  return (add);
+again:	end;
+      end;
+      rldr_data_.prev_bitx (pvindex) = 2;		/* reset since no pages in this word free */
+    end;
+						/* Try rescan only once */
+    if ^rescan then do;
+        rescan = "1"b;
+        rldr_data_.prev_wordx (pvindex) = 1;
+        goto scan;
+      end;
+    code = error_table_$end_of_info;
+    return (volume_reloader_null_addr);
+
+  end mark_used_;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+mark_unused_: proc (add) returns (bit (18));
+
+/* This proc marks a record as unused in the volume map. Care is taken not to over deposit the volume map,
+   or to deposit a record in the vtoc area, or to deposit a free record. */
+
+dcl add		     bit (18);
+dcl fadd		     fixed bin (18);
+dcl adj_add	     fixed bin;
+						/* convert bit to fixed */
+    fadd = fixed (add, 18);
+						/* check if address within records availaible for deposit */
+    if fadd > vol_map.base_add + vol_map.n_rec
+         | fadd < vol_map.base_add then do;
+        if rldr_data_.per_pv (pvindex).restart & fadd = 0 then ;
+        else call rldr_report_$error_output (rldr_datap, 0, myname,
+	        "Attempt to deposit out of range address ^o on pv ^a", fadd, rldr_data_.pvname (pvindex));
+        return ("0"b);
+      end;
+						/* if volume map all free */
+    if vol_map.n_free_rec = vol_map.n_rec then return ("0"b);
+						/* increment free record count */
+    vol_map.n_free_rec = vol_map.n_free_rec + 1;
+						/* adjust address by base address of volume map */
+    adj_add = fadd - vol_map.base_add;
+						/* convert address to word and bit index */
+    if adj_add = 0 then do;				/* special case */
+        wordx = 1;
+        bitx = 2;
+      end;
+    else do;					/* round up */
+        wordx = divide (adj_add, 32, 17, 0) + 1;
+        bitx = mod (adj_add, 32) + 2;
+      end;
+						/* if restarting  things may be confused */
+    if ^rldr_data_.per_pv (pvindex).restart & substr (fsmap.table (wordx), bitx, 1) then
+      call rldr_report_$error_output (rldr_datap, 0, myname, "Attempt to deposit free record on pv ^a",
+	 rldr_data_.pvname (pvindex));
+						/* mark record as unused */
+    substr (fsmap.table (wordx), bitx, 1) = "1"b;
+    return (volume_reloader_null_addr);
+
+  end mark_unused_;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+sector: proc (add) returns (fixed bin);
+
+/* This proc converts a Multics record number to a sector number */
+dcl add		     fixed bin;
+dcl (dev_idx, sector)    fixed bin;
+
+    dev_idx = rldr_data_.disk_type (pvindex);
+    sector = add * SECTORS_PER_RECORD (dev_idx);
+    sector = sector + divide (sector, rldr_data_.usable_sectors (pvindex), 17, 0) * rldr_data_.unusable_sectors (pvindex);
+    return (sector * words_per_sect (dev_idx) * 4);
+
+  end sector;
+
+%include rldr_data_;
+
+%include disk_pack;
+
+%include vol_map;
+
+%include fsmap;
+
+%include fs_dev_types_sector;
+
+%include vtoce;
+
+%include null_addresses;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   rldr_volume_map_: Map position failed: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error was encountered during reload volume map construction. Reloading continues.
+
+   A:	$ignore
+
+
+   Message:
+   rldr_volume_map_: Error reading volume map: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error was encountered during reload volume map construction. Reloading continues.
+
+   A:	$ignore
+
+
+   Message:
+   rldr_volume_map_: Map position failed: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error was encountered during reload volume map construction. Reloading continues.
+
+   A:	$ignore
+
+
+   Message:
+   rldr_volume_map_: Error writing volume map: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error was encountered during reload volume map construction. Reloading continues.
+
+   A:	$ignore
+
+
+   Message:
+   rldr_volume_map_: Attempt to deposit out of range address WWW
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error was encountered during reload volume map construction. Reloading continues.
+
+   A:	$ignore
+
+
+   Message:
+   rldr_volume_map_: Attempt to deposit free record
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error was encountered during reload volume map construction. Reloading continues.
+
+   A:	$ignore
+
+
+   END MESSAGE DOCUMENTATION */
+
+  end rldr_volume_map_;
+
+
+
+
+		    rldr_vtoc_buffer_.pl1           11/11/89  1129.2r w 11/11/89  0851.4       58689
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-02-11,GWMay), approve(), audit(), install():
+     old history comments:
+         Written in antiquity by Dave Vinograd.
+         Modified: 03/83 by GA Texada to support multiple physical volume
+                        reloading.
+         Modified: Jan. 1985 by Greg Texada (fix by Steve Harris UNCA) to not
+                        checksum null vtoces (phx18754).
+         Modified: Feb. 1985 by Greg Texada for hardcore 821
+  2) change(86-02-11,GWMay), approve(86-07-10,MCR7445), audit(86-07-14,GDixon),
+     install(86-11-21,MR12.0-1223):
+     added the value pvindex to the vtoc_buffer.array structure for use as
+     a backward link to the owner PV info stored in rldr_data_. Changed the
+     write routine to better implement the use of a single segment containing
+     a the vtoc_buffer array limited to 100 entries. Formerly, a separate
+     segment was created for each PV entry in rldr_data_. To reduce storage
+     requirements for reloading when only the rpv is available, the vtoce segs
+     were limited to one common segment to be used by all of the PVs. The idea
+     is now to fill the buffer and then flush it when and end of volume is
+     encountered or the array tops out at the limit. To make the emptying of
+     the array easier, I added the pvindex value to the vtoc_buffer structure.
+     The code now lopps throught the vtoc_buffer outputting the vtoce to the
+     corresponding PV pointed to by vtoc_buffer.array(xxx).pvindex. Then
+     clears both the control buffer_index and the vtoc_buffer entry.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+rldr_vtoc_buffer_: proc;
+
+
+dcl (buffer_idx, pvindex, vtocx) fixed bin;
+dcl code		     fixed bin (35);
+
+dcl myname	     char (32) int static init ("rldr_vtoc_buffer_") options (constant);
+dcl all_parts	     fixed bin static init (3) options (constant);
+
+dcl filemap_checksum_    entry (ptr, fixed bin, bit (36) aligned);
+dcl rldr_report_$error_output entry options (variable);
+dcl rldr_vtoc_buffer_$write entry (ptr, fixed bin (35));
+dcl rldr_output_$read_vtoce entry (ptr, fixed bin, ptr, fixed bin, fixed bin, fixed bin (35));
+dcl rldr_output_$write_vtoce entry (ptr, fixed bin, ptr, fixed bin, fixed bin, fixed bin (35));
+
+dcl (addr, bin, hbound, lbound, unspec) builtin;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+put: entry (rldr_datap, pvindex, vtocep, vtocx, code);
+    code = 0;
+    vtocbp = rldr_data_.vtocbp (pvindex);
+    controlp = rldr_data_.controlp (pvindex);
+    if vtoc_buffer.next = hbound (vtoc_buffer.array, 1) then
+      call rldr_vtoc_buffer_$write (rldr_datap, 0);
+    vtoc_buffer.next = vtoc_buffer.next + 1;
+    rldr_control (vtocx).buffer_idx = vtoc_buffer.next;
+    vtoc_buffer (vtoc_buffer.next).vtocx = vtocx;
+    vtoc_buffer (vtoc_buffer.next).pvindex = pvindex;
+    unspec (vtoc_buffer (vtoc_buffer.next).vtoce) = unspec (vtocep -> vtoce);
+    return;
+ 
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+get: entry (rldr_datap, pvindex, vtocep, vtocx, code);
+    code = 0;
+    vtocbp = rldr_data_.vtocbp (pvindex);
+    controlp = rldr_data_.controlp (pvindex);
+    buffer_idx = rldr_control (vtocx).buffer_idx;
+    if buffer_idx = 0 then
+      call rldr_output_$read_vtoce (rldr_datap, pvindex, vtocep, vtocx, all_parts, code);
+    else unspec (vtocep -> vtoce) = unspec (vtoc_buffer (buffer_idx).vtoce);
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+write: entry (rldr_datap, code);
+
+    code = 0;
+    vtocbp = rldr_data_.vtocbp (1);			/* use 1 because the vtoc buffer is */
+						/* always in the same segment.      */
+						/* walk through the vtoc_buffer     */
+
+    do buffer_idx = lbound (vtoc_buffer.array, 1) to vtoc_buffer.next;
+						/* fill in vtoce info before output */
+
+       if vtoc_buffer (buffer_idx).vtoce.uid ^= "0"b then do;
+	call filemap_checksum_ (addr (vtoc_buffer (buffer_idx).vtoce.fm (0)),
+	   bin (vtoc_buffer (buffer_idx).vtoce.csl),
+	   vtoc_buffer (buffer_idx).vtoce.fm_checksum);
+	vtoc_buffer (buffer_idx).vtoce.fm_checksum_valid = "1"b;
+	vtoc_buffer (buffer_idx).vtoce.fm_damaged = "0"b;
+       end;
+						/* get the rldr control info for     */
+						/* this vtoce.		       */
+
+       controlp = rldr_data_(vtoc_buffer(buffer_idx).pvindex).controlp;
+
+						/* write this vtoc_buffer entry vtoce*/
+						/* to disk.		       */
+
+       call rldr_output_$write_vtoce (rldr_datap, 
+	vtoc_buffer (buffer_idx).pvindex,
+	addr (vtoc_buffer (buffer_idx).vtoce),
+	vtoc_buffer (buffer_idx).vtocx, all_parts, code);
+
+       if code ^= 0 then
+	call rldr_report_$error_output (rldr_datap, code, myname,
+	   "Unable to update vtoce ^o on pv ^a",
+	    vtoc_buffer (buffer_idx).vtocx, 
+	    rldr_data_.pvname (vtoc_buffer(buffer_idx).pvindex));
+
+						/* wipe out the control index which  */
+						/* pointed to this vtoc_buffer entry */
+
+       rldr_control(vtoc_buffer.array(buffer_idx).vtocx).buffer_idx = 0;
+
+						/* now wipe out this vtoc_buffer ent.*/
+
+       unspec (vtoc_buffer.array(buffer_idx)) = "0"b;
+
+    end;
+						/* reset the limiter of the array    */
+    vtoc_buffer.next = 0;
+    return;
+
+%include rldr_data_;
+
+%include fs_vol_label;
+%include vol_map;
+%include vtoc_header;
+
+%include rldr_vtoc_buffer;
+%include rldr_control;
+
+%include vtoce;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   rldr_vtoc_buffer_: Unable to update vtoce WWW: ERROR_MESS
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred updating a VTOCE. Reloading continues.
+
+   A:	$ignore
+
+
+   END MESSAGE DOCUMENTATION */
+
+  end rldr_vtoc_buffer_;
+   
+
+
+
+		    rldr_vtoc_header_.pl1           04/27/92  1330.9r w 04/27/92  1329.3       81675
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1991   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-05-13,GJohnson), approve(86-05-13,MCR7387),
+     audit(86-05-13,Martinson), install(86-05-14,MR12.0-1056):
+     Correct error message documentation.
+  2) change(86-05-15,Fawcett), approve(86-04-11,MCR7383),
+     audit(86-06-03,GWMay), install(86-07-17,MR12.0-1097):
+     Add support for 512_WORD_IO devices.
+  3) change(91-11-12,Schroth), approve(91-12-02,MCR8253),
+     audit(92-04-27,WAAnderson), install(92-04-27,MR12.5-1015):
+     Corrected call to rldr_report_$error_output that failed to pass rldr_datap
+     as first argument.
+                                                   END HISTORY COMMENTS */
+
+/* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+
+rldr_vtoc_header_: proc;
+
+/* This routine manages  the vtoc header data base for the volume reloader.
+   It also maintains the VTOC map.
+
+   Probably written by Vinograd.
+   Modified April 1982 by J. Bongiovanni for the VTOC Map
+   Modified: 03/83 by GA Texada to support multiple physical volume reloading.
+*/
+
+dcl code		     fixed bin (35);
+dcl old_vtocep	     ptr;
+dcl (vtocx, prev_vtocx, n_read, wordx, bitx, pvindex) fixed bin;
+dcl 1 free_vtoce	     like vtoce aligned;
+dcl 1 old_vtoce	     like vtoce aligned;
+dcl 1 l_vtoc_map	     aligned like vtoc_map;
+
+dcl myname	     char (32) int static init ("rldr_vtoc_header_") options (constant);
+
+dcl rldr_report_$error_output entry options (variable);
+dcl iox_$position	     entry (ptr, fixed bin, fixed bin, fixed bin (35));
+dcl iox_$get_chars	     entry (ptr, ptr, fixed bin, fixed bin, fixed bin (35));
+dcl iox_$put_chars	     entry (ptr, ptr, fixed bin, fixed bin (35));
+
+dcl (addr, divide, mod, size, substr, unspec) builtin;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+open: entry (rldr_datap, pvindex, code);
+
+/* This entry initializes the vtoc header data base. */
+
+/* position to sector */
+    call iox_$position (rldr_data_.outputvol_iocbp (pvindex), 2, sector (DUMPER_BIT_MAP_ADDR), code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "VTOC header position failed on ^a",
+	   rldr_data_.pvname (pvindex));
+        return;
+      end;
+						/* read vtoc header */
+    call iox_$get_chars (rldr_data_.outputvol_iocbp (pvindex), rldr_data_.vtoc_headerp (pvindex),
+         size (vtoc_header) * 4, n_read, code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "VTOC header read failed on ^a",
+	   rldr_data_.pvname (pvindex));
+        return;
+      end;
+						/* set static variables */
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+update: entry (rldr_datap, pvindex, code);
+close: entry (rldr_datap, pvindex, code);
+
+/* This entry updates the vtoc header on the physical volume from the data base */
+
+/* position to sector */
+    call iox_$position (rldr_data_.outputvol_iocbp (pvindex), 2, sector (DUMPER_BIT_MAP_ADDR), code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "VTOC header position failed on ^a",
+	   rldr_data_.pvname (pvindex));
+        return;
+      end;
+						/* write vtoc header */
+    call iox_$put_chars (rldr_data_.outputvol_iocbp (pvindex), rldr_data_.vtoc_headerp (pvindex),
+         size (vtoc_header) * 4, code);
+    if code ^= 0 then
+      call rldr_report_$error_output (rldr_datap, code, myname, "VTOC header write failed on ^a",
+	 rldr_data_.pvname (pvindex));
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+build_vtoc_map: entry (rldr_datap, pvindex, code);
+
+/* This entry builds the map of free VTOCEs. init_vol set the VTOC map to
+   indicate that all VTOCEs are free. As this is likely no longer the case,
+   the map must be built. Each VTOCE in the local control data base is
+   examined. If it is not free, it is marked as in-use in the VTOC map. */
+
+/* set control variables and init structures */
+    controlp = rldr_data_.controlp (pvindex);
+    prev_vtocx = 0;
+    unspec (free_vtoce) = "0"b;
+    unspec (old_vtoce) = "0"b;
+    vtocep = addr (free_vtoce);
+    old_vtocep = addr (old_vtoce);
+    vtoc_headerp = rldr_data_.vtoc_headerp (pvindex);
+    vtoc_header.n_free_vtoce, code = 0;
+    call iox_$position (rldr_data_.outputvol_iocbp (pvindex), 2, sector (VTOC_MAP_ADDR), code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "VTOC map position failed on ^a",
+	   rldr_data_.pvname (pvindex));
+        return;
+      end;
+    call iox_$get_chars (rldr_data_.outputvol_iocbp (pvindex), addr (l_vtoc_map), size (vtoc_map) * 4, n_read, code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "VTOC map read failed on ^a",
+	   rldr_data_.pvname (pvindex));
+        return;
+      end;
+    l_vtoc_map.n_free_vtoce = l_vtoc_map.n_vtoce;
+						/* scan all free vtoces */
+    do vtocx = 0 to vtoc_header.n_vtoce - 1;
+      if rldr_control (vtocx).uid ^= "0"b then do;	/* VTOCE in use */
+	l_vtoc_map.n_free_vtoce = l_vtoc_map.n_free_vtoce - 1;
+	wordx = divide (vtocx, 32, 17);
+	bitx = mod (vtocx, 32);
+	bit_map_wordp = addr (l_vtoc_map.bit_map (wordx));
+	substr (bit_map_word.bits, bitx + 1, 1) = "0"b;
+        end;
+    end;
+
+    call iox_$position (rldr_data_.outputvol_iocbp (pvindex), 2, sector (VTOC_MAP_ADDR), code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "VTOC map position failed on ^a",
+	   rldr_data_.pvname (pvindex));
+        return;
+      end;
+    call iox_$put_chars (rldr_data_.outputvol_iocbp (pvindex), addr (l_vtoc_map), size (vtoc_map) * 4, code);
+    if code ^= 0 then do;
+        call rldr_report_$error_output (rldr_datap, code, myname, "VTOC map write failed on ^a",
+	   rldr_data_.pvname (pvindex));
+        return;
+      end;
+    return;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+
+
+sector: proc (add) returns (fixed bin);
+
+/* This proc converts a Multics record number to a sector number */
+
+dcl add		     fixed bin;
+dcl (dev_idx, sector)    fixed bin;
+
+    dev_idx = rldr_data_.disk_type (pvindex);
+    sector = add * SECTORS_PER_RECORD (dev_idx);
+    sector = sector + divide (sector, rldr_data_.usable_sectors (pvindex), 17, 0) * rldr_data_.unusable_sectors (pvindex);
+    return (sector * words_per_sect (dev_idx) * 4);
+
+  end sector;
+
+%include rldr_data_;
+
+%include rldr_control;
+
+%include vtoce;
+
+%include fs_dev_types_sector;
+
+%include disk_pack;
+
+%include fs_vol_label;
+
+%include vtoc_header;
+%include vol_map;
+%include vtoc_map;
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   rldr_vtoc_header_: VTOC header position failed
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred writing out the VTOC header for an output volume.
+
+   A:	$inform
+
+
+   Message:
+   rldr_vtoc_header_: VTOC header read failed
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred writing out the VTOC header for an output volume.
+
+   A:	$inform
+
+
+   Message:
+   rldr_vtoc_header_: VTOC header position failed
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred writing out the VTOC header for an output volume.
+
+   A:	$inform
+
+
+   Message:
+   rldr_vtoc_header_: VTOC header write failed
+
+   S:	$rld_out
+
+   T:	$reload
+
+   M:	An error occurred writing out the VTOC header for an output volume.
+
+   A:	$inform
+
+
+   Message:
+   rldr_vtoc_header_: VTOC map position failed
+
+   S:     $rld_out
+
+   T:	$reload
+
+   M:	An error occurred writing out the VTOC map for an output volume.
+
+   A:	$inform
+
+   Message:
+   rldr_vtoc_header_: VTOC map read failed
+
+   S:     $rld_out
+
+   T:	$reload
+
+   M:	An error occurred reading the VTOC map for an output volume.
+
+   A:	$inform
+
+   Message:
+   rldr_vtoc_header_: VTOC map write failed
+
+   S:     $rld_out
+
+   T:	$reload
+
+   M:	An error occurred writing out the VTOC map for an output volume.
+
+   A:	$inform
+
+
+
+   END MESSAGE DOCUMENTATION */
+
+  end rldr_vtoc_header_;
+
+
+
+
+		    bull_copyright_notice.txt       08/30/05  1008.4r   08/30/05  1007.3    00020025
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group Bull including Bull HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell Bull Inc., Groupe Bull
+and Bull HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato.Users consider that Multics provided the best software architecture for 
+managing computer hardware properly and for executing programs. Many subsequent operating systems
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, Bull or Bull HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by Bull HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

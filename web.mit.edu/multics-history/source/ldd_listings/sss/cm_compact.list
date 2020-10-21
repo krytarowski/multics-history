@@ -1,0 +1,762 @@
+	COMPILATION LISTING OF SEGMENT cm_compact
+	Compiled by: Multics PL/I Compiler, Release 33e, of October 6, 1992
+	Compiled at: CGI                             
+	Compiled on: 2000-05-05_1827.38_Fri_mdt
+	    Options: optimize map
+
+        1 /****^  ***********************************************************
+        2*        *                                                         *
+        3*        * Copyright, (C) BULL HN Information Systems Inc., 1989   *
+        4*        *                                                         *
+        5*        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        6*        *                                                         *
+        7*        *********************************************************** */
+        8 
+        9 
+       10 /* DESCRIPTION:
+       11*
+       12*   Given the identifier of a control interval (in p_element_id) or a pointer
+       13*   to a copy of a control interval (p_ci_buffer_ptr), re-arrange the contents
+       14*   of the control interval so as to maximize the amount of contiguous space in
+       15*   the free pool, or un-used portion, between the header and slots on one side
+       16*   and the used portion (where each datum is stored).  The non-buffered
+       17*   entries must first get the contents of the control interval in a local
+       18*   buffer (old_ci), compact the contents of the control interval into another
+       19*   local buffer (new_ci), and finally put the new contents back into the file.
+       20*   The buffered entries are given a pointer to a buffered control interval
+       21*   from which to work.  On input, this control interval buffer contains the
+       22*   contents of the control interval to be compacted; on output, it contains
+       23*   the new, compacted contents of the control interval.  Therefore, the
+       24*   buffered entries must first copy the contents of the control interval
+       25*   buffer into a local buffer (old_ci), then compact the contents back into
+       26*   the supplied control interval buffer.  The file is not actually updated by
+       27*   the buffered entries.
+       28*   
+       29*        The caller specified the number of datum slots (p_number_of_slots) the
+       30*   control interval is to have after the compaction.  This allows the caller
+       31*   to specify more slots than are in the old control interval.
+       32*   
+       33*        The replacement entries do not retain the contents of the datum
+       34*   specified by p_element_id, but do retain the datum's slot.  This is used
+       35*   when modifying a datum to a size larger than its previous size and larger
+       36*   than can fit in the current free pool.  One wants the contents, which will
+       37*   be changed, to be removed by the compaction, to be replaced later with the
+       38*   new contents.  The non-replacement entries retain each datum.
+       39*   
+       40*        If p_basic_control_interval_header_ptr (only in the non-buffered
+       41*   entries) is non-null, it points to a buffer maintained by the caller in
+       42*   which to but the contents of the control interval header after the
+       43*   compaction.  The caller may need some of the information in that header.
+       44**/
+       45 
+       46 /* HISTORY:
+       47*Written by Matthew Pierret 06/15/82.
+       48*     (Mostly copied from cm_compact_and_add.pl1)
+       49*Modified:
+       50*09/21/82 by Lindsey Spratt:  Added the replacement entry.  This entry is used
+       51*	  to reclaim them the storage associated with the p_element_id'th
+       52*	  slot, rather than create a new slot a p_element_id.  It is called
+       53*	  by cm_put_element.
+       54*10/20/82 by Matthew Pierret:  Converted to use file_manager_.
+       55*11/03/82 by Matthew Pierret:  Converted to use the BASIC_CI_LAYOUT_1, which
+       56*            has flags in the datum slots.
+       57*11/23/82 by Matthew Pierret:  Added initialization of new_control_interval_buffer
+       58*            improper initialization was allowing stack garbage to find its way
+       59*            into the datum slot flags.  Also fully qualified all references
+       60*            to basic_control_interval with one of new_ci_ptr and old_ci_ptr.
+       61*01/07/83 by Matthew Pierret:  Added $buffered & $buffered_replacement entries.
+       62*02/03/83 by Matthew Pierret:  Changed to check CI version for $buffered*
+       63*01/13/84 by Matthew Pierret:  Added check to make sure that slots are not
+       64*            inserted in past the end of the new CI's datum_position_table.
+       65*09/26/84 by Matthew Pierret:  Beefed up DESCRIPTION section.  Removed un-used
+       66*            variables. Removed BEGIN_BLOCK, instead declaring the control
+       67*            interval buffers in the main procedure. Changed to use 
+       68*            file_manager_$simple_(get put), thus removing the ci_parts
+       69*            structure.
+       70**/
+       71 
+       72 
+       73 /****^  HISTORY COMMENTS:
+       74*  1) change(89-05-10,Dupuis), approve(89-06-06,MCR8112),
+       75*     audit(89-06-07,Farley), install(89-06-09,MR12.3-1054):
+       76*     Fixed a bug in the compaction algorithm where it was clobbering free
+       77*     slots because a loop counter wasn't being updated.
+       78*                                                   END HISTORY COMMENTS */
+       79 
+       80 
+       81 /* format: style2,ind3 */
+       82 
+       83 cm_compact:
+       84    proc (p_file_opening_id, p_number_of_slots, p_element_id, p_basic_control_interval_header_ptr, p_code);
+       85 
+       86 /* START OF DECLARATIONS */
+       87 /* Parameter */
+       88 
+       89       dcl	    p_ci_buffer_ptr	       ptr;
+       90       dcl	    p_file_opening_id      bit (36) aligned;
+       91       dcl	    p_number_of_slots      fixed bin;
+       92       dcl	    p_element_id	       bit (36) aligned;
+       93       dcl	    p_basic_control_interval_header_ptr
+       94 			       ptr;
+       95       dcl	    p_code	       fixed bin (35);
+       96 
+       97 /* Automatic */
+       98 
+       99       dcl	    code		       fixed bin (35);
+      100       dcl	    ci_length_in_bytes     fixed bin (21);
+      101       dcl	    datum_length_in_bytes  fixed bin (17);
+      102       dcl	    old_datum_offset       fixed bin;
+      103       dcl	    new_datum_offset       fixed bin;
+      104       dcl	    old_slot_idx	       fixed bin init (-1);
+      105       dcl	    new_slot_idx	       fixed bin init (-1);
+      106       dcl	    new_ci_ptr	       ptr;
+      107       dcl	    old_ci_ptr	       ptr;
+      108       dcl	    (is_buffered, is_replacement)
+      109 			       bit (1) aligned;
+      110 
+      111       dcl	    new_ci	       (CONTROL_INTERVAL_ADDRESSABLE_LENGTH_IN_BYTES / BYTES_PER_DOUBLE_WORD) fixed
+      112 			       bin (71);
+      113       dcl	    old_ci	       (CONTROL_INTERVAL_ADDRESSABLE_LENGTH_IN_BYTES / BYTES_PER_DOUBLE_WORD) fixed
+      114 			       bin (71);
+      115 
+      116 /* Based */
+      117 
+      118       dcl	    based_ci	       char (ci_length_in_bytes) based;
+      119 
+      120 /* Builtin */
+      121 
+      122       dcl	    (addr, ceil, divide, hbound, null, string, substr, unspec)
+      123 			       builtin;
+      124 
+      125 /* Controlled */
+      126 /* Constant */
+      127 
+      128       dcl	    myname	       init ("cm_compact") char (32) varying internal static options (constant);
+      129       dcl	    BITS_PER_BYTE	       fixed bin init (9) int static options (constant);
+      130       dcl	    BYTES_PER_DOUBLE_WORD  fixed bin init (8) int static options (constant);
+      131       dcl	    START_OF_CI_OFFSET     fixed bin (21) init (0) int static options (constant);
+      132 
+      133 /* Entry */
+      134 
+      135       dcl	    file_manager_$simple_get
+      136 			       entry (bit (36) aligned, fixed bin (27), fixed bin (21), ptr, fixed bin (21),
+      137 			       fixed bin (35));
+      138       dcl	    file_manager_$simple_put
+      139 			       entry (bit (36) aligned, fixed bin (27), fixed bin (21), ptr, fixed bin (21),
+      140 			       fixed bin (35));
+      141       dcl	    sub_err_	       entry () options (variable);
+      142 
+      143 /* External */
+      144 
+      145       dcl	    dm_error_$unimplemented_ci_version
+      146 			       ext fixed bin (35);
+      147 
+      148 /* END OF DECLARATIONS */
+      149 
+      150       is_buffered = "0"b;
+      151       is_replacement = "0"b;
+      152       go to JOIN;
+      153 
+      154 
+      155 replacement:
+      156    entry (p_file_opening_id, p_number_of_slots, p_element_id, p_basic_control_interval_header_ptr, p_code);
+      157 
+      158       is_buffered = "0"b;
+      159       is_replacement = "1"b;
+      160       go to JOIN;
+      161 
+      162 buffered:
+      163    entry (p_ci_buffer_ptr, p_number_of_slots, p_element_id, p_code);
+      164 
+      165       is_buffered = "1"b;
+      166       is_replacement = "0"b;
+      167       new_ci_ptr = p_ci_buffer_ptr;
+      168       go to JOIN;
+      169 
+      170 
+      171 buffered_replacement:
+      172    entry (p_ci_buffer_ptr, p_number_of_slots, p_element_id, p_code);
+      173 
+      174       is_buffered = "1"b;
+      175       is_replacement = "1"b;
+      176       new_ci_ptr = p_ci_buffer_ptr;
+      177       go to JOIN;
+      178 
+      179 JOIN:
+      180       p_code, code = 0;
+      181       element_id_string = p_element_id;
+      182 
+      183       if element_id.control_interval_id = 0
+      184       then ci_length_in_bytes = CONTROL_INTERVAL_ZERO_ADDRESSABLE_LENGTH_IN_BYTES;
+      185       else ci_length_in_bytes = CONTROL_INTERVAL_ADDRESSABLE_LENGTH_IN_BYTES;
+      186 
+      187       old_ci_ptr = addr (old_ci);
+      188 
+      189       if is_buffered
+      190       then
+      191          do;
+      192 	  call CHECK_CI_VERSION (new_ci_ptr -> basic_control_interval.header.layout_type);
+      193 	  unspec (old_ci_ptr -> based_ci) = unspec (new_ci_ptr -> based_ci);
+      194 	  unspec (new_ci_ptr -> based_ci) = ""b;
+      195          end;
+      196       else
+      197          do;
+      198 	  call file_manager_$simple_get (p_file_opening_id, (element_id.control_interval_id), START_OF_CI_OFFSET,
+      199 	       old_ci_ptr, ci_length_in_bytes, code);
+      200 	  if code ^= 0
+      201 	  then call ERROR_RETURN (code);
+      202 	  call CHECK_CI_VERSION (old_ci_ptr -> basic_control_interval.header.layout_type);
+      203 	  new_ci_ptr = addr (new_ci);
+      204 	  unspec (new_ci_ptr -> based_ci) = "0"b;
+      205          end;
+      206 
+      207       basic_control_interval_ptr = null;
+      208 
+      209       new_datum_offset = ci_length_in_bytes;
+      210 
+      211       new_ci_ptr -> basic_control_interval.header = old_ci_ptr -> basic_control_interval.header;
+      212       new_ci_ptr -> basic_control_interval.header.scattered_free_space = 0;
+      213       new_ci_ptr -> basic_control_interval.header.number_of_datums = p_number_of_slots;
+      214 
+      215       new_slot_idx = 1;
+      216 PUT_EACH_DATUM_IN_NEW_CI_LOOP:
+      217       do old_slot_idx = 1 to hbound (old_ci_ptr -> basic_control_interval.datum_position_table, 1)
+      218 	 while (new_slot_idx <= hbound (new_ci_ptr -> basic_control_interval.datum_position_table, 1));
+      219          if new_slot_idx = element_id.index
+      220          then
+      221 	  do;
+      222 	     string (new_ci_ptr -> basic_control_interval.datum_position_table (new_slot_idx).flags) = "0"b;
+      223 	     new_ci_ptr -> basic_control_interval.datum_position_table (new_slot_idx).offset_in_bytes = FREE_SLOT;
+      224 	     new_ci_ptr -> basic_control_interval.datum_position_table (new_slot_idx).length_in_bits = 0;
+      225 
+      226 	     new_slot_idx = new_slot_idx + 1;
+      227 	     if ^is_replacement
+      228 	     then if old_ci_ptr -> basic_control_interval.datum_position_table (old_slot_idx).offset_in_bytes
+      229 		     ^= FREE_SLOT
+      230 		then old_slot_idx = old_slot_idx - 1;	/* The old_slot hasn't been processed yet. old_slot_idx */
+      231 						/* will be incremented back up to the current old_slot at */
+      232 						/* the end of the loop. */
+      233 	  end;
+      234          else if old_ci_ptr -> basic_control_interval.datum_position_table (old_slot_idx).offset_in_bytes = FREE_SLOT
+      235          then
+      236 COPY_FREE_SLOT:
+      237 	  do;
+      238 	     string (new_ci_ptr -> basic_control_interval.datum_position_table (new_slot_idx).flags) = "0"b;
+      239 	     new_ci_ptr -> basic_control_interval.datum_position_table (new_slot_idx).offset_in_bytes = FREE_SLOT;
+      240 	     new_ci_ptr -> basic_control_interval.datum_position_table (new_slot_idx).length_in_bits = 0;
+      241 
+      242 	     new_slot_idx = new_slot_idx + 1;
+      243 	  end COPY_FREE_SLOT;
+      244          else
+      245 COPY_OLD_DATUM:
+      246 	  do;
+      247 	     datum_length_in_bytes =
+      248 		ceil (
+      249 		divide (old_ci_ptr -> basic_control_interval.datum_position_table (old_slot_idx).length_in_bits,
+      250 		BITS_PER_BYTE, 35, 18));
+      251 
+      252 	     new_datum_offset = new_datum_offset - datum_length_in_bytes;
+      253 
+      254 	     old_datum_offset =
+      255 		old_ci_ptr -> basic_control_interval.datum_position_table (old_slot_idx).offset_in_bytes;
+      256 	     substr (new_ci_ptr -> based_ci, new_datum_offset + 1, datum_length_in_bytes) =
+      257 		substr (old_ci_ptr -> based_ci, old_datum_offset + 1, datum_length_in_bytes);
+      258 
+      259 	     string (new_ci_ptr -> basic_control_interval.datum_position_table (new_slot_idx).flags) =
+      260 		string (old_ci_ptr -> basic_control_interval.datum_position_table (old_slot_idx).flags);
+      261 	     new_ci_ptr -> basic_control_interval.datum_position_table (new_slot_idx).offset_in_bytes =
+      262 		new_datum_offset;
+      263 	     new_ci_ptr -> basic_control_interval.datum_position_table (new_slot_idx).length_in_bits =
+      264 		old_ci_ptr -> basic_control_interval.datum_position_table (old_slot_idx).length_in_bits;
+      265 
+      266 	     new_slot_idx = new_slot_idx + 1;
+      267 
+      268 	  end COPY_OLD_DATUM;
+      269       end PUT_EACH_DATUM_IN_NEW_CI_LOOP;
+      270 
+      271 INIT_NEW_FREE_SLOTS:
+      272       do new_slot_idx = new_slot_idx to element_id.index - 1;
+      273 
+      274          string (new_ci_ptr -> basic_control_interval.datum_position_table (new_slot_idx).flags) = "0"b;
+      275          new_ci_ptr -> basic_control_interval.datum_position_table (new_slot_idx).offset_in_bytes = FREE_SLOT;
+      276          new_ci_ptr -> basic_control_interval.datum_position_table (new_slot_idx).length_in_bits = 0;
+      277 
+      278       end INIT_NEW_FREE_SLOTS;
+      279 
+      280       if element_id.index = new_slot_idx
+      281       then new_ci_ptr -> basic_control_interval.datum_position_table (new_slot_idx).offset_in_bytes = FREE_SLOT;
+      282 
+      283       new_ci_ptr -> basic_control_interval.header.start_of_used_space = new_datum_offset;
+      284 
+      285       if ^is_buffered
+      286       then
+      287          do;
+      288 	  call file_manager_$simple_put (p_file_opening_id, (element_id.control_interval_id), START_OF_CI_OFFSET,
+      289 	       new_ci_ptr, ci_length_in_bytes, code);
+      290 	  if code ^= 0
+      291 	  then call ERROR_RETURN (code);
+      292 	  p_basic_control_interval_header_ptr -> basic_control_interval.header =
+      293 	       new_ci_ptr -> basic_control_interval.header;
+      294          end;
+      295 
+      296 MAIN_RETURN:
+      297       return;
+      298 
+      299 
+      300 ERROR_RETURN:
+      301    proc (er_p_code);
+      302 
+      303       dcl	    er_p_code	       fixed bin (35);
+      304 
+      305       p_code = er_p_code;
+      306       go to MAIN_RETURN;
+      307 
+      308    end ERROR_RETURN;
+      309 
+      310 CHECK_CI_VERSION:
+      311    proc (ccv_p_given_version);
+      312 
+      313       dcl	    ccv_p_given_version    char (4) aligned;
+      314 
+      315       if ccv_p_given_version ^= BASIC_CI_LAYOUT_1
+      316       then call sub_err_ (dm_error_$unimplemented_ci_version, myname, ACTION_CANT_RESTART, null, 0,
+      317 	      "^/Expected version ""^4a"" control interval; received ""^4a"".", BASIC_CI_LAYOUT_1, ccv_p_given_version);
+      318 
+      319       return;
+      320 
+      321 
+      322    end CHECK_CI_VERSION;
+      323 
+  1     1 /* BEGIN INCLUDE FILE dm_cm_basic_ci.incl.pl1 */
+  1     2 
+  1     3 /* DESCRIPTION:
+  1     4*
+  1     5*        The collection_manager_ manages the structure of the addressable
+  1     6*   portion of a control interval.  The addressable portion is that portion of
+  1     7*   a control interval which the file_manager_ will allow the
+  1     8*   collection_manager_ to address.  In this description control interval will
+  1     9*   be used to mean the addressable portion of a control interval.
+  1    10*   
+  1    11*        A control interval is divided into four parts: the header, the datum
+  1    12*   position table (also known as the slot table or slots), un-used space and
+  1    13*   used space.  The beginning of the header is at offset 0, and the end of the
+  1    14*   used space is at the end of the control interval (curently offset 4072).
+  1    15*   Pictoriarly, a control interval is structured as follows:
+  1    16*   
+  1    17*   ----------------------------------------------------------------------
+  1    18*   |        || | | | | | ||               ||   | / / |       |/|   |    |
+  1    19*   | Header || | slot  | || un-used space ||   |/ / /|       |/|   |    |
+  1    20*   |        || | table | ||               ||   | / / |       |/|   |    |
+  1    21*   |        || | | | | | ||               ||   |/ / /|       |/|   |    |
+  1    22*   ----------------------------------------------------------------------
+  1    23*                                           ^ ^    ^      ^    ^  ^   ^
+  1    24*                                           | |    |      |    |  |   |
+  1    25*                                           | |...........|.......|...|
+  1    26*                        start of used space|      |           |      |
+  1    27*                                                  |           |  each|
+  1    28*                                          scattered free space|  is a used
+  1    29*                                                                 datum
+  1    30*   
+  1    31*      The basic_control_interval structure describes the header
+  1    32*   (basic_control_interval.header, bci_header) and the slots
+  1    33*   (basic_control_interval.datum_position_table, datum_slot for one only).
+  1    34*   Each datum_slot contains the offset (in bytes) and the length (in bits) of
+  1    35*   a datum in the used space.  If the offset is equal to FREE_SLOT (declared
+  1    36*   in dm_cm_basic_ci_const.incl.pl1), the slot is un-used.  The slot also
+  1    37*   contains flags describing the type of datum (see dm_cm_datum.incl.pl1).
+  1    38**/
+  1    39 
+  1    40 /* HISTORY:
+  1    41*Written by Matthew Pierret, 02/07/82.
+  1    42*Modified:
+  1    43*03/25/82 by Matthew Pierret: Fixed alignment differences basic_control_interval
+  1    44*            and its sub-structures.
+  1    45*06/14/82 by Matthew Pierret: Removed common header and buffers. Changed
+  1    46*            basic_ci_header to bci_header. Added previous_control_interval.
+  1    47*07/12/82 by Matthew Pierret: Changed collection_id to be bit (36) aligned.
+  1    48*10/29/82 by Matthew Pierret: Added flags to datum slots. 
+  1    49*11/10/82 by Matthew Pierret: Removed continued_datum_is_present flag, as it
+  1    50*            is not used.
+  1    51*03/28/84 by Matthew Pierret: Added the constants BCI_HEADER_LENGTH_IN_BYTES
+  1    52*            and DATUM_POSITION_TABLE_OFFSET_IN_BYTES.
+  1    53**/
+  1    54 
+  1    55 /* format: style2 */
+  1    56      dcl	   1 basic_control_interval
+  1    57 			      aligned based (basic_control_interval_ptr),
+  1    58 	     2 header	      like bci_header,
+  1    59 	     2 datum_position_table
+  1    60 			      (0 refer (basic_control_interval.number_of_datums)) like datum_slot;
+  1    61 
+  1    62 
+  1    63      dcl	   1 bci_header	      aligned based (bci_header_ptr),
+  1    64 	     2 layout_type	      char (4) aligned,
+  1    65 	     2 collection_id      bit (36) aligned,
+  1    66 	     2 next_control_interval
+  1    67 			      fixed bin (24) uns unal,
+  1    68 	     2 previous_control_interval
+  1    69 			      fixed bin (24) uns unal,
+  1    70 	     2 flags	      unal,
+  1    71 	       3 continuation_datum_is_present
+  1    72 			      bit (1) unal,
+  1    73 	       3 free_slot_is_present
+  1    74 			      bit (1) unal,
+  1    75 	       3 must_be_zero     bit (4) unal,		/* reserved */
+  1    76 	     2 scattered_free_space
+  1    77 			      fixed bin (17) unal,
+  1    78 	     2 start_of_used_space
+  1    79 			      fixed bin (17) unal,
+  1    80 	     2 number_of_datums   fixed bin (17) unal;
+  1    81 
+  1    82      dcl	   1 datum_slot	      aligned based (datum_slot_ptr),
+  1    83 	     2 flags	      unal,
+  1    84 	       3 special_format_datum
+  1    85 			      bit (1) unal,		/* reserved */
+  1    86 	       3 is_continued     bit (1) unal,
+  1    87 	       3 is_continuation  bit (1) unal,
+  1    88 	       3 mbz	      bit (1) unal,		/* reserved */
+  1    89 	     2 offset_in_bytes    fixed bin (15) uns unal,
+  1    90 	     2 length_in_bits     fixed bin (17) uns unal;
+  1    91 
+  1    92      dcl	   basic_control_interval_ptr
+  1    93 			      ptr;
+  1    94      dcl	   bci_header_ptr	      ptr;
+  1    95      dcl	   datum_slot_ptr	      ptr;
+  1    96 
+  1    97      dcl	   BASIC_CI_LAYOUT_1      char (4) aligned init ("bci1") internal static options (constant);
+  1    98 
+  1    99 /* END INCLUDE FILE dm_cm_basic_ci.incl.pl1 */
+      324 
+      325 
+  2     1 /* BEGIN INCLUDE FILE dm_cm_basic_ci_const.incl.pl1 */
+  2     2 
+  2     3 /* DESCRIPTION:
+  2     4*
+  2     5*   Contains constants useful in describing parts of a basic control interval.
+  2     6**/
+  2     7 
+  2     8 /* HISTORY:
+  2     9*Written by Matthew Pierret, 09/20/84.
+  2    10*Modified:
+  2    11**/
+  2    12 
+  2    13      dcl	   FREE_SLOT	      init (0) fixed bin (15) uns internal static options (constant);
+  2    14      dcl	   BCI_HEADER_LENGTH_IN_BYTES
+  2    15 			      init (20) fixed bin internal static options (constant);
+  2    16      dcl	   DATUM_POSITION_TABLE_OFFSET_IN_BYTES
+  2    17 			      init (20) fixed bin internal static options (constant);
+  2    18 
+  2    19 
+  2    20 /* END INCLUDE FILE dm_cm_basic_ci_const.incl.pl1 */
+      326 
+      327 
+  3     1 /* BEGIN INCLUDE FILE dm_element_id.incl.pl1 */
+  3     2 
+  3     3 /* DESCRIPTION:
+  3     4*
+  3     5*        Contains the declaration of an element identifier.  Element
+  3     6*   identifiers consist of two parts, the id (number) of the control interval
+  3     7*   in which the element resides, and the index into the slot table of
+  3     8*   the element in the control interval.  The declaration of the element_id 
+  3     9*   structure reflects this division of the element identifier.  The structure 
+  3    10*   is based on the automatic bit string element_id_string because programs
+  3    11*   generally pass bit strings (element_id_string) to each other, then 
+  3    12*   interpret the bit string by overlaying the element_id structure ony if
+  3    13*   it is necessary to access the parts of the id.  Basing element_id on
+  3    14*   addr(element_id_string) instead of on a pointer removes the necessity
+  3    15*   for always setting that pointer explicitly and guarantees that changes
+  3    16*   made to the string or structure do not get inconsistent.
+  3    17*
+  3    18*   Changes made to element_id must also be made to datum_id, declared in 
+  3    19*   dm_cm_datum.incl.pl1.
+  3    20**/
+  3    21 
+  3    22 /* HISTORY:
+  3    23*Written by Matthew Pierret, 04/01/82.
+  3    24*Modified:
+  3    25*09/24/84 by Matthew Pierret: Added DESCRIPTION section.
+  3    26**/
+  3    27 
+  3    28 /* format: style2,ind3,ll79 */
+  3    29 
+  3    30      dcl	   element_id_string      bit (36) aligned;
+  3    31 
+  3    32      dcl	   1 element_id	      aligned based (addr (element_id_string)),
+  3    33 	     2 control_interval_id
+  3    34 			      fixed bin (24) unal unsigned,
+  3    35 	     2 index	      fixed bin (12) unal unsigned;
+  3    36 
+  3    37 
+  3    38 /* END INCLUDE FILE dm_element_id.incl.pl1 */
+      328 
+      329 
+  4     1 /* BEGIN INCLUDE FILE dm_ci_lengths.incl.pl1 */
+  4     2 
+  4     3 /* DESCRIPTION:
+  4     4*       This include file contains constants which are the length in bytes
+  4     5*   of the addressable portion of a control interval.  The addressable portion
+  4     6*   is that part of the control interval which callers of file_manager_
+  4     7*   may access, specifically, everything between the end of the control
+  4     8*   interval header (ci_header) and the control interval trailer (ci_trailer).
+  4     9*   Control interval 0 is slightly different, as it also contains an 
+  4    10*   unaddressable portion in which it maintains the file attributes.  For
+  4    11*   control interval 0 the addressable portion is everything between the end
+  4    12*   of the control interval header and the beginning of the file attributes.
+  4    13**/
+  4    14 
+  4    15 /* HISTORY:
+  4    16*Written by Matthew Pierret, 11/02/84.
+  4    17*Modified:
+  4    18**/
+  4    19 
+  4    20 /* format: style2,ind3 */
+  4    21 
+  4    22      dcl	   CONTROL_INTERVAL_ADDRESSABLE_LENGTH_IN_BYTES
+  4    23 			      fixed bin (17) init (4072) int static options (constant);
+  4    24 
+  4    25      dcl	   CONTROL_INTERVAL_ZERO_ADDRESSABLE_LENGTH_IN_BYTES
+  4    26 			      fixed bin (17) init (3176) int static options (constant);
+  4    27 
+  4    28 
+  4    29      dcl	   CI_ADDRESSABLE_LENGTH  fixed bin (17) init (4072) int static options (constant);
+  4    30 
+  4    31      dcl	   CI_0_ADDRESSABLE_LENGTH
+  4    32 			      fixed bin (17) init (3176) int static options (constant);
+  4    33 
+  4    34 /* END INCLUDE FILE dm_ci_lengths.incl.pl1 */
+      330 
+      331 
+  5     1 /* BEGIN INCLUDE FILE sub_err_flags.incl.pl1 BIM 11/81 */
+  5     2 /* format: style3 */
+  5     3 
+  5     4 /* These constants are to be used for the flags argument of sub_err_ */
+  5     5 /* They are just "string (condition_info_header.action_flags)" */
+  5     6 
+  5     7 declare	(
+  5     8 	ACTION_CAN_RESTART	init (""b),
+  5     9 	ACTION_CANT_RESTART init ("1"b),
+  5    10 	ACTION_DEFAULT_RESTART
+  5    11 			init ("01"b),
+  5    12 	ACTION_QUIET_RESTART
+  5    13 			init ("001"b),
+  5    14 	ACTION_SUPPORT_SIGNAL
+  5    15 			init ("0001"b)
+  5    16 	)		bit (36) aligned internal static options (constant);
+  5    17 
+  5    18 /* End include file */
+      332 
+      333 
+      334    end cm_compact;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    05/05/00  1827.3  cm_compact.pl1                    >udd>sm>ds>w>ml>cm_compact.pl1
+324          1    01/07/85  0958.0  dm_cm_basic_ci.incl.pl1           >ldd>incl>dm_cm_basic_ci.incl.pl1
+326          2    01/07/85  0958.1  dm_cm_basic_ci_const.incl.pl1     >ldd>incl>dm_cm_basic_ci_const.incl.pl1
+328          3    01/07/85  0958.5  dm_element_id.incl.pl1            >ldd>incl>dm_element_id.incl.pl1
+330          4    01/07/85  1000.7  dm_ci_lengths.incl.pl1            >ldd>incl>dm_ci_lengths.incl.pl1
+332          5    04/16/82  1058.1  sub_err_flags.incl.pl1            >ldd>incl>sub_err_flags.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+ACTION_CANT_RESTART             000016 constant        bit(36)                  initial dcl 5-7 set ref 315*
+BASIC_CI_LAYOUT_1               000000 constant        char(4)                  initial dcl 1-97 set ref 315 315*
+BITS_PER_BYTE                   000707 constant        fixed bin(17,0)          initial dcl 129 ref 247
+BYTES_PER_DOUBLE_WORD           000706 constant        fixed bin(17,0)          initial dcl 130 ref 111 113
+CONTROL_INTERVAL_ADDRESSABLE_LENGTH_IN_BYTES
+                                       constant        fixed bin(17,0)          initial dcl 4-22 ref 111 113 185
+CONTROL_INTERVAL_ZERO_ADDRESSABLE_LENGTH_IN_BYTES
+                                       constant        fixed bin(17,0)          initial dcl 4-25 ref 183
+FREE_SLOT                              constant        fixed bin(15,0)          initial unsigned dcl 2-13 ref 223 227 234 239 275
+                                                                                  280
+START_OF_CI_OFFSET              000017 constant        fixed bin(21,0)          initial dcl 131 set ref 198* 288*
+addr                                                   builtin function         dcl 122 ref 183 187 198 203 219 271 280 288
+based_ci                               based           char                     packed unaligned dcl 118 set ref 193* 193 194* 204*
+                                                                                  256* 256
+basic_control_interval                 based           structure                level 1 dcl 1-56
+basic_control_interval_ptr      000116 automatic       pointer                  dcl 1-92 set ref 207*
+bci_header                             based           structure                level 1 dcl 1-63
+ccv_p_given_version                    parameter       char(4)                  dcl 313 set ref 310 315 315*
+ceil                                                   builtin function         dcl 122 ref 247
+ci_length_in_bytes              000101 automatic       fixed bin(21,0)          dcl 100 set ref 183* 185* 193 193 194 198* 204 209
+                                                                                  256 256 288*
+code                            000100 automatic       fixed bin(35,0)          dcl 99 set ref 179* 198* 200 200* 288* 290 290*
+control_interval_id                    based           fixed bin(24,0)          level 2 packed packed unsigned unaligned dcl 3-32
+                                                                                  ref 183 198 288
+datum_length_in_bytes           000102 automatic       fixed bin(17,0)          dcl 101 set ref 247* 252 256 256
+datum_position_table      5            based           structure                array level 2 dcl 1-56 set ref 216 216
+datum_slot                             based           structure                level 1 dcl 1-82
+divide                                                 builtin function         dcl 122 ref 247
+dm_error_$unimplemented_ci_version
+                                000016 external static fixed bin(35,0)          dcl 145 set ref 315*
+element_id                             based           structure                level 1 dcl 3-32
+element_id_string               000120 automatic       bit(36)                  dcl 3-30 set ref 181* 183 198 219 271 280 288
+er_p_code                              parameter       fixed bin(35,0)          dcl 303 ref 300 305
+file_manager_$simple_get        000010 constant        entry                    external dcl 135 ref 198
+file_manager_$simple_put        000012 constant        entry                    external dcl 138 ref 288
+flags                     5            based           structure                array level 3 packed packed unaligned dcl 1-56 set
+                                                                                  ref 222* 238* 259* 259 274*
+hbound                                                 builtin function         dcl 122 ref 216 216
+header                                 based           structure                level 2 dcl 1-56 set ref 211* 211 292* 292
+index                     0(24)        based           fixed bin(12,0)          level 2 packed packed unsigned unaligned dcl 3-32
+                                                                                  ref 219 271 280
+is_buffered                     000114 automatic       bit(1)                   dcl 108 set ref 150* 158* 165* 174* 189 285
+is_replacement                  000115 automatic       bit(1)                   dcl 108 set ref 151* 159* 166* 175* 227
+layout_type                            based           char(4)                  level 3 dcl 1-56 set ref 192* 202*
+length_in_bits            5(19)        based           fixed bin(17,0)          array level 3 packed packed unsigned unaligned
+                                                                                  dcl 1-56 set ref 224* 240* 247 263* 263 276*
+myname                          000001 constant        varying char(32)         initial dcl 128 set ref 315*
+new_ci                          000116 automatic       fixed bin(71,0)          array dcl 111 set ref 203
+new_ci_ptr                      000110 automatic       pointer                  dcl 106 set ref 167* 176* 192 193 194 203* 204 211
+                                                                                  212 213 216 222 223 224 238 239 240 256 259 261
+                                                                                  263 274 275 276 280 283 288* 292
+new_datum_offset                000104 automatic       fixed bin(17,0)          dcl 103 set ref 209* 252* 252 256 261 283
+new_slot_idx                    000106 automatic       fixed bin(17,0)          initial dcl 105 set ref 105* 215* 216 219 222 223
+                                                                                  224 226* 226 238 239 240 242* 242 259 261 263 266*
+                                                                                  266 271* 271* 274 275 276* 280 280
+null                                                   builtin function         dcl 122 ref 207 315 315
+number_of_datums          4(18)        based           fixed bin(17,0)          level 3 packed packed unaligned dcl 1-56 set ref
+                                                                                  213* 216 216
+offset_in_bytes           5(04)        based           fixed bin(15,0)          array level 3 packed packed unsigned unaligned
+                                                                                  dcl 1-56 set ref 223* 227 234 239* 254 261* 275*
+                                                                                  280*
+old_ci                          000116 automatic       fixed bin(71,0)          array dcl 113 set ref 187
+old_ci_ptr                      000112 automatic       pointer                  dcl 107 set ref 187* 193 198* 202 211 216 227 234
+                                                                                  247 254 256 259 263
+old_datum_offset                000103 automatic       fixed bin(17,0)          dcl 102 set ref 254* 256
+old_slot_idx                    000105 automatic       fixed bin(17,0)          initial dcl 104 set ref 104* 216* 227 227* 227 234
+                                                                                  247 254 259 263*
+p_basic_control_interval_header_ptr    parameter       pointer                  dcl 93 ref 83 155 292
+p_ci_buffer_ptr                        parameter       pointer                  dcl 89 ref 162 167 171 176
+p_code                                 parameter       fixed bin(35,0)          dcl 95 set ref 83 155 162 171 179* 305*
+p_element_id                           parameter       bit(36)                  dcl 92 ref 83 155 162 171 181
+p_file_opening_id                      parameter       bit(36)                  dcl 90 set ref 83 155 198* 288*
+p_number_of_slots                      parameter       fixed bin(17,0)          dcl 91 ref 83 155 162 171 213
+scattered_free_space      3(18)        based           fixed bin(17,0)          level 3 packed packed unaligned dcl 1-56 set ref
+                                                                                  212*
+start_of_used_space       4            based           fixed bin(17,0)          level 3 packed packed unaligned dcl 1-56 set ref
+                                                                                  283*
+string                                                 builtin function         dcl 122 set ref 222* 238* 259* 259 274*
+sub_err_                        000014 constant        entry                    external dcl 141 ref 315
+substr                                                 builtin function         dcl 122 set ref 256* 256
+unspec                                                 builtin function         dcl 122 set ref 193* 193 194* 204*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+ACTION_CAN_RESTART                     internal static bit(36)                  initial dcl 5-7
+ACTION_DEFAULT_RESTART                 internal static bit(36)                  initial dcl 5-7
+ACTION_QUIET_RESTART                   internal static bit(36)                  initial dcl 5-7
+ACTION_SUPPORT_SIGNAL                  internal static bit(36)                  initial dcl 5-7
+BCI_HEADER_LENGTH_IN_BYTES             internal static fixed bin(17,0)          initial dcl 2-14
+CI_0_ADDRESSABLE_LENGTH                internal static fixed bin(17,0)          initial dcl 4-31
+CI_ADDRESSABLE_LENGTH                  internal static fixed bin(17,0)          initial dcl 4-29
+DATUM_POSITION_TABLE_OFFSET_IN_BYTES   internal static fixed bin(17,0)          initial dcl 2-16
+bci_header_ptr                         automatic       pointer                  dcl 1-94
+datum_slot_ptr                         automatic       pointer                  dcl 1-95
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+CHECK_CI_VERSION                000616 constant        entry                    internal dcl 310 ref 192 202
+COPY_FREE_SLOT                  000417 constant        label                    dcl 234
+COPY_OLD_DATUM                  000434 constant        label                    dcl 244
+ERROR_RETURN                    000611 constant        entry                    internal dcl 300 ref 200 290
+INIT_NEW_FREE_SLOTS             000477 constant        label                    dcl 271
+JOIN                            000207 constant        label                    dcl 179 ref 152 160 168 177
+MAIN_RETURN                     000610 constant        label                    dcl 296 ref 306
+PUT_EACH_DATUM_IN_NEW_CI_LOOP   000336 constant        label                    dcl 216
+buffered                        000143 constant        entry                    external dcl 162
+buffered_replacement            000166 constant        entry                    external dcl 171
+cm_compact                      000103 constant        entry                    external dcl 83
+replacement                     000121 constant        entry                    external dcl 155
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      1024        1044     710        1034
+Length      1316     710        20         235     114           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+cm_compact                          186 external procedure  is an external procedure.  
+ERROR_RETURN                            internal procedure  shares stack frame of external procedure cm_compact.  
+CHECK_CI_VERSION                        internal procedure  shares stack frame of external procedure cm_compact.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+cm_compact               000100 code                        cm_compact
+                         000101 ci_length_in_bytes          cm_compact
+                         000102 datum_length_in_bytes       cm_compact
+                         000103 old_datum_offset            cm_compact
+                         000104 new_datum_offset            cm_compact
+                         000105 old_slot_idx                cm_compact
+                         000106 new_slot_idx                cm_compact
+                         000110 new_ci_ptr                  cm_compact
+                         000112 old_ci_ptr                  cm_compact
+                         000114 is_buffered                 cm_compact
+                         000115 is_replacement              cm_compact
+                         000116 old_ci                      cm_compact
+                         000116 new_ci                      cm_compact
+                         000116 basic_control_interval_ptr  cm_compact
+                         000120 element_id_string           cm_compact
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+call_ext_out_desc   call_ext_out        return_mac          alloc_auto_adj      ext_entry           trunc_fx2
+ceil_fx1            divide_fx1
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+file_manager_$simple_get      file_manager_$simple_put      sub_err_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+dm_error_$unimplemented_ci_version
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+    104 000046       105 000050       111 000051       113 000065        83 000076       150 000114       151 000115
+    152 000116       155 000117       158 000132       159 000133       160 000135       162 000136       165 000154
+    166 000156       167 000157       168 000163       171 000164       174 000177       175 000201       176 000202
+    177 000206       179 000207       181 000211       183 000214       185 000223       187 000225       189 000227
+    192 000231       193 000237       194 000246       195 000251       198 000252       200 000275       202 000301
+    203 000307       204 000311       207 000316       209 000320       211 000322       212 000327       213 000331
+    215 000334       216 000336       219 000355       222 000361       223 000364       224 000370       226 000374
+    227 000375       233 000407       234 000410       238 000417       239 000422       240 000426       242 000432
+    243 000433       247 000434       252 000445       254 000447       256 000451       259 000456       261 000463
+    263 000470       266 000474       269 000475       271 000477       274 000511       275 000514       276 000520
+    278 000524       280 000526       283 000542       285 000546       288 000550       290 000575       292 000601
+    296 000610       300 000611       305 000613       306 000615       310 000616       315 000620       319 000676
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

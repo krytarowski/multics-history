@@ -1,0 +1,1323 @@
+	COMPILATION LISTING OF SEGMENT purge_volume_log
+	Compiled by: Multics PL/I Compiler, Release 32f, of October 9, 1989
+	Compiled at: Bull HN, Phoenix AZ, System-M   
+	Compiled on: 11/01/89  0845.8 mst Wed
+	    Options: optimize map
+
+        1 /****^  ***********************************************************
+        2*        *                                                         *
+        3*        * Copyright, (C) BULL HN Information Systems Inc., 1989   *
+        4*        *                                                         *
+        5*        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        6*        *                                                         *
+        7*        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        8*        *                                                         *
+        9*        * Copyright (c) 1972 by Massachusetts Institute of        *
+       10*        * Technology and Honeywell Information Systems, Inc.      *
+       11*        *                                                         *
+       12*        *********************************************************** */
+       13 
+       14 /****^  HISTORY COMMENTS:
+       15*  1) change(86-02-26,GWMay), approve(86-02-27,MCR7368),
+       16*     audit(86-03-28,Fawcett), install(86-03-31,MR12.0-1035):
+       17*     added assignment statement for rpv_pvid. This was being dropped from the
+       18*     original log when passed through this program.
+       19*  2) change(88-03-01,GWMay), approve(89-10-03,MCR8135),
+       20*     audit(89-10-04,Beattie), install(89-10-10,MR12.3-1103):
+       21*     Redesigned purge selection loop to more accurately represent reload
+       22*     groups per the documentation.  Prior to this change consolidated dumps
+       23*     were not being freed and reload groups > 2 did not work.  Also changed
+       24*     display of status messages to use ioa_ in place of com_err_.  Also
+       25*     changed to unlock the volog when using -test.  Prior to this fix, vologs
+       26*     are left locked by the -test control pass.
+       27*  3) change(89-10-16,GWMay), approve(89-10-16,PBF8135),
+       28*     audit(89-10-16,Beattie), install(89-10-18,MR12.3-1095):	
+       29*     Fixed bug where one too many reload groups was retained.
+       30*  4) change(89-10-26,GWMay), approve(89-10-26,MCR8135),
+       31*     audit(89-10-26,Beattie), install(89-11-01,MR12.3-1103):	
+       32*     Fixed bug where a dump volume was deleted from the volog but wasn't
+       33*     getting posted for later purging from the pvologs and contents_name
+       34*     segments.
+       35*                                                   END HISTORY COMMENTS */
+       36 
+       37 
+       38 /* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+       39 
+       40 purge_volume_log: proc;
+       41 
+       42 /* This command tool allows the caller to purge/delete in a controlled maner dump volumes from a volume log. It
+       43*   only deletes those dump volumes that have been superceeded by other dump volumes. In other words we delete incremental
+       44*   dump volumes that have been superceeded by consolidated dump volumes and consolidated dump volumes that have been
+       45*   superceeded by complete dump volumes. We take great care to preserve  reload groups, where a reload group is defined
+       46*   as those dump volumes necessary to logically recreate a physical volume during a volume reload. */
+       47 /* Status:
+       48*     0) Created:	 Sometime in the past by D.R. Vinograd
+       49*     1) Modified:	 12/13/82 by GA Texada to pretend -force if called as a subroutine.
+       50**/
+       51 
+       52 /* set flags */
+       53     code = 0;
+       54     sub, force_mode, test_mode = "0"b;
+       55     error_rnt = com_err_;
+       56     manual_free = "1"b;
+       57     myname = "purge_volume_log";
+       58     pvlp, bvlp = null;
+       59     sys_dir = ">daemon_dir_dir>volume_backup";
+       60 						/* pick up name of volume log */
+       61     call cu_$arg_ptr (1, argp, argl, code);
+       62     if code ^= 0 then do;
+       63 argerr: call error_rnt (error_table_$noarg, myname, "
+       64 Usage:   ^a pvname {-control_args}
+       65          control_args:   -auto   -test   -force   -working_dir,-wd",
+       66 	 myname);
+       67         goto finish;
+       68       end;
+       69     if substr (arg, 1, 1) = "-" then goto argerr;
+       70     volog = arg;
+       71 						/* pickup control args if any */
+       72     ac = 2;
+       73     call cu_$arg_count (narg);
+       74     do while (ac <= narg);
+       75       call cu_$arg_ptr (ac, argp, argl, code);
+       76       if code ^= 0 then do;
+       77 	call error_rnt (code, myname, "Unable to access arg after ^a", arg);
+       78 	goto finish;
+       79         end;
+       80       if arg = "-auto" then manual_free = "0"b;
+       81       else if arg = "-force" then force_mode = "1"b;
+       82       else if arg = "-test" then test_mode = "1"b;
+       83       else if arg = "-wd" | arg = "-working_dir" then sys_dir = get_wdir_ ();
+       84       else do;
+       85 	call error_rnt (error_table_$badopt, myname, "^a", arg);
+       86 	goto finish;
+       87         end;
+       88       ac = ac + 1;
+       89     end;
+       90 
+       91 common:
+       92     tp (*) = null;
+       93     new_pool_path = rtrim (sys_dir) || ">Volume_Dumper";
+       94     volog_dir = sys_dir;
+       95     pvolog_dir = rtrim (sys_dir) || ">pvolog";
+       96     contents_dir = rtrim (sys_dir) || ">contents";
+       97     on cleanup call finish_;
+       98     call find_volog_and_lock (volog);
+       99     if ^manual_free then do;
+      100         call manage_volume_pool_$set_pool_path (error_rnt, new_pool_path, vpp, code);
+      101         if code ^= 0 then do;
+      102 	  call error_rnt (code, myname, "Unable to set new volume pool path");
+      103 	  goto finish;
+      104 	end;
+      105       end;
+      106     code = 0;
+      107     new_ent_cnt = 0;
+      108     call get_temp_segments_ (myname, tp, code);
+      109     if code ^= 0 then do;
+      110         call error_rnt (code, myname, "Unable to create temp segs");
+      111         goto finish;
+      112       end;
+      113     tbvlp = tp (1);
+      114     old_vlp = tp (2);
+      115     new_vlp = tp (3);
+      116     del_vlp = tp (4);
+      117 						/* build name list of all dump volumes in log */
+      118     call build_volume_list (bvlp, old_vlp);
+      119 						/*  initialize what will be new volume log */
+      120     reload_groups = backup_volume_log.reload_groups;
+      121     tbvlp -> backup_volume_log.header = backup_volume_log.header;
+      122     tbvlp -> backup_volume_log.info = backup_volume_log.info;
+      123     tbvlp -> backup_volume_log.version = backup_volume_log.version;
+      124     tbvlp -> backup_volume_log.lock = backup_volume_log.lock;
+      125     tbvlp -> backup_volume_log.pvname = backup_volume_log.pvname;
+      126     tbvlp -> backup_volume_log.pvid = backup_volume_log.pvid;
+      127     if backup_volume_log.version = backup_volume_log_version_2 |
+      128        backup_volume_log.version = backup_volume_log_version_3 then
+      129       tbvlp -> backup_volume_log.disk_type = backup_volume_log.disk_type;
+      130     tbvlp -> backup_volume_log.next = backup_volume_log.next;
+      131     tbvlp -> backup_volume_log.reload_groups = reload_groups;
+      132     tbvlp -> backup_volume_log.rpv_pvid = backup_volume_log.rpv_pvid;
+      133     tbvlp -> backup_volume_log.Nsaved_incr_sets = backup_volume_log.Nsaved_incr_sets;
+      134     tbvlp -> backup_volume_log.Nsaved_cons_sets = backup_volume_log.Nsaved_cons_sets;
+      135     
+      136 /* Back scan the volume log to develop as many reload groups as are desired.
+      137*   The basic scheme is to use incremental dump volumes until they are superceeded
+      138*   by consolidated dump volumes and consolidated dump volumes until a complete dump volume is found. Care must
+      139*   be taken for the case where the dumping process overlapped, as well as for the multi volume consolidated
+      140*   or complete dump.  We also allow the caller to save very recent incremental dump volumes even though they may have
+      141*   been superceeded by consolidated dump volumes.  */
+      142 
+      143 /* save count of number of log entries */
+      144 
+      145     old_ent_cnt = backup_volume_log.next;
+      146     comp_count, cons_count = 0;
+      147     comp_cycle_uid, cons_cycle_uid = "0"b;
+      148     subsequent_dump_open_time = 0;
+      149 						/* scan log entries not looked at */
+      150     do idx = old_ent_cnt to 1 by -1
+      151        while (comp_count <= reload_groups);
+      152       bvlep = addr (backup_volume_log.array (idx));
+      153 						/* if compelete dump */
+      154       if bvle.dump_type = comp then do;
+      155          if comp_cycle_uid ^= bvle.cycle_uid then do;
+      156 	  comp_count = comp_count + 1;
+      157 	  if comp_count <= reload_groups then do;
+      158 	     comp_cycle_uid = bvle.cycle_uid;
+      159 	     subsequent_dump_open_time = open_time ();
+      160                call log_volume_entry (idx);
+      161 	     end;
+      162 	  end;
+      163          else
+      164             call log_volume_entry (idx);
+      165          end;
+      166 						/* if consolidated dump */
+      167       else
+      168          if bvle.dump_type = cons & comp_count < reload_groups then do;
+      169 	  if cons_cycle_uid ^= bvle.cycle_uid then do;
+      170 	     cons_count = cons_count + 1;
+      171 	     cons_cycle_uid = bvle.cycle_uid;
+      172 	     if comp_count = 0 then
+      173 	        subsequent_dump_open_time = open_time ();
+      174 	     end;
+      175 
+      176 	  if subsequent_dump_open_time < bvle.close_time
+      177 	     | backup_volume_log.Nsaved_cons_sets < 1
+      178 	     | comp_count = 0
+      179 	     | cons_count <= backup_volume_log.Nsaved_cons_sets then
+      180 	     call log_volume_entry (idx);
+      181 	  end;
+      182 						/* if incremental dump */
+      183       else
+      184          if bvle.dump_type = incr & comp_count < reload_groups then do;
+      185             if subsequent_dump_open_time < bvle.close_time
+      186 	     | backup_volume_log.Nsaved_incr_sets < 1
+      187 	     | cons_count = 0
+      188 	     | cons_count <= backup_volume_log.Nsaved_incr_sets then
+      189                call log_volume_entry (idx);
+      190 	  end;
+      191     end;
+      192 
+      193 /* Compress the temp volume log such that there are no empty entries */
+      194 
+      195     do bvlx = old_ent_cnt to 1 by -1;
+      196       do sortx = old_ent_cnt to 1 by -1;
+      197         if tbvlp -> backup_volume_log.array (sortx).cycle_uid = "0"b
+      198 	   & (sortx + 1 <= hbound (backup_volume_log.array, 1)) then do;
+      199 	  tbvlp -> backup_volume_log.array (sortx) =
+      200 	       tbvlp -> backup_volume_log.array (sortx + 1);
+      201 	  unspec (tbvlp -> backup_volume_log.array (sortx + 1)) = "0"b;
+      202 	end;
+      203       end;
+      204     end;
+      205     tbvlp -> backup_volume_log.next = new_ent_cnt;
+      206     call build_volume_list (tbvlp, new_vlp);
+      207 
+      208     call build_delete_list;
+      209 
+      210     call process_delete_list;
+      211 
+      212     if ^test_mode then do;
+      213         call hcs_$fs_move_seg (tbvlp, bvlp, 1, code);
+      214         if code ^= 0 then do;
+      215 	  call error_rnt (code, myname, "Unable to replace volume log");
+      216 	  goto finish;
+      217 	end;
+      218       end;
+      219 
+      220     call set_lock_$unlock (backup_volume_log.lock, code);
+      221     if code ^= 0 then do;
+      222         call error_rnt (code, myname, "Error unlocking volume log");
+      223         goto finish;
+      224       end;
+      225 
+      226     if old_ent_cnt ^= new_ent_cnt then do;
+      227         call ioa_ ("^a: Volume log ^a ^[not ^]purged. Entry count ^[would have ^]changed from ^d to ^d",
+      228 	   myname, volog_name, test_mode, test_mode, old_ent_cnt, new_ent_cnt);
+      229       end;
+      230 finish:
+      231     if sub then a_code = code;
+      232     call finish_;
+      233     return;
+      234 
+      235 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      236 
+      237 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      238 
+      239 
+      240 purge_volume_log_: entry (a_sys_dir, a_volog, throw_away_value, a_manual_free, a_code);
+      241 
+      242 /* This entry provide a subroutine interface for use by the volume dumper */
+      243 
+      244     sys_dir = a_sys_dir;
+      245     volog = a_volog;
+      246     sub, force_mode = "1"b;
+      247     test_mode = "0"b;
+      248     manual_free = a_manual_free;
+      249     myname = "purge_volume_log_";
+      250     error_rnt = dmpr_report_$error_output;
+      251     bvlp, pvlp = null;
+      252     goto common;
+      253 
+      254 
+      255 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      256 
+      257 
+      258 log_volume_entry: proc (idx);
+      259 dcl idx		     fixed bin;
+      260 
+      261 /* This proc records in the temp volume log the log entry found during the scan. */
+      262     if tbvlp -> backup_volume_log.array (idx).cycle_uid ^= "0"b then return;
+      263     tbvlp -> backup_volume_log.array (idx) = backup_volume_log.array (idx);
+      264     new_ent_cnt = new_ent_cnt + 1;
+      265     return;
+      266   end log_volume_entry;
+      267 
+      268 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      269 
+      270 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      271 
+      272 
+      273 build_volume_list: proc (bvlp, vlp);
+      274 
+      275 /* This proc builds a list of the dump volumes contained in a volume log */
+      276 
+      277 dcl vlp		     ptr;
+      278 dcl bvlp		     ptr;
+      279 dcl (bvlx, vlx)	     fixed bin;
+      280     do bvlx = 1 to bvlp -> backup_volume_log.next;
+      281       bvlep = addr (bvlp -> backup_volume_log.array (bvlx));
+      282       do vlx = 1 to vlp -> vol_list.next while
+      283 	 (bvle.volname ^= vlp -> vol_list.name (vlx));
+      284       end;
+      285       found = (vlx <= vlp -> vol_list.next);
+      286       if ^found then do;
+      287 	vlp -> vol_list.next = vlp -> vol_list.next + 1;
+      288 	vlp -> vol_list.name (vlp -> vol_list.next) = bvle.volname;
+      289 	vlp -> vol_list.count (vlp -> vol_list.next) = 1;
+      290         end;
+      291       else vlp -> vol_list.count (vlx) = vlp -> vol_list (vlx).count + 1;
+      292     end;
+      293     return;
+      294   end build_volume_list;
+      295 
+      296 
+      297 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      298 
+      299 
+      300 build_delete_list: proc;
+      301 
+      302 /* This proc compares the volume names in the new and old volume lists and takes the ones not in the new but in
+      303*   the old and places them into the delete list. */
+      304 
+      305 dcl (nvlx, pvlx)	     fixed bin;
+      306 dcl Sdelete              bit (1) aligned;
+      307 dcl count                fixed bin;
+      308 
+      309     do pvlx = 1 to old_vlp -> vol_list.next;
+      310       search_name = old_vlp -> vol_list.name (pvlx);
+      311       do nvlx = 1 to new_vlp -> vol_list.next while
+      312 	 (search_name ^= new_vlp -> vol_list.name (nvlx));
+      313       end;
+      314 
+      315       Sdelete = "1"b;
+      316       count = -1;
+      317       if (nvlx <= new_vlp -> vol_list.next) then do;
+      318          if (old_vlp -> vol_list.count (pvlx) = new_vlp -> vol_list.count (nvlx)) then
+      319             Sdelete = "0"b;
+      320          else
+      321             count = new_vlp -> vol_list.count (nvlx);
+      322       end;
+      323 
+      324       if Sdelete then do;
+      325          del_vlp -> vol_list.next = del_vlp -> vol_list.next + 1;
+      326          del_vlp -> vol_list.name (del_vlp -> vol_list.next) = search_name;
+      327          del_vlp -> vol_list.count (del_vlp -> vol_list.next) = count;
+      328       end;
+      329     end;
+      330  
+      331 
+      332     return;
+      333   end build_delete_list;
+      334 
+      335 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      336 
+      337 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      338 
+      339 
+      340 process_delete_list: proc;
+      341 
+      342 /* This proc goes through the delete list and for each dump volume it locates the output log associated with it.
+      343*   It then removes the entry for this physical volume and decrements the in-use count.  If the output log has no
+      344*   more enties then the dump volume is considered free and the output log and contents seg are deleted. The volume
+      345*   is also marked as free in the dump volume pool. */
+      346 dcl (dvlx, pvlx)	     fixed bin;
+      347 dcl rebuild_failed	     bit (1);
+      348 
+      349 
+      350     do dvlx = 1 to del_vlp -> vol_list.next;
+      351       volname = del_vlp -> vol_list.name (dvlx);
+      352       count = del_vlp -> vol_list.count (dvlx);
+      353       call find_pvolog_and_lock (volname, pvlp);
+      354       if pvlp = null then do;
+      355 	call ioa_ ("^a: ^a>^a.pvolog",
+      356 	     myname, pvolog_dir, volname);
+      357 	call ioa_ ("^a: Rebuilding ^a.pvolog", myname, volname);
+      358 	call rebuild_pvolog_ (volog_dir, volname, error_rnt, pvlp, code);
+      359 	rebuild_failed = (code ^= 0);
+      360 	if rebuild_failed then
+      361 	  call error_rnt (code, myname, "Rebuild of pvolog ^a.pvolog failed", volname);
+      362 	if pvlp ^= null then call set_lock_$lock (pvolog.lock, lock_wait_time, code);
+      363         end;
+      364       if pvlp = null then do;
+      365 	if ^rebuild_failed then goto next;		/* it was a null output log */
+      366 	if force_mode then goto next;
+      367 	else do;
+      368 	    call error_rnt (0, myname,
+      369 	         "Aborting purge because of missing output volume log ^a.pvolog", volname);
+      370 	    goto finish;
+      371 	  end;
+      372         end;
+      373       in_use = pvolog.in_use;
+      374       do pvlx = 1 to pvolog.next;
+      375         pvlep = addr (pvolog.array (pvlx));
+      376         if pvle.pvname = backup_volume_log.pvname then do;
+      377 	  if ^test_mode then do;
+      378 	      if count = -1 then do;
+      379 		pvle.pvname = "";
+      380 		pvle.invocation_count = 0;
+      381 		in_use,
+      382 		     pvolog.in_use = pvolog.in_use - 1;
+      383 	        end;
+      384 	      else pvle.invocation_count = count;
+      385 	    end;
+      386 	  else if count = -1 then in_use = in_use - 1;
+      387 	end;
+      388       end;
+      389       if in_use <= 0 & ^test_mode then do;
+      390 
+      391 	call hcs_$delentry_seg (pvlp, code);
+      392 	if code ^= 0 then
+      393 	  call error_rnt (code, myname, "Unable to delete output log for volume ^a", volname);
+      394 	else pvlp = null;
+      395 
+      396 	call delete_contents_segs (volname);
+      397 	if ^manual_free then do;
+      398 	    call manage_volume_pool_$free (vpp, error_rnt, volname, code);
+      399 	    if code ^= 0 & code ^= error_table_$action_not_performed then
+      400 	      call error_rnt (code, myname, "Unable to free volume ^a", volname);
+      401 	    else call ioa_ ("^a: Output volume ^a is now available for use",
+      402 		    myname, volname);
+      403 	  end;
+      404         end;
+      405       else do;
+      406 	call set_lock_$unlock (pvolog.lock, code);
+      407 	if ^pvolog_known then do;
+      408 	    call hcs_$terminate_noname (pvlp, ignore);
+      409 	    pvlp = null;
+      410 	  end;
+      411         end;
+      412 next:
+      413     end;
+      414     code = 0;
+      415     return;
+      416   end process_delete_list;
+      417 
+      418 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      419 
+      420 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      421 
+      422 
+      423 finish_: proc;
+      424 						/* unlock, terminate, and release as required */
+      425     if bvlp ^= null then call set_lock_$unlock (backup_volume_log.lock, ignore);
+      426     if bvlp ^= null then
+      427       call adjust_bit_count_ (volog_dir, volog_name, "1"b, (0), ignore);
+      428     if bvlp ^= null & ^volog_known then do;
+      429         call hcs_$terminate_noname (bvlp, ignore);
+      430         bvlp = null;
+      431       end;
+      432     if tp (1) ^= null then call release_temp_segments_ (myname, tp, ignore);
+      433     if pvlp ^= null then call set_lock_$unlock (pvolog.lock, ignore);
+      434     if pvlp ^= null & ^pvolog_known then call hcs_$terminate_noname (pvlp, ignore);
+      435   end finish_;
+      436 
+      437 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      438 
+      439 
+      440 find_volog_and_lock: proc (name);
+      441 dcl name		     char (32);
+      442     call suffixed_name_$make (name, "volog", volog_name, code);
+      443     if code ^= 0 then do;
+      444         call error_rnt (code, myname, "Unable to create volog name from ^a", name);
+      445         goto finish;
+      446       end;
+      447 
+      448 /* and then ptr */
+      449     call hcs_$initiate (volog_dir, volog_name, "", 0, 0, bvlp, code);
+      450     if bvlp = null then do;
+      451         call error_rnt (code, myname, "Unable to locate volog ^a>^a", volog_dir, volog_name);
+      452         goto finish;
+      453       end;
+      454     volog_known = (code = error_table_$segknown);
+      455     call set_lock_$lock (backup_volume_log.lock, lock_wait_time, code);
+      456     if code ^= 0 then do;
+      457         if code = error_table_$invalid_lock_reset then code = 0;
+      458         if code ^= 0 then do;
+      459 	  call error_rnt (code, myname, "Unable to lock volume log ^a", volog_name);
+      460 	  goto finish;
+      461 	end;
+      462       end;
+      463   end find_volog_and_lock;
+      464 
+      465 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      466 
+      467 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      468 
+      469 
+      470 open_time: proc returns (fixed bin (71));
+      471 dcl temp		     fixed bin (71);
+      472 dcl jdx		     fixed bin;
+      473 
+      474     do jdx = idx to 1 by -1;
+      475       if backup_volume_log.array (jdx).cycle_uid = bvle.cycle_uid then
+      476         temp = backup_volume_log.array (jdx).open_time;
+      477     end;
+      478     return (temp);
+      479 
+      480   end open_time;
+      481 
+      482 
+      483 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      484 
+      485 
+      486 delete_contents_segs: proc (volname);
+      487 dcl seg_type	     char (32);
+      488 dcl volname	     char (32);
+      489     do seg_type = "contents", "contents_names";
+      490       call suffixed_name_$make (volname, seg_type, ename, code);
+      491       if code ^= 0 then do;
+      492 	call error_rnt (code, myname, "Unable to create ^a name from ^a", seg_type, volname);
+      493 	return;
+      494         end;
+      495       if ^test_mode then do;
+      496 	call delete_$path (contents_dir, ename, "100111"b, "", code);
+      497 	if code ^= 0 & code ^= error_table_$noentry then
+      498 	  call error_rnt (code, myname, "Unable to delete ^a>^a ", contents_dir, ename);
+      499         end;
+      500     end;
+      501   end delete_contents_segs;
+      502 
+      503 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      504 
+      505 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      506 
+      507 
+      508 find_pvolog_and_lock: proc (volname, pvlp);
+      509 dcl volname	     char (32);
+      510 dcl pvlp		     ptr;
+      511     pvlp = null;
+      512     call suffixed_name_$make (volname, "pvolog", pvolog_name, code);
+      513     if code ^= 0 then do;
+      514         call error_rnt (code, myname, "Unable to construct pvolog name from ^a", volname);
+      515         return;
+      516       end;
+      517     call hcs_$initiate (pvolog_dir, pvolog_name, "", 0, 0, pvlp, code);
+      518     pvolog_known = (code = error_table_$segknown);
+      519     if pvlp = null then return;
+      520     call set_lock_$lock (pvolog.lock, lock_wait_time, code);
+      521     if code ^= 0 then do;
+      522         if code = error_table_$invalid_lock_reset then code = 0;
+      523         if code ^= 0 then do;
+      524 	  call error_rnt (code, myname, "Unable to lock output volume log ^a", pvolog_name);
+      525 	  goto finish;
+      526 	end;
+      527       end;
+      528   end find_pvolog_and_lock;
+      529 
+      530 
+      531 
+      532 dcl a_sys_dir	     char (*);
+      533 dcl count		     fixed bin;
+      534 dcl vpp		     ptr;
+      535 dcl sortx		     fixed bin;
+      536 dcl new_pool_path	     char (168);
+      537 dcl bvlx		     fixed bin;
+      538 dcl a_volog	     char (*);
+      539 dcl force_mode	     bit (1);
+      540 dcl narg		     fixed bin;
+      541 dcl volog		     char (32);
+      542 dcl volog_name	     char (32);
+      543 dcl test_mode	     bit (1);
+      544 dcl in_use	     fixed bin;
+      545 dcl ac		     fixed bin;
+      546 dcl pvolog_name	     char (32);
+      547 dcl throw_away_value     fixed bin;
+      548 dcl a_manual_free	     bit (1);
+      549 dcl a_code	     fixed bin (35);
+      550 dcl arg		     char (argl) based (argp);
+      551 dcl myname	     char (32);
+      552 dcl argl		     fixed bin;
+      553 dcl argp		     ptr;
+      554 dcl reload_groups	     fixed bin;
+      555 dcl sub		     bit (1);
+      556 dcl subsequent_dump_open_time
+      557 		     fixed bin (71);
+      558 dcl idx		     fixed bin;
+      559 dcl comp_cycle_uid	     bit (36);
+      560 dcl cons_cycle_uid	     bit (36);
+      561 dcl comp_count	     fixed bin;
+      562 dcl cons_count	     fixed bin;
+      563 dcl tp		     (4) ptr;
+      564 dcl found		     bit (1);
+      565 dcl search_name	     char (32);
+      566 dcl volname	     char (32);
+      567 dcl ename		     char (32);
+      568 dcl volog_dir	     char (168);
+      569 dcl pvolog_dir	     char (168);
+      570 dcl contents_dir	     char (168);
+      571 dcl sys_dir	     char (168);
+      572 
+      573 dcl manual_free	     bit (1);
+      574 dcl code		     fixed bin (35);
+      575 dcl new_ent_cnt	     fixed bin;
+      576 dcl old_ent_cnt	     fixed bin;
+      577 dcl pvolog_known	     bit (1);
+      578 dcl volog_known	     bit (1);
+      579 dcl ignore	     fixed bin (35);
+      580 dcl old_vlp	     ptr;
+      581 dcl new_vlp	     ptr;
+      582 dcl del_vlp	     ptr;
+      583 dcl tbvlp		     ptr;
+      584 
+      585 dcl 1 vol_list	     aligned based,
+      586     2 next	     fixed bin,
+      587     2 array	     (1:1 refer (vol_list.next)),
+      588       3 count	     fixed bin,
+      589       3 name	     char (32);
+      590 
+      591 dcl lock_wait_time	     fixed bin static init (60) options (constant);
+      592 
+      593 dcl cleanup	     condition;
+      594 
+      595 dcl error_table_$badopt  ext fixed bin (35);
+      596 dcl error_table_$noarg fixed bin(35) ext static;
+      597 dcl error_table_$noentry ext fixed bin (35);
+      598 dcl error_table_$action_not_performed ext fixed bin (35);
+      599 dcl error_table_$segknown ext fixed bin (35);
+      600 dcl error_table_$invalid_lock_reset fixed bin (35) ext;
+      601 
+      602 dcl delete_$path	     entry (char (*), char (*), bit (6), char (*), fixed bin (35));
+      603 dcl ioa_		     entry () options (variable);
+      604 dcl manage_volume_pool_$set_pool_path entry (entry options (variable), char (*), ptr, fixed bin (35));
+      605 dcl get_wdir_	     entry returns (char (168));
+      606 dcl rebuild_pvolog_	     entry (char (*), char (*), entry options (variable), ptr, fixed bin (35));
+      607 dcl adjust_bit_count_    entry (char (*), char (*), bit (1), fixed bin, fixed bin (35));
+      608 dcl manage_volume_pool_$free entry (ptr, entry options (variable), char (*), fixed bin (35));
+      609 dcl cu_$arg_ptr	     entry (fixed bin, ptr, fixed bin, fixed bin (35));
+      610 dcl get_temp_segments_   entry (char (*), (*) ptr, fixed bin (35));
+      611 dcl release_temp_segments_ entry (char (*), (*) ptr, fixed bin (35));
+      612 dcl com_err_	     entry options (variable);
+      613 dcl error_rnt	     entry variable options (variable);
+      614 dcl dmpr_report_$error_output entry options (variable);
+      615 dcl suffixed_name_$make  entry (char (*), char (*), char (*), fixed bin (35));
+      616 dcl hcs_$delentry_seg    entry (ptr, fixed bin (35));
+      617 dcl hcs_$initiate	     entry (char (*), char (*), char (*), fixed bin, fixed bin, ptr, fixed bin (35));
+      618 dcl hcs_$fs_move_seg     entry (ptr, ptr, fixed bin, fixed bin (35));
+      619 dcl set_lock_$lock	     entry (bit (36) aligned, fixed bin, fixed bin (35));
+      620 dcl set_lock_$unlock     entry (bit (36) aligned, fixed bin (35));
+      621 dcl hcs_$terminate_noname entry (ptr, fixed bin (35));
+      622 dcl cu_$arg_count	     entry (fixed bin);
+      623 
+      624 dcl (hbound, rtrim, substr, null, addr, unspec) builtin;
+      625 
+  1     1 /* BEGIN INCLUDE FILE ... backup_volume_log.incl.pl1 ... Feb 1976 */
+  1     2 
+  1     3 
+  1     4 /****^  HISTORY COMMENTS:
+  1     5*  1) change(88-03-03,GWMay), approve(89-10-03,MCR8135),
+  1     6*     audit(89-10-04,Beattie), install(89-10-10,MR12.3-1089):
+  1     7*     Added values for storing the number of incremental and consolidated dump
+  1     8*     sets to retain in the volume log.  Incremented version number to 3.
+  1     9*                                                   END HISTORY COMMENTS */
+  1    10 
+  1    11 
+  1    12 /*     Modified: 3/7/84 by GA Texada to change to version 2						*/
+  1    13 dcl  bvlp ptr;
+  1    14 dcl  bvlep ptr;
+  1    15 
+  1    16 dcl  backup_volume_log_version_1 fixed bin static init (1) options (constant);
+  1    17 dcl  backup_volume_log_version_2 fixed bin init(2) int static options(constant);
+  1    18 dcl  backup_volume_log_version_3 fixed bin init(3) int static options(constant);
+  1    19 
+  1    20 dcl 1 backup_volume_log based (bvlp) aligned,
+  1    21     2 header like backup_volume_header aligned,
+  1    22     2 info like backup_pvol_info aligned,
+  1    23     2 version fixed bin,				/* version number */
+  1    24     2 lock bit (36),				/* shared data base */
+  1    25     2 pvname char (32),				/* physical volume name */
+  1    26     2 pvid bit (36),				/* physical volume id */
+  1    27     2 next fixed bin,				/* next available dump record */
+  1    28     2 reload_groups fixed bin,			/* number of reload groups in log */
+  1    29     2 purge_control (3),				/* control selective purging by dump type */
+  1    30       3 group (36) bit (1) unaligned,			/* up to 36 reload groups */
+  1    31     2 disk_type fixed bin unal,			/* type of disk drive			*/	
+  1    32     2 half_word_pad bit(18) unal,			/* MBZ					*/
+  1    33     2 rpv_pvid bit(36),				/* pvid of this volumes RPV			*/
+  1    34     2 Nsaved_incr_sets fixed bin,			/* number of incr cycles to retain */
+  1    35     2 Nsaved_cons_sets fixed bin,			/* number of incr cycles to retain */
+  1    36     2 pad (31) bit (36),				/* for future expansion (MBZ)			*/
+  1    37     2 array (1:1 refer (backup_volume_log.next)) like bvle aligned;
+  1    38 
+  1    39 dcl 1 bvle based (bvlep) aligned,
+  1    40     2 cycle_uid bit (36),				/* uid of this dump cycle */
+  1    41     2 dump_type fixed bin,				/* type of dump */
+  1    42     2 volname char (32),				/* name of output volume */
+  1    43     2 open_time fixed bin (71),			/* opening time of dump pass on this physical volume */
+  1    44     2 close_time fixed bin (71),			/* ending time of dump pass */
+  1    45     2 volid bit (36),				/* uid of output volume */
+  1    46     2 io_module char (32),				/* outer module name that wrote this volume */
+  1    47     2 flags,					/* flags */
+  1    48       3 purge_scan_logged bit (1) unaligned,		/* if on object looged during purge scan */
+  1    49       3 pad1 bit (35) unaligned,
+  1    50     2 pad (7) bit (36),				/* for future expansion */
+  1    51    (2 dir_num fixed bin,				/* number of dirs dumped on this pass */
+  1    52     2 dir_rec fixed bin,				/* number of records of dirs */
+  1    53     2 seg_num fixed bin,				/* number of segs dumped on this pass */
+  1    54     2 seg_rec fixed bin) unaligned;			/* number of records of segs */
+  1    55 
+  1    56 /* END INCLUDE FILE ... backup_volume_log */
+      626 
+  2     1 /* BEGIN INCLUDE FILE ... backup_pvol_info.incl.pl1 */
+  2     2 
+  2     3 dcl  bpvip ptr;
+  2     4 
+  2     5 dcl 1 backup_pvol_info based (bpvip) aligned,
+  2     6     2 label like label aligned,
+  2     7     2 n_vtoce fixed bin,
+  2     8     2 n_free_vtoce fixed bin,
+  2     9     2 n_rec fixed bin,
+  2    10     2 baseadd fixed bin,
+  2    11     2 n_free_rec fixed bin;
+  2    12 
+  2    13 /* END INCLUDE FILE ... backup_pvol_info.incl.pl1 */
+      627 
+      628 
+  3     1 /* BEGIN INCLUDE FILE ... fs_vol_label.incl.pl1 .. last modified January 1982 for new volume map format  */
+  3     2 
+  3     3 /****^  HISTORY COMMENTS:
+  3     4*  1) change(86-04-10,Fawcett), approve(86-04-10,MCR7383),
+  3     5*     audit(86-05-12,Coppola), install(86-07-18,MR12.0-1098):
+  3     6*     Add the subvolume info.
+  3     7*  2) change(88-05-27,GWMay), approve(88-05-27,MCR7883),
+  3     8*     audit(88-06-14,Beattie), install(88-07-19,MR12.2-1061):
+  3     9*     Added inconsistent_dbm bit used to determine consistency of volume
+  3    10*     dumper bit maps.
+  3    11*                                                   END HISTORY COMMENTS */
+  3    12 
+  3    13 /* This is the label at fixed location of each physical volume. Length 1 page */
+  3    14 /* Note: fsout_vol clears pad fields before writing the label */
+  3    15 
+  3    16 dcl  labelp ptr;
+  3    17 
+  3    18 dcl 1 label based (labelp) aligned,
+  3    19 
+  3    20 /* First comes data not used by Multics.. for compatibility with GCOS */
+  3    21 
+  3    22     2 gcos (5*64) fixed bin,
+  3    23 
+  3    24 /* Now we have the Multics label */
+  3    25 
+  3    26     2 Multics char (32) init ("Multics Storage System Volume"), /* Identifier */
+  3    27     2 version fixed bin,				/* Version 1 */
+  3    28     2 mfg_serial char (32),				/* Manufacturer's serial number */
+  3    29     2 pv_name char (32),				/* Physical volume name. */
+  3    30     2 lv_name char (32),				/* Name of logical volume for pack */
+  3    31     2 pvid bit (36),				/* Unique ID of this pack */
+  3    32     2 lvid bit (36),				/* unique ID of its logical vol */
+  3    33     2 root_pvid bit (36),				/* unique ID of the pack containing the root. everybody must agree. */
+  3    34     2 time_registered fixed bin (71),			/* time imported to system */
+  3    35     2 n_pv_in_lv fixed bin,				/* # phys volumes in logical */
+  3    36     2 vol_size fixed bin,				/* total size of volume, in records */
+  3    37     2 vtoc_size fixed bin,				/* number of recs in fixed area + vtoc */
+  3    38     2 not_used bit (1) unal,				/* used to be multiple_class */
+  3    39     2 private bit (1) unal,				/* TRUE if was registered as private */
+  3    40     2 inconsistent_dbm bit (1) unal,			/* TRUE if ESD-less crash */
+  3    41     2 flagpad bit (33) unal,
+  3    42     2 max_access_class bit (72),			/* Maximum access class for stuff on volume */
+  3    43     2 min_access_class bit (72),			/* Minimum access class for stuff on volume */
+  3    44     2 password bit (72),				/* not yet used */
+  3    45     2 number_of_sv fixed bin,				/* if = 0 not a subvolume else the number of svs */
+  3    46     2 this_sv fixed bin,				/* what subvolume number it is */
+  3    47     2 sub_vol_name char (1),				/* what subvolume name (a b c d) it is */
+  3    48     2 pad1 (13) fixed bin,
+  3    49     2 time_mounted fixed bin (71),			/* time mounted */
+  3    50     2 time_map_updated fixed bin (71),			/* time vmap known good */
+  3    51 
+  3    52 /* The next two words overlay time_unmounted on pre-MR10 systems. This
+  3    53*   forces a salvage if an MR10 pack is mounted on an earlier system.
+  3    54* */
+  3    55     2 volmap_version fixed bin,			/* version of volume map (currently 1) */
+  3    56     2 pad6 fixed bin,				
+  3    57 
+  3    58     2 time_salvaged fixed bin (71),			/* time salvaged */
+  3    59     2 time_of_boot fixed bin (71),			/* time of last bootload */
+  3    60     2 time_unmounted fixed bin (71),			/* time unmounted cleanly */
+  3    61     2 last_pvtx fixed bin,				/* pvtx in that PDMAP */
+  3    62     2 pad1a (2) fixed bin,
+  3    63     2 err_hist_size fixed bin,			/* size of pack error history */
+  3    64     2 time_last_dmp (3) fixed bin (71),			/* time last completed dump pass started */
+  3    65     2 time_last_reloaded fixed bin (71),		/* what it says */
+  3    66     2 pad2 (40) fixed bin,
+  3    67     2 root,
+  3    68       3 here bit (1),				/* TRUE if the root is on this pack */
+  3    69       3 root_vtocx fixed bin (35),			/* VTOC index of root, if it is here */
+  3    70       3 shutdown_state fixed bin,			/* Status of hierarchy */
+  3    71       3 pad7 bit (1) aligned,				
+  3    72       3 disk_table_vtocx fixed bin,			/* VTOC index of disk table on RPV */
+  3    73       3 disk_table_uid bit (36) aligned,		/* UID of disk table */
+  3    74       3 esd_state fixed bin,				/* State of esd */
+  3    75     2 volmap_record fixed bin,			/* Begin record of volume map */
+  3    76     2 size_of_volmap fixed bin,			/* Number of records in volume map */
+  3    77     2 vtoc_map_record fixed bin,			/* Begin record of VTOC map */
+  3    78     2 size_of_vtoc_map fixed bin,			/* Number of records in VTOC map */
+  3    79     2 volmap_unit_size fixed bin,			/* Number of words per volume map section */
+  3    80     2 vtoc_origin_record fixed bin,			/* Begin record of VTOC */
+  3    81     2 dumper_bit_map_record fixed bin,			/* Begin record of dumper bit-map */
+  3    82     2 vol_trouble_count fixed bin,			/* Count of inconsistencies found since salvage */
+  3    83     2 pad3 (52) fixed bin,
+  3    84     2 nparts fixed bin,				/* Number of special partitions on pack */
+  3    85     2 parts (47),
+  3    86       3 part char (4),				/* Name of partition */
+  3    87       3 frec fixed bin,				/* First record */
+  3    88       3 nrec fixed bin,				/* Number of records */
+  3    89       3 pad5 fixed bin,
+  3    90     2 pad4 (5*64) fixed bin;
+  3    91 
+  3    92 dcl  Multics_ID_String char (32) init ("Multics Storage System Volume") static;
+  3    93 
+  3    94 /* END INCLUDE FILE fs_vol_label.incl.pl1 */
+      629 
+      630 
+  4     1 /* BEGIN INCLUDE FILE ... backup_volume_header ... Feb 1976 */
+  4     2 
+  4     3 dcl  hdp ptr;					/* ptr to header */
+  4     4 
+  4     5 dcl 1 backup_volume_header based (hdp) aligned,
+  4     6     2 pattern1 bit (36),				/* unique  word 1 */
+  4     7     2 rec1_type fixed bin,				/* record 1 type */
+  4     8     2 rec1_len fixed bin,				/* length in chars */
+  4     9     2 pattern2 bit (36),				/* unique word 2 */
+  4    10     2 rec2_type fixed bin,				/* record 2 type */
+  4    11     2 rec2_len fixed bin,				/* length in chars */
+  4    12     2 pattern3 bit (36),				/* unique word 3 */
+  4    13     2 time_dumped bit (36);				/* dump time of this record */
+  4    14 
+  4    15 dcl  vtoce_type fixed bin static init (1) options (constant); /* type code for vtoce */
+  4    16 dcl  dir_type fixed bin static init (2) options (constant); /* type code for directory */
+  4    17 dcl  seg_type fixed bin static init (3) options (constant); /* type code for segment */
+  4    18 dcl  null_type fixed bin static init (4) options (constant); /* type code for null record */
+  4    19 dcl  volume_log_type fixed bin static init (5) options (constant); /* type code for volume log */
+  4    20 dcl  prev_output_log_type fixed bin static init (6) options (constant); /* type code for prev output log */
+  4    21 dcl  contents_type fixed bin static init (7) options (constant); /* type code for contents segment of previous volume */
+  4    22 dcl  info_type fixed bin static init (8) options (constant); /* type code for info structure */
+  4    23 
+  4    24 dcl  pattern1 bit (36) int static init ("110111000011001100011101101010100101"b) options (constant);
+  4    25 dcl  pattern2 bit (36) int static init ("101001010101101110001100110000111011"b) options (constant);
+  4    26 dcl  pattern3 bit (36) int static init ("001000111100110011100010010101011010"b) options (constant);
+  4    27 
+  4    28 /* END INCLUDE FILE ... backup_volume_header */
+      631 
+  5     1 /* BEGIN INCLUDE FILE ... backup_static_variables.incl.pl1 ... March 1976 */
+  5     2 
+  5     3 
+  5     4 dcl  incr fixed bin init (1) internal static options (constant); /* incremental dump mode */
+  5     5 dcl  cons fixed bin init (2) internal static options (constant); /* consolidated dump mode */
+  5     6 dcl  comp fixed bin init (3) internal static options (constant); /* complete dump mode */
+  5     7 dcl  backup_version_1 fixed bin init (1) static internal options (constant); /* backup_version_1 of input/output structures */
+  5     8 
+  5     9 
+  5    10 
+  5    11 /* END INCLUDE FILE ... backup_static_variables.incl.pl1 */
+      632 
+  6     1 /* BEGIN INCLUDE FILE ... pvolog.incl.pl1 9/76 */
+  6     2 
+  6     3 dcl  pvlp ptr;
+  6     4 dcl  pvlep ptr;
+  6     5 
+  6     6 dcl  pvolog_version_1 fixed bin int static init (1) options (constant);
+  6     7 
+  6     8 dcl 1 pvolog aligned based (pvlp),
+  6     9     2 lock bit (36),
+  6    10     2 version fixed bin,
+  6    11     2 dump_type fixed bin,
+  6    12     2 mount_time fixed bin (71),
+  6    13     2 volid bit (36),
+  6    14     2 next fixed bin,
+  6    15     2 in_use fixed bin,
+  6    16     2 array (1:1 refer (pvolog.next)) like pvle aligned;
+  6    17 
+  6    18 dcl 1 pvle based (pvlep) aligned,
+  6    19     2 pvname char (32),
+  6    20     2 invocation_count fixed bin;
+  6    21 
+  6    22 /* END INCLUDE FILE ... pvolog.incl.pl1 */
+      633 
+      634 
+      635   end purge_volume_log;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    11/01/89  0844.2  purge_volume_log.pl1              >spec>install>1103>purge_volume_log.pl1
+626          1    10/12/89  2013.4  backup_volume_log.incl.pl1        >ldd>include>backup_volume_log.incl.pl1
+627          2    06/07/77  1233.6  backup_pvol_info.incl.pl1         >ldd>include>backup_pvol_info.incl.pl1
+629          3    07/21/88  2036.0  fs_vol_label.incl.pl1             >ldd>include>fs_vol_label.incl.pl1
+631          4    09/05/80  1136.5  backup_volume_header.incl.pl1     >ldd>include>backup_volume_header.incl.pl1
+632          5    09/05/80  1136.5  backup_static_variables.incl.pl1  >ldd>include>backup_static_variables.incl.pl1
+633          6    03/26/81  1320.5  pvolog.incl.pl1                   >ldd>include>pvolog.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+Nsaved_cons_sets       2040            based           fixed bin(17,0)          level 2 dcl 1-20 set ref 134* 134 176 176
+Nsaved_incr_sets       2037            based           fixed bin(17,0)          level 2 dcl 1-20 set ref 133* 133 185 185
+Sdelete                         000646 automatic       bit(1)                   dcl 306 set ref 315* 318* 324
+a_code                                 parameter       fixed bin(35,0)          dcl 549 set ref 230* 240
+a_manual_free                          parameter       bit(1)                   packed unaligned dcl 548 ref 240 248
+a_sys_dir                              parameter       char                     packed unaligned dcl 532 ref 240 244
+a_volog                                parameter       char                     packed unaligned dcl 538 ref 240 245
+ac                              000204 automatic       fixed bin(17,0)          dcl 545 set ref 72* 74 75* 88* 88
+addr                                                   builtin function         dcl 624 ref 152 281 375
+adjust_bit_count_               000036 constant        entry                    external dcl 607 ref 426
+arg                                    based           char                     packed unaligned dcl 550 set ref 69 70 77* 80 81 82
+                                                                                  83 83 85*
+argl                            000225 automatic       fixed bin(17,0)          dcl 552 set ref 61* 69 70 75* 77 77 80 81 82 83 83
+                                                                                  85 85
+argp                            000226 automatic       pointer                  dcl 553 set ref 61* 69 70 75* 77 80 81 82 83 83 85
+array                     1            based           structure                array level 2 in structure "vol_list" dcl 585
+                                                                                  in procedure "purge_volume_log"
+array                    11            based           structure                array level 2 in structure "pvolog" dcl 6-8
+                                                                                  in procedure "purge_volume_log" set ref 375
+array                  2100            based           structure                array level 2 in structure "backup_volume_log"
+                                                                                  dcl 1-20 in procedure "purge_volume_log" set ref
+                                                                                  152 197 199* 199 201* 263* 263 281
+backup_pvol_info                       based           structure                level 1 dcl 2-5
+backup_volume_header                   based           structure                level 1 dcl 4-5
+backup_volume_log                      based           structure                level 1 dcl 1-20
+backup_volume_log_version_2            constant        fixed bin(17,0)          initial dcl 1-17 ref 127
+backup_volume_log_version_3            constant        fixed bin(17,0)          initial dcl 1-18 ref 127
+bvle                                   based           structure                level 1 dcl 1-39
+bvlep                           000606 automatic       pointer                  dcl 1-14 set ref 152* 154 155 158 167 169 171 176
+                                                                                  183 185 281* 282 288 475
+bvlp                                   parameter       pointer                  dcl 278 in procedure "build_volume_list" ref 273 280
+                                                                                  281
+bvlp                            000604 automatic       pointer                  dcl 1-13 in procedure "purge_volume_log" set ref 58*
+                                                                                  118* 120 121 122 123 124 125 126 127 127 127 130
+                                                                                  132 133 134 145 152 176 176 185 185 197 213* 220
+                                                                                  251* 263 376 425 425 426 428 429* 430* 449* 450
+                                                                                  455 475 475
+bvlx                            000157 automatic       fixed bin(17,0)          dcl 537 in procedure "purge_volume_log" set ref 195*
+bvlx                            000632 automatic       fixed bin(17,0)          dcl 279 in procedure "build_volume_list" set ref
+                                                                                  280* 281*
+cleanup                         000572 stack reference condition                dcl 593 ref 97
+close_time               14            based           fixed bin(71,0)          level 2 dcl 1-39 ref 176 185
+code                            000554 automatic       fixed bin(35,0)          dcl 574 set ref 53* 61* 62 75* 76 77* 100* 101 102*
+                                                                                  106* 108* 109 110* 213* 214 215* 220* 221 222* 230
+                                                                                  358* 359 360* 362* 391* 392 392* 398* 399 399 399*
+                                                                                  406* 414* 442* 443 444* 449* 451* 454 455* 456 457
+                                                                                  457* 458 459* 490* 491 492* 496* 497 497 497* 512*
+                                                                                  513 514* 517* 518 520* 521 522 522* 523 524*
+com_err_                        000050 constant        entry                    external dcl 612 ref 55
+comp                                   constant        fixed bin(17,0)          initial dcl 5-6 ref 154
+comp_count                      000237 automatic       fixed bin(17,0)          dcl 561 set ref 146* 150 156* 156 157 167 172 176
+                                                                                  183
+comp_cycle_uid                  000235 automatic       bit(36)                  packed unaligned dcl 559 set ref 147* 155 158*
+cons                                   constant        fixed bin(17,0)          initial dcl 5-5 ref 167
+cons_count                      000240 automatic       fixed bin(17,0)          dcl 562 set ref 146* 170* 170 176 185 185
+cons_cycle_uid                  000236 automatic       bit(36)                  packed unaligned dcl 560 set ref 147* 169 171*
+contents_dir                    000427 automatic       char(168)                packed unaligned dcl 570 set ref 96* 496* 497*
+count                           000100 automatic       fixed bin(17,0)          dcl 533 in procedure "purge_volume_log" set ref 352*
+                                                                                  378 384 386
+count                     1            based           fixed bin(17,0)          array level 3 in structure "vol_list" dcl 585
+                                                                                  in procedure "purge_volume_log" set ref 289* 291*
+                                                                                  291 318 318 320 327* 352
+count                           000647 automatic       fixed bin(17,0)          dcl 307 in procedure "build_delete_list" set ref
+                                                                                  316* 320* 327
+cu_$arg_count                   000072 constant        entry                    external dcl 622 ref 73
+cu_$arg_ptr                     000042 constant        entry                    external dcl 609 ref 61 75
+cycle_uid              2100            based           bit(36)                  array level 3 in structure "backup_volume_log"
+                                                                                  dcl 1-20 in procedure "purge_volume_log" set ref
+                                                                                  197 262 475
+cycle_uid                              based           bit(36)                  level 2 in structure "bvle" dcl 1-39 in procedure
+                                                                                  "purge_volume_log" ref 155 158 169 171 475
+del_vlp                         000566 automatic       pointer                  dcl 582 set ref 116* 325 325 326 326 327 327 350 351
+                                                                                  352
+delete_$path                    000024 constant        entry                    external dcl 602 ref 496
+disk_type              2035            based           fixed bin(17,0)          level 2 packed packed unaligned dcl 1-20 set ref
+                                                                                  127* 127
+dmpr_report_$error_output       000052 constant        entry                    external dcl 614 ref 250
+dump_type                 1            based           fixed bin(17,0)          level 2 dcl 1-39 ref 154 167 183
+dvlx                            000660 automatic       fixed bin(17,0)          dcl 346 set ref 350* 351 352*
+ename                           000273 automatic       char(32)                 packed unaligned dcl 567 set ref 490* 496* 497*
+error_rnt                       000600 automatic       entry variable           dcl 613 set ref 55* 63 77 85 100* 102 110 215 222
+                                                                                  250* 358* 360 368 392 398* 399 444 451 459 492 497
+                                                                                  514 524
+error_table_$action_not_performed
+                                000016 external static fixed bin(35,0)          dcl 598 ref 399
+error_table_$badopt             000010 external static fixed bin(35,0)          dcl 595 set ref 85*
+error_table_$invalid_lock_reset 000022 external static fixed bin(35,0)          dcl 600 ref 457 522
+error_table_$noarg              000012 external static fixed bin(35,0)          dcl 596 set ref 63*
+error_table_$noentry            000014 external static fixed bin(35,0)          dcl 597 ref 497
+error_table_$segknown           000020 external static fixed bin(35,0)          dcl 599 ref 454 518
+force_mode                      000160 automatic       bit(1)                   packed unaligned dcl 539 set ref 54* 81* 246* 366
+found                           000252 automatic       bit(1)                   packed unaligned dcl 564 set ref 285* 286
+get_temp_segments_              000044 constant        entry                    external dcl 610 ref 108
+get_wdir_                       000032 constant        entry                    external dcl 605 ref 83
+hbound                                                 builtin function         dcl 624 ref 197
+hcs_$delentry_seg               000056 constant        entry                    external dcl 616 ref 391
+hcs_$fs_move_seg                000062 constant        entry                    external dcl 618 ref 213
+hcs_$initiate                   000060 constant        entry                    external dcl 617 ref 449 517
+hcs_$terminate_noname           000070 constant        entry                    external dcl 621 ref 408 429 434
+header                                 based           structure                level 2 dcl 1-20 set ref 121* 121
+idx                             000234 automatic       fixed bin(17,0)          dcl 558 in procedure "purge_volume_log" set ref 150*
+                                                                                  152 160* 163* 176* 185* 474
+idx                                    parameter       fixed bin(17,0)          dcl 259 in procedure "log_volume_entry" ref 258 262
+                                                                                  263 263
+ignore                          000561 automatic       fixed bin(35,0)          dcl 579 set ref 408* 425* 426* 429* 432* 433* 434*
+in_use                          000203 automatic       fixed bin(17,0)          dcl 544 in procedure "purge_volume_log" set ref 373*
+                                                                                  381* 386* 386 389
+in_use                   10            based           fixed bin(17,0)          level 2 in structure "pvolog" dcl 6-8 in procedure
+                                                                                  "purge_volume_log" set ref 373 381 381*
+incr                                   constant        fixed bin(17,0)          initial dcl 5-4 ref 183
+info                     10            based           structure                level 2 dcl 1-20 set ref 122* 122
+invocation_count         10            based           fixed bin(17,0)          level 2 dcl 6-18 set ref 380* 384*
+ioa_                            000026 constant        entry                    external dcl 603 ref 227 355 357 401
+jdx                             000704 automatic       fixed bin(17,0)          dcl 472 set ref 474* 475 475*
+label                                  based           structure                level 1 dcl 3-18
+lock                                   based           bit(36)                  level 2 in structure "pvolog" dcl 6-8 in procedure
+                                                                                  "purge_volume_log" set ref 362* 406* 433* 520*
+lock                   2016            based           bit(36)                  level 2 in structure "backup_volume_log" dcl 1-20
+                                                                                  in procedure "purge_volume_log" set ref 124* 124
+                                                                                  220* 425* 455*
+lock_wait_time                  000000 constant        fixed bin(17,0)          initial dcl 591 set ref 362* 455* 520*
+manage_volume_pool_$free        000040 constant        entry                    external dcl 608 ref 398
+manage_volume_pool_$set_pool_path
+                                000030 constant        entry                    external dcl 604 ref 100
+manual_free                     000553 automatic       bit(1)                   packed unaligned dcl 573 set ref 56* 80* 99 248* 397
+myname                          000215 automatic       char(32)                 packed unaligned dcl 551 set ref 57* 63* 63* 77* 85*
+                                                                                  102* 108* 110* 215* 222* 227* 249* 355* 357* 360*
+                                                                                  368* 392* 399* 401* 432* 444* 451* 459* 492* 497*
+                                                                                  514* 524*
+name                                   parameter       char(32)                 packed unaligned dcl 441 in procedure
+                                                                                  "find_volog_and_lock" set ref 440 442* 444*
+name                      2            based           char(32)                 array level 3 in structure "vol_list" dcl 585
+                                                                                  in procedure "purge_volume_log" set ref 282 288*
+                                                                                  310 311 326* 351
+narg                            000161 automatic       fixed bin(17,0)          dcl 540 set ref 73* 74
+new_ent_cnt                     000555 automatic       fixed bin(17,0)          dcl 575 set ref 107* 205 226 227* 264* 264
+new_pool_path                   000105 automatic       char(168)                packed unaligned dcl 536 set ref 93* 100*
+new_vlp                         000564 automatic       pointer                  dcl 581 set ref 115* 206* 311 311 317 318 320
+next                      7            based           fixed bin(17,0)          level 2 in structure "pvolog" dcl 6-8 in procedure
+                                                                                  "purge_volume_log" ref 374
+next                   2030            based           fixed bin(17,0)          level 2 in structure "backup_volume_log" dcl 1-20
+                                                                                  in procedure "purge_volume_log" set ref 130* 130
+                                                                                  145 197 205* 280
+next                                   based           fixed bin(17,0)          level 2 in structure "vol_list" dcl 585 in procedure
+                                                                                  "purge_volume_log" set ref 282 285 287* 287 288
+                                                                                  289 309 311 317 325* 325 326 327 350
+null                                                   builtin function         dcl 624 ref 58 91 251 354 362 364 394 409 425 426
+                                                                                  428 430 432 433 434 450 511 519
+nvlx                            000644 automatic       fixed bin(17,0)          dcl 305 set ref 311* 311* 317 318 320
+old_ent_cnt                     000556 automatic       fixed bin(17,0)          dcl 576 set ref 145* 150 195 196 226 227*
+old_vlp                         000562 automatic       pointer                  dcl 580 set ref 114* 118* 309 310 318
+open_time              2112            based           fixed bin(71,0)          array level 3 dcl 1-20 set ref 475
+pvid                   2027            based           bit(36)                  level 2 dcl 1-20 set ref 126* 126
+pvle                                   based           structure                level 1 dcl 6-18
+pvlep                           000612 automatic       pointer                  dcl 6-4 set ref 375* 376 379 380 384
+pvlp                                   parameter       pointer                  dcl 510 in procedure "find_pvolog_and_lock" set ref
+                                                                                  508 511* 517* 519
+pvlp                            000610 automatic       pointer                  dcl 6-3 in procedure "purge_volume_log" set ref 58*
+                                                                                  251* 353* 354 358* 362 362 364 373 374 375 381 381
+                                                                                  391* 394* 406 408* 409* 433 433 434 434* 520
+pvlx                            000661 automatic       fixed bin(17,0)          dcl 346 in procedure "process_delete_list" set ref
+                                                                                  374* 375*
+pvlx                            000645 automatic       fixed bin(17,0)          dcl 305 in procedure "build_delete_list" set ref
+                                                                                  309* 310 318*
+pvname                 2017            based           char(32)                 level 2 in structure "backup_volume_log" dcl 1-20
+                                                                                  in procedure "purge_volume_log" set ref 125* 125
+                                                                                  376
+pvname                                 based           char(32)                 level 2 in structure "pvle" dcl 6-18 in procedure
+                                                                                  "purge_volume_log" set ref 376 379*
+pvolog                                 based           structure                level 1 dcl 6-8
+pvolog_dir                      000355 automatic       char(168)                packed unaligned dcl 569 set ref 95* 355* 517*
+pvolog_known                    000557 automatic       bit(1)                   packed unaligned dcl 577 set ref 407 434 518*
+pvolog_name                     000205 automatic       char(32)                 packed unaligned dcl 546 set ref 512* 517* 524*
+rebuild_failed                  000662 automatic       bit(1)                   packed unaligned dcl 347 set ref 359* 360 365
+rebuild_pvolog_                 000034 constant        entry                    external dcl 606 ref 358
+release_temp_segments_          000046 constant        entry                    external dcl 611 ref 432
+reload_groups                   000230 automatic       fixed bin(17,0)          dcl 554 in procedure "purge_volume_log" set ref 120*
+                                                                                  131 150 157 167 183
+reload_groups          2031            based           fixed bin(17,0)          level 2 in structure "backup_volume_log" dcl 1-20
+                                                                                  in procedure "purge_volume_log" set ref 120 131*
+rpv_pvid               2036            based           bit(36)                  level 2 dcl 1-20 set ref 132* 132
+rtrim                                                  builtin function         dcl 624 ref 93 95 96
+search_name                     000253 automatic       char(32)                 packed unaligned dcl 565 set ref 310* 311 326
+seg_type                        000714 automatic       char(32)                 packed unaligned dcl 487 set ref 489* 490* 492*
+set_lock_$lock                  000064 constant        entry                    external dcl 619 ref 362 455 520
+set_lock_$unlock                000066 constant        entry                    external dcl 620 ref 220 406 425 433
+sortx                           000104 automatic       fixed bin(17,0)          dcl 535 set ref 196* 197 197 199 199 201*
+sub                             000231 automatic       bit(1)                   packed unaligned dcl 555 set ref 54* 230 246*
+subsequent_dump_open_time       000232 automatic       fixed bin(71,0)          dcl 556 set ref 148* 159* 172* 176 185
+substr                                                 builtin function         dcl 624 ref 69
+suffixed_name_$make             000054 constant        entry                    external dcl 615 ref 442 490 512
+sys_dir                         000501 automatic       char(168)                packed unaligned dcl 571 set ref 59* 83* 93 94 95 96
+                                                                                  244*
+tbvlp                           000570 automatic       pointer                  dcl 583 set ref 113* 121 122 123 124 125 126 127 130
+                                                                                  131 132 133 134 197 199 199 201 205 206* 213* 262
+                                                                                  263
+temp                            000702 automatic       fixed bin(71,0)          dcl 471 set ref 475* 478
+test_mode                       000202 automatic       bit(1)                   packed unaligned dcl 543 set ref 54* 82* 212 227*
+                                                                                  227* 247* 377 389 495
+throw_away_value                       parameter       fixed bin(17,0)          dcl 547 ref 240
+tp                              000242 automatic       pointer                  array dcl 563 set ref 91* 108* 113 114 115 116 432
+                                                                                  432*
+unspec                                                 builtin function         dcl 624 set ref 201*
+version                2015            based           fixed bin(17,0)          level 2 dcl 1-20 set ref 123* 123 127 127
+vlp                                    parameter       pointer                  dcl 277 ref 273 282 282 285 287 287 288 288 289 289
+                                                                                  291 291
+vlx                             000633 automatic       fixed bin(17,0)          dcl 279 set ref 282* 282* 285 291 291
+vol_list                               based           structure                level 1 dcl 585
+volname                                parameter       char(32)                 packed unaligned dcl 488 in procedure
+                                                                                  "delete_contents_segs" set ref 486 490* 492*
+volname                         000263 automatic       char(32)                 packed unaligned dcl 566 in procedure
+                                                                                  "purge_volume_log" set ref 351* 353* 355* 357*
+                                                                                  358* 360* 368* 392* 396* 398* 399* 401*
+volname                                parameter       char(32)                 packed unaligned dcl 509 in procedure
+                                                                                  "find_pvolog_and_lock" set ref 508 512* 514*
+volname                   2            based           char(32)                 level 2 in structure "bvle" dcl 1-39 in procedure
+                                                                                  "purge_volume_log" ref 282 288
+volog                           000162 automatic       char(32)                 packed unaligned dcl 541 set ref 70* 98* 245*
+volog_dir                       000303 automatic       char(168)                packed unaligned dcl 568 set ref 94* 358* 426* 449*
+                                                                                  451*
+volog_known                     000560 automatic       bit(1)                   packed unaligned dcl 578 set ref 428 454*
+volog_name                      000172 automatic       char(32)                 packed unaligned dcl 542 set ref 227* 426* 442* 449*
+                                                                                  451* 459*
+vpp                             000102 automatic       pointer                  dcl 534 set ref 100* 398*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+Multics_ID_String                      internal static char(32)                 initial packed unaligned dcl 3-92
+backup_version_1                       internal static fixed bin(17,0)          initial dcl 5-7
+backup_volume_log_version_1            internal static fixed bin(17,0)          initial dcl 1-16
+bpvip                                  automatic       pointer                  dcl 2-3
+contents_type                          internal static fixed bin(17,0)          initial dcl 4-21
+dir_type                               internal static fixed bin(17,0)          initial dcl 4-16
+hdp                                    automatic       pointer                  dcl 4-3
+info_type                              internal static fixed bin(17,0)          initial dcl 4-22
+labelp                                 automatic       pointer                  dcl 3-16
+null_type                              internal static fixed bin(17,0)          initial dcl 4-18
+pattern1                               internal static bit(36)                  initial packed unaligned dcl 4-24
+pattern2                               internal static bit(36)                  initial packed unaligned dcl 4-25
+pattern3                               internal static bit(36)                  initial packed unaligned dcl 4-26
+prev_output_log_type                   internal static fixed bin(17,0)          initial dcl 4-20
+pvolog_version_1                       internal static fixed bin(17,0)          initial dcl 6-6
+seg_type                               internal static fixed bin(17,0)          initial dcl 4-17
+volume_log_type                        internal static fixed bin(17,0)          initial dcl 4-19
+vtoce_type                             internal static fixed bin(17,0)          initial dcl 4-15
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+argerr                          000517 constant        label                    dcl 63 ref 69
+build_delete_list               002115 constant        entry                    internal dcl 300 ref 208
+build_volume_list               002016 constant        entry                    internal dcl 273 ref 118 206
+common                          000752 constant        label                    dcl 91 ref 252
+delete_contents_segs            003444 constant        entry                    internal dcl 486 ref 396
+find_pvolog_and_lock            003641 constant        entry                    internal dcl 508 ref 353
+find_volog_and_lock             003152 constant        entry                    internal dcl 440 ref 98
+finish                          001675 constant        label                    dcl 230 ref 67 78 86 103 111 216 223 370 445 452 460
+                                                                                  525
+finish_                         002757 constant        entry                    internal dcl 423 ref 97 232
+log_volume_entry                001775 constant        entry                    internal dcl 258 ref 160 163 176 185
+next                            002752 constant        label                    dcl 412 ref 365 366
+open_time                       003415 constant        entry                    internal dcl 470 ref 159 172
+process_delete_list             002223 constant        entry                    internal dcl 340 ref 210
+purge_volume_log                000447 constant        entry                    external dcl 40
+purge_volume_log_               001714 constant        entry                    external dcl 240
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      4474        4570    4126        4504
+Length      5144    4126        74         337     346           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+purge_volume_log                    822 external procedure  is an external procedure.  
+on unit on line 97                   64 on unit               
+log_volume_entry                        internal procedure  shares stack frame of external procedure purge_volume_log.  
+build_volume_list                       internal procedure  shares stack frame of external procedure purge_volume_log.  
+build_delete_list                       internal procedure  shares stack frame of external procedure purge_volume_log.  
+process_delete_list                     internal procedure  shares stack frame of external procedure purge_volume_log.  
+finish_                              94 internal procedure  is called by several nonquick procedures.  
+find_volog_and_lock                     internal procedure  shares stack frame of external procedure purge_volume_log.  
+open_time                               internal procedure  shares stack frame of external procedure purge_volume_log.  
+delete_contents_segs                    internal procedure  shares stack frame of external procedure purge_volume_log.  
+find_pvolog_and_lock                    internal procedure  shares stack frame of external procedure purge_volume_log.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+purge_volume_log         000100 count                       purge_volume_log
+                         000102 vpp                         purge_volume_log
+                         000104 sortx                       purge_volume_log
+                         000105 new_pool_path               purge_volume_log
+                         000157 bvlx                        purge_volume_log
+                         000160 force_mode                  purge_volume_log
+                         000161 narg                        purge_volume_log
+                         000162 volog                       purge_volume_log
+                         000172 volog_name                  purge_volume_log
+                         000202 test_mode                   purge_volume_log
+                         000203 in_use                      purge_volume_log
+                         000204 ac                          purge_volume_log
+                         000205 pvolog_name                 purge_volume_log
+                         000215 myname                      purge_volume_log
+                         000225 argl                        purge_volume_log
+                         000226 argp                        purge_volume_log
+                         000230 reload_groups               purge_volume_log
+                         000231 sub                         purge_volume_log
+                         000232 subsequent_dump_open_time   purge_volume_log
+                         000234 idx                         purge_volume_log
+                         000235 comp_cycle_uid              purge_volume_log
+                         000236 cons_cycle_uid              purge_volume_log
+                         000237 comp_count                  purge_volume_log
+                         000240 cons_count                  purge_volume_log
+                         000242 tp                          purge_volume_log
+                         000252 found                       purge_volume_log
+                         000253 search_name                 purge_volume_log
+                         000263 volname                     purge_volume_log
+                         000273 ename                       purge_volume_log
+                         000303 volog_dir                   purge_volume_log
+                         000355 pvolog_dir                  purge_volume_log
+                         000427 contents_dir                purge_volume_log
+                         000501 sys_dir                     purge_volume_log
+                         000553 manual_free                 purge_volume_log
+                         000554 code                        purge_volume_log
+                         000555 new_ent_cnt                 purge_volume_log
+                         000556 old_ent_cnt                 purge_volume_log
+                         000557 pvolog_known                purge_volume_log
+                         000560 volog_known                 purge_volume_log
+                         000561 ignore                      purge_volume_log
+                         000562 old_vlp                     purge_volume_log
+                         000564 new_vlp                     purge_volume_log
+                         000566 del_vlp                     purge_volume_log
+                         000570 tbvlp                       purge_volume_log
+                         000600 error_rnt                   purge_volume_log
+                         000604 bvlp                        purge_volume_log
+                         000606 bvlep                       purge_volume_log
+                         000610 pvlp                        purge_volume_log
+                         000612 pvlep                       purge_volume_log
+                         000632 bvlx                        build_volume_list
+                         000633 vlx                         build_volume_list
+                         000644 nvlx                        build_delete_list
+                         000645 pvlx                        build_delete_list
+                         000646 Sdelete                     build_delete_list
+                         000647 count                       build_delete_list
+                         000660 dvlx                        process_delete_list
+                         000661 pvlx                        process_delete_list
+                         000662 rebuild_failed              process_delete_list
+                         000702 temp                        open_time
+                         000704 jdx                         open_time
+                         000714 seg_type                    delete_contents_segs
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+r_l_a               r_e_as              r_ne_as             r_le_a              alloc_char_temp     call_ent_var_desc
+call_ext_out_desc   call_ext_out        call_int_this       call_int_other      return_mac          enable_op
+shorten_stack       ext_entry           ext_entry_desc      int_entry
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+adjust_bit_count_             com_err_                      cu_$arg_count                 cu_$arg_ptr
+delete_$path                  dmpr_report_$error_output     get_temp_segments_            get_wdir_
+hcs_$delentry_seg             hcs_$fs_move_seg              hcs_$initiate                 hcs_$terminate_noname
+ioa_                          manage_volume_pool_$free      manage_volume_pool_$set_pool_path
+rebuild_pvolog_               release_temp_segments_        set_lock_$lock                set_lock_$unlock
+suffixed_name_$make
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$action_not_performed                           error_table_$badopt
+error_table_$invalid_lock_reset                             error_table_$noarg            error_table_$noentry
+error_table_$segknown
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     40 000446        53 000454        54 000455        55 000460        56 000464        57 000466        58 000471
+     59 000474        61 000477        62 000515        63 000517        67 000546        69 000547        70 000554
+     72 000560        73 000562        74 000571        75 000575        76 000612        77 000614        78 000646
+     80 000647        81 000657        82 000666        83 000675        85 000715        86 000747        88 000750
+     89 000751        91 000752        93 000765        94 001013        95 001017        96 001034        97 001052
+     98 001075        99 001077       100 001101       101 001126       102 001130       103 001153       106 001154
+    107 001155       108 001156       109 001177       110 001201       111 001224       113 001225       114 001227
+    115 001231       116 001233       118 001235       120 001237       121 001242       122 001246       123 001252
+    124 001254       125 001256       126 001261       127 001263       130 001272       131 001274       132 001276
+    133 001300       134 001302       145 001304       146 001306       147 001310       148 001312       150 001314
+    152 001324       154 001331       155 001334       156 001337       157 001340       158 001343       159 001345
+    160 001347       162 001351       163 001352       165 001354       167 001355       169 001365       170 001370
+    171 001371       172 001373       176 001377       181 001416       183 001417       185 001424       191 001441
+    195 001444       196 001451       197 001457       199 001473       201 001501       203 001505       204 001510
+    205 001513       206 001516       208 001520       210 001521       212 001522       213 001525       214 001544
+    215 001546       216 001571       220 001572       221 001604       222 001606       223 001631       226 001632
+    227 001635       230 001675       232 001702       233 001706       240 001707       244 001734       245 001742
+    246 001747       247 001752       248 001754       249 001761       250 001764       251 001771       252 001774
+    258 001775       262 001777       263 002006       264 002014       265 002015       273 002016       280 002020
+    281 002031       282 002037       284 002061       285 002063       286 002071       287 002072       288 002073
+    289 002103       290 002106       291 002107       292 002112       293 002114       300 002115       309 002116
+    310 002125       311 002133       313 002152       315 002154       316 002156       317 002160       318 002163
+    320 002200       324 002202       325 002204       326 002205       327 002214       329 002220       332 002222
+    340 002223       350 002224       351 002233       352 002241       353 002244       354 002246       355 002252
+    357 002302       358 002325       359 002356       360 002361       362 002410       364 002427       365 002433
+    366 002435       368 002437       370 002466       373 002467       374 002472       375 002501       376 002504
+    377 002511       378 002514       379 002517       380 002522       381 002523       383 002530       384 002531
+    385 002532       386 002533       388 002540       389 002542       391 002547       392 002560       394 002611
+    396 002613       397 002615       398 002617       399 002644       401 002700       404 002723       406 002724
+    407 002735       408 002737       409 002750       412 002752       414 002754       415 002755       423 002756
+    425 002764       426 003002       428 003043       429 003052       430 003063       432 003066       433 003113
+    434 003131       435 003151       440 003152       442 003154       443 003202       444 003204       445 003233
+    449 003234       450 003276       451 003302       452 003334       454 003335       455 003342       456 003355
+    457 003357       458 003363       459 003365       460 003413       463 003414       470 003415       474 003417
+    475 003425       477 003435       478 003440       486 003444       489 003446       490 003453       491 003477
+    492 003501       493 003533       495 003534       496 003537       497 003572       500 003631       501 003640
+    508 003641       511 003643       512 003645       513 003673       514 003675       515 003724       517 003725
+    518 003770       519 003775       520 004003       521 004015       522 004017       523 004023       524 004025
+    525 004053       528 004054
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

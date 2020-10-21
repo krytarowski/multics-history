@@ -1,0 +1,965 @@
+	COMPILATION LISTING OF SEGMENT g115_protocol_
+	Compiled by: Multics PL/I Compiler, Release 25b, of November 27, 1979
+	Compiled at: Honeywell LISD Phoenix, System M
+	Compiled on: 02/14/80  1738.1 mst Thu
+	    Options: optimize map
+
+        1 /* ******************************************************
+        2*   *                                                    *
+        3*   *                                                    *
+        4*   * Copyright (c) 1972 by Massachusetts Institute of   *
+        5*   * Technology and Honeywell Information Systems, Inc. *
+        6*   *                                                    *
+        7*   *                                                    *
+        8*   ****************************************************** */
+        9 
+       10 g115_protocol_$write: proc (a_adp, a_ddp, a_bufp, a_nelem, a_code);
+       11 
+       12 /* This procedure performs all the message blocking and formatting required by the G115
+       13*   Remote Computer Interface protocol.  Input and output are in the form of records, where one
+       14*   record may be a partial message, a full message or must be split across messages.
+       15*
+       16*   On output, records are packed into messages.  The message is sent when it becomes
+       17*   full or when the format code of the message must be changed. Each record of a message begins with
+       18*   a media code which defines the target device (e.g. printer, bcd punch, binary punch, teleprinter)
+       19*
+       20*   On input, only character data is allowed.  This may be for the teleprinter (operator commands) or for the
+       21*   card_input facility, but we can't tell which one (a deficiency in the protocol).
+       22**/
+       23 
+       24 /* Adapted from the original program g115_io_ by J. C. Whitmore, 9/79 */
+       25 
+       26 dcl  a_adp ptr parameter;
+       27 dcl  a_ddp ptr parameter;
+       28 dcl  a_bufp ptr parameter;
+       29 dcl  a_nelem fixed bin parameter;
+       30 dcl  a_nelemt fixed bin parameter;
+       31 dcl  a_code parameter;
+       32 
+       33 
+       34 dcl  bufp ptr;
+       35 dcl  nelem fixed bin;
+       36 dcl  code fixed bin (35);
+       37 
+       38 dcl  binary_record bit (960) aligned;			/* one binary card image */
+       39 dcl  level fixed bin;				/* automatic version of our invocation level */
+       40 dcl  format_code bit (9);
+       41 dcl  slew_char char (1);
+       42 dcl  io_data char (646) var;				/* data part of an input or output record */
+       43 dcl  io_record char (648) var;			/* the full record with media code and record separator */
+       44 dcl  idx fixed bin;					/* index variable */
+       45 dcl  CC_index fixed bin;				/* where the next compression char sits */
+       46 dcl  temp_buffer char (648) var;
+       47 dcl  test_char char (1);
+       48 dcl  rep_count fixed bin;				/* number of repeated chars in compression sequence */
+       49 dcl  bcd_count fixed bin;				/* number of 6-bit elements in data to be output */
+       50 dcl  space_left fixed bin;				/* number of chars remaining in current message block */
+       51 dcl  count_char char (1);				/* ASCII char representing BCD equiv compression count */
+       52 
+       53 dcl  mess_p ptr;					/* temporary pointer to partial input message */
+       54 dcl  mess_len fixed bin;				/* length of partial input message */
+       55 dcl  remaining_message char (mess_len) based (mess_p);	/* the partial input message */
+       56 
+       57 dcl  six_bit_number (bcd_count) fixed bin (6) unsigned unal based;
+       58 
+       59 dcl  data_string char (nelem) based;			/* input data for the write entry */
+       60 						/* or output data for the read entry */
+       61 dcl  data_bit_string bit (nelem) based;			/* for binary punch, record length is in bits */
+       62 
+       63 dcl  based_record char (record_len) based;
+       64 dcl  record_len fixed bin;
+       65 dcl  rec_p ptr;
+       66 
+       67 dcl  convert_string_$input entry (char (*) var, ptr, char (*) var, fixed bin (35));
+       68 dcl  convert_string_$output entry (char (*) var, ptr, char (*) var, fixed bin (35));
+       69 dcl  g115_io_$write entry (ptr, ptr, fixed bin (35));
+       70 dcl  g115_io_$read entry (ptr, ptr, fixed bin (35));
+       71 
+       72 dcl (addr, null, length, substr, copy, index, divide, maxlength) builtin;
+       73 
+       74 dcl (error_table_$eof_record,
+       75      error_table_$too_many_buffers,
+       76      error_table_$no_operation,
+       77      error_table_$improper_data_format,
+       78      error_table_$long_record,
+       79      error_table_$data_loss) fixed bin (35) ext;
+       80 
+       81 
+       82 dcl  legal_slew_chars char (19) int static options (constant) init (" 0123456789[#@:>?AB");
+       83 						/* printer slew codes, in order: */
+       84 						/* Top of Form - space */
+       85 						/* slew 0 to 15 lines - 0...? */
+       86 						/* VFU_1 - A,  VFU_2 - B  */
+       87 
+       88 dcl  bcd_equiv_string char (64) unal int static options (constant)
+       89      init ("0123456789[#@:>? ABCDEFGHI&.](<\^JKLMNOPQR-$*);'+/STUVWXYZ_,%=""!");
+       90 
+       91 dcl  bcd_equiv (0:63) char (1) unal defined (bcd_equiv_string); /* 6-bit index to get equiv ASCII char */
+       92 
+       93 dcl  bcd_equiv_overlay char (63) defined (bcd_equiv_string) pos (2); /* overlay of bcd_equiv_string starting at element 2 */
+       94 
+       95 dcl  cleanup condition;
+       96 
+       97 
+  1     1 /* BEGIN INCLUDE FILE ...  g115_device_data.incl.pl1 ... 9-7-79 */
+  1     2 
+  1     3 
+  1     4 /* This structure describes all the data specific to a tty channel used for the G115 protocol.
+  1     5*   There is one device data block per channel chained together in a list.  Chaining and allocation
+  1     6*   of each data block is managed by g115_.pl1
+  1     7**/
+  1     8 
+  1     9 dcl  device_data_p ptr init (null);
+  1    10 
+  1    11 dcl 1 g115_device_data aligned based (device_data_p),
+  1    12     2 fwd_ptr ptr,					/* forward pointer in chain of these structures */
+  1    13     2 back_ptr ptr,					/* backward pointer   "      "    "      "	*/
+  1    14     2 tty_name char (32),				/* name of the device channel for devx */
+  1    15     2 devx fixed bin,				/* Ring 0 device index for the device */
+  1    16     2 attach_count fixed bin,				/* number of switches currently active */
+  1    17     2 dial_mgr_ev_chan fixed bin (71),			/* IPC channel for dial manager */
+  1    18     2 as_ev_chan fixed bin (71),			/* IPC event channel from answering service */
+  1    19     2 wait_list,					/* IPC wait list to block on for hardcore tty dim */
+  1    20       3 nchan fixed bin,				/* this must be 2 and must be on an even word */
+  1    21       3 dummy_word fixed bin,
+  1    22       3 tty_ev_channel fixed bin (71),			/* because the compiler wants this on even word */
+  1    23       3 timeout_ev_channel fixed bin (71),
+  1    24     2 control_bits,
+  1    25       3 as_priv_no_block bit (1) unal,			/* ON for answering service reads and writes */
+  1    26       3 write_split bit (1) unal,			/* ON if split records are to be sent to device */
+  1    27       3 write_compress bit (1) unal,			/* ON if compressed records are to be sent */
+  1    28       3 hangup_signalled bit (1) unal,			/* ON if a hangup control is sent */
+  1    29     2 delay fixed bin (35),				/* runout delay for L6 bug */
+  1    30     2 fmt_code,					/* the current data and operator msg format codes */
+  1    31       3 data bit (9) unal,				/* format code for data transfer to remote terminal */
+  1    32       3 control bit (9) unal,				/* format code for operator messages (teleprinter) */
+  1    33     2 process_id bit (36),				/* process id for sending wakeups to ourselves */
+  1    34     2 padding (14) fixed bin,				/* for the future */
+  1    35     2 buffer_areap ptr,				/* ptr to area for buffer allocation */
+  1    36     2 first_bp ptr,					/* ptr to first input buffer of chain */
+  1    37     2 last_bp ptr,					/* ptr to last  input buffer of chain */
+  1    38     2 template_ptr ptr,				/* ptr to template output buffer */
+  1    39     2 level fixed bin,				/* write recursion (or quit) level index */
+  1    40     2 outp (100) ptr;				/* pointers to output buffers in buffer area
+  1    41*						   indexed by level */
+  1    42 
+  1    43 dcl  buffer_area based (g115_device_data.buffer_areap) area (262144); /* area for input and output buffers */
+  1    44 
+  1    45 /* END INCLUDE FILE ... g115_device_data.incl.pl1 */
+       98 
+       99 
+  2     1 /* BEGIN include file ...  g115_message.incl.pl1 */
+  2     2 
+  2     3 /* This structure describes the format of any message which may be sent by the
+  2     4*   g115_dim to the G115 data terminal or received by the dim from that terminal.
+  2     5*   The structure includes some state information associated with the processing
+  2     6*   of the message block.
+  2     7**/
+  2     8 
+  2     9 /* Modified 04/10/77 by Bob Franklin to unpack input blocks */
+  2    10 /* Modified by J. Nicholls 7/78 to allow for remaing_record_count instead of character */
+  2    11 /* Modified by J. Whitmore, 8/79, to remove null char field, count and garbage variables, and to improve comments */
+  2    12 
+  2    13 dcl  msgp ptr init (null);				/* pointer to message structure */
+  2    14 
+  2    15 dcl 1 g115_message aligned based (msgp),		/* message and related state variables */
+  2    16     2 next_bp ptr,					/* forward thread when buffers are chained */
+  2    17 
+  2    18     2 text_char_count fixed bin,			/* character count of text */
+  2    19     2 rec_count fixed bin,				/* remaining text records to be processed (input only) */
+  2    20     2 last_char_read fixed bin,			/* index of last processed input char (Record Separator) */
+  2    21     2 being_changed bit (1),				/* message or state is being modified */
+  2    22 
+  2    23     2 g115_msg_block,				/* chars forming the message to/from ring 0 */
+  2    24 
+  2    25       3 soh bit (9) unal,				/* start of header character */
+  2    26       3 fmt_code bit (9) unal,			/* format code */
+  2    27       3 seq_code bit (9) unal,			/* sequence code */
+  2    28       3 addr_code bit (9) unal,			/* address code */
+  2    29       3 op_code unal,				/* operations code */
+  2    30         4 ascii_pad bit (2) unal,			/* -- */
+  2    31         4 use bit (1) unal,				/* should = "1"b */
+  2    32         4 ack bit (3) unal,				/* acknowledgement field */
+  2    33         4 cmd bit (3) unal,				/* instruction field */
+  2    34       3 id_code bit (9) unal,				/* identification code */
+  2    35       3 stx bit (9) unal,				/* start of text character */
+  2    36       3 text (324 refer (text_char_count)) char (1) unal,	/* text of message: <mc><data_record><rs> ...  */
+  2    37       3 etx bit (9) unal;				/* end of text character */
+  2    38 
+  2    39 
+  2    40 /* END include file ...  g115_message.incl.pl1 */
+      100 
+      101 
+  3     1 /* BEGIN include file G115.incl.pl1 */
+  3     2 
+  3     3 /* This include file defines several special character codes used by the Ring 4 portion of the
+  3     4*   Multics support for G115 (GRTS/NPS) protocol */
+  3     5 
+  3     6 /* JCW, 8/79 */
+  3     7 
+  3     8 dcl 1 G115 aligned internal static options (constant),
+  3     9 
+  3    10 /* This group defines input/output media codes associated with records within the text of a message block */
+  3    11 
+  3    12     2 media_codes unal,
+  3    13       3 bcd_input_mc char (1) init ("H"),		/* Input media code for BCD data - 110 octal */
+  3    14       3 bin_input_mc char (1) init ("P"),		/* Input media code for Binary data - 120 octal */
+  3    15 
+  3    16       3 printer_mc char (1) init ("L"),			/* printer output media code - 114 octal */
+  3    17       3 punch_bcd_mc char (1) init ("O"),		/* punch output media code (BCD data)  - 117 octal */
+  3    18       3 punch_bin_mc char (1) init ("W"),		/* punch output media code (Binary data)  - 127 octal */
+  3    19       3 teleprinter_mc char (1) init ("N"),		/* teleprinter output media code - 116 octal */
+  3    20 
+  3    21 /* This group defines the message format codes which apply to all records in a single message block */
+  3    22 
+  3    23     2 format_codes unal,
+  3    24       3 info_ns_nc bit (9) init ("110"b3),		/* information message, no split, no compression */
+  3    25       3 info_ns_c bit (9) init ("111"b3),		/* information message, no split, compression */
+  3    26       3 info_s_nc bit (9) init ("112"b3),		/* information message, split, no compression */
+  3    27       3 info_s_c bit (9) init ("113"b3),		/* information message, split, compression */
+  3    28       3 special_nc bit (9) init ("104"b3),		/* Special control record, no compression */
+  3    29       3 special_c bit (9) init ("105"b3),		/* Special control record, compression */
+  3    30 
+  3    31 /* This group defines reserved characters which appear in the message block */
+  3    32 
+  3    33     2 char_codes unal,
+  3    34       3 stx_char bit (9) init ("002"b3),		/* start-of-text (STX) char */
+  3    35       3 etx_char bit (9) init ("003"b3),		/* end-of-text (ETX) char */
+  3    36       3 soh_char bit (9) init ("001"b3),		/* start-of-header (SOH) char */
+  3    37       3 addr_code_char bit (9) init ("100"b3),		/* address code character */
+  3    38       3 id_code_char bit (9) init ("100"b3),		/* identification code character */
+  3    39       3 RS char (1) init (""),			/* record separator - 036 octal */
+  3    40       3 CC char (1) init (""),			/* compression character code - 037 octal */
+  3    41 
+  3    42 /* The maximum size of a single g115 message from SOH to ETX */
+  3    43 
+  3    44     2 max_msg_len fixed bin init (324);			/* max data in a message */
+  3    45 
+  3    46 
+  3    47 /* END include file G115.incl.pl1 */
+      102 
+      103 
+  4     1 /* BEGIN include file g115_attach_data.incl.pl1 */
+  4     2 
+  4     3 /* This structure describes all data which is defined per g115 switch attachment */
+  4     4 
+  4     5 /* Modified by J. C. Whitmore, 8/79, adding new fields and changing name from g115_data.incl.pl1 */
+  4     6 
+  4     7 dcl  adp ptr init (null);
+  4     8 
+  4     9 dcl 1 g115_attach_data aligned based (adp),
+  4    10     2 ttt_info like remote_ttt_info,
+  4    11     2 device_ptr ptr,				/* pointer to g115_device_data for this attachment */
+  4    12     2 media_code char (1) unal,			/* current media code used for this attachment */
+  4    13     2 attach_description char (256) var,
+  4    14     2 open_description char (32) var,
+  4    15     2 device char (32),				/* name of the generic type of remote device */
+  4    16     2 device_type fixed bin;				/* device type code in fixed bin form */
+  4    17 						/* 1 = reader	*/
+  4    18 						/* 2 = printer	*/
+  4    19 						/* 3 = teleprinter	*/
+  4    20 						/* 4 = punch	*/
+  4    21 
+  4    22 /* Constants which describe the defined device types */
+  4    23 
+  4    24 dcl  reader fixed bin static options (constant) init (1);
+  4    25 dcl  printer fixed bin static options (constant) init (2);
+  4    26 dcl  teleprinter fixed bin static options (constant) init (3);
+  4    27 dcl  punch fixed bin static options (constant) init (4);
+  4    28 
+  4    29 /* END include file g115_attach_data.incl.pl1 */
+      104 
+      105 
+  5     1 /* BEGIN...   remote_ttt_info.incl.pl1 ... 5/78 */
+  5     2 
+  5     3 dcl  rttp ptr;					/* ptr to data structure */
+  5     4 
+  5     5 
+  5     6 dcl 1 remote_ttt_info based (rttp) aligned,		/* data */
+  5     7     2 ttt_bits,					/* control bits */
+  5     8      (3 escape_output bit (1),			/* if on enables output escape processing */
+  5     9       3 translate_output bit (1),			/* if on enables output translation */
+  5    10       3 translate_input bit (1),			/* if on enables input translation */
+  5    11       3 escape_input bit (1),				/* if on enables input escape processing */
+  5    12       3 erase_input bit (1),				/* if on enables input erase processing */
+  5    13       3 canonicalize_input bit (1),			/* if on enables input canonicalization */
+  5    14       3 edited bit (1)) unal,				/* if on enables edited escape processing */
+  5    15     2 terminal_type char (32),			/* terminal type in TTT */
+  5    16     2 kill_char char (1),				/* specified kil character */
+  5    17     2 erase_char char (1),				/* and erase character */
+  5    18     2 ttt_ptrs,					/* ptr to various ttt tables */
+  5    19       3 input_mvtp ptr,				/* input translation table */
+  5    20       3 output_mvtp ptr,				/* output translation table */
+  5    21       3 input_tctp ptr,				/* input escape table */
+  5    22       3 output_tctp ptr,				/* output escape table */
+  5    23       3 specp ptr;					/* special table */
+  5    24 
+  5    25 /* END remote_ttt_info.incl.pl1 */
+      106 
+      107 
+      108 /* g115_protocol_$write:  proc (a_adp, a_ddp, a_bufp, a_nelem, a_code);  */
+      109 
+      110 /* This entry takes a record described by a_bufp -> output_string (a_nelem) and prepares it to be
+      111*   sent to the remote computer.  The message defined by g115_device_data.outp (level) -> g115_message.g115_msg_block
+      112*   is used to accumulate records until the 324 char message block is full (or almost).  Then it is sent to the
+      113*   remote computer by calling g115_io_$write.
+      114*
+      115*   The current message block is kept in a consistent state at all times so it can be "runout" by the
+      116*   subsystem at any time.  A cleanup handler is used to insure that any message being updated was not
+      117*   left in an inconsistent state.
+      118*
+      119*   The attach data for the switch performing the write defines the media code (i.e. target device).
+      120*   A single message block can contain records for several devices as long as the format code of
+      121*   the entire message is constant for all records.
+      122*
+      123*   The format code for the teleprinter device is different than for printer and punch data.
+      124*   Also, records for the teleprinter are sent immediately, one record per message block, and must not
+      125*   be compressed or split across messages.
+      126*
+      127*   If the media code is printer, the last char of the input string must be the slew control character.
+      128*
+      129*   If the media code is binary punch, the input string is a record of 1 to 960 bits as defined by a_nelem.
+      130*   The input string is taken 6-bits at a time and converted to
+      131*   an ASCII character equivalent to the BCD representation of the 6-bits.
+      132**/
+      133 
+      134 	a_code, code = 0;
+      135 	adp = a_adp;
+      136 	device_data_p = a_ddp;
+      137 	nelem = a_nelem;
+      138 	bufp = a_bufp;
+      139 
+      140 	if g115_attach_data.media_code = G115.punch_bin_mc then do; /* length of binary input is different */
+      141 	     if nelem > length (binary_record) then go to NO_ROOM; /* too many bits for one card */
+      142 	end;
+      143 	else if nelem > maxlength (io_data) then do;	/* internal buffer limit for character records */
+      144 NO_ROOM:	     a_code = error_table_$long_record;
+      145 	     return;
+      146 	end;
+      147 
+      148 	if g115_device_data.level = hbound (g115_device_data.outp, 1) then do;
+      149 	     a_code = error_table_$too_many_buffers;
+      150 	     return;
+      151 	end;
+      152 
+      153 	g115_device_data.level = g115_device_data.level + 1; /* set buffer level for this invocation */
+      154 	level = g115_device_data.level;		/* save a copy in automatic storage */
+      155 	msgp = g115_device_data.outp (level);		/* get the output buffer for this level */
+      156 	if msgp = null then do;			/* if not allocated, do it (never free output buffers) */
+      157 	     allocate g115_message in (buffer_area) set (g115_device_data.outp (level));
+      158 	     msgp = g115_device_data.outp (level);	/* set ref ptr for structure */
+      159 	     g115_message = g115_device_data.template_ptr -> g115_message; /* initialize it */
+      160 	end;
+      161 
+      162 	on cleanup begin;
+      163 
+      164 /*	check out the status of the message defined by this invocation   */
+      165 
+      166 	     if g115_message.being_changed | g115_device_data.level > 1 then do;
+      167 						/* flush inconsistent or higher level messages */
+      168 		msgp -> g115_message.text_char_count = 0;
+      169 		msgp -> g115_message.rec_count = 0;
+      170 		msgp -> g115_message.fmt_code = "0"b;
+      171 		msgp -> g115_message.being_changed = "0"b; /* OK now */
+      172 	     end;
+      173 
+      174 	     g115_device_data.level = g115_device_data.level - 1; /* back to value when called */
+      175 	end;
+      176 
+      177 /* define the format code for this record */
+      178 
+      179 	if g115_attach_data.device_type = teleprinter then format_code = g115_device_data.fmt_code.control;
+      180 	else format_code = g115_device_data.fmt_code.data;
+      181 
+      182 	if g115_message.text_char_count > 0 then	/* if there are records waiting */
+      183 	     if g115_message.fmt_code ^= format_code then do; /* and the format code is changing */
+      184 		call send_message_block (code);	/* then send the partial block */
+      185 		if code ^= 0 then go to WRITE_RETURN;
+      186 	     end;
+      187 
+      188 	g115_message.fmt_code = format_code;		/* this may be redundant at times, but cheap ... */
+      189 
+      190 /* start special processing of text */
+      191 
+      192 	if g115_attach_data.device_type = printer then do; /* for the printer, check the slew char */
+      193 	     slew_char = substr (bufp -> data_string, nelem, 1); /* slew code is the last char of input data */
+      194 	     if index (legal_slew_chars, slew_char) = 0 then /* if slew code not defined ...  */
+      195 		slew_char = "1";			/* default to single new line */
+      196 	     nelem = nelem - 1;			/* process remaining text up to the slew char */
+      197 	end;
+      198 
+      199 	if g115_attach_data.media_code = G115.punch_bin_mc then do; /* Binary Punch Output */
+      200 	     binary_record = bufp -> data_bit_string;	/* align data and pad with zeros */
+      201 	     bufp = addr (binary_record);		/* use our copy now */
+      202 	     bcd_count = divide (nelem + 5, 6, 0);	/* number of 6-bit elements */
+      203 
+      204 
+      205 	     io_data = "";				/* clear the conversion string */
+      206 	     do idx = 1 to bcd_count;
+      207 						/* get six bits as unsigned fixed bin index */
+      208 		io_data = io_data || bcd_equiv (bufp -> six_bit_number (idx)); /* output ASCII - bcd equiv of index */
+      209 	     end;
+      210 	end;
+      211 	else do;					/* Character Output */
+      212 	     temp_buffer = bufp -> data_string;		/* put data into local buffer */
+      213 	     if length (temp_buffer) > 0 then do;
+      214 						/* do any escape and/or translation processing */
+      215 		call convert_string_$output (temp_buffer, addr (g115_attach_data.ttt_info), io_data, code);
+      216 		if code ^= 0 then go to WRITE_RETURN;
+      217 	     end;
+      218 	     else io_data = "";			/* no data, could be just a printer slew record */
+      219 	end;
+      220 
+      221 /* are we supposed to compress multiple characters (NOT allowed for teleprinter output) */
+      222 
+      223 	if g115_device_data.write_compress & g115_attach_data.device_type ^= teleprinter then do;
+      224 	     temp_buffer = io_data;			/* copy into temp buffer */
+      225 	     io_data = "";				/* clear output and rebuild */
+      226 	     idx = 1;
+      227 	     do while (idx <= length (temp_buffer));	/* loop through the input string */
+      228 		test_char = substr (temp_buffer, idx, 1); /* find next char */
+      229 		rep_count = verify (substr (temp_buffer, idx), test_char) - 1; /* how many are there? */
+      230 
+      231 		if rep_count < 1 then		/* remainder of string is the same */
+      232 		     rep_count = length (temp_buffer) - idx + 1; /* see how many */
+      233 
+      234 		if rep_count > 3 then do;		/* compress if more than three in a row */
+      235 		     if rep_count > 64 then rep_count = 64; /* only compress 64 at a time */
+      236 		     count_char = bcd_equiv (rep_count - 1); /* don't include first char in repitition count */
+      237 		     io_data = io_data || test_char || G115.CC || count_char;
+      238 		end;
+      239 
+      240 		else do;				/* put in a few (1 to 3) of the char */
+      241 		     io_data = io_data || substr (temp_buffer, idx, rep_count);
+      242 		end;
+      243 
+      244 		idx = idx + rep_count;		/* bump the index */
+      245 	     end;
+      246 	end;
+      247 
+      248 /* format the data into a legal G115 record: <media_code><data>[<slew>]<record_separator> */
+      249 
+      250 	if g115_attach_data.device_type = printer
+      251 	then io_record = g115_attach_data.media_code || io_data || slew_char || G115.RS;
+      252 	else io_record = g115_attach_data.media_code || io_data || G115.RS;
+      253 	record_len = length (io_record);		/* set the length of the based record */
+      254 
+      255 	if g115_attach_data.device_type = teleprinter & record_len > G115.max_msg_len then go to NO_ROOM;
+      256 						/* teleprinter records cannot be split */
+      257 
+      258 /* this is the critical part of the code, add the record to the current message */
+      259 
+      260 	space_left = G115.max_msg_len - g115_message.text_char_count;
+      261 
+      262 	if record_len > space_left then do;		/* won't fit completely (can't happen for the teleprinter) */
+      263 	     if g115_device_data.write_split then do;	/* can we add part of it to current message block */
+      264 		g115_message.being_changed = "1"b;	/* mark as inconsistent */
+      265 		rec_p = addr (g115_message.etx);	/* get ptr to start of next record */
+      266 		substr (rec_p -> based_record, 1, space_left) = substr (io_record, 1, space_left);
+      267 		g115_message.text_char_count = g115_message.text_char_count + space_left;
+      268 		g115_message.etx = G115.etx_char;	/* put back the closing ETX */
+      269 		g115_message.being_changed = "0"b;	/* message is now back to normal */
+      270 		io_record = substr (io_record, space_left + 1); /* save the part not sent */
+      271 		record_len = length (io_record);	/* define new based record length */
+      272 	     end;
+      273 	     call send_message_block (code);		/* send off the current block and start a new one */
+      274 	     if code ^= 0 then go to WRITE_RETURN;
+      275 	end;
+      276 
+      277 	g115_message.being_changed = "1"b;		/* tell handler message is inconsistent */
+      278 	rec_p = addr (g115_message.etx);		/* find start of next record */
+      279 	rec_p -> based_record = io_record;		/* add in the record (or the last part of split) */
+      280 	g115_message.text_char_count = g115_message.text_char_count + record_len;
+      281 	g115_message.etx = G115.etx_char;
+      282 	g115_message.being_changed = "0"b;		/* back to a legal message again */
+      283 
+      284 /* All is safe now, the message is again consistent and ready to transmit.
+      285*   See if we should send it now or wait.  Protocol says that there can only be one record per message
+      286*   for the teleprinter, so always send teleprinter output.  Otherwise wait til there is enough to keep
+      287*   the line overhead down or til the caller wants a runout.
+      288*
+      289*   The exception to this rule is that if this invocation level is greater than 1, we should send the
+      290*   message because we may not get back to this level again to fill up the block.
+      291**/
+      292 
+      293 	if g115_attach_data.device_type = teleprinter then call send_message_block (code);
+      294 
+      295 	else if level > 1 then call send_message_block (code);
+      296 
+      297 	else if g115_message.text_char_count > 300 then call send_message_block (code);
+      298 						/* if close to full, why wait? */
+      299 WRITE_RETURN:
+      300 
+      301 	a_code = code;				/* copy back the code */
+      302 
+      303 	g115_device_data.level = g115_device_data.level - 1; /* pop the invocation level */
+      304 
+      305 	revert cleanup;				/* be sure we don't do it twice */
+      306 
+      307 	return;
+      308 
+      309 
+      310 
+      311 
+      312 send_message_block: proc (code);
+      313 
+      314 dcl  code fixed bin (35);
+      315 
+      316 	     code = 0;
+      317 
+      318 	     if ^g115_message.being_changed then do;	/* if not consistent, quietly flush it */
+      319 		call g115_io_$write (device_data_p, msgp, code);
+      320 		if code ^= 0 then return;
+      321 	     end;
+      322 
+      323 	     g115_message.text_char_count = 0;		/* make this message block clean again */
+      324 	     g115_message.being_changed = ""b;
+      325 
+      326 	     return;
+      327 
+      328 	end send_message_block;
+      329 
+      330 read:	entry (a_adp, a_ddp, a_bufp, a_nelem, a_nelemt, a_code);
+      331 
+      332 /* This entry is used to read one record of a message block from the remote computer.
+      333*   Only character data is accepted, and we have no way of knowing if the data is for the reader device
+      334*   or for the operator.
+      335*
+      336*   The caller wants the data to be put into the string a_bufp -> data_string (a_nelem).  The record may
+      337*   be shorter than a_nelem, so we tell how many were in the record by setting a_nelemt.
+      338*   If the record is greater than a_nelem, we return as many as possible, throw away the extra
+      339*   and return error_table_$data_loss as a status code.
+      340*
+      341**/
+      342 
+      343 	a_code, code, a_nelemt = 0;			/* init return stuff */
+      344 	adp = a_adp;
+      345 	device_data_p = a_ddp;
+      346 	bufp = a_bufp;
+      347 	nelem = a_nelem;
+      348 
+      349 	if nelem < 1 then do;			/* read zero length record? */
+      350 	     a_code = error_table_$no_operation;
+      351 	     return;
+      352 	end;
+      353 
+      354 	msgp = g115_device_data.first_bp;		/* get pointer to first input buffer */
+      355 	if g115_message.rec_count < 1 then do;		/* is this block finished? */
+      356 	     call get_next_message (msgp, code);	/* find a new message to process */
+      357 	     if code ^= 0 then go to READ_RETURN;
+      358 	end;
+      359 
+      360 /* at this point msgp should point to a valid data block (unless this is the Answering Service) */
+      361 
+      362 	if msgp -> g115_message.rec_count < 1 then return; /* no data */
+      363 
+      364 /* The input message block consists of one or more records of the form:
+      365*
+      366*   <media_code><text_data><record_separator>
+      367*
+      368*   we want to give the caller the text_data part of the next unprocessed record	*/
+      369 	test_char = g115_message.text (g115_message.last_char_read + 1); /* pickup the media code of next record */
+      370 
+      371 	if test_char ^= G115.bcd_input_mc then do;	/* force the issue, ignore binary input */
+      372 	     g115_message.text_char_count = 0;
+      373 	     g115_message.rec_count = 0;		/* for now, kill the whole record */
+      374 	     code = error_table_$improper_data_format;
+      375 	     go to READ_RETURN;
+      376 	end;
+      377 
+      378 	mess_p = addr (g115_message.text (g115_message.last_char_read + 2)); /* pointer to <text_data> (after media code) */
+      379 	mess_len = g115_message.text_char_count - g115_message.last_char_read - 1; /* length of remaining message */
+      380 
+      381 	g115_message.last_char_read = g115_message.last_char_read + 1; /* we have used up the media code */
+      382 
+      383 	io_data = "";				/* clear the buffer */
+      384 	idx = index (remaining_message, G115.RS);	/* find record separator which ends record */
+      385 	do while (idx = 0);				/* collect split records if any */
+      386 	     if length (io_data) + mess_len > maxlength (io_data) then do; /* will it fit */
+      387 LONG_RECORD:	a_code = error_table_$long_record;
+      388 		return;
+      389 	     end;
+      390 	     io_data = io_data || remaining_message;	/* first part of record is all this remaining message */
+      391 	     call get_next_message (msgp, code);	/* rest of record should be in next message */
+      392 	     if code ^= 0 then goto READ_RETURN;
+      393 	     mess_p = addr (g115_message.text (1));	/* define the new remaining message string */
+      394 	     mess_len = g115_message.text_char_count;	/* continuation of record has no media code */
+      395 	     idx = index (remaining_message, G115.RS);	/* look for the record separator */
+      396 	     if length (io_data) + idx > maxlength (io_data) then go to LONG_RECORD;
+      397 	end;
+      398 	io_data = io_data || substr (remaining_message, 1, idx - 1); /* last of record text less separator (G115.RS) */
+      399 
+      400 	g115_message.last_char_read = g115_message.last_char_read + idx; /* record the last char that was used */
+      401 	g115_message.rec_count = g115_message.rec_count - 1; /* decrement input count in message */
+      402 
+      403 /* The text_data can contain compressed data of the form:
+      404*
+      405*   <repeat_char><G115.CC><count_char>
+      406*
+      407*   Where:
+      408*
+      409*   *	repeat_char	is the actual character that appears 3 to 64 times in a row.
+      410*   *	G115.CC		is the compression code - 037 octal.
+      411*
+      412*   *	count_char	is an ASCII char, the equivalent 6-bit BCD value of which is the fixed bin
+      413*   *			representation of the number of times the repeat char is repeated AFTER the first occurance.
+      414*   *			(i.e. count_char "[" represents the number 10, thus 11 repeat_chars should appear
+      415*   *			in the output data after de-compression.)
+      416**/
+      417 
+      418 	temp_buffer = "";				/* get ready to rebuild the data in the temporary */
+      419 	idx = 1;					/* start looking from the first char in the record */
+      420 	CC_index = index (io_data, G115.CC);		/* look for a compression code (CC) */
+      421 	do while (CC_index > 0);			/* loop de-compressing record */
+      422 	     temp_buffer = temp_buffer || substr (io_data, idx, CC_index - 1); /* copy all up to compression code */
+      423 	     test_char = substr (io_data, idx + CC_index - 2, 1); /* pick up repeated char (before CC) */
+      424 	     idx = idx + CC_index + 1;		/* move index to next unprocessed char */
+      425 	     count_char = substr (io_data, idx - 1, 1);	/* this represents number of repeates */
+      426 	     rep_count = index (bcd_equiv_overlay, count_char); /* convert to fixed bin */
+      427 	     temp_buffer = temp_buffer || copy (test_char, rep_count);
+      428 	     CC_index = index (substr (io_data, idx), G115.CC); /* look for next compression code */
+      429 	end;
+      430 	temp_buffer = temp_buffer || substr (io_data, idx); /* copy remainder of input */
+      431 
+      432 /* do any escape and/or translation processing */
+      433 
+      434 	call convert_string_$input (temp_buffer, addr (g115_attach_data.ttt_info), io_data, code);
+      435 	if code ^= 0 then go to READ_RETURN;
+      436 
+      437 	if io_data = "++EOF" | io_data = "++eof" then
+      438 	     code = error_table_$eof_record;		/* set end-of-file code */
+      439 
+      440 	record_len = length (io_data);
+      441 	if nelem < record_len then do;		/* not enough room to return all */
+      442 	     code = error_table_$data_loss;		/* give warning */
+      443 	     record_len = nelem;
+      444 	end;
+      445 	substr (bufp -> data_string, 1, record_len) = substr (io_data, 1, record_len); /* give data to caller */
+      446 	a_nelemt = record_len;
+      447 
+      448 READ_RETURN:
+      449 
+      450 	a_code = code;
+      451 
+      452 	return;
+      453 
+      454 
+      455 get_next_message: proc (msgp, code);
+      456 
+      457 dcl  msgp ptr;
+      458 dcl  code fixed bin (35);
+      459 
+      460 	     code = 0;
+      461 
+      462 /*	see if there is a chain of messages already */
+      463 
+      464 follow_chain:  if msgp -> g115_message.next_bp = null then	/* must read a message from Ring 0 */
+      465 		call g115_io_$read (device_data_p, msgp, code);
+      466 
+      467 	     else do;				/* chain of input blocks exist, go to the next one */
+      468 		g115_device_data.first_bp = g115_message.next_bp;
+      469 		free msgp -> g115_message in (buffer_area);
+      470 		msgp = g115_device_data.first_bp;
+      471 		if msgp -> g115_message.rec_count = 0 then go to follow_chain; /* if empty, try again */
+      472 	     end;
+      473 
+      474 	     return;
+      475 
+      476 	end get_next_message;
+      477 
+      478 
+      479 
+      480 
+      481      end g115_protocol_$write;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    02/14/80  1738.1  g115_protocol_.pl1                >special_ldd>online>spec0214>g115_protocol_.pl1
+98           1    02/07/80  0930.1  g115_device_data.incl.pl1         >ldd>include>g115_device_data.incl.pl1
+100          2    02/07/80  0930.1  g115_message.incl.pl1             >ldd>include>g115_message.incl.pl1
+102          3    02/07/80  0930.1  G115.incl.pl1                     >ldd>include>G115.incl.pl1
+104          4    02/07/80  0930.1  g115_attach_data.incl.pl1         >ldd>include>g115_attach_data.incl.pl1
+106          5    08/03/78  2021.0  remote_ttt_info.incl.pl1          >ldd>include>remote_ttt_info.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+CC                        4(18) 000000 constant        char(1)                  initial level 3 packed unaligned dcl 3-8 ref 237 420
+                                                                                  428
+CC_index                        000651 automatic       fixed bin(17,0)          dcl 45 set ref 420* 421 422 423 424 428*
+G115                            000000 constant        structure                level 1 dcl 3-8
+RS                        4(09) 000000 constant        char(1)                  initial level 3 packed unaligned dcl 3-8 ref 250 252
+                                                                                  384 395
+a_adp                                  parameter       pointer                  dcl 26 ref 10 135 330 344
+a_bufp                                 parameter       pointer                  dcl 28 ref 10 138 330 346
+a_code                                 parameter       fixed bin(17,0)          dcl 31 set ref 10 134* 144* 149* 299* 330 343* 350*
+                                                                                  387* 448*
+a_ddp                                  parameter       pointer                  dcl 27 ref 10 136 330 345
+a_nelem                                parameter       fixed bin(17,0)          dcl 29 ref 10 137 330 347
+a_nelemt                               parameter       fixed bin(17,0)          dcl 30 set ref 330 343* 446*
+addr                                                   builtin function         dcl 72 ref 201 215 215 265 278 378 393 434 434
+adp                             001142 automatic       pointer                  initial dcl 4-7 set ref 135* 140 179 192 199 215 215
+                                                                                  223 250 250 252 255 293 344* 434 434 4-7*
+based_record                           based           char                     unaligned dcl 63 set ref 266* 279*
+bcd_count                       001117 automatic       fixed bin(17,0)          dcl 49 set ref 202* 206
+bcd_equiv                              defined         char(1)                  array unaligned dcl 91 ref 208 236
+bcd_equiv_overlay                      defined         char(63)                 unaligned dcl 93 ref 426
+bcd_equiv_string                000006 constant        char(64)                 initial unaligned dcl 88 ref 208 208 236 236 426 426
+bcd_input_mc                    000000 constant        char(1)                  initial level 3 packed unaligned dcl 3-8 ref 371
+being_changed             5            based           bit(1)                   level 2 dcl 2-15 set ref 166 171* 264* 269* 277*
+                                                                                  282* 318 324*
+binary_record                   000104 automatic       bit(960)                 dcl 38 set ref 141 200* 201
+buffer_area                            based           area(262144)             dcl 1-43 ref 157 469
+buffer_areap             52            based           pointer                  level 2 dcl 1-11 ref 157 469
+bufp                            000100 automatic       pointer                  dcl 34 set ref 138* 193 200 201* 208 212 346* 445
+char_codes                3     000000 constant        structure                level 2 packed unaligned dcl 3-8
+cleanup                         001130 stack reference condition                dcl 95 ref 162 305
+code                                   parameter       fixed bin(35,0)          dcl 314 in procedure "send_message_block" set ref
+                                                                                  312 316* 319* 320
+code                            000103 automatic       fixed bin(35,0)          dcl 36 in procedure "g115_protocol_$write" set ref
+                                                                                  134* 184* 185 215* 216 273* 274 293* 295* 297* 299
+                                                                                  343* 356* 357 374* 391* 392 434* 435 437* 442* 448
+code                                   parameter       fixed bin(35,0)          dcl 458 in procedure "get_next_message" set ref 455
+                                                                                  460* 464*
+control                  32(09)        based           bit(9)                   level 3 packed unaligned dcl 1-11 ref 179
+control_bits             30            based           structure                level 2 dcl 1-11
+convert_string_$input           000010 constant        entry                    external dcl 67 ref 434
+convert_string_$output          000012 constant        entry                    external dcl 68 ref 215
+copy                                                   builtin function         dcl 72 ref 427
+count_char                      001121 automatic       char(1)                  unaligned dcl 51 set ref 236* 237 425* 426
+data                     32            based           bit(9)                   level 3 packed unaligned dcl 1-11 ref 180
+data_bit_string                        based           bit                      unaligned dcl 61 ref 200
+data_string                            based           char                     unaligned dcl 59 set ref 193 212 445*
+device_data_p                   001136 automatic       pointer                  initial dcl 1-9 set ref 136* 148 148 153 153 154 155
+                                                                                  157 157 158 159 179 180 223 263 303 303 345* 354
+                                                                                  1-9* 166 174 174 319* 464* 468 469 470
+device_type             153            based           fixed bin(17,0)          level 2 dcl 4-9 ref 179 192 223 250 255 293
+divide                                                 builtin function         dcl 72 ref 202
+error_table_$data_loss          000032 external static fixed bin(35,0)          dcl 74 ref 442
+error_table_$eof_record         000020 external static fixed bin(35,0)          dcl 74 ref 437
+error_table_$improper_data_format
+                                000026 external static fixed bin(35,0)          dcl 74 ref 374
+error_table_$long_record        000030 external static fixed bin(35,0)          dcl 74 ref 144 387
+error_table_$no_operation       000024 external static fixed bin(35,0)          dcl 74 ref 350
+error_table_$too_many_buffers   000022 external static fixed bin(35,0)          dcl 74 ref 149
+etx                                    based           bit(9)                   level 3 packed unaligned dcl 2-15 set ref 265 268*
+                                                                                  278 281*
+etx_char                  3(09) 000000 constant        bit(9)                   initial level 3 packed unaligned dcl 3-8 ref 268 281
+first_bp                 54            based           pointer                  level 2 dcl 1-11 set ref 354 468* 470
+fmt_code                  6(09)        based           bit(9)                   level 3 in structure "g115_message" packed unaligned
+                                                                                  dcl 2-15 in procedure "g115_protocol_$write" set
+                                                                                  ref 170* 182 188*
+fmt_code                 32            based           structure                level 2 in structure "g115_device_data" dcl 1-11
+                                                                                  in procedure "g115_protocol_$write"
+format_code                     000140 automatic       bit(9)                   unaligned dcl 40 set ref 179* 180* 182 188
+g115_attach_data                       based           structure                level 1 dcl 4-9
+g115_device_data                       based           structure                level 1 dcl 1-11
+g115_io_$read                   000016 constant        entry                    external dcl 70 ref 464
+g115_io_$write                  000014 constant        entry                    external dcl 69 ref 319
+g115_message                           based           structure                level 1 dcl 2-15 set ref 157 159* 159 469
+g115_msg_block            6            based           structure                level 2 dcl 2-15
+idx                             000650 automatic       fixed bin(17,0)          dcl 44 set ref 206* 208* 226* 227 228 229 231 241
+                                                                                  244* 244 384* 385 395* 396 398 400 419* 422 423
+                                                                                  424* 424 425 428 430
+index                                                  builtin function         dcl 72 ref 194 384 395 420 426 428
+io_data                         000142 automatic       varying char(646)        dcl 42 set ref 143 205* 208* 208 215* 218* 224 225*
+                                                                                  237* 237 241* 241 250 252 383* 386 386 390* 390
+                                                                                  396 396 398* 398 420 422 423 425 428 430 434* 437
+                                                                                  437 440 445
+io_record                       000405 automatic       varying char(648)        dcl 43 set ref 250* 252* 253 266 270* 270 271 279
+last_char_read            4            based           fixed bin(17,0)          level 2 dcl 2-15 set ref 369 378 379 381* 381 400*
+                                                                                  400
+legal_slew_chars                000026 constant        char(19)                 initial unaligned dcl 82 ref 194
+length                                                 builtin function         dcl 72 ref 141 213 227 231 253 271 386 396 440
+level                    62            based           fixed bin(17,0)          level 2 in structure "g115_device_data" dcl 1-11
+                                                                                  in procedure "g115_protocol_$write" set ref 148
+                                                                                  153* 153 154 166 174* 174 303* 303
+level                           000137 automatic       fixed bin(17,0)          dcl 39 in procedure "g115_protocol_$write" set ref
+                                                                                  154* 155 157 158 295
+max_msg_len               5     000000 constant        fixed bin(17,0)          initial level 2 dcl 3-8 ref 255 260
+maxlength                                              builtin function         dcl 72 ref 143 386 396
+media_code               30            based           char(1)                  level 2 packed unaligned dcl 4-9 ref 140 199 250 252
+media_codes                     000000 constant        structure                level 2 packed unaligned dcl 3-8
+mess_len                        001124 automatic       fixed bin(17,0)          dcl 54 set ref 379* 384 386 390 394* 395 398
+mess_p                          001122 automatic       pointer                  dcl 53 set ref 378* 384 390 393* 395 398
+msgp                            001140 automatic       pointer                  initial dcl 2-13 in procedure "g115_protocol_$write"
+                                                                                  set ref 155* 156 158* 159 182 182 188 260 264 265
+                                                                                  267 267 268 269 277 278 280 280 281 282 297 354*
+                                                                                  355 356* 362 369 369 372 373 378 378 379 379 381
+                                                                                  381 391* 393 394 400 400 401 401 2-13* 166 168 169
+                                                                                  170 171 318 319* 323 324 468
+msgp                                   parameter       pointer                  dcl 457 in procedure "get_next_message" set ref 455
+                                                                                  464 464* 469 470* 471
+nelem                           000102 automatic       fixed bin(17,0)          dcl 35 set ref 137* 141 143 193 193 196* 196 200 202
+                                                                                  212 347* 349 441 443 445
+next_bp                                based           pointer                  level 2 dcl 2-15 set ref 464 468
+null                                                   builtin function         dcl 72 ref 156 1-9 2-13 4-7 464
+outp                     64            based           pointer                  array level 2 dcl 1-11 set ref 148 155 157* 158
+printer                                constant        fixed bin(17,0)          initial dcl 4-25 ref 192 250
+punch_bin_mc              1     000000 constant        char(1)                  initial level 3 packed unaligned dcl 3-8 ref 140 199
+rec_count                 3            based           fixed bin(17,0)          level 2 dcl 2-15 set ref 169* 355 362 373* 401* 401
+                                                                                  471
+rec_p                           001126 automatic       pointer                  dcl 65 set ref 265* 266 278* 279
+record_len                      001125 automatic       fixed bin(17,0)          dcl 64 set ref 253* 255 262 266 271* 279 280 440*
+                                                                                  441 443* 445 445 446
+remaining_message                      based           char                     unaligned dcl 55 ref 384 390 395 398
+remote_ttt_info                        based           structure                level 1 dcl 5-6
+rep_count                       001116 automatic       fixed bin(17,0)          dcl 48 set ref 229* 231 231* 234 235 235* 236 241
+                                                                                  244 426* 427
+six_bit_number                         based           fixed bin(6,0)           array unsigned unaligned dcl 57 ref 208
+slew_char                       000141 automatic       char(1)                  unaligned dcl 41 set ref 193* 194 194* 250
+space_left                      001120 automatic       fixed bin(17,0)          dcl 50 set ref 260* 262 266 266 267 270
+substr                                                 builtin function         dcl 72 set ref 193 228 229 241 266* 266 270 398 422
+                                                                                  423 425 428 430 445* 445
+teleprinter                            constant        fixed bin(17,0)          initial dcl 4-26 ref 179 223 255 293
+temp_buffer                     000652 automatic       varying char(648)        dcl 46 set ref 212* 213 215* 224* 227 228 229 231
+                                                                                  241 418* 422* 422 427* 427 430* 430 434*
+template_ptr             60            based           pointer                  level 2 dcl 1-11 ref 159
+test_char                       001115 automatic       char(1)                  unaligned dcl 47 set ref 228* 229 237 369* 371 423*
+                                                                                  427
+text                      7(27)        based           char(1)                  array level 3 packed unaligned dcl 2-15 set ref 369
+                                                                                  378 393
+text_char_count           2            based           fixed bin(17,0)          level 2 dcl 2-15 set ref 157* 159 168* 182 260 265
+                                                                                  267* 267 268 278 280* 280 281 297 323* 372* 379
+                                                                                  394 469
+ttt_info                               based           structure                level 2 dcl 4-9 set ref 215 215 434 434
+write_compress           30(02)        based           bit(1)                   level 3 packed unaligned dcl 1-11 ref 223
+write_split              30(01)        based           bit(1)                   level 3 packed unaligned dcl 1-11 ref 263
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+punch                                  internal static fixed bin(17,0)          initial dcl 4-27
+reader                                 internal static fixed bin(17,0)          initial dcl 4-24
+rttp                                   automatic       pointer                  dcl 5-3
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+LONG_RECORD                     001221 constant        label                    dcl 387 ref 396
+NO_ROOM                         000126 constant        label                    dcl 144 ref 141 255
+READ_RETURN                     001544 constant        label                    dcl 448 ref 357 375 392 435
+WRITE_RETURN                    001057 constant        label                    dcl 299 ref 185 216 274
+follow_chain                    001604 constant        label                    dcl 464 ref 471
+g115_protocol_$write            000064 constant        entry                    external dcl 10
+get_next_message                001601 constant        entry                    internal dcl 455 ref 356 391
+read                            001074 constant        entry                    external dcl 330
+send_message_block              001547 constant        entry                    internal dcl 312 ref 184 273 293 295 297
+
+NAMES DECLARED BY CONTEXT OR IMPLICATION.
+hbound                                                 builtin function         ref 148
+verify                                                 builtin function         ref 229
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      2050        2104    1667        2060
+Length      2400    1667        34         260     160           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+g115_protocol_$write                668 external procedure  is an external procedure.  
+on unit on line 162                  64 on unit               
+send_message_block                      internal procedure  shares stack frame of external procedure g115_protocol_$write.  
+get_next_message                        internal procedure  shares stack frame of external procedure g115_protocol_$write.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+g115_protocol_$write     000100 bufp                        g115_protocol_$write
+                         000102 nelem                       g115_protocol_$write
+                         000103 code                        g115_protocol_$write
+                         000104 binary_record               g115_protocol_$write
+                         000137 level                       g115_protocol_$write
+                         000140 format_code                 g115_protocol_$write
+                         000141 slew_char                   g115_protocol_$write
+                         000142 io_data                     g115_protocol_$write
+                         000405 io_record                   g115_protocol_$write
+                         000650 idx                         g115_protocol_$write
+                         000651 CC_index                    g115_protocol_$write
+                         000652 temp_buffer                 g115_protocol_$write
+                         001115 test_char                   g115_protocol_$write
+                         001116 rep_count                   g115_protocol_$write
+                         001117 bcd_count                   g115_protocol_$write
+                         001120 space_left                  g115_protocol_$write
+                         001121 count_char                  g115_protocol_$write
+                         001122 mess_p                      g115_protocol_$write
+                         001124 mess_len                    g115_protocol_$write
+                         001125 record_len                  g115_protocol_$write
+                         001126 rec_p                       g115_protocol_$write
+                         001136 device_data_p               g115_protocol_$write
+                         001140 msgp                        g115_protocol_$write
+                         001142 adp                         g115_protocol_$write
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+alloc_cs            cat_realloc_cs      call_ext_out_desc   call_ext_out        return              enable
+shorten_stack       ext_entry           int_entry           repeat              set_cs_eis          verify_eis
+alloc_based         free_based
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+convert_string_$input         convert_string_$output        g115_io_$read                 g115_io_$write
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$data_loss        error_table_$eof_record       error_table_$improper_data_format
+error_table_$long_record      error_table_$no_operation     error_table_$too_many_buffers
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+ 1    9 000051    2   13 000053    4    7 000054        10 000057       134 000075       135 000077       136 000103
+    137 000106       138 000110       140 000113       141 000117       142 000122       143 000123       144 000126
+    145 000131       148 000132       149 000135       150 000140       153 000141       154 000142       155 000144
+    156 000147       157 000154       158 000171       159 000172       162 000206       166 000222       168 000232
+    169 000233       170 000234       171 000236       174 000237       175 000242       179 000243       180 000255
+    182 000261       184 000271       185 000273       188 000275       192 000301       193 000305       194 000313
+    196 000326       199 000330       200 000334       201 000341       202 000343       205 000347       206 000350
+    208 000356       209 000375       210 000377       212 000400       213 000411       215 000413       216 000442
+    217 000444       218 000445       223 000446       224 000456       225 000463       226 000464       227 000466
+    228 000471       229 000475       231 000512       234 000520       235 000522       236 000526       237 000532
+    238 000575       241 000577       244 000612       245 000614       250 000615       252 000664       253 000717
+    255 000722       260 000730       262 000734       263 000736       264 000742       265 000744       266 000752
+    267 000756       268 000760       269 000766       270 000767       271 001000       273 001002       274 001004
+    277 001006       278 001011       279 001017       280 001024       281 001026       282 001034       293 001035
+    295 001044       297 001052       299 001057       303 001061       305 001064       307 001065       330 001066
+    343 001105       344 001111       345 001114       346 001117       347 001122       349 001124       350 001126
+    351 001131       354 001132       355 001134       356 001137       357 001141       362 001143       369 001150
+    371 001155       372 001161       373 001162       374 001163       375 001166       378 001167       379 001173
+    381 001177       383 001200       384 001201       385 001212       386 001214       387 001221       388 001224
+    390 001225       391 001240       392 001242       393 001244       394 001251       395 001253       396 001264
+    397 001267       398 001270       400 001305       401 001310       418 001312       419 001313       420 001315
+    421 001327       422 001331       423 001346       424 001354       425 001360       426 001364       427 001375
+    428 001415       429 001435       430 001436       434 001457       435 001506       437 001510       440 001525
+    441 001527       442 001531       443 001534       445 001536       446 001542       448 001544       452 001546
+    312 001547       316 001551       318 001552       319 001555       320 001571       323 001575       324 001577
+    326 001600       455 001601       460 001603       464 001604       468 001626       469 001632       470 001645
+    471 001651       474 001653
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

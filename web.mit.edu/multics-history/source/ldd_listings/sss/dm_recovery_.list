@@ -1,0 +1,1330 @@
+	COMPILATION LISTING OF SEGMENT dm_recovery_
+	Compiled by: Multics PL/I Compiler, Release 28e, of February 14, 1985
+	Compiled at: Honeywell Multics Op. - System M
+	Compiled on: 04/04/85  0931.9 mst Thu
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *						 *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        4*   *						 *
+        5*   *********************************************************** */
+        6 
+        7 /*  DESCRIPTION:
+        8*
+        9*	This is the program that does all crash recovery work.  It looks at
+       10*     the configuration file for bootload indicators and has two main parts:
+       11*     check to see if recovery is necessary or can be done at all, and the
+       12*     actual rollback of uncompleted transactions.  This program should only
+       13*     be called by dm_initializer_ from within the DM Daemon at initialization
+       14*     time for a particular AIM level.
+       15*
+       16*	The first is responsible for making sure there is a previous set of
+       17*     DM tables to possibly recover from.  Any of three things missing can make
+       18*     recovery impossible: the previous per-bootload directory is missing, the
+       19*     file manager's UID to pathname table is missing, or the before journal
+       20*     manager's UID to pathname table is missing.  If we find a dm_system_data_
+       21*     in the old directory with the normal shutdown indicator set properly,
+       22*     recovery need not be done and we return.
+       23*
+       24*	The rollback after crash is the second part of recovery.  It opens
+       25*     the before journals recorded in the old bootload BJM UID-pathname table,
+       26*     finds the ends of these journals, and creates a list of transactions
+       27*     that have not been committed or aborted.  These transactions are then
+       28*     rolled back using the normal methods with some minor modifications of
+       29*     the Daemon adoption/abandon scheme.  If any before journal or
+       30*     synchronized file cannot be found, an error is registered in the Data
+       31*     Management log.  Any errors found during recovery will be logged in the
+       32*     above log using dm_misc_util_$log, but this program and its subordinates
+       33*     will not print the error on the console.  If dm_recovery_ finds a fatal
+       34*     error, or if non-fatal recovery errors are not allowed (expected to be 
+       35*     the normal case), sub_err_ will be called at the end of all work to abort
+       36*     further DMS initialization.  This keeps msgs. for the System administrator
+       37*     from confusing the operator.
+       38*
+       39*/* DESCRIPTION CONTINUED NEXT PAGE */
+       40 
+       41 /* DESCRIPTION CONTINUED FROM PREVIOUS PAGE */
+       42 /*
+       43*
+       44*	Note that two changes will have to be made to this recovery
+       45*     procedure when some parts of DM are implemented that are not being done
+       46*     now.  The first is before journal and after journal phasing.  The other
+       47*     is multi-phase commits, which are only partially handled currently.
+       48**/
+       49 
+       50 /*  HISTORY:
+       51*
+       52*Written by Lee A. Newcomb, 11/01/82.
+       53*Modified:
+       54*01/13/83 by L. A. Newcomb: add call to file_manager_$end_of_crash_recovery.
+       55*03/01/83 by L. A. Newcomb: to use dm_log_sv_codes include and fix up
+       56*	  the program to reference correctly the modified bj_txt structure.
+       57*03/27/83 by L. A. Newcomb: log how many journals were opened for
+       58*	  crash recovery.  Should be a temp. mod.
+       59*03/29/83 by L. A. Newcomb: correct a typo in a log msg., report when some BJ's
+       60*	  could not be opened for recovery, and how many were opened.
+       61*04/07/83 by L. A. Newcomb:  added call to bjm_$close_bj_after_recovery if an
+       62*            error occurred recovering the txns in a journal so it cannot be
+       63*            used.
+       64*05/18/83 by Lindsey L. Spratt:  Changed to use version 3 of the TDT.
+       65*06/07/83 by L. A. Newcomb:  fixed to handle all recovery tasks and use the
+       66*	  configuration file for deciding if we do recovery, what to do with
+       67*	  the old bootload dir, and whether or not to die on non-fatal
+       68*	  recovery errors.
+       69*06/13/83 by L. A. Newcomb:  fixed problem where old bootload directories from
+       70*            the same Multics bootload would cause holding of the current
+       71*            recovered dir.  to fail.
+       72*08/14/83 by L. A. Newcomb:  fixed some calls to dm_log_ to be information type
+       73*            instead of error type.
+       74*10/07/83 by L. A. Newcomb:  to terminate old file_manager_ UID to pathname
+       75*	  table reference before deleting old bootload directory.
+       76*03/05/84 by L. A. Newcomb:  To use the include file dm_system_states (renamed
+       77*            from dm_statuses) and the new names therein.
+       78*05/29/84 by Lindsey L. Spratt:  Changed to use version 2 of dm_system_config,
+       79*            added a version check via CHECK_VERSION.
+       80*11/22/84 by Lee A. Newcomb:  Changed to use dm_misc_util_$get_aim_dir.
+       81*12/07/84 by R. Michael Tague:  Changed dm_util_$* to dm_misc_util_$*.
+       82*02/20/85 by Lee A. Newcomb:  Fixed to reset the validation level before
+       83*            returning, and to not lose an error from tm_$recovery_after_crash
+       84*            when deciding to increment n_bjs_completely_recovered.  Also
+       85*            changed to init automatic vars.
+       86*02/26/85 by Lee A. Newcomb:  Fixed to understand
+       87*            dm_error_$too_many_bootload_dirs is a fatal error.
+       88*03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+       89*03/18/85 by Steve Herbst: Fixed format of "ENTERING" log message.
+       90**/
+       91 /* format:  style4,indattr,ifthenstmt,ifthen,idind33,^indcomtxt */
+       92 
+       93 dm_recovery_: proc ();
+       94 
+       95 /* START OF DECLARATIONS */
+       96 
+       97 /* Parameter */
+       98 
+       99 /* Automatic */
+      100 dcl  (
+      101      aim_dir		        char (168) init (""),
+      102      bj_oid_p		        ptr init (null),	/* location of vector of bj_oid's */
+      103      bj_uid_p		        ptr init (null),	/* location of vector of bj_uid's */
+      104      check_mode		        bit (1) aligned init (""b), /* how extensivly examine BJ's? */
+      105      code			        fixed bin (35) init (0), /* normal error code */
+      106      do_not_force_enable	        bit (1) aligned init (""b), /* def: die no fatal errors */
+      107      idx			        fixed bin init (0),	/* loop index */
+      108      n_bjs_completely_recovered       fixed bin init (0),	/* how many BJ's were recovered with no errors */
+      109      n_bjs_opened_for_recovery        fixed bin init (0),	/* how many BJ's could be opened for crash recovery */
+      110      n_hold_dirs		        fixed bin init (0),	/* how many old bootload dirs exist */
+      111      no_recovery_needed	        bit (1) aligned init (""b), /* def: recover unless told otherwise */
+      112      old_bj_txt_p		        ptr init (null),
+      113      old_boot_dir		        char (168) init (""), /* last dm_dir.BOOTLOAD dir in DM_AIM_dir */
+      114      old_boot_dir_name	        char (32) init (""),	/* entryname of old_boot_dir for deleting */
+      115      old_dm_status		        char (4) aligned init (""), /* state of last bootload instance */
+      116      old_tm_tdt_p		        ptr init (null),
+      117      saved_dm_state		        char (4) aligned init (""),
+      118      saved_level		        fixed bin init (-1)	/* validation level at entry */
+      119      )			        automatic;
+      120 
+      121 /* Based */
+      122 dcl  (						/* temp. vectors for recovery */
+      123      bj_oid		        based (bj_oid_p),
+      124      bj_uid		        based (bj_uid_p)
+      125      )			        bit (36) aligned dim (1:n_bjs_opened_for_recovery);
+      126 
+      127 /* Builtin */
+      128 dcl
+      129      (char, null, ltrim,
+      130      rtrim, unspec)		        builtin;
+      131 
+      132 /* Condition */
+      133 dcl  cleanup		        condition;
+      134 
+      135 /* Constant */
+      136 dcl
+      137      MYNAME		        char (12) init ("dm_recovery_")
+      138 			        internal static options (constant);
+      139 						/* Entry */
+      140 dcl  (
+      141      before_journal_manager_$close_bj entry (bit (36) aligned, fixed bin (35)),
+      142      before_journal_manager_$close_bj_after_recovery
+      143 			        entry (bit (36) aligned, fixed bin (35)),
+      144      before_journal_manager_$find_txns_after_crash
+      145 			        entry (ptr, ptr, bit (36) aligned, bit (1) aligned, fixed bin (35)),
+      146      before_journal_manager_$open_all_after_crash
+      147 			        entry (char (*), ptr, ptr, fixed bin, fixed bin (35)),
+      148      cu_$level_get		        entry (fixed bin),
+      149      cu_$level_set		        entry (fixed bin),
+      150      delete_$path		        entry (char (*), char (*), bit (6), char (*), fixed bin (35)),
+      151      dm_find_configuration_	        entry () returns (ptr),
+      152      dm_misc_util_$log	        entry options (variable),
+      153      dm_misc_util_$get_aim_dir        entry (char (*)),
+      154      dm_misc_util_$dm_status	        entry (char (*), char (4) aligned, fixed bin (35)),
+      155      dm_misc_util_$find_old_boot_dir  entry (char (*), char (*), fixed bin (35)),
+      156      expand_pathname_	        entry (char (*), char (*), char (*), fixed bin (35)),
+      157      file_manager_$end_of_crash_recovery
+      158 			        entry (fixed bin (35)),
+      159      file_manager_$find_old_uid_pn_table
+      160 			        entry (char (*), fixed bin (35)),
+      161      get_ring_		        entry () returns (fixed bin (3)),
+      162      get_temp_segment_	        entry (char (*), ptr, fixed bin (35)),
+      163      hcs_$chname_file	        entry (char (*), char (*), char (*), char (*), fixed bin (35)),
+      164      hcs_$star_		        entry (char (*), char (*), fixed bin (2), ptr, fixed bin, ptr, ptr, fixed bin (35)),
+      165      release_temp_segment_	        entry (char (*), ptr, fixed bin (35)),
+      166      sub_err_		        entry () options (variable),
+      167      transaction_manager_$recover_after_crash
+      168 			        entry (ptr, ptr, fixed bin (35))
+      169      )			        external;
+      170 
+      171 /* External */
+      172 dcl  (
+      173      dm_error_$bj_not_all_opened_after_crash fixed bin (35),
+      174      dm_error_$partial_recovery       fixed bin (35),
+      175      dm_error_$too_many_bootload_dirs fixed bin (35),
+      176      dm_system_data_$current_dm_state char (4) aligned,
+      177      error_table_$nomatch	        fixed bin (35),
+      178      error_table_$unimplemented_version fixed bin (35)
+      179      )			        external static;
+      180 
+      181 /* Static */
+      182 
+      183 /* END OF DECLARATIONS */
+      184 
+      185 SET_LEVEL_AND_CLEANUP_HANDLER:
+      186 	do;
+      187 
+      188 	     call cu_$level_get (saved_level);
+      189 
+      190 	     on cleanup begin;
+      191 		call CLEAN_UP ("0"b /* we are unwinding, don't call sub_err_ */);
+      192 		call cu_$level_set (saved_level);
+      193 	     end;
+      194 
+      195 	     call cu_$level_set (get_ring_ ());
+      196 
+      197 	end SET_LEVEL_AND_CLEANUP_HANDLER;
+      198 
+      199 FIND_CONFIG_FILE:
+      200 	dm_system_config_ptr = dm_find_configuration_ ();
+      201 
+      202 	call CHECK_VERSION (dm_system_config.version, DM_CONFIG_VERSION_2, "dm_system_config");
+      203 
+      204 	call dm_misc_util_$log (LOG_SV, "ENTERING system crash recovery code.");
+      205 
+      206 FIND_DIRS_AND_SET_INDICATORS:
+      207 	do;
+      208 
+      209 	     call dm_misc_util_$get_aim_dir (aim_dir);
+      210 
+      211 	     saved_dm_state = dm_system_data_$current_dm_state; /* save state for reset if success */
+      212 	     dm_system_data_$current_dm_state = DM_SYSTEM_STATE_RECOVERING;
+      213 
+      214 /* must we die on "non-fatal" recovery errors? */
+      215 	     do_not_force_enable = (dm_system_config.curr_dm_enable = DM_DO_NOT_FORCE_ENABLE_NEW_BOOTLOAD);
+      216 
+      217 /* how extensive before journal examination? */
+      218 	     check_mode = (dm_system_config.recovery_check_mode = DM_RECOVERY_CHECK_MODE_ON);
+      219 
+      220 	end FIND_DIRS_AND_SET_INDICATORS;
+      221 
+      222 FIND_OLD_BOOTLOAD_TO_RECOVER:
+      223 	do;
+      224 
+      225 	     call dm_misc_util_$find_old_boot_dir (aim_dir, old_boot_dir, code);
+      226 	     if code = dm_error_$too_many_bootload_dirs then /* fatal error */
+      227 		call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null, 0, "Per-AIM directory is ^a.", aim_dir);
+      228 	     else if code ^= 0 then do;
+      229 		call dm_misc_util_$log (LOG_SV, code, MYNAME,
+      230 		     "No old bootload directory to recover in ^a.", aim_dir);
+      231 						/* EXTRA CODE MUST BE ADDED HERE TO */
+      232 						/* DETECT LOST BOOTLOADS IF RECOVERY ENABLED */
+      233 		go to RESET_DM_STATE;
+      234 	     end;
+      235 	     else
+      236 CHECK_IF_TO_IGNORE_RECOVERY:
+      237 		if dm_system_config.recover = DM_DO_NOT_RECOVER_OLD_BOOTLOAD then do;
+      238 		call dm_misc_util_$log (LOG_SV,
+      239 		     "WARNING: recovery has been disabled by administrator; will not recover ^a.",
+      240 		     rtrim (old_boot_dir));
+      241 		no_recovery_needed = "1"b;
+      242 		go to RECOVERY_CLEANUP_CHORES;	/* we still must do this part */
+      243 	     end;
+      244 	     else call dm_misc_util_$log (LOG_SV, "^5xDirectory to recover:^2x^a.", rtrim (old_boot_dir));
+      245 
+      246 	     call dm_misc_util_$dm_status (old_boot_dir, old_dm_status, code);
+      247 	     if code = 0 then			/* have a good dm_system_data_ left */
+      248 		if old_dm_status = DM_SYSTEM_STATE_NORMAL_SHUTDOWN then do; /* nothing to recover */
+      249 		     call dm_misc_util_$log (LOG_SV, "No recovery required, no errors in previous DMS shutdown.");
+      250 		     no_recovery_needed = "1"b;
+      251 		     go to RECOVERY_CLEANUP_CHORES;
+      252 		end;
+      253 
+      254 	end FIND_OLD_BOOTLOAD_TO_RECOVER;		/* ok, we need to do recovery */
+      255 
+      256 GET_FM_UID_PATHNAME_TABLE:
+      257 
+      258 	call file_manager_$find_old_uid_pn_table (old_boot_dir, code);
+      259 	if code ^= 0 then do;
+      260 	     call dm_misc_util_$log (LOG_SV, code, MYNAME, "No old file manager pathname-UID table.");
+      261 	     call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+      262 		"No old file manager path-UID table to use for recovery in ^a.", old_boot_dir);
+      263 	end;
+      264 
+      265 GET_TEMP_STORAGE:
+      266 	do;
+      267 
+      268 	     call get_temp_segment_ (MYNAME, bj_oid_p, code);
+      269 	     if code ^= 0 then
+      270 		call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+      271 		     "Unable to get temp. storage for BJ OID's.");
+      272 
+      273 	     call get_temp_segment_ (MYNAME, bj_uid_p, code);
+      274 	     if code ^= 0 then
+      275 		call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+      276 		     "Unable to get temp. storage for BJ UID's.");
+      277 
+      278 	     call get_temp_segment_ (MYNAME, old_bj_txt_p, code);
+      279 	     if code ^= 0 then
+      280 		call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+      281 		     "Unable to get temp. storage for txn list building.");
+      282 
+      283 	     call get_temp_segment_ (MYNAME, old_tm_tdt_p, code);
+      284 	     if code ^= 0 then
+      285 		call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+      286 		     "Unable to get temp. storage for txn list building.");
+      287 
+      288 
+      289 	end GET_TEMP_STORAGE;
+      290 
+      291 FIND_JOURNALS_TO_RECOVER:
+      292 	do;
+      293 
+      294 /* Now find the before journals to be used in recovery. */
+      295 /*     We initialize the cell n_bjs_completely_recovered which will be used */
+      296 /*     to detect partial or complete recovery.  Every time we recovery using */
+      297 /*     a journal with no errors, we add one to this cell.  If a code of one */
+      298 /*     is returned from the call to open the BJ's, we set the cell to -1 so */
+      299 /*     we will always see partial recovery. */
+      300 
+      301 	     call before_journal_manager_$open_all_after_crash (old_boot_dir,
+      302 		bj_oid_p, bj_uid_p, n_bjs_opened_for_recovery, code);
+      303 
+      304 	     if code = dm_error_$bj_not_all_opened_after_crash then do; /* some BJ's could not be opened */
+      305 		n_bjs_completely_recovered = -1;	/* make sure we report partial recovery */
+      306 		call dm_misc_util_$log (LOG_SV, code, MYNAME);
+      307 	     end;
+      308 	     else if code ^= 0 then			/* FATAL -> could not open any BJ's */
+      309 		call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0, /* consider it a fatal recovery error */
+      310 		     "Unable to open before journals open at crash time.");
+      311 
+      312 	     call dm_misc_util_$log (LOG_SV, "Number of journals opened for crash recovery = ^d.", n_bjs_opened_for_recovery);
+      313 
+      314 	end FIND_JOURNALS_TO_RECOVER;
+      315 
+      316 /***** IF CONTROL GETS HERE, WE HAVE TO DO CRASH RECOVERY *****/
+      317 
+      318 RECOVER_EACH_JOURNAL_LOOP:
+      319 	do idx = 1 to n_bjs_opened_for_recovery;
+      320 
+      321 /* step:  create a temporary transaction list of the old txns not finished */
+      322 /*     at crash time, initially empty.  This currently consists of two */
+      323 /*     temporary segments corresponding to the transaction and before */
+      324 /*     journal managers' transaction tables.  These tables must be */
+      325 /*     logically empty before processing each before journal. */
+      326 
+      327 	     old_tm_tdt_p -> tm_tdt.entry_count = 0;
+      328 	     unspec (old_tm_tdt_p -> tm_tdt) = ""b;
+      329 	     old_tm_tdt_p -> tm_tdt.version = TM_TDT_VERSION_3;
+      330 	     old_bj_txt_p -> bj_txt.version = BJ_TXT_VERSION_1;
+      331 	     old_bj_txt_p -> bj_txt.n_entries_used,
+      332 		old_bj_txt_p -> bj_txt.max_n_entries = 0;
+      333 	     old_bj_txt_p -> bj_txt.pad_entry_to_32_words = ""b;
+      334 
+      335 /* step:  find unfinished transactions in the BJ and add them to the */
+      336 /*     temporary transaction table(s) for processing later */
+      337 
+      338 	     call before_journal_manager_$find_txns_after_crash (
+      339 		old_tm_tdt_p, old_bj_txt_p, bj_oid (idx), check_mode, code);
+      340 	     if code ^= 0 then do;
+      341 		call dm_misc_util_$log (LOG_SV, code, MYNAME,
+      342 		     "Unable to list unfinished txns. in BJ, OID = ^o.", bj_oid (idx));
+      343 		go to SKIP_BEFORE_JOURNAL;
+      344 	     end;
+      345 	     old_bj_txt_p -> bj_txt.entry.bj_uid = bj_uid (idx); /* must patch in for rollback */
+      346 
+      347 /* step:  pass the temp. tables to transaction_manager_ to finish any */
+      348 /*     processing needed on the txns found. */
+      349 
+      350 	     call transaction_manager_$recover_after_crash (
+      351 		old_tm_tdt_p, old_bj_txt_p, code);	/* code checked in next step */
+      352 
+      353 /* step:  we may now close the journal.  This will be done normally if no */
+      354 /*     errors occurred in recovering the txns in the journal.  Otherwise, */
+      355 /*     we note the journal had unrecoverable txns for later observation. */
+      356 
+      357 SKIP_BEFORE_JOURNAL:
+      358 	     if code = 0 then do;
+      359 		call before_journal_manager_$close_bj (bj_oid (idx), code);
+      360 						/* no errors at all, record for partial vs. */
+      361 						/* complete recovery
+      362*decision */
+      363 		if code = 0 then
+      364 		     n_bjs_completely_recovered = n_bjs_completely_recovered + 1;
+      365 	     end;
+      366 	     else call before_journal_manager_$close_bj_after_recovery (bj_oid (idx), code);
+      367 	     if code ^= 0 then			/* oh, well... */
+      368 		call dm_misc_util_$log (LOG_SV, code, MYNAME, "Unable to close BJ, OID ^o.", bj_oid (idx));
+      369 
+      370 	end RECOVER_EACH_JOURNAL_LOOP;
+      371 
+      372 RECOVERY_CLEANUP_CHORES:				/* we always come here except when we die */
+      373 
+      374 REPORT_JOURNALS_NOT_RECOVERED:
+      375 	if ^no_recovery_needed then do;		/* did try recovery */
+      376 	     if n_bjs_completely_recovered ^= n_bjs_opened_for_recovery then
+      377 		if do_not_force_enable then		/* must die here */
+      378 		     call sub_err_ (dm_error_$partial_recovery, MYNAME, ACTION_CANT_RESTART, null (), 0,
+      379 			"Trying to recover ^a.", old_boot_dir);
+      380 		else call dm_misc_util_$log (LOG_SV, dm_error_$partial_recovery, MYNAME,
+      381 			"Trying to recover ^a.", old_boot_dir);
+      382 	end;
+      383 
+      384 FILE_MANAGER_CLEANUP_CHORE:
+      385 	if ^no_recovery_needed then do;		/* file_mamanger_ knows some things */
+      386 	     call file_manager_$end_of_crash_recovery (code);
+      387 	     if code ^= 0 then
+      388 		call dm_misc_util_$log (LOG_SV, code, MYNAME,
+      389 		     "Unable to terminate file_manager_'s ref. to old bootload tables.");
+      390 	end;
+      391 
+      392 OLD_BOOTLOAD_DIR_DISPOSITION:
+      393 	do;
+      394 
+      395 	     call expand_pathname_ (old_boot_dir, (aim_dir), old_boot_dir_name, code);
+      396 	     if code ^= 0 then			/* fatal? */
+      397 		if do_not_force_enable then		/*  yes */
+      398 		     call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+      399 			"Could not expand old bootload dir pathname ^a.", old_boot_dir);
+      400 		else call dm_misc_util_$log (LOG_SV, code, MYNAME,
+      401 			"Could not expand old bootload dir pathname ^a.", old_boot_dir);
+      402 
+      403 	     if dm_system_config.hold = DM_HOLD_OLD_BOOTLOAD_DIRECTORY then do;
+      404 						/* do any .hold.*'s already exist? */
+      405 		call hcs_$star_ (aim_dir, rtrim (old_boot_dir_name) || ".hold.*", star_BRANCHES_ONLY,
+      406 		     null (), n_hold_dirs, (null ()), (null ()), code);
+      407 		if code ^= 0 & code ^= error_table_$nomatch then
+      408 		     if do_not_force_enable then
+      409 			call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+      410 			     "Cannot find out the current # of .hold.* direcotries in ^a.", aim_dir);
+      411 		     else call dm_misc_util_$log (LOG_SV, code, MYNAME,
+      412 			     "Cannot find out the current # of .hold.* directories in ^a.", aim_dir);
+      413 
+      414 		else do;				/* get hold tag and rename */
+      415 		     call hcs_$chname_file (aim_dir, old_boot_dir_name, old_boot_dir_name,
+      416 			rtrim (old_boot_dir_name) || ".hold." || ltrim (rtrim (char (n_hold_dirs + 1))), code);
+      417 		     if code ^= 0 then		/* see if we can allow this */
+      418 			if do_not_force_enable then
+      419 			     call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+      420 				"Cannot rename old bootload directory ^a.", old_boot_dir);
+      421 			else call dm_misc_util_$log (LOG_SV, code, MYNAME,
+      422 				"Cannot rename old bootload directory ^a.", old_boot_dir);
+      423 		end;
+      424 	     end;
+      425 	     else do;				/* must delete */
+      426 		call delete_$path (aim_dir, old_boot_dir_name, "101000"b, MYNAME, code);
+      427 		if code ^= 0 then			/* fatal? */
+      428 		     if do_not_force_enable then	/*  yes */
+      429 			call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+      430 			     "Could not delete old bootload direcotry ^a.", old_boot_dir);
+      431 		     else call dm_misc_util_$log (LOG_SV, code, MYNAME,
+      432 			     "Could not delete old bootload direcotry ^a.", old_boot_dir);
+      433 	     end;
+      434 
+      435 	     if no_recovery_needed then
+      436 		go to RESET_DM_STATE;
+      437 
+      438 	end OLD_BOOTLOAD_DIR_DISPOSITION;
+      439 
+      440 NORMAL_TERMINATION_CLEANUP:
+      441 
+      442 	call CLEAN_UP ("1"b /* report clean_up errors */);
+      443 	call cu_$level_set (saved_level);
+      444 
+      445 RESET_DM_STATE:
+      446 	dm_system_data_$current_dm_state = saved_dm_state;
+      447 
+      448 	call dm_misc_util_$log (LOG_SV, "FINISHED recovery^[ of ^a^].",
+      449 	     (old_boot_dir ^= ""), old_boot_dir);
+      450 
+      451 	return;
+      452 
+      453 CLEAN_UP:
+      454      proc (report_error_sw);
+      455 
+      456 /* This procedure releases the temporary segments acquired for recovery.   */
+      457 /* If report_error_sw is on, it means that the call is after a successful  */
+      458 /* recovery (or at least one where non-fatal errors are allowed).  Any     */
+      459 /* error in this program when the parameter switch is on is considered a   */
+      460 /* fatal recovery error. */
+      461 
+      462 dcl
+      463      report_error_sw	        bit (1) aligned
+      464 			        parameter;
+      465 
+      466 dcl
+      467      cleanup_code		        fixed bin (35)
+      468 			        automatic;
+      469 
+      470 	if bj_oid_p ^= null () then do;
+      471 	     call release_temp_segment_ (MYNAME, bj_oid_p, cleanup_code);
+      472 	     if cleanup_code ^= 0 then
+      473 		if report_error_sw then
+      474 		     call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+      475 			"Unable to release temp. storage for BJ OID's.");
+      476 	end;
+      477 
+      478 	if bj_uid_p ^= null () then do;
+      479 	     call release_temp_segment_ (MYNAME, bj_uid_p, cleanup_code);
+      480 	     if cleanup_code ^= 0 then
+      481 		if report_error_sw then
+      482 		     call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+      483 			"Unable to release temp. storage for BJ UID's.");
+      484 	end;
+      485 
+      486 	if old_tm_tdt_p ^= null () then do;
+      487 	     call release_temp_segment_ (MYNAME, old_tm_tdt_p, cleanup_code);
+      488 	     if cleanup_code ^= 0 then
+      489 		if report_error_sw then
+      490 		     call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+      491 			"Unable to release temp. txn. lists.");
+      492 	end;
+      493 
+      494 	if old_bj_txt_p ^= null () then do;
+      495 	     call release_temp_segment_ (MYNAME, old_bj_txt_p, cleanup_code);
+      496 	     if cleanup_code ^= 0 then
+      497 		if report_error_sw then
+      498 		     call sub_err_ (code, MYNAME, ACTION_CANT_RESTART, null (), 0,
+      499 			"Unable to release temp. txn. lists.");
+      500 	end;
+      501 
+      502      end CLEAN_UP;
+      503 
+      504 CHECK_VERSION:
+      505      proc (cv_p_received_version, cv_p_expected_version, cv_p_structure_name);
+      506 
+      507 dcl  cv_p_received_version	        char (8) aligned;
+      508 dcl  cv_p_expected_version	        char (8) aligned;
+      509 dcl  cv_p_structure_name	        char (*);
+      510 
+      511 	if cv_p_received_version ^= cv_p_expected_version
+      512 	     then call
+      513 		sub_err_ (error_table_$unimplemented_version, MYNAME, ACTION_CANT_RESTART, null, 0,
+      514 		"^/Expected version ^d of the ^a structure.
+      515 Received version ^d, instead.", cv_p_expected_version, cv_p_structure_name, cv_p_received_version);
+      516 
+      517      end CHECK_VERSION;
+      518 
+  1     1 /* BEGIN INCLUDE FILE:	dm_bj_txt.incl.pl1	*/
+  1     2 /* 
+  1     3*dm_bj_txt - before journal per-system transaction table.
+  1     4*
+  1     5*Designed by A. Bensoussan
+  1     6*Written  by M. Pandolf 06/02/82
+  1     7*Modified:
+  1     8*10/01/82 by Lee A. Newcomb:  To use dm_system_data_ for dimension attributes
+  1     9*	  and specify alignment on level one.
+  1    10*08feb83  by M. Pandolf:      To restructure the TXT and TXTE.
+  1    11*30mar83  by M. Pandolf:      To add last_completed_operation and ok_to_write.
+  1    12**/
+  1    13 /* format: style4,indattr,idind33,^indcomtxt */
+  1    14 
+  1    15 dcl  BJ_TXT_VERSION_1	        fixed bin int static options (constant) init (1);
+  1    16 
+  1    17 dcl  bj_txt_ptr		        ptr;		/* pointer to transaction table */
+  1    18 dcl  bj_txte_ptr		        ptr;		/* pointer to transaction table element */
+  1    19 
+  1    20 dcl  1 bj_txt		        aligned based (bj_txt_ptr), /* transaction table */
+  1    21        2 version		        fixed bin,		/* should be BJ_TXT_VERSION_1 */
+  1    22        2 max_n_entries	        fixed bin,
+  1    23        2 n_entries_used	        fixed bin,		/* assumed contiguous */
+  1    24        2 pad_header_to_32_words       bit (36) dim (29),	/* to mod32 align bj_txt.entry */
+  1    25        2 entry		        dim (dm_system_data_$max_n_transactions refer (bj_txt.max_n_entries))
+  1    26 			        like bj_txte;
+  1    27 
+  1    28 dcl  1 bj_txte		        based (bj_txte_ptr) aligned, /* single entry, must be mod32 word aligned */
+  1    29        2 tid		        bit (36),		/* transaction id if this or last txn */
+  1    30        2 bj_uid		        bit (36),		/* UID of before journal chosen at begin mark */
+  1    31        2 entry_state aligned,
+  1    32          3 last_completed_operation   char (4),		/* to prevent multiple abort and commit */
+  1    33          3 ok_to_write                bit (1),		/* basically validates using this entry */
+  1    34        2 owner_info aligned,				/* info about creation of txte */
+  1    35          3 process_id	        bit (36),		/* of process that wrote begin mark */
+  1    36        2 operator_info aligned,			/* of process that is currently using this txte */
+  1    37          3 process_id	        bit (36),		/* of process that shall write subsequent marks */
+  1    38          3 ppte_ptr		        ptr,		/* pointer to PPTE for this transaction */
+  1    39          3 bj_oid		        bit (36),		/* before journal opening ID for operator */
+  1    40        2 records_info aligned,			/* grouped to be saved and restored as one unit */
+  1    41          3 curr_checkpoint_rec_id     bit (36),		/* ident of checkpoint record if doing a rollback, */
+  1    42 						/* else, this value must be zero. */
+  1    43          3 first_bj_rec_id	        bit (36),		/* ident of first mark for this transaction */
+  1    44          3 last_bj_rec_id	        bit (36),		/* ident of current mark for this transaction */
+  1    45          3 n_rec_written	        fixed bin (35),	/* count of marks written for this transaction */
+  1    46          3 n_bytes_written	        fixed bin (35),	/* count of total bytes written to journal */
+  1    47          3 last_fm_postcommit_handler_rec_id
+  1    48 			        bit (36),		/* ident of last special handler in list */
+  1    49        2 append_state aligned,			/* the first two members define the state of this */
+  1    50          3 current_operation	        char (4),		/* transaction and its interaction with bj_storage: */
+  1    51          3 pending_bj_rec_id	        bit (36),		/* operation  rec_id  state */
+  1    52 						/*   *null*    XXX    quiesed */
+  1    53 						/*   ^null     "0"b   write pending */
+  1    54 						/*   ^null     ^"0"b  write completed, needs flushing */
+  1    55 						/* */
+  1    56          3 pending_n_rec_written      fixed bin (35),	/* copy to n_rec_written before flush */
+  1    57          3 pending_n_bytes_written    fixed bin (35),	/* copy to n_bytes_written before flush */
+  1    58        2 pad_entry_to_32_words        bit (36) dim (13);	/* make any part of table 32 words long */
+  1    59 
+  1    60 /* END INCLUDE FILE:	dm_bj_txt_ptr	*/
+      519 
+      520 
+  2     1 /*  START OF:	dm_tm_tdt.incl.pl1		*/
+  2     2 
+  2     3 /* Transaction Definition Table for transaction_manager_ */
+  2     4 /* This structure is used to reference the TDT. The process_id field for the
+  2     5*   i'th TDT entry, for example, is usually referenced as tm_tdt.process_id (i).
+  2     6*   A TDT entry is in use by a process when its process_id field is nonzero.
+  2     7*   An entry is reserved by using the stacq builtin to set process_id, if and
+  2     8*   only if it is already zero. The entry is being used for a transaction when
+  2     9*   tm_tdt.txn_id (i) is nonzero. The possible values of tm_tdt.state (i) are
+  2    10*   listed in dm_tm_states.incl.pl1. If state = 0, no operation has been
+  2    11*   performed yet on the transaction. */
+  2    12 
+  2    13 
+  2    14 /* HISTORY:
+  2    15*Designed by Matt Pierret, 01/26/82.
+  2    16*Coded by Steve Herbst, 07/27/82.
+  2    17*Modified:
+  2    18*08/05/82 by Steve Herbst: Added tm_tdt.operation and padded last_uid to full word.
+  2    19*08/05/82 by Steve Herbst: Changed creator_process_id to bit (36).
+  2    20*08/16/82 by Steve Herbst: Added contents of dm_tm_tdt_entry.incl.pl1.
+  2    21*09/09/82 by Steve Herbst: Removed in_use flag from TDT entry and rearranged fields.
+  2    22*09/20/82 by Steve Herbst: Removed tm_tdt.operation.
+  2    23*11/01/82 by Steve Herbst: Added event_channel and error_sw to tm_tdt_entry.
+  2    24*11/05/82 by Steve Herbst: Added suspended_sw and error_code to tm_tdt_entry.
+  2    25*11/11/82 by Steve Herbst: Deleted tm_tdt_entry.alloc_complete.
+  2    26*11/23/82 by Steve Herbst: Compacted, changed some numbers to unsigned.
+  2    27*12/14/82 by Steve Herbst: Added tm_tdt_entry.daemon_error_sw.
+  2    28*01/11/83 by Steve Herbst: Added owner_name, abandoned_sw & kill_sw to tm_tdt_entry.
+  2    29*01/24/83 by Steve Herbst: Replaced daemon_error_sw with daemon_adjust_count.
+  2    30*01/25/83 by Steve Herbst: Moved abandoned_sw from transaction portion to entry header portion.
+  2    31*05/13/83 by Steve Herbst: Version 3, changed all fixed bin (18) unal uns numbers to fixed bin (17) unaligned.
+  2    32*05/26/83 by Steve Herbst: Added rollback_count and checkpoint_id.
+  2    33**/
+  2    34 
+  2    35 dcl	tm_tdt_ptr	ptr;
+  2    36 dcl	tdt_max_count	fixed bin;
+  2    37 
+  2    38 dcl TM_TDT_VERSION_3 char (8) int static options (constant) init ("TM-TDT 3");
+  2    39 
+  2    40 
+  2    41 dcl  1	tm_tdt		aligned based (tm_tdt_ptr),
+  2    42       2	version char (8),				/* = "TM-TDT 3" */
+  2    43       2	lock fixed bin (71),			/* (currently not used) */
+  2    44       2	last_uid		bit (27) aligned,		/* last transaction uid assigned */
+  2    45       2	flags,
+  2    46        3	no_begins		bit (1) unaligned,		/* ON => only priv process can begin transaction */
+  2    47        3	mbz1		bit (35) unaligned,
+  2    48       2	entry_count	fixed bin,		/* number of slots allocated */
+  2    49       2	mbz2		fixed bin,		/* for even word boundary */
+  2    50       2	entry  (tdt_max_count refer (tm_tdt.entry_count))
+  2    51 			like tm_tdt_entry;
+  2    52 
+  2    53 
+  2    54 
+  2    55 /* TDT entries: */
+  2    56 
+  2    57 dcl	tm_tdt_entry_ptr	ptr;
+  2    58 
+  2    59 dcl  1	tm_tdt_entry	aligned based (tm_tdt_entry_ptr),
+  2    60       2	event_channel	fixed bin (71),		/* for communication with the process */
+  2    61       2	process_id	bit (36) aligned,		/* process for which this entry is reserved */
+  2    62       2	owner_name	char (32),		/* person.project of owner process */
+  2    63       2	entry_flags,
+  2    64        3	abandoned_sw	bit (1) unaligned,		/* ON => owner has called tm_$abandon on this entry */
+  2    65        3	mbz3		bit (35) unaligned,
+  2    66       2	transaction	unaligned,
+  2    67        3	txn_id		bit (36) aligned,		/* unique identifier assigned at begin time */
+  2    68        3	date_time_created	fixed bin (71) aligned,
+  2    69        3	mode		fixed bin (17) unaligned,	/* mode specified with transaction begin */
+  2    70        3	state		fixed bin (17) unaligned,	/* state transaction is currently in */
+  2    71        3  error_code	fixed bin (35) aligned,	/* goes along with error_sw and error state */
+  2    72        3 	checkpoint_id	fixed bin (17) unaligned,	/* identifier of the current rollback checkpoint */
+  2    73        3	rollback_count	fixed bin (17) unaligned,	/* number of times bjm_$rollback has been called */
+  2    74        3	daemon_adjust_count	fixed bin (17) unaligned,	/* number of times daemon has tried to adjust since user */
+  2    75        3	return_idx	fixed bin (17) unaligned,	/* parent transaction, or zero */
+  2    76        3	flags,
+  2    77         4 dead_process_sw	bit (1) unaligned,		/* ON => treat process as dead even if it isn't yet */
+  2    78         4 suspended_sw	bit (1) unaligned,		/* ON => suspended by tm_$suspend_txn */
+  2    79         4 error_sw		bit (1) unaligned,		/* ON => state is one of the error states */
+  2    80         4 kill_sw		bit (1) unaligned,		/* ON => being processed by tm_$kill */
+  2    81         4	mbz4		bit (29) unaligned,
+  2    82        3	post_commit_flags,
+  2    83         4 (fmgr,
+  2    84 	 bjmgr,
+  2    85 	 ajmgr)	 	 bit (1) unaligned,
+  2    86        3	mbz4		fixed bin;
+  2    87 
+  2    88 
+  2    89 /*  END OF:	dm_tm_tdt.incl.pl1		*/
+      521 
+      522 
+  3     1 /* BEGIN INCLUDE FILE dm_system_config.incl.pl1 */
+  3     2 
+  3     3 /* format: style4,indattr,ifthenstmt,ifthen,^indcomtxt,idind33 */
+  3     4 
+  3     5 /* DESCRIPTION:
+  3     6*	This is the structure of the data in a Data Management configuration
+  3     7*     file.  The configuration data is used during Data Management per-system
+  3     8*     initialization to override hardcoded default in dm_system_data_ and
+  3     9*     give the disposition of old bootloads.  This table is created at runtime
+  3    10*     via a call to dm_translate_system_config_ subroutine.
+  3    11*
+  3    12*	NOTE:  only the data in the dm_system_config_info structure is used
+  3    13*     to generate the checksum; the dm_system_config structure is used to
+  3    14*     overlay the segment containing the configuration data, including the
+  3    15*     lock and checksum cells.
+  3    16**/
+  3    17 /* HISTORY:
+  3    18*Written by M. Pandolf, 12/06/82.
+  3    19*Modified:
+  3    20*03/14/83 by M. Pandolf: for single AIM class structure and more items.
+  3    21*03/28/83 by M. Pandolf: for default default_bj and log_terms.
+  3    22*05/04/83 by L. A. Newcomb:  Added new element, recovery_check_mode, and
+  3    23*	  changed the version and most character values to "char (8)"'s for
+  3    24*	  ease of use.  A string of 8 blanks is no longer a valid value for
+  3    25*	  any of the char strings.
+  3    26*06/09/83 by L. A. Newcomb:  moved lock to just before checksum so we can
+  3    27*	  correctly determine checksum without the lock in the way.
+  3    28*05/29/84 by Lindsey L. Spratt:  Changed to version 2.  Removed various cells
+  3    29*            which are not used; first_boot, trace_stack_mode, max_n_bj and
+  3    30*            subsystem_disposition (to enable/disable bjm, tm or lm).
+  3    31*06/12/84 by Lindsey L. Spratt:  Added the shutdown_delay cell.
+  3    32**/
+  3    33 
+  3    34 dcl  dm_system_config_ptr	        pointer;
+  3    35 
+  3    36 dcl  1 dm_system_config	        aligned based (dm_system_config_ptr),
+  3    37        2 information	        like dm_system_config_info,
+  3    38 						/* NEXT MUST NOT BE IN CHECKSUM VALUE */
+  3    39        2 lock		        bit (36) aligned,	/* to prevent installations during initialization */
+  3    40        2 checksum		        fixed bin (35);	/* for error detection */
+  3    41 
+  3    42 dcl  1 dm_system_config_info	        aligned based (dm_system_config_ptr),
+  3    43        2 version		        char (8) aligned,	/* = DM_CONFIG_VERSION_2 */
+  3    44        2 idle_timeout	        fixed bin,		/* max time daemon will remain idle before wakeup */
+  3    45        2 shutdown_delay	        fixed bin (71),	/* Default time offset from issuing shutdown warning to forcing user shutdown */
+  3    46        2 log_proc_terms	        bit (1) aligned,	/* true if process terminations to be logged */
+  3    47        2 max_n_txn		        fixed bin,		/* found in the data segment */
+  3    48        2 max_n_proc		        fixed bin,		/* dm_system_data_ */
+  3    49        2 default_bj_size	        fixed bin,		/* size of before journal made by daemon */
+  3    50        2 default_bj		        aligned,
+  3    51          3 dir		        char (168),		/* dir containing default before journal */
+  3    52          3 entry		        char (32),		/* entryname of default before journal */
+  3    53        2 prev_dm_disp	        aligned,		/* what to do with old botload */
+  3    54          3 adopt		        char (8),		/* DM_ADOPT_OLD_BOOTLOAD | DM_DO_NOT_ADOPT_OLD_BOOTLOAD */
+  3    55          3 hold		        char (8),		/* DM_HOLD_OLD_BOOTLOAD_DIRECTORY | */
+  3    56 						/*   DM_DO_NOT_HOLD_OLD_BOOTLOAD_DIRECTORY */
+  3    57          3 recover		        char (8),		/* DM_RECOVER_OLD_BOOTLOAD | */
+  3    58 						/*   DM_DO_NOT_RECOVER_OLD_BOOTLOAD */
+  3    59          3 recovery_check_mode        char (8),		/* DM_RECOVERY_CHECK_MODE_ON | DM_RECOVERY_CHECK_MODE_OFF */
+  3    60        2 curr_dm_enable	        char (8);		/* DM_FORCE_ENABLE_NEW_BOOTLOAD | */
+  3    61 						/*   DM_DO_NOT_FORCE_ENABLE_NEW_BOOTLOAD */
+  3    62 
+  3    63 dcl  (						/* all the "char (8) aligned" constants */
+  3    64      DM_CONFIG_VERSION_2	        init ("dmcnfg_2"),
+  3    65 
+  3    66      DM_ADOPT_OLD_BOOTLOAD	        init ("adopt"),
+  3    67      DM_DO_NOT_ADOPT_OLD_BOOTLOAD     init ("no_adopt"),
+  3    68 
+  3    69      DM_FORCE_ENABLE_NEW_BOOTLOAD     init ("fc_enabl"),
+  3    70      DM_DO_NOT_FORCE_ENABLE_NEW_BOOTLOAD init ("no_enabl"),
+  3    71 
+  3    72      DM_HOLD_OLD_BOOTLOAD_DIRECTORY   init ("hold"),
+  3    73      DM_DO_NOT_HOLD_OLD_BOOTLOAD_DIRECTORY init ("no_hold"),
+  3    74 
+  3    75      DM_RECOVER_OLD_BOOTLOAD	        init ("do_recov"),
+  3    76      DM_DO_NOT_RECOVER_OLD_BOOTLOAD   init ("no_recov"),
+  3    77 
+  3    78      DM_RECOVERY_CHECK_MODE_ON        init ("rcvck_on"),
+  3    79      DM_RECOVERY_CHECK_MODE_OFF       init ("rcvck_of")
+  3    80 
+  3    81      )			        char (8) aligned internal static options (constant);
+  3    82 
+  3    83 /* END INCLUDE FILE dm_system_config.incl.pl1 */
+      523 
+      524 
+  4     1 /* BEGIN INCLUDE FILE - dm_system_states.incl.pl1 */
+  4     2 
+  4     3 /* DESCRIPTION:
+  4     4*
+  4     5*	This include file gives all defined values that
+  4     6*     dm_system_data_$current_dm_state may have.
+  4     7**/
+  4     8 
+  4     9 /* HISTORY:
+  4    10*Written by Lee A. Newcomb, CISL, 11/04/82
+  4    11*Modified:
+  4    12*03/02/84 by Lee A. Newcomb:  added DM_SYSTEM_STATE_SHUTDOWN_WARNING and
+  4    13*	  DM_SYSTEM_STATE_USER_SHUTDOWN; also renamed from dm_statuses to
+  4    14*	  dm_system_states.incl.pl1.
+  4    15*04/06/84 by Lindsey Spratt:  Added DM_SYSTEM_STATE_SYSTEM_SHUTDOWN.
+  4    16*09/05/84 by Lee A. Newcomb:  renamed DM_SYSTEM_STATE_SHUTDOWN_WARNING do
+  4    17*            ...SHUTDOWN_BEGUN and ...SYSTEM_SHUTDOWN to
+  4    18*            ...SHUTDOWN_BUMP_USERS; deleted ...USER_SHUTDOWN.
+  4    19**/
+  4    20 /* format:  style2,^inddcls,linecom,ifthendo,ifthen,^indnoniterdo,dclind5,idind35 */
+  4    21 
+  4    22 dcl  (						/* valid statuses of data management */
+  4    23 						/* ordered to expected sequence of use */
+  4    24      DM_SYSTEM_STATE_UNDEFINED	init ("undf"),	/* found in a template dm_system_data_ */
+  4    25      DM_SYSTEM_STATE_INITIALIZING	init ("init"),
+  4    26      DM_SYSTEM_STATE_RECOVERING	init ("rcov"),
+  4    27      DM_SYSTEM_STATE_RUNNING		init ("run "),
+  4    28      DM_SYSTEM_STATE_SHUTDOWN_BEGUN	init ("sbgn"),
+  4    29      DM_SYSTEM_STATE_SHUTDOWN_BUMP_USERS
+  4    30 				init ("sbmp"),
+  4    31      DM_SYSTEM_STATE_NORMAL_SHUTDOWN	init ("shut")
+  4    32      )				char (4) aligned int static options (constant);
+  4    33 
+  4    34 /* END INCLUDE FILE - dm_system_states.incl.pl1 */
+      525 
+      526 
+  5     1 /* BEGIN INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+  5     2 
+  5     3 /* format: ^indcom */
+  5     4 
+  5     5 /* DESCRIPTION:
+  5     6*   These are the severity codes used by the dms daemon when calling its logger.
+  5     7*   The severity is ranked thusly:
+  5     8*
+  5     9*   severity log write situation
+  5    10*   -------- --- ----- ---------
+  5    11*          0 no  yes   standard output, query, etc.
+  5    12*          1 yes yes   fatal error, terminate dms daemon.
+  5    13*          2 yes yes   nonfatal error.
+  5    14*          3 yes yes   informative message.
+  5    15*          4 yes no    log information only.
+  5    16**/
+  5    17 
+  5    18 /* HISTORY:
+  5    19*
+  5    20*Written by M. Pandolf, 10/06/82.
+  5    21*Modified:
+  5    22*12/10/84 by R. Michael Tague: Rename and reformat description/history.
+  5    23*01/13/85 by Lee A. Newcomb:  Renamed to dm_log_sv_codes from
+  5    24*            dm_daemon_sv_codes as the severity codes for the DM log are not
+  5    25*            restrained to the DM Daemon's use.
+  5    26*01/24/85 by Lee A. Newcomb:  Fixed to say dm_log_sv_codes.incl.pl1 in the
+  5    27*            BEGIN and END INCLUDE comments, instead of dm_daemon_sv_codes.==.
+  5    28**/
+  5    29 
+  5    30 /* format: style5 */
+  5    31 
+  5    32      dcl	   (PRINT_SV, QUERY_SV)    fixed bin internal static
+  5    33 			       options (constant) init (0);
+  5    34      dcl	   (CRASH_SV, FATAL_SV)    fixed bin internal static
+  5    35 			       options (constant) init (1);
+  5    36      dcl	   ERROR_SV	       fixed bin internal static
+  5    37 			       options (constant) init (2);
+  5    38      dcl	   INFORM_SV	       fixed bin internal static
+  5    39 			       options (constant) init (3);
+  5    40      dcl	   LOG_SV		       fixed bin internal static
+  5    41 			       options (constant) init (4);
+  5    42 
+  5    43 /* END INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+      527 
+      528 
+  6     1 /* BEGIN INCLUDE FILE . . . star_structures.incl.pl1 */
+  6     2 
+  6     3 /* This include file contains structures for the hcs_$star_,
+  6     4*   hcs_$star_list_ and hcs_$star_dir_list_ entry points.
+  6     5*
+  6     6*   Written 23 October 1978 by Monte Davidoff.
+  6     7*   Modified January 1979 by Michael R. Jordan to use unsigned and different pointers for different structures.
+  6     8*   Modified June 1981 by C. Hornig to count link pathnames more efficiently.
+  6     9**/
+  6    10 
+  6    11 /* automatic */
+  6    12 
+  6    13 declare  star_branch_count fixed binary;		/* hcs_$star_list_, hcs_$star_dir_list_: matching branch count */
+  6    14 declare  star_entry_count fixed binary;			/* hcs_$star_: number of matching entries */
+  6    15 declare  star_entry_ptr pointer;			/* hcs_$star_: pointer to array of entry information */
+  6    16 declare  star_list_branch_ptr pointer;			/* hcs_$star_list_, hcs_$star_dir_list_: ptr to array of info */
+  6    17 declare  star_link_count fixed binary;			/* hcs_$star_list_, hcs_$star_dir_list_: matching link count */
+  6    18 declare  star_linkx fixed binary;			/* hcs_$star_list_, hcs_$star_dir_list_: index into star_links */
+  6    19 declare  star_names_ptr pointer;			/* hcs_$star_: pointer to array of entry names */
+  6    20 declare  star_list_names_ptr pointer;			/* hcs_$star_list_, hcs_$star_dir_list_: ptr to entry names */
+  6    21 declare  star_select_sw fixed binary (3);		/* hcs_$star_list_, hcs_$star_dir_list_: what info to return */
+  6    22 
+  6    23 /* based */
+  6    24 
+  6    25 /* hcs_$star_ entry structure */
+  6    26 
+  6    27 declare 1 star_entries (star_entry_count) aligned based (star_entry_ptr),
+  6    28         2 type fixed binary (2) unsigned unaligned,
+  6    29 						/* storage system type */
+  6    30         2 nnames fixed binary (16) unsigned unaligned,
+  6    31 						/* number of names of entry that match star_name */
+  6    32         2 nindex fixed binary (18) unsigned unaligned;
+  6    33 						/* index of first name in star_names */
+  6    34 
+  6    35 /* hcs_$star_ name structure */
+  6    36 
+  6    37 declare  star_names (sum (star_entries (*).nnames)) char (32) based (star_names_ptr);
+  6    38 
+  6    39 /* hcs_$star_list_ branch structure */
+  6    40 
+  6    41 declare 1 star_list_branch (star_branch_count + star_link_count) aligned based (star_list_branch_ptr),
+  6    42         2 type fixed binary (2) unsigned unaligned,
+  6    43 						/* storage system type */
+  6    44         2 nnames fixed binary (16) unsigned unaligned,
+  6    45 						/* number of names of entry that match star_name */
+  6    46         2 nindex fixed binary (18) unsigned unaligned,
+  6    47 						/* index of first name in star_list_names */
+  6    48         2 dtcm bit (36) unaligned,			/* date-time contents of branch were last modified */
+  6    49         2 dtu bit (36) unaligned,			/* date-time branch was last used */
+  6    50         2 mode bit (5) unaligned,			/* user's access mode to the branch */
+  6    51         2 raw_mode bit (5) unaligned,			/* user's ACL access mode */
+  6    52         2 master_dir bit (1) unaligned,			/* is branch a master directory */
+  6    53         2 pad bit (7) unaligned,
+  6    54         2 records fixed binary (18) unsigned unaligned;
+  6    55 						/* records used by branch */
+  6    56 
+  6    57 /* hcs_$star_dir_list_ branch structure */
+  6    58 
+  6    59 declare 1 star_dir_list_branch (star_branch_count + star_link_count) aligned based (star_list_branch_ptr),
+  6    60         2 type fixed binary (2) unsigned unaligned,
+  6    61 						/* storage system type */
+  6    62         2 nnames fixed binary (16) unsigned unaligned,
+  6    63 						/* number of names of entry that match star_name */
+  6    64         2 nindex fixed binary (18) unsigned unaligned,
+  6    65 						/* index of first name in star_list_names */
+  6    66         2 dtem bit (36) unaligned,			/* date-time directory entry of branch was last modified */
+  6    67         2 pad bit (36) unaligned,
+  6    68         2 mode bit (5) unaligned,			/* user's access mode to the branch */
+  6    69         2 raw_mode bit (5) unaligned,			/* user's ACL access mode */
+  6    70         2 master_dir bit (1) unaligned,			/* is branch a master directory */
+  6    71         2 bit_count fixed binary (24) unaligned;
+  6    72 						/* bit count of the branch */
+  6    73 
+  6    74 /* hcs_$star_list_ and hcs_$star_dir_list_ link structure */
+  6    75 
+  6    76 declare 1 star_links (star_branch_count + star_link_count) aligned based (star_list_branch_ptr),
+  6    77         2 type fixed binary (2) unsigned unaligned,
+  6    78 						/* storage system type */
+  6    79         2 nnames fixed binary (16) unsigned unaligned,
+  6    80 						/* number of names of entry that match star_name */
+  6    81         2 nindex fixed binary (18) unsigned unaligned,
+  6    82 						/* index of first name in star_list_names */
+  6    83         2 dtem bit (36) unaligned,			/* date-time link was last modified */
+  6    84         2 dtd bit (36) unaligned,			/* date-time the link was last dumped */
+  6    85         2 pathname_len fixed binary (18) unsigned unaligned,
+  6    86 						/* length of the pathname of the link */
+  6    87         2 pathname_index fixed binary (18) unsigned unaligned;
+  6    88 						/* index of start of pathname in star_list_names */
+  6    89 
+  6    90 /* hcs_$star_list_ and hcs_$star_dir_list_ name array */
+  6    91 
+  6    92 declare  star_list_names char (32) based (star_list_names_ptr)
+  6    93 	dimension (star_links (star_branch_count + star_link_count).nindex
+  6    94 	 + star_links (star_branch_count + star_link_count).nnames
+  6    95 	 + divide (star_links (star_branch_count + star_link_count).pathname_len + 31, 32, 17, 0)
+  6    96 	   * binary (
+  6    97 	     (star_links (star_branch_count + star_link_count).type = star_LINK)
+  6    98 	     & (star_select_sw >= star_LINKS_ONLY_WITH_LINK_PATHS), 1));
+  6    99 
+  6   100 /* hcs_$star_list_ and hcs_$star_dir_list_ link pathname */
+  6   101 
+  6   102 declare  star_link_pathname char (star_links (star_linkx).pathname_len)
+  6   103          based (addr (star_list_names (star_links (star_linkx).pathname_index)));
+  6   104 
+  6   105 /* internal static */
+  6   106 
+  6   107 /* star_select_sw values */
+  6   108 
+  6   109 declare  star_LINKS_ONLY fixed binary (2) internal static options (constant) initial (1);
+  6   110 declare  star_BRANCHES_ONLY fixed binary (2) internal static options (constant) initial (2);
+  6   111 declare  star_ALL_ENTRIES fixed binary (2) internal static options (constant) initial (3);
+  6   112 declare  star_LINKS_ONLY_WITH_LINK_PATHS
+  6   113          fixed binary (3) internal static options (constant) initial (5);
+  6   114 declare  star_ALL_ENTRIES_WITH_LINK_PATHS
+  6   115          fixed binary (3) internal static options (constant) initial (7);
+  6   116 
+  6   117 /* storage system types */
+  6   118 
+  6   119 declare  star_LINK fixed binary (2) unsigned internal static options (constant) initial (0);
+  6   120 declare  star_SEGMENT fixed binary (2) unsigned internal static options (constant) initial (1);
+  6   121 declare  star_DIRECTORY fixed binary (2) unsigned internal static options (constant) initial (2);
+  6   122 
+  6   123 /* END INCLUDE FILE . . . star_structures.incl.pl1 */
+      529 
+      530 
+  7     1 /* BEGIN INCLUDE FILE sub_err_flags.incl.pl1 BIM 11/81 */
+  7     2 /* format: style3 */
+  7     3 
+  7     4 /* These constants are to be used for the flags argument of sub_err_ */
+  7     5 /* They are just "string (condition_info_header.action_flags)" */
+  7     6 
+  7     7 declare	(
+  7     8 	ACTION_CAN_RESTART	init (""b),
+  7     9 	ACTION_CANT_RESTART init ("1"b),
+  7    10 	ACTION_DEFAULT_RESTART
+  7    11 			init ("01"b),
+  7    12 	ACTION_QUIET_RESTART
+  7    13 			init ("001"b),
+  7    14 	ACTION_SUPPORT_SIGNAL
+  7    15 			init ("0001"b)
+  7    16 	)		bit (36) aligned internal static options (constant);
+  7    17 
+  7    18 /* End include file */
+      531 
+      532 
+      533 
+      534      end dm_recovery_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/04/85  0824.6  dm_recovery_.pl1                  >spec>on>7192.pbf-04/04/85>dm_recovery_.pl1
+519          1    01/07/85  0858.0  dm_bj_txt.incl.pl1                >ldd>include>dm_bj_txt.incl.pl1
+521          2    01/07/85  0900.1  dm_tm_tdt.incl.pl1                >ldd>include>dm_tm_tdt.incl.pl1
+523          3    01/07/85  0859.9  dm_system_config.incl.pl1         >ldd>include>dm_system_config.incl.pl1
+525          4    01/07/85  0900.0  dm_system_states.incl.pl1         >ldd>include>dm_system_states.incl.pl1
+527          5    03/06/85  1031.1  dm_log_sv_codes.incl.pl1          >ldd>include>dm_log_sv_codes.incl.pl1
+529          6    06/10/82  1045.5  star_structures.incl.pl1          >ldd>include>star_structures.incl.pl1
+531          7    04/16/82  0958.1  sub_err_flags.incl.pl1            >ldd>include>sub_err_flags.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+ACTION_CANT_RESTART             000053 constant        bit(36)                  initial dcl 7-7 set ref 226* 261* 269* 274* 279*
+                                                                                  284* 308* 376* 396* 407* 417* 427* 472* 480* 488*
+                                                                                  496* 511*
+BJ_TXT_VERSION_1                       constant        fixed bin(17,0)          initial dcl 1-15 ref 330
+DM_CONFIG_VERSION_2             000012 constant        char(8)                  initial dcl 3-63 set ref 202*
+DM_DO_NOT_FORCE_ENABLE_NEW_BOOTLOAD
+                                000010 constant        char(8)                  initial dcl 3-63 ref 215
+DM_DO_NOT_RECOVER_OLD_BOOTLOAD  000004 constant        char(8)                  initial dcl 3-63 ref 235
+DM_HOLD_OLD_BOOTLOAD_DIRECTORY  000006 constant        char(8)                  initial dcl 3-63 ref 403
+DM_RECOVERY_CHECK_MODE_ON       000002 constant        char(8)                  initial dcl 3-63 ref 218
+DM_SYSTEM_STATE_NORMAL_SHUTDOWN 000000 constant        char(4)                  initial dcl 4-22 ref 247
+DM_SYSTEM_STATE_RECOVERING      000001 constant        char(4)                  initial dcl 4-22 ref 212
+LOG_SV                          000071 constant        fixed bin(17,0)          initial dcl 5-40 set ref 204* 229* 238* 244* 249*
+                                                                                  260* 306* 312* 341* 367* 380* 387* 400* 411* 421*
+                                                                                  431* 448*
+MYNAME                          000016 constant        char(12)                 initial unaligned dcl 136 set ref 226* 229* 260*
+                                                                                  261* 268* 269* 273* 274* 278* 279* 283* 284* 306*
+                                                                                  308* 341* 367* 376* 380* 387* 396* 400* 407* 411*
+                                                                                  417* 421* 426* 427* 431* 471* 472* 479* 480* 487*
+                                                                                  488* 495* 496* 511*
+TM_TDT_VERSION_3                000014 constant        char(8)                  initial unaligned dcl 2-38 ref 329
+aim_dir                         000100 automatic       char(168)                initial unaligned dcl 100 set ref 100* 209* 225*
+                                                                                  226* 229* 395 405* 407* 411* 415* 426*
+before_journal_manager_$close_bj
+                                000010 constant        entry                    external dcl 140 ref 359
+before_journal_manager_$close_bj_after_recovery
+                                000012 constant        entry                    external dcl 140 ref 366
+before_journal_manager_$find_txns_after_crash
+                                000014 constant        entry                    external dcl 140 ref 338
+before_journal_manager_$open_all_after_crash
+                                000016 constant        entry                    external dcl 140 ref 301
+bj_oid                                 based           bit(36)                  array dcl 122 set ref 338* 341* 359* 366* 367*
+bj_oid_p                        000152 automatic       pointer                  initial dcl 100 set ref 100* 268* 301* 338 341 359
+                                                                                  366 367 470 471*
+bj_txt                                 based           structure                level 1 dcl 1-20
+bj_txte                                based           structure                level 1 dcl 1-28
+bj_uid                   41            based           bit(36)                  array level 3 in structure "bj_txt" dcl 1-20
+                                                                                  in procedure "dm_recovery_" set ref 345*
+bj_uid                                 based           bit(36)                  array dcl 122 in procedure "dm_recovery_" ref 345
+bj_uid_p                        000154 automatic       pointer                  initial dcl 100 set ref 100* 273* 301* 345 478 479*
+char                                                   builtin function         dcl 128 ref 415
+check_mode                      000156 automatic       bit(1)                   initial dcl 100 set ref 100* 218* 338*
+cleanup                         000260 stack reference condition                dcl 133 ref 190
+cleanup_code                    000100 automatic       fixed bin(35,0)          dcl 466 set ref 471* 472 479* 480 487* 488 495* 496
+code                            000157 automatic       fixed bin(35,0)          initial dcl 100 set ref 100* 225* 226 226* 228 229*
+                                                                                  246* 247 256* 259 260* 261* 268* 269 269* 273* 274
+                                                                                  274* 278* 279 279* 283* 284 284* 301* 304 306* 308
+                                                                                  308* 338* 340 341* 350* 357 359* 363 366* 367 367*
+                                                                                  386* 387 387* 395* 396 396* 400* 405* 407 407 407*
+                                                                                  411* 415* 417 417* 421* 426* 427 427* 431* 472*
+                                                                                  480* 488* 496*
+cu_$level_get                   000020 constant        entry                    external dcl 140 ref 188
+cu_$level_set                   000022 constant        entry                    external dcl 140 ref 192 195 443
+curr_dm_enable          104            based           char(8)                  level 3 dcl 3-36 ref 215
+cv_p_expected_version                  parameter       char(8)                  dcl 508 set ref 504 511 511*
+cv_p_received_version                  parameter       char(8)                  dcl 507 set ref 504 511 511*
+cv_p_structure_name                    parameter       char                     unaligned dcl 509 set ref 504 511*
+delete_$path                    000024 constant        entry                    external dcl 140 ref 426
+dm_error_$bj_not_all_opened_after_crash
+                                000064 external static fixed bin(35,0)          dcl 172 ref 304
+dm_error_$partial_recovery      000066 external static fixed bin(35,0)          dcl 172 set ref 376* 380*
+dm_error_$too_many_bootload_dirs
+                                000070 external static fixed bin(35,0)          dcl 172 ref 226
+dm_find_configuration_          000026 constant        entry                    external dcl 140 ref 199
+dm_misc_util_$dm_status         000034 constant        entry                    external dcl 140 ref 246
+dm_misc_util_$find_old_boot_dir 000036 constant        entry                    external dcl 140 ref 225
+dm_misc_util_$get_aim_dir       000032 constant        entry                    external dcl 140 ref 209
+dm_misc_util_$log               000030 constant        entry                    external dcl 140 ref 204 229 238 244 249 260 306 312
+                                                                                  341 367 380 387 400 411 421 431 448
+dm_system_config                       based           structure                level 1 dcl 3-36
+dm_system_config_info                  based           structure                level 1 dcl 3-42
+dm_system_config_ptr            000266 automatic       pointer                  dcl 3-34 set ref 199* 202 215 218 235 403
+dm_system_data_$current_dm_state
+                                000072 external static char(4)                  dcl 172 set ref 211 212* 445*
+do_not_force_enable             000160 automatic       bit(1)                   initial dcl 100 set ref 100* 215* 376 396 407 417
+                                                                                  427
+entry                    40            based           structure                array level 2 dcl 1-20
+entry_count               6            based           fixed bin(17,0)          level 2 dcl 2-41 set ref 327* 328
+error_table_$nomatch            000074 external static fixed bin(35,0)          dcl 172 ref 407
+error_table_$unimplemented_version
+                                000076 external static fixed bin(35,0)          dcl 172 set ref 511*
+expand_pathname_                000040 constant        entry                    external dcl 140 ref 395
+file_manager_$end_of_crash_recovery
+                                000042 constant        entry                    external dcl 140 ref 386
+file_manager_$find_old_uid_pn_table
+                                000044 constant        entry                    external dcl 140 ref 256
+get_ring_                       000046 constant        entry                    external dcl 140 ref 195 195
+get_temp_segment_               000050 constant        entry                    external dcl 140 ref 268 273 278 283
+hcs_$chname_file                000052 constant        entry                    external dcl 140 ref 415
+hcs_$star_                      000054 constant        entry                    external dcl 140 ref 405
+hold                     76            based           char(8)                  level 4 dcl 3-36 ref 403
+idx                             000161 automatic       fixed bin(17,0)          initial dcl 100 set ref 100* 318* 338 341 345 359
+                                                                                  366 367*
+information                            based           structure                level 2 dcl 3-36
+ltrim                                                  builtin function         dcl 128 ref 415
+max_n_entries             1            based           fixed bin(17,0)          level 2 dcl 1-20 set ref 331* 333 345
+n_bjs_completely_recovered      000162 automatic       fixed bin(17,0)          initial dcl 100 set ref 100* 305* 363* 363 376
+n_bjs_opened_for_recovery       000163 automatic       fixed bin(17,0)          initial dcl 100 set ref 100* 301* 312* 318 376
+n_entries_used            2            based           fixed bin(17,0)          level 2 dcl 1-20 set ref 331*
+n_hold_dirs                     000164 automatic       fixed bin(17,0)          initial dcl 100 set ref 100* 405* 415
+no_recovery_needed              000165 automatic       bit(1)                   initial dcl 100 set ref 100* 241* 250* 372 384 435
+null                                                   builtin function         dcl 128 ref 100 100 100 100 226 226 261 261 269 269
+                                                                                  274 274 279 279 284 284 308 308 376 376 396 396
+                                                                                  405 405 405 405 407 407 417 417 427 427 470 472
+                                                                                  472 478 480 480 486 488 488 494 496 496 511 511
+old_bj_txt_p                    000166 automatic       pointer                  initial dcl 100 set ref 100* 278* 330 331 331 333
+                                                                                  338* 345 350* 494 495*
+old_boot_dir                    000170 automatic       char(168)                initial unaligned dcl 100 set ref 100* 225* 238 238
+                                                                                  244 244 246* 256* 261* 301* 376* 380* 395* 396*
+                                                                                  400* 417* 421* 427* 431* 448 448*
+old_boot_dir_name               000242 automatic       char(32)                 initial unaligned dcl 100 set ref 100* 395* 405 415*
+                                                                                  415* 415 426*
+old_dm_status                   000252 automatic       char(4)                  initial dcl 100 set ref 100* 246* 247
+old_tm_tdt_p                    000254 automatic       pointer                  initial dcl 100 set ref 100* 283* 327 328 329 338*
+                                                                                  350* 486 487*
+pad_entry_to_32_words
+                         65            based           bit(36)                  array level 3 dcl 1-20 set ref 333*
+prev_dm_disp             74            based           structure                level 3 dcl 3-36
+recover                 100            based           char(8)                  level 4 dcl 3-36 ref 235
+recovery_check_mode     102            based           char(8)                  level 4 dcl 3-36 ref 218
+release_temp_segment_           000056 constant        entry                    external dcl 140 ref 471 479 487 495
+report_error_sw                        parameter       bit(1)                   dcl 462 ref 453 472 480 488 496
+rtrim                                                  builtin function         dcl 128 ref 238 238 244 244 405 415 415
+saved_dm_state                  000256 automatic       char(4)                  initial dcl 100 set ref 100* 211* 445
+saved_level                     000257 automatic       fixed bin(17,0)          initial dcl 100 set ref 100* 188* 192* 443*
+star_BRANCHES_ONLY              000023 constant        fixed bin(2,0)           initial dcl 6-110 set ref 405*
+sub_err_                        000060 constant        entry                    external dcl 140 ref 226 261 269 274 279 284 308 376
+                                                                                  396 407 417 427 472 480 488 496 511
+tm_tdt                                 based           structure                level 1 dcl 2-41 set ref 328*
+tm_tdt_entry                           based           structure                level 1 dcl 2-59
+transaction_manager_$recover_after_crash
+                                000062 constant        entry                    external dcl 140 ref 350
+unspec                                                 builtin function         dcl 128 set ref 328*
+version                                based           fixed bin(17,0)          level 2 in structure "bj_txt" dcl 1-20 in procedure
+                                                                                  "dm_recovery_" set ref 330*
+version                                based           char(8)                  level 3 in structure "dm_system_config" dcl 3-36
+                                                                                  in procedure "dm_recovery_" set ref 202*
+version                                based           char(8)                  level 2 in structure "tm_tdt" dcl 2-41 in procedure
+                                                                                  "dm_recovery_" set ref 329*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+ACTION_CAN_RESTART                     internal static bit(36)                  initial dcl 7-7
+ACTION_DEFAULT_RESTART                 internal static bit(36)                  initial dcl 7-7
+ACTION_QUIET_RESTART                   internal static bit(36)                  initial dcl 7-7
+ACTION_SUPPORT_SIGNAL                  internal static bit(36)                  initial dcl 7-7
+CRASH_SV                               internal static fixed bin(17,0)          initial dcl 5-34
+DM_ADOPT_OLD_BOOTLOAD                  internal static char(8)                  initial dcl 3-63
+DM_DO_NOT_ADOPT_OLD_BOOTLOAD           internal static char(8)                  initial dcl 3-63
+DM_DO_NOT_HOLD_OLD_BOOTLOAD_DIRECTORY  internal static char(8)                  initial dcl 3-63
+DM_FORCE_ENABLE_NEW_BOOTLOAD           internal static char(8)                  initial dcl 3-63
+DM_RECOVERY_CHECK_MODE_OFF             internal static char(8)                  initial dcl 3-63
+DM_RECOVER_OLD_BOOTLOAD                internal static char(8)                  initial dcl 3-63
+DM_SYSTEM_STATE_INITIALIZING           internal static char(4)                  initial dcl 4-22
+DM_SYSTEM_STATE_RUNNING                internal static char(4)                  initial dcl 4-22
+DM_SYSTEM_STATE_SHUTDOWN_BEGUN         internal static char(4)                  initial dcl 4-22
+DM_SYSTEM_STATE_SHUTDOWN_BUMP_USERS    internal static char(4)                  initial dcl 4-22
+DM_SYSTEM_STATE_UNDEFINED              internal static char(4)                  initial dcl 4-22
+ERROR_SV                               internal static fixed bin(17,0)          initial dcl 5-36
+FATAL_SV                               internal static fixed bin(17,0)          initial dcl 5-34
+INFORM_SV                              internal static fixed bin(17,0)          initial dcl 5-38
+PRINT_SV                               internal static fixed bin(17,0)          initial dcl 5-32
+QUERY_SV                               internal static fixed bin(17,0)          initial dcl 5-32
+bj_txt_ptr                             automatic       pointer                  dcl 1-17
+bj_txte_ptr                            automatic       pointer                  dcl 1-18
+star_ALL_ENTRIES                       internal static fixed bin(2,0)           initial dcl 6-111
+star_ALL_ENTRIES_WITH_LINK_PATHS       internal static fixed bin(3,0)           initial dcl 6-114
+star_DIRECTORY                         internal static fixed bin(2,0)           initial unsigned dcl 6-121
+star_LINK                              internal static fixed bin(2,0)           initial unsigned dcl 6-119
+star_LINKS_ONLY                        internal static fixed bin(2,0)           initial dcl 6-109
+star_LINKS_ONLY_WITH_LINK_PATHS        internal static fixed bin(3,0)           initial dcl 6-112
+star_SEGMENT                           internal static fixed bin(2,0)           initial unsigned dcl 6-120
+star_branch_count                      automatic       fixed bin(17,0)          dcl 6-13
+star_dir_list_branch                   based           structure                array level 1 dcl 6-59
+star_entries                           based           structure                array level 1 dcl 6-27
+star_entry_count                       automatic       fixed bin(17,0)          dcl 6-14
+star_entry_ptr                         automatic       pointer                  dcl 6-15
+star_link_count                        automatic       fixed bin(17,0)          dcl 6-17
+star_link_pathname                     based           char                     unaligned dcl 6-102
+star_links                             based           structure                array level 1 dcl 6-76
+star_linkx                             automatic       fixed bin(17,0)          dcl 6-18
+star_list_branch                       based           structure                array level 1 dcl 6-41
+star_list_branch_ptr                   automatic       pointer                  dcl 6-16
+star_list_names                        based           char(32)                 array unaligned dcl 6-92
+star_list_names_ptr                    automatic       pointer                  dcl 6-20
+star_names                             based           char(32)                 array unaligned dcl 6-37
+star_names_ptr                         automatic       pointer                  dcl 6-19
+star_select_sw                         automatic       fixed bin(3,0)           dcl 6-21
+tdt_max_count                          automatic       fixed bin(17,0)          dcl 2-36
+tm_tdt_entry_ptr                       automatic       pointer                  dcl 2-57
+tm_tdt_ptr                             automatic       pointer                  dcl 2-35
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+CHECK_IF_TO_IGNORE_RECOVERY     001172 constant        label                    dcl 235
+CHECK_VERSION                   004326 constant        entry                    internal dcl 504 ref 202
+CLEAN_UP                        003721 constant        entry                    internal dcl 453 ref 191 440
+FILE_MANAGER_CLEANUP_CHORE      002613 constant        label                    dcl 384
+FIND_CONFIG_FILE                000734 constant        label                    dcl 199
+FIND_DIRS_AND_SET_INDICATORS    001006 constant        label                    dcl 206
+FIND_JOURNALS_TO_RECOVER        002031 constant        label                    dcl 291
+FIND_OLD_BOOTLOAD_TO_RECOVER    001037 constant        label                    dcl 222
+GET_FM_UID_PATHNAME_TABLE       001363 constant        label                    dcl 256
+GET_TEMP_STORAGE                001501 constant        label                    dcl 265
+NORMAL_TERMINATION_CLEANUP      003641 constant        label                    dcl 440
+OLD_BOOTLOAD_DIR_DISPOSITION    002656 constant        label                    dcl 392
+RECOVERY_CLEANUP_CHORES         002472 constant        label                    dcl 372 ref 242 251
+RECOVER_EACH_JOURNAL_LOOP       002177 constant        label                    dcl 318
+REPORT_JOURNALS_NOT_RECOVERED   002472 constant        label                    dcl 372
+RESET_DM_STATE                  003660 constant        label                    dcl 445 set ref 233 435
+SET_LEVEL_AND_CLEANUP_HANDLER   000650 constant        label                    dcl 185
+SKIP_BEFORE_JOURNAL             002372 constant        label                    dcl 357 ref 343
+dm_recovery_                    000606 constant        entry                    external dcl 93
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      5056        5156    4432        5066
+Length      5564    4432       100         371     424           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+dm_recovery_                        370 external procedure  is an external procedure.  
+on unit on line 190                  72 on unit               
+CLEAN_UP                            108 internal procedure  is called by several nonquick procedures.  
+CHECK_VERSION                           internal procedure  shares stack frame of external procedure dm_recovery_.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+CLEAN_UP                 000100 cleanup_code                CLEAN_UP
+dm_recovery_             000100 aim_dir                     dm_recovery_
+                         000152 bj_oid_p                    dm_recovery_
+                         000154 bj_uid_p                    dm_recovery_
+                         000156 check_mode                  dm_recovery_
+                         000157 code                        dm_recovery_
+                         000160 do_not_force_enable         dm_recovery_
+                         000161 idx                         dm_recovery_
+                         000162 n_bjs_completely_recovered  dm_recovery_
+                         000163 n_bjs_opened_for_recovery   dm_recovery_
+                         000164 n_hold_dirs                 dm_recovery_
+                         000165 no_recovery_needed          dm_recovery_
+                         000166 old_bj_txt_p                dm_recovery_
+                         000170 old_boot_dir                dm_recovery_
+                         000242 old_boot_dir_name           dm_recovery_
+                         000252 old_dm_status               dm_recovery_
+                         000254 old_tm_tdt_p                dm_recovery_
+                         000256 saved_dm_state              dm_recovery_
+                         000257 saved_level                 dm_recovery_
+                         000266 dm_system_config_ptr        dm_recovery_
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+r_e_as              r_ne_as             alloc_cs            cat_realloc_cs      call_ext_out_desc   call_ext_out
+call_int_this       call_int_other      return              enable              shorten_stack       ext_entry
+int_entry
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+before_journal_manager_$close_bj                            before_journal_manager_$close_bj_after_recovery
+before_journal_manager_$find_txns_after_crash               before_journal_manager_$open_all_after_crash
+cu_$level_get                 cu_$level_set                 delete_$path                  dm_find_configuration_
+dm_misc_util_$dm_status       dm_misc_util_$find_old_boot_dir                             dm_misc_util_$get_aim_dir
+dm_misc_util_$log             expand_pathname_              file_manager_$end_of_crash_recovery
+file_manager_$find_old_uid_pn_table                         get_ring_                     get_temp_segment_
+hcs_$chname_file              hcs_$star_                    release_temp_segment_         sub_err_
+transaction_manager_$recover_after_crash
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+dm_error_$bj_not_all_opened_after_crash                     dm_error_$partial_recovery
+dm_error_$too_many_bootload_dirs                            dm_system_data_$current_dm_state
+error_table_$nomatch          error_table_$unimplemented_version
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     93 000605       100 000613       188 000650       190 000656       191 000672       192 000703       193 000713
+    195 000714       199 000734       202 000743       204 000766       209 001006       211 001017       212 001022
+    215 001024       218 001032       225 001037       226 001056       228 001134       229 001136       233 001171
+    235 001172       238 001177       241 001242       242 001245       244 001246       246 001311       247 001333
+    249 001340       250 001360       251 001362       256 001363       259 001400       260 001402       261 001432
+    268 001501       269 001522       273 001567       274 001610       278 001655       279 001676       283 001743
+    284 001764       301 002031       304 002061       305 002065       306 002067       307 002107       308 002110
+    312 002154       318 002177       327 002207       328 002211       329 002222       330 002225       331 002227
+    333 002232       338 002253       340 002274       341 002276       343 002336       345 002337       350 002357
+    357 002372       359 002374       363 002407       365 002412       366 002413       367 002426       370 002470
+    372 002472       376 002474       380 002554       384 002613       386 002615       387 002624       395 002656
+    396 002706       400 002762       403 003016       405 003023       407 003120       411 003177       415 003233
+    417 003362       421 003437       424 003473       426 003474       427 003527       431 003603       435 003637
+    440 003641       443 003651       445 003660       448 003663       451 003717       453 003720       470 003726
+    471 003733       472 003753       478 004025       479 004032       480 004053       486 004125       487 004132
+    488 004153       494 004225       495 004232       496 004253       502 004325       504 004326       511 004337
+    517 004427
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

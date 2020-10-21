@@ -1,0 +1,2393 @@
+	COMPILATION LISTING OF SEGMENT apl_storage_manager_
+	Compiled by: Multics PL/I Compiler, Release 28d, of October 4, 1983
+	Compiled at: Honeywell LCPD Phoenix, System M
+	Compiled on: 11/29/83  1616.9 mst Tue
+	    Options: optimize map
+
+        1 /* ******************************************************
+        2*   *                                                    *
+        3*   *                                                    *
+        4*   * Copyright (c) 1972 by Massachusetts Institute of   *
+        5*   * Technology and Honeywell Information Systems, Inc. *
+        6*   *                                                    *
+        7*   *                                                    *
+        8*   ****************************************************** */
+        9 
+       10 apl_storage_manager_:
+       11 	procedure;
+       12 
+       13 /*
+       14* * this module manages the storage heap for APL
+       15* *
+       16* * free blocks are remembered in a binary tree structure, sorted by address
+       17* * there is a seperate tree for each segment
+       18* * allocation is done by first-fit.
+       19* * big beads and little beads are kept in seperate segments in the
+       20* * vain hope that fragmentation and map overhead can be kept down.
+       21* * (maps are the binary trees of free beads, kept in their own seg)
+       22* *
+       23* *
+       24* * written 7/15/73 by DAM
+       25* * modified 8/4/73 by DAM for new ws format
+       26* * modified 8/24/73, 8/26/73 by DAM for newer ws format (version 3) and interrupts
+       27* * modified 12/06/73 by PG for apl_segment_manager_
+       28* * modified by G. Gordon Benedict in July 1974 to fix a bug in which unless ws_info.meter_mode is on,
+       29* * once balance was called free_apl_bead would loop forever; and to change names of entries to appropriate
+       30* * apl names.
+       31* * Modified 740910 by PG to flush apl_error_table_$random_system_error, properly compute storage used by
+       32* * value stacks, and remove last reference to apl_static_$temp_dir (long obsolete).
+       33* * Modified 750630 by PG to re-type about 120 lines which were lost due to EIS hardware problems.
+       34* * Modified 760325 by PG to correct balancer to zero out slots that it frees up, and fix allocater to
+       35* * 	correctly rebalance tree after deleting nodes.
+       36*   Modified 760420 by PG to correct allocater to walk free map in pre-order (not sequential),
+       37*	thus speeding things up when no match is found in (sparse) tree,
+       38*	and to correct problem in rebalancing after deletion.
+       39*   Modified 770413 by PG to add name apl_get_value_stack_ to apl_get_next_value_stack_seg_.
+       40*   Modified 780227 by PG to catch duplicate free requests.
+       41*   Modified 780502 by PG to fix 320 (can't find first free map entry, walking map in postorder instead of inorder),
+       42*	and bug 301 (launder internal procedure not nulling argument).
+       43*   Modified 780517 by William York to make apl_allocate_words_ and the tree
+       44*	balancer in apl_free_words_ walk the free tree correctly, fixing bug 325.
+       45*   Modified 780523 by WMY to round up sizes of allocations to even words to eliminate lost words between
+       46*	storage blocks.
+       47*   Modified 790321 by WMY to fix bug 382 (values that take up exactly 261120 words
+       48*	cause phony WS FULL errors by using up all of the valuse stack segs
+       49*	while looking for one big enough.
+       50*   Modified 790328 by WMY to be able to free lexed_function_beads with no
+       51*	statement map (i.e. no statements).
+       52* */
+       53 
+       54 /* The allocation/free type codes used by the trace facility are as follows:
+       55*	1 - off end of segment
+       56*	2 - with map
+       57*	3 - left merge
+       58*	4 - left merge simple
+       59*	5 - right merge
+       60*	6 - right merge simple
+       61*	7 - discard
+       62*	8 - error, duplicate free request
+       63**/
+       64 
+       65 /* automatic */
+       66 
+       67 dcl p pointer unaligned,		/* to bead being allocated or freed */
+       68     s fixed bin(18);		/* size of it in words */
+       69 dcl depth fixed bin;
+       70 dcl map_stack (11) fixed bin;		/* stack for walking free tree.  dim must be >= log2 (LittleMapSize) */
+       71 dcl found bit (1) aligned;
+       72 dcl  neighbor fixed bin;
+       73 dcl  global_storage_system_data_pointer ptr;
+       74 dcl hash_index fixed bin,
+       75     which_free fixed bin,				/* for tracing; which way bead was freed */
+       76     sli fixed bin,				/* index into seg_list of seg currently being munged */
+       77     new_sli fixed bin,
+       78     enter_balance_time fixed bin(71),
+       79     enter_time fixed bin(71),
+       80     p_rel_loc bit(18),			/* rel(p) */
+       81     already_balanced bit(1),			/* flag to avoid balance loop when tree is just too big */
+       82     (q, old_q) pointer unaligned,
+       83     i fixed bin,
+       84 
+       85 	/* next 3 vars are used for metering only */
+       86     rangex fixed bin,			/* index of proper element in metric.range, determined from s */
+       87     endp fixed bin(1),			/* 0 or 1, depending on whether alloced off end of seg */
+       88     newp fixed bin(1),			/* 0 or 1, depending on whether alloced in new seg */
+       89 
+       90     mapx fixed bin,				/* index in map of current free bead being looked at */
+       91     other fixed bin,			/* index in map of some other bead */
+       92     base fixed bin,				/*  ..  */
+       93     scan_pos fixed bin,			/* index in map of next bead to look at when allocating */
+       94 
+       95     esw fixed bin,				/* entry switch */
+       96     n_left fixed bin(18),			/* number of words left in bead or seg after allocation */
+       97     required_usage fixed bin,			/* used in searching seg_list for match usage field */
+       98     temp_ptr ptr,
+       99     segp pointer aligned,			/* -> some segment involved with file system */
+      100     small_piece fixed bin(18),		/* value to store into seg_map.smallest_piece */
+      101     map_size fixed bin,			/* number of map entries to allocate, must be power of 2 - 1 */
+      102     new_slot fixed bin,
+      103     data_elements fixed bin(21);
+      104 
+      105 /* conditions */
+      106 
+      107 declare	apl_dirty_stop_ condition;
+      108 
+      109 /* internal static */
+      110 
+      111 dcl (trace_flags bit (36) aligned initial ((36)"0"b),
+      112      trace_allocate_words bit (36) aligned initial ("1"b),
+      113      trace_balancer bit (36) aligned initial ("01"b),
+      114      trace_copy_value bit (36) aligned initial ("001"b),
+      115 /*   trace_unused bit (36) aligned initial ("0001"b), */
+      116      trace_free bit (36) aligned initial ("00001"b),
+      117      trace_get_stack_seg bit (36) aligned initial ("000001"b),
+      118      trace_reference_count_errors bit (36) aligned initial ("0000001"b),
+      119      trace_clear_storage bit (36) aligned initial ("00000001"b),
+      120      check_storage_manager bit (36) aligned initial ("000000000000000000000000000000000001"b)
+      121     ) internal static;
+      122 
+      123 /* external static */
+      124 
+      125 dcl sys_info$max_seg_size fixed bin(18) external;
+      126 
+      127 /* entries called */
+      128 
+      129 dcl apl_segment_manager_$get entry () returns (pointer),
+      130     apl_segment_manager_$free entry (pointer),
+      131     apl_get_symbol_ entry(char(*), pointer unaligned, fixed bin),
+      132     apl_system_error_ entry (fixed bin (35)),
+      133     (check_storage_manager_$allocate, check_storage_manager_$free) entry (ptr unal, fixed bin (18)),
+      134      check_storage_manager_$clear entry (),
+      135     debug entry (),
+      136     ioa_$ioa_stream entry options (variable),
+      137     hcs_$truncate_seg entry(pointer, fixed bin(18), fixed bin(35));
+      138 
+      139 /* status codes */
+      140 
+      141 dcl (apl_error_table_$bead_already_free,
+      142      apl_error_table_$invalid_free_bead,
+      143      apl_error_table_$uninterned_symbol,
+      144      apl_error_table_$bead_not_known_to_apl,
+      145      apl_error_table_$wsfull_alloc_too_big,
+      146      apl_error_table_$wsfull_out_of_maps,
+      147      apl_error_table_$wsfull_out_of_segs,
+      148      apl_error_table_$hash_table_full,
+      149      apl_error_table_$no_type_bits,
+      150      apl_error_table_$wsfull_on_stack,
+      151      apl_error_table_$non_existent_stack,
+      152      apl_error_table_$wsfull_no_stack_segs,
+      153      apl_error_table_$tables_inconsistent
+      154     ) fixed bin(35) external;
+      155 
+      156 /* constants which can be used for tuning */
+      157 
+      158 dcl BreakSize fixed bin(18) static init(64),		/* boundary between "big" beads and "little" beads */
+      159     BigMapSize fixed bin static init(511),		/* number of entries per map for big beads */
+      160     LittleMapSize fixed bin static init(2047),		/* number of entries per map for little beads */
+      161     BigSmallPiece fixed bin(18) static init(40),		/* minimum number of words in a free bead in "big" space */
+      162     LittleSmallPiece fixed bin(18) static init(4);	/* minimum number of words in a free bead in "little" space */
+      163 
+      164 /* builtin */
+      165 
+      166 dcl (addr, addrel, baseno, binary, bit, dim, divide, fixed, hbound, lbound,	/* that lbound train */
+      167      max, mod, null, ptr, rel, size, string, substr, unspec, vclock) builtin;
+      168 
+      169 /* include files */
+      170 
+  1     1 /* ====== BEGIN INCLUDE SEGMENT	apl_storage_system_data.incl.pl1 ========================== */
+  1     2 
+  1     3 /*
+  1     4* * This include file contains a declaration of the data structure
+  1     5* * kept in the "map segment" by the apl_storage_mngr_
+  1     6* *
+  1     7* * Written July 1973 by DAM
+  1     8* * Modified Dec 1973 to change spelling of structure name from stroage to storage by PG
+  1     9* */
+  1    10 
+  1    11 	/* data in the map seg */
+  1    12 
+  1    13 declare
+  1    14     1 global_storage_system_data	aligned based (global_storage_system_data_pointer),
+  1    15       2 seg_map_hash_table(0:88),			/* hash table for finding seg_list entry given pointer */
+  1    16         3 seg_baseno bit(18) unaligned,			/* 0 if empty, or segment number */
+  1    17         3 seg_list_idx fixed bin(17) unaligned,		/* 0 if empty, or index into seg_list for this seg */
+  1    18       2 last_map unaligned pointer,			/* -> last seg_map in the storage_system_data segment */
+  1    19       2 current_little_bead_seg fixed bin,		/* 0 or index in seg_list of little bead allocation seg. */
+  1    20       2 current_big_bead_seg fixed bin,			/* 0 or index in seg_list of big bead allocation seg. */
+  1    21       2 current_little_scan_pos fixed bin,		/* next map entry to scan in current_little_bead_seg */
+  1    22       2 current_big_scan_pos fixed bin,			/* next map entry to scan in current_big_bead_seg */
+  1    23       2 seg_list (30),				/* <--- one entry for each segment in use by storage mngr */
+  1    24         3 words_free fixed bin(18),			/* total number of unallocated words in the segment */
+  1    25         3 pointer unaligned pointer,			/* -> seg if usage = 1 or 2, else -> seg_map */
+  1    26         3 usage fixed bin,				/* 0 = entry free, 1 = seg not currently in use,
+  1    27*						   2 = value_stack seg, 3 = little bead seg, 4 = big bead seg */
+  1    28 
+  1    29       2 metric,					/* METERING DATA, governed by ws_info.meter_mode */
+  1    30 
+  1    31         3 big_seg_balance,				/* meters for balancing of big-bead segs */
+  1    32 	4 count fixed bin,				/* number of times a balance occurred */
+  1    33 	4 thrown_away fixed bin,			/* number of times a bead had to be thrown away */
+  1    34 	4 amt_thrown_away fixed bin,			/* total number of words that had to be thrown away */
+  1    35 	4 time_spent_balancing fixed bin(71),		/* time spent balancing */
+  1    36 	4 space_left fixed bin(30),			/* sum of amounts space left in use by maps after balances */
+  1    37         3 little_seg_balance,				/* same meters for balancing of little-bead segs */
+  1    38 	4 count fixed bin,
+  1    39 	4 thrown_away fixed bin,
+  1    40 	4 space_left fixed bin(30),
+  1    41 	4 amt_thrown_away fixed bin,
+  1    42 	4 time_spent_balancing fixed bin(71),
+  1    43         3 get_next_value_stack_seg_calls fixed bin,	/* number of times new value stack seg was needed */
+  1    44         3 copy_apl_value_calls fixed bin,		/* number of values copied */
+  1    45         3 copy_apl_value_time fixed bin(71),		/* amount of time spent copying values */
+  1    46 
+  1    47         3 range(16),				/* alloc-free meters by size range */
+  1    48 	4 size fixed bin(18),			/* number of words have to be as big as to fit in range */
+  1    49 	4 free_count fixed bin,			/* number beads this size freed */
+  1    50 	4 map_free_count fixed bin,			/* number times freeing required search of map */
+  1    51 	4 free_time fixed bin(71),			/* amount of time spent freeing beads this size */
+  1    52 	4 words_freed fixed bin(24),			/* total number of words freed in beads this size */
+  1    53 
+  1    54 	4 alloc_count fixed bin,			/* number beads this size allocated */
+  1    55 	4 alloc_end_count fixed bin,			/* number times allocated from end of segment */
+  1    56 	4 alloc_new_count fixed bin,			/* number times had to switch to a new segment */
+  1    57 	4 alloc_time fixed bin(71),			/* total time spent allocating */
+  1    58 	4 words_alloced fixed bin(24),		/* total number of words in beads alloc'ed this size */
+  1    59 
+  1    60 
+  1    61       2 first_seg_map;				/* first seg_map is created at this address */
+  1    62 
+  1    63 
+  1    64 dcl 1 seg_map aligned based(seg_map_p),			/* there is one of these for each segment in APL heap-space */
+  1    65       2 seg_ptr pointer unaligned,			/* -> base of segment */
+  1    66       2 smallest_piece fixed bin(18),			/* minimum permissible size for a free bead */
+  1    67       2 number_of_entries fixed bin,			/* size of map */
+  1    68       2 last_entry_used fixed bin,			/* size of non-zero portion of map, used to speed up allocate */
+  1    69       2 amount_of_seg_used fixed bin(18),		/* number of words in segment covered by the map */
+  1    70       2 map (map_size refer (seg_map.number_of_entries)),	/* one entry per free bead, in binary tree form */
+  1    71         3 size bit (18) unaligned,			/* 0 if not a free bead, else number of words in free bead */
+  1    72         3 rel_loc bit (18) unaligned;			/* 0 if not a free bead, else position in segment of free bead */
+  1    73 
+  1    74 /* pointers to above data */
+  1    75 
+  1    76 dcl seg_map_p pointer;
+  1    77 
+  1    78 /* ------ END INCLUDE SEGMENT		apl_storage_system_data.incl.pl1 -------------------------- */
+      171 
+  2     1 /* ====== BEGIN INCLUDE SEGMENT	apl_number_data.incl.pl1 ================================== */
+  2     2 
+  2     3 /*
+  2     4*   This include file contains information about the machine representation of numbers.
+  2     5*   In all programs numbers should simply be declared 'float'.
+  2     6*   All default statements should be in this include file.
+  2     7*
+  2     8*   This is the binary version.  The manifest constant Binary should be used by programs
+  2     9*   that need to know whether we are using binary or decimal.
+  2    10* */
+  2    11 
+  2    12 /* format: style3,initlm0,idind30 */
+  2    13 
+  2    14 default (float & ^decimal & ^binary & ^precision & ^constant) float binary (63);
+  2    15 
+  2    16 declare	(
+  2    17 	TheBiggestNumberWeveGot	float initial (0.1701411834604692317e+39),
+  2    18 	TheSmallestNumberWeveGot	float initial (.1469367938527859385e-38),
+  2    19 	Binary			bit (1) aligned initial ("1"b)
+  2    20 	)			internal static options (constant);
+  2    21 
+  2    22 /* Number of characters in a number datum entry; used for copying float number arrays as strings.
+  2    23*   (Obsolete! use array copies!) */
+  2    24 
+  2    25 declare	NumberSize		fixed binary precision (4) internal static initial (8);
+  2    26 
+  2    27 /* ------ END INCLUDE SEGMENT		apl_number_data.incl.pl1 ---------------------------------- */
+      172 
+  3     1 /* ====== BEGIN INCLUDE SEGMENT	apl_ws_info.incl.pl1 ====================================== */
+  3     2 
+  3     3 /* This structure contains all of the global data (or pointers to it) for the APL subsystem */
+  3     4 
+  3     5 /* automatic */
+  3     6 
+  3     7 declare	ws_info_ptr ptr initial (apl_static_$ws_info_ptr.static_ws_info_ptr);
+  3     8 
+  3     9 /* external static */
+  3    10 
+  3    11 declare	1 apl_static_$ws_info_ptr	external static aligned structure,
+  3    12 	  2 static_ws_info_ptr	unaligned pointer;
+  3    13 
+  3    14 /* based */
+  3    15 
+  3    16 declare	1 ws_info			aligned based (ws_info_ptr),
+  3    17 	  2 version_number		fixed bin,	/* version of this structure (3) */
+  3    18 	  2 switches		unaligned,	/* mainly ws parameters */
+  3    19 	    3 long_error_mode	bit,		/* if 1, long Multics format, else APL/360 format */
+  3    20 	    3 debug_mode		bit,		/* if 1, system error causes escape to command level */
+  3    21 	    3 canonicalize_mode	bit,		/* if 1, the editor canonicalizes user input */
+  3    22 	    3 restrict_exec_command	bit,		/* if 1, the )EXEC command may not be used */
+  3    23 	    3 restrict_debug_command	bit,		/* if 1, the )DEBUG command may not be used */
+  3    24 	    3 restrict_external_functions
+  3    25 				bit,		/* if 1, the )ZFN, )MFN, and )DFN commands may not be used */
+  3    26 	    3 restrict_load		bit,		/* if 1, the )LOAD and )COPY commands may not be used */
+  3    27 	    3 restrict_load_directory	bit,		/* if 1, no directory allowed in )LOAD or )COPY pathnames */
+  3    28 	    3 restrict_save		bit,		/* if 1, the )SAVE command may not be used */
+  3    29 	    3 restrict_save_directory	bit,		/* if 1, no directory allowed in )SAVE pathnames */
+  3    30 	    3 off_hold		bit,		/* if 1, )OFF HOLD was typed, else just )OFF */
+  3    31 	    3 transparent_to_signals	bit,		/* if 1, any conditions slip right past APL */
+  3    32 	    3 meter_mode		bit,		/* if 1, metering may be done, else speed is all-important */
+  3    33 	    3 restrict_msg_command	bit,		/* if 1, the )MSG command may not be used. */
+  3    34 	    3 compatibility_check_mode
+  3    35 				bit,		/* if 1, check for incompatible operators */
+  3    36 	    3 no_quit_handler	bit,		/* if 1, do not trap QUITs. */
+  3    37 						/* remaining 20 bits not presently used */
+  3    38 
+  3    39 	  2 values,				/* attributes of the workspace */
+  3    40 	    3 digits		fixed bin,	/* number of digits of precision printed on output */
+  3    41 	    3 width		fixed bin,	/* line length for formatted output */
+  3    42 	    3 index_origin		fixed bin,	/* the index origin (0 or 1) */
+  3    43 	    3 random_link		fixed bin(35),	/* seed for random number generator */
+  3    44 	    3 fuzz		float,		/* comparison tolerance (relative fuzz) */
+  3    45 	    3 float_index_origin	float,		/* the index origin	in floating point */
+  3    46 	    3 number_of_symbols	fixed bin,	/* the number of symbol_beads currently in existence */
+  3    47 	    3 maximum_value_stack_size
+  3    48 				fixed bin (18),	/* maximum number of words in one segment of value stack */
+  3    49 
+  3    50 	  2 pointers,				/* pointers to various internal tables */
+  3    51 	    3 symbol_table_ptr	unaligned pointer,	/* -> symbol_table (apl_symbol_table.incl.pl1) */
+  3    52 	    3 current_parse_frame_ptr	unaligned pointer,	/* -> topmost parse frame */
+  3    53 	    3 value_stack_ptr	unaligned pointer,	/* -> next free location on value stack */
+  3    54 	    3 alloc_free_info_ptr	unaligned pointer,	/* -> apl_storage_mngr_ data (apl_storage_system_data.incl.pl1) */
+  3    55 
+  3    56 	  2 time_invoked		fixed bin(71),	/* clock time that APL was entered */
+  3    57 	  2 integer_fuzz		float,		/* the absolute fuzz used in checking for integers */
+  3    58 	  2 user_number		fixed bin(35),	/* number under which the user is signed on */
+  3    59 	  2 latent_expression	unaligned pointer,	/* -> value_bead for QuadLX */
+  3    60 	  2 lock			char(32),		/* the lock currently set on this workspace (password) */
+  3    61 	  2 wsid			char(100),	/* the workspace identification: name, number name, or clear ws */
+  3    62 	  2 last_error_code		fixed bin(35),	/* last code passed to apl_error_ */
+  3    63 	  2 signoff_lock		character (32),
+  3    64 
+  3    65 	  2 interrupt_info		aligned,		/* bits used by apl_interpreter_ to tell when to abort */
+  3    66 	    3 dont_interrupt_parse	bit,		/* if 1, don't do a dirty stop because the parser is running */
+  3    67 	    3 dont_interrupt_operator	bit,		/* if 1, don't do a dirty stop because an operator is running */
+  3    68 	    3 dont_interrupt_storage_manager		/* if 1, don't stop because apl_storage_mngr_ is */
+  3    69 				bit,		/*       munging his tables */
+  3    70 	    3 unused_interrupt_bit	bit,		/* not presently used */
+  3    71 	    3 dont_interrupt_command	bit,
+  3    72 	    3 can_be_interrupted	bit,		/* if 1, OK to do a clean stop (we are between lines, reading) */
+  3    73 	    3 clean_interrupt_pending	bit,		/* interrupt occured, break cleanly (between lines) */
+  3    74 	    3 dirty_interrupt_pending	bit,		/* interrupt occured, break as soon as not inhibited */
+  3    75 
+  3    76 	  2 user_name		char (32),	/* process group id of user */
+  3    77 	  2 immediate_input_prompt	char (32) varying,	/* normal input */
+  3    78 	  2 evaluated_input_prompt	char (32) varying,	/* quad input */
+  3    79 	  2 character_input_prompt	char (32) varying,	/* quad-quote input */
+  3    80 	  2 vcpu_time		aligned,
+  3    81 	    3 total		fixed bin (71),
+  3    82 	    3 setup		fixed bin (71),
+  3    83 	    3 parse		fixed bin (71),
+  3    84 	    3 lex			fixed bin (71),
+  3    85 	    3 operator		fixed bin (71),
+  3    86 	    3 storage_manager	fixed bin (71),
+  3    87 	  2 output_info		aligned,		/* data pertaining to output buffer */
+  3    88 	    3 output_buffer_ptr	unal ptr,		/* ptr to output buffer */
+  3    89 	    3 output_buffer_len	fixed bin (21),	/* length (bytes) of output buffer */
+  3    90 	    3 output_buffer_pos	fixed bin (21),	/* index of next byte to write in */
+  3    91 	    3 output_buffer_ll	fixed bin (21),	/* print positions used up so far */
+  3    92 	  2 tab_width		fixed bin (21);	/* number of columns a tabs moves cursor */
+  3    93 
+  3    94 declare	output_buffer char (ws_info.output_buffer_len) based (ws_info.output_buffer_ptr);
+  3    95 
+  3    96 /* internal static */
+  3    97 
+  3    98 declare	max_parse_stack_depth fixed bin int static init(64536);
+  3    99 
+  3   100 /* ------ END INCLUDE SEGMENT		apl_ws_info.incl.pl1 -------------------------------------- */
+      173 
+  4     1 /* BEGIN INCLUDE FILE apl_symbol_table.incl.pl1
+  4     2*
+  4     3*   initially written 20 June 1973 by Dan Bricklin */
+  4     4 
+  4     5 declare
+  4     6 	initial_size fixed bin int static init(17),	/* initial size of hash table */
+  4     7 
+  4     8 	1 symbol_table aligned based(ws_info.symbol_table_ptr),
+  4     9 	   2 table_size fixed bin,			/* how many buckets */
+  4    10 	   2 hash_bucket_ptr(initial_size refer(table_size)) ptr unaligned; /* the buckets */
+  4    11 
+  4    12 /* END INCLUDE FILE apl_symbol_table.incl.pl1 */
+      174 
+  5     1 /* ====== BEGIN INCLUDE SEGMENT	apl_bead_format.incl.pl1 ================================== */
+  5     2 
+  5     3 declare 1 general_bead  		aligned based,	/* The Venerable Bead		*/
+  5     4 	2 type 			unaligned,
+  5     5 	  3 bead_type		unaligned,
+  5     6 	    4 operator		bit (1),		/* ON if operator bead		*/
+  5     7 	    4 symbol		bit (1),		/* ON if symbol bead		*/
+  5     8 	    4 value		bit (1),		/* ON if value bead			*/
+  5     9 	    4 function		bit (1),		/* ON if function bead		*/
+  5    10 	    4 group		bit (1),		/* ON if group bead			*/
+  5    11 	    4 label		bit (1),		/* ON if label bead			*/
+  5    12 	    4 shared_variable	bit (1),		/* ON if shared variable bead 	*/
+  5    13 	    4 lexed_function	bit (1),		/* ON if lexed function bead  	*/
+  5    14 	  3 data_type		unaligned,
+  5    15 	    4 list_value		bit (1),		/* ON if a list value bead		*/
+  5    16 	    4 character_value	bit (1),		/* ON if a character value bead	*/
+  5    17 	    4 numeric_value		bit (1),		/* ON if a numeric value bead		*/
+  5    18 	    4 integral_value	bit (1),		/* ON if an integral value bead	*/
+  5    19 	    4 zero_or_one_value	bit (1),		/* ON if a boolean value bead		*/
+  5    20 	    4 complex_value		bit (1),		/* ON if a complex, numeric value bead   */
+  5    21 	  3 unused_bits		bit (4) unaligned,	/* pad to 18 bits (for future use)	*/
+  5    22 	2 size			bit (18) unaligned,	/* Number of words this bead occupies
+  5    23*						   (used by bead storage manager)	*/
+  5    24 	2 reference_count 		fixed binary (29);	/* Number of pointers which point
+  5    25*						   to this bead (used by bead manager)	*/
+  5    26 
+  5    27 
+  5    28 /* constant strings for initing type field in various beads */
+  5    29 
+  5    30 declare (
+  5    31 	operator_type		init("100000000000000000"b),
+  5    32 	symbol_type		init("010000000000000000"b),
+  5    33     	value_type		init("001000000000000000"b),
+  5    34 	function_type		init("000100000000000000"b),
+  5    35 	group_type		init("000010000000000000"b),
+  5    36 	label_type		init("001001000011000000"b),
+  5    37 	shared_variable_type	init("001000100000000000"b),
+  5    38 	lexed_function_type		init("000000010000000000"b),
+  5    39 
+  5    40 	list_value_type		init("000000001000000000"b),
+  5    41 	character_value_type 	init("001000000100000000"b),
+  5    42 	numeric_value_type		init("001000000010000000"b),
+  5    43 	integral_value_type		init("001000000011000000"b),
+  5    44 	zero_or_one_value_type	init("001000000011100000"b),
+  5    45 	complex_value_type		init("001000000000010000"b),
+  5    46 
+  5    47 	not_integer_mask		init("111111111110011111"b),		/* to clear integral, zero_or_one bits */
+  5    48 	not_zero_or_one_mask	init("111111111111011111"b)		/* to clear zero_or_one bit */
+  5    49         ) bit(18) internal static;
+  5    50 
+  5    51 /* ------ END INCLUDE SEGMENT		apl_bead_format.incl.pl1 ---------------------------------- */
+      175 
+  6     1 /* ====== BEGIN INCLUDE SEGMENT	apl_value_bead.incl.pl1 =================================== */
+  6     2 
+  6     3 declare
+  6     4 	number_of_dimensions fixed bin,
+  6     5 
+  6     6 	1 value_bead		aligned based,
+  6     7 	2 header			aligned like general_bead,
+  6     8 	2 total_data_elements	fixed binary (21),	/* length of ,[value] in APL		*/
+  6     9 	2 rhorho			fixed binary,	/* number of dimensions of value	*/
+  6    10 	2 data_pointer		pointer unaligned,	/* packed pointer to the data in value	*/
+  6    11 	2 rho			fixed binary (21) dimension (number_of_dimensions refer (value_bead.rhorho));
+  6    12 						/* dimensions of value (zero-origin)	*/
+  6    13 
+  6    14 
+  6    15 declare 1 character_data_structure	aligned based,	/* alignment trick for PL/I compiler	*/
+  6    16 	2 character_datum		character (1) unaligned dimension (0:data_elements - 1);
+  6    17 						/* actual elements of character array	*/
+  6    18 
+  6    19 declare   character_string_overlay	character (data_elements) aligned based;
+  6    20 						/* to overlay on above structure	 */
+  6    21 
+  6    22 
+  6    23 declare   numeric_datum		float aligned dimension (0:data_elements - 1) based;
+  6    24 						/* actual elements of numeric array	*/
+  6    25 
+  6    26 declare	complex_datum		complex float aligned dimension (0:data_elements -1) based;
+  6    27 
+  6    28 declare	MAX_VALUE_BEAD_SIZE		fixed bin (19) init (261120) int static options (constant);
+  6    29 
+  6    30 /* ------ END INCLUDE SEGMENT		apl_value_bead.incl.pl1 ----------------------------------- */
+      176 
+  7     1 /* ====== BEGIN INCLUDE SEGMENT	apl_operator_bead.incl.pl1 ================================ */
+  7     2 
+  7     3 declare
+  7     4 	1 operator_bead		aligned based,
+  7     5 
+  7     6 	  2 type			unaligned like general_bead.type,
+  7     7 
+  7     8 	  2 bits_for_lex		unaligned,
+  7     9 	    3 allow_brackets	bit(1),		/* operator may have dimension info in brackets */
+  7    10 	    3 allow_product		bit(1),		/* operator may be used in inner and outer product */
+  7    11 	    3 allow_reduction	bit(1),		/* operator may be used in reduction and scan */
+  7    12 	    3 special_assignment	bit(1),		/* doesn't use standard assignment operator */
+  7    13 	    3 ignores_assignment	bit(1),		/* assignment has no effect */
+  7    14 	    3 allow_subscripted_assignment
+  7    15 				bit(1),		/* system variable that can be subscripted assigned */
+  7    16 	    3 pad			bit(12),
+  7    17 
+  7    18 	  2 bits_for_parse		unaligned,
+  7    19 	    3 stop_trace_control	bit(1),		/* next lexeme is function being stopped/traced
+  7    20*						   (op1 tells which) */
+  7    21 	    3 quad		bit(1),		/* this is a quad type */
+  7    22 	    3 system_variable	bit(1),		/* this is a system variable, not an op */
+  7    23 	    3 dyadic		bit(1),		/* operator may be dyadic */
+  7    24 	    3 monadic		bit(1),		/* operator may be monadic */
+  7    25 	    3 function		bit(1),		/* operator is a user defined function */
+  7    26 	    3 semantics_valid	bit(1),		/* if semantics has been set */
+  7    27 	    3 has_list		bit(1),		/* semantics is a list */
+  7    28 	    3 inner_product		bit(1),		/* op2 is valid */
+  7    29 	    3 semantics_on_stack	bit(1),		/* semantics points to value stack */
+  7    30 	    3 is_external_function	bit(1),		/* semantics points to function bead for ext function */
+  7    31 	    3 pad			bit(7),
+  7    32 	    3 op2			fixed bin(8) unaligned,	/* secondary operator code */
+  7    33 	    3 op1			fixed bin(8) unaligned,	/* primary operator code */
+  7    34 	  2 type_code		fixed bin;	/* for parse */
+  7    35 
+  7    36 /* ------ END INCLUDE SEGMENT		apl_operator_bead.incl.pl1 -------------------------------- */
+      177 
+  8     1 /* ====== BEGIN INCLUDE SEGMENT	apl_symbol_bead.incl.pl1 ================================== */
+  8     2 
+  8     3 /* Explanation of fields:
+  8     4*   symbol_bead.hash_link_pointer	points to next symbol in same hash bucket in the symbol table.
+  8     5*   symbol_bead.meaning_pointer	points to current "value" of this name:
+  8     6*				   =  null	  => unused (e.g. undefined variable)
+  8     7*				   -> group bead      => group name
+  8     8*				   -> value bead      => variable with a value
+  8     9*				   -> function bead   => function name
+  8    10*				   -> label bead      => localized label value
+  8    11*				   -> shared var bead => shared variable	*/
+  8    12 
+  8    13 declare 1 symbol_bead 		aligned based,
+  8    14 	2 header	 		aligned like general_bead,
+  8    15 	2 hash_link_pointer		pointer unaligned,
+  8    16 	2 meaning_pointer		pointer unaligned,
+  8    17 	2 name_length 		fixed binary,
+  8    18 	2 name			character (0 refer (symbol_bead.name_length)) unaligned;
+  8    19 
+  8    20 /* ------ END INCLUDE SEGMENT		apl_symbol_bead.incl.pl1 ---------------------------------- */
+      178 
+  9     1 /* ====== BEGIN INCLUDE SEGMENT	apl_function_bead.incl.pl1 ================================ */
+  9     2 
+  9     3 /* This bead is used by apl to store the source code for user-defined functions */
+  9     4 
+  9     5 declare	1 function_bead		aligned based,
+  9     6 
+  9     7 	  2 header		aligned like general_bead,
+  9     8 
+  9     9 	  2 lexed_function_bead_pointer unaligned pointer, /* null if unlexed or has errors, else -> lexed code */
+  9    10 	  2 class			fixed bin,	/* 0=normal, 1=locked, 2=external zfn, 3=mfn, 4=dfn */
+  9    11 	  2 stop_control_pointer	unaligned ptr,	/* points to stop value bead, or null (no stop control) */
+  9    12 	  2 trace_control_pointer	unaligned ptr,	/* points to trace value bead, or null (no trace control) */
+  9    13 	  2 text_length		fixed bin(21),	/* length of function text */
+  9    14 	  2 text			aligned char(data_elements refer (function_bead.text_length));
+  9    15 						/* the user's code exactly as typed in */
+  9    16 
+  9    17 /* ------ END INCLUDE SEGMENT		apl_function_bead.incl.pl1 -------------------------------- */
+      179 
+ 10     1 /* ====== BEGIN INCLUDE SEGMENT	apl_lexed_function_bead.incl.pl1 ========================== */
+ 10     2 
+ 10     3 /* this is the format of a user-defined function after it has been run
+ 10     4*   through apl_lex_, the first (left to right) parsing phase. */
+ 10     5 
+ 10     6 dcl 1 lexed_function_bead based aligned,
+ 10     7     2 header like general_bead,			/* type bits, etc. */
+ 10     8 
+ 10     9     2 name pointer unaligned,				/* -> symbol bead which names the function */
+ 10    10     2 bits_for_parse unaligned like operator_bead.bits_for_parse,	/* so can treat like system function */
+ 10    11     2 number_of_statements fixed bin,
+ 10    12     2 number_of_localized_symbols fixed bin,		/* including labels and parameter variables, return var */
+ 10    13 						/* even if they aren't there, thus >_ 3 */
+ 10    14     2 number_of_labels fixed bin,
+ 10    15     2 label_values_ptr pointer unaligned,			/* -> label_values below */
+ 10    16     2 statement_map_ptr pointer unaligned,			/* -> statement_map below */
+ 10    17     2 lexeme_array_ptr pointer unaligned,			/* -> lexeme_array below */
+ 10    18 
+ 10    19 	/* the first 3 localized symbols are always reserved for ReturnSymbol, LeftArgSymbol, RighArgSymbol respectively.
+ 10    20*	   If some of these symbols are not present (e.g. monadic or value-less function), null pointers are used.
+ 10    21*	   So beware!, there can be null ptrs in the localized_symbols array. */
+ 10    22 
+ 10    23     2 localized_symbols(  (0) refer (lexed_function_bead.number_of_localized_symbols)) pointer unaligned,
+ 10    24 						/* first localized vars from header line, then labels */
+ 10    25     2 label_values ( (0) refer (lexed_function_bead.number_of_labels)) pointer unaligned,
+ 10    26 						/* ptrs to label-value beads for labels */
+ 10    27     2 statement_map ( (0) refer (lexed_function_bead.number_of_statements)) fixed bin(18),
+ 10    28 						/* index in lexeme_array of rightmost lexeme of each stmt */
+ 10    29     2 lexeme_array ( (0) refer (lexed_function_bead.number_of_labels)	/* not really, but fake out compiler */ ) pointer unaligned;
+ 10    30 			/* the actual lexemes.  Length of array is
+ 10    31*							statement_map(number_of_statements)   */
+ 10    32 
+ 10    33 
+ 10    34 /* manifest constants for first 3 localized symbols */
+ 10    35 
+ 10    36 dcl (ReturnSymbol	init(1),
+ 10    37      LeftArgSymbol	init(2),
+ 10    38      RightArgSymbol	init(3)
+ 10    39     ) fixed binary static;
+ 10    40 
+ 10    41 
+ 10    42 	/* the last three parts of this bead are referenced separately, though ptrs earlier in the bead.
+ 10    43*	   Here are declarations for them as level-1 structures */
+ 10    44 
+ 10    45 dcl 1 lexed_function_label_values_structure based aligned,
+ 10    46      2 lexed_function_label_values ( 500 /* or so */ ) pointer unaligned,
+ 10    47 
+ 10    48     statement_count fixed bin,
+ 10    49     lexed_function_statement_map (statement_count) fixed bin(18) aligned based,
+ 10    50 
+ 10    51     1 lexed_function_lexemes_structure based aligned,
+ 10    52      2 lexed_function_lexeme_array ( 500 /* or so */ ) pointer unaligned;
+ 10    53 
+ 10    54 /* ------ END INCLUDE SEGMENT		apl_lexed_function_bead.incl.pl1 -------------------------- */
+      180 
+ 11     1 /*	BEGIN INCLUDE FILE:		apl_group_bead.incl.pl1			*/
+ 11     2 
+ 11     3 /* 		Initial Version:	1973.06.18
+ 11     4*		Typed in by:	Richard S. Lamson					*/
+ 11     5 
+ 11     6 
+ 11     7 declare 1 group_bead		aligned based,	/* Group:  bead_type.group = "1"b	*/
+ 11     8 
+ 11     9 	2 header			aligned like general_bead,
+ 11    10 
+ 11    11 	2 number_of_members		fixed binary,
+ 11    12 
+ 11    13 	2 member			pointer unaligned dimension (0 refer (group_bead.number_of_members));
+ 11    14 						/* Pointer to the symbol bead for each
+ 11    15*						    member of the group		*/
+ 11    16 
+ 11    17 /*	END INCLUDE FILE		apl_group_bead.incl.pl1				*/
+      181 
+      182 
+      183 trace_storage_manager:
+      184 	entry (bv_trace_flags);
+      185 
+      186 /* parameters */
+      187 
+      188 dcl  bv_trace_flags bit (36) aligned;
+      189 
+      190 /* entry */
+      191 
+      192 	trace_flags = bv_trace_flags;			/* someday we should copy these into the ws */
+      193 	return;					/* during initialization to avoid the extra pagefault */
+      194 
+      195 apl_free_bead_:
+      196 	entry (free_ptr_structure);
+      197 
+      198 dcl 1 free_ptr_structure aligned parameter,
+      199       2 free_ptr unaligned pointer;
+      200 
+      201 	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+      202 	p = free_ptr;				/* -> block to be freed */
+      203 	s = fixed (p -> general_bead.size, 18);		/* number of words to free */
+      204 
+      205 
+      206 	if p -> general_bead.reference_count ^= 0
+      207 	then do;
+      208 		if trace_flags & trace_reference_count_errors
+      209 		then do;
+      210 			call ioa_$ioa_stream ("apl_trace_", "ref ct error: ^d ^d ^p; calling debug",
+      211 			     p -> general_bead.reference_count, s, p);
+      212 			call debug;
+      213 		     end;
+      214 
+      215 		call apl_system_error_ (apl_error_table_$invalid_free_bead);
+      216 	     end;
+      217 
+      218 	/* if necessary, recursively free the components of the bead.  we use actual PL/I recursion since
+      219*	   in the most common case (value beads) it won't be used. */
+      220 
+      221 	if p -> general_bead.type.symbol
+      222 	then if p -> symbol_bead.meaning_pointer = null	/* only throw away symbol if it is truly meaningless */
+      223 	     then do;
+      224 		     call apl_get_symbol_ (p -> symbol_bead.name, q, i);	/* get hash-bucket number */
+      225 		     if q ^= p
+      226 		     then call apl_system_error_ (apl_error_table_$uninterned_symbol);
+      227 
+      228 		     old_q = null;			/* trace hash chain and remove this symbol from table */
+      229 		     do q = hash_bucket_ptr (i) repeat (old_q -> symbol_bead.hash_link_pointer) while (q ^= null);
+      230 			if q = p
+      231 			then do;
+      232 				if old_q = null	/* first on chain */
+      233 				then hash_bucket_ptr (i) = q -> symbol_bead.hash_link_pointer;
+      234 				else old_q -> symbol_bead.hash_link_pointer = q -> symbol_bead.hash_link_pointer;
+      235 
+      236 				go to escape;
+      237 			     end;
+      238 			old_q = q;
+      239 		     end;
+      240 						/* should never take normal exit from loop */
+      241 		     call apl_system_error_ (apl_error_table_$uninterned_symbol);
+      242 
+      243 escape:
+      244 		     ws_info.number_of_symbols = ws_info.number_of_symbols - 1;	/* maintain this count for rsl */
+      245 		end;
+      246 	     else return;				/* meaning ptr non null */
+      247 
+      248 	else if p -> general_bead.type.function
+      249 	     then do;
+      250 		     if p -> function_bead.class <= 1
+      251 		     then call launder (p -> function_bead.lexed_function_bead_pointer);
+      252 					/* check for external function, where is not really bead ptr */
+      253 		     call launder (p -> function_bead.stop_control_pointer);
+      254 		     call launder (p -> function_bead.trace_control_pointer);
+      255 		end;
+      256 
+      257 	else if p -> general_bead.type.group
+      258 	     then do i = 1 to p -> group_bead.number_of_members;
+      259 		     call launder (p -> group_bead.member (i));
+      260 		end;
+      261 
+      262 	else if p -> general_bead.type.lexed_function
+      263 	     then do;
+      264 		     call launder (p -> lexed_function_bead.name);
+      265 		     do i = 1 to p -> lexed_function_bead.number_of_localized_symbols;
+      266 			if p -> lexed_function_bead.localized_symbols (i) ^= null
+      267 			then if p -> lexed_function_bead.localized_symbols (i) -> general_bead.type.symbol
+      268 					/* only does next line if real symbol, not localized system variable */
+      269 			     then call launder (p -> lexed_function_bead.localized_symbols (i));
+      270 		     end;
+      271 		     do i = 1 to p -> lexed_function_bead.number_of_labels;
+      272 			call launder (p -> lexed_function_bead.label_values_ptr -> lexed_function_label_values (i));
+      273 		     end;
+      274 
+      275 		     /* Make sure that there are any statements at all before
+      276*			trying to free their lexemes. */
+      277 
+      278 		     if p -> lexed_function_bead.number_of_statements > 0
+      279 			then do i = 1 to p -> lexed_function_bead.statement_map_ptr -> lexed_function_statement_map (
+      280 			     p -> lexed_function_bead.number_of_statements);
+      281 
+      282 			     call launder (p -> lexed_function_bead.lexeme_array_ptr -> lexed_function_lexeme_array (i));
+      283 			end;
+      284 		end;
+      285 
+      286 	go to free_something;		/* go free up the storage that was occupied by this bead */
+      287 
+      288 apl_free_words_:
+      289 	entry (alloc_amount, alloc_ptr_structure);
+      290 
+      291 dcl alloc_amount fixed bin(18) parameter,
+      292     1 alloc_ptr_structure aligned parameter,
+      293       2 alloc_ptr unaligned pointer;
+      294 
+      295 	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+      296 
+      297 	p = alloc_ptr;
+      298 	s = alloc_amount;
+      299 
+      300 free_something:				/* p -> bead to free, s is number of words */
+      301 	ws_info.dont_interrupt_storage_manager = "1"b;		/* inhibit interruptions while munging the map seg */
+      302 
+      303 	if ws_info.meter_mode
+      304 	then enter_time = vclock ();
+      305 
+      306 	/* find map for segment in which bead is being freed */
+      307 
+      308 	hash_index = mod(fixed(baseno(p), 18), dim(seg_map_hash_table, 1));
+      309 	do i = hash_index by 1 while (i <= hbound(seg_map_hash_table, 1)),
+      310 	       lbound(seg_map_hash_table, 1) by 1 while (i < hash_index);	/* circular scan of hash table */
+      311 	   if seg_map_hash_table(i).seg_baseno = baseno(p) then go to g0001;
+      312 	   end;
+      313 	call apl_system_error_(apl_error_table_$bead_not_known_to_apl);	/* not in hash table??!?!?!?!!!??? */
+      314 
+      315 g0001:	sli = seg_map_hash_table(i).seg_list_idx;
+      316 	if seg_list(sli).usage ^> 2 then call apl_system_error_(apl_error_table_$bead_not_known_to_apl);
+      317 	seg_map_p = seg_list(sli).pointer;
+      318 
+      319 	p_rel_loc = rel(p);			/* avoid repeated recomputation of this */
+      320 
+      321 	/* check if this free bead falls at end of segmant, in which case don't bother with map */
+      322 
+      323 	if fixed(p_rel_loc, 18) + s = seg_map.amount_of_seg_used then do;
+      324 		seg_map.amount_of_seg_used = fixed(p_rel_loc, 18);
+      325 		mapx = 0;				/* METER */
+      326 		which_free = 1;			/* TRACE; 1 = OFF END */
+      327 		go to tree_search_exit;
+      328 		end;
+      329 
+      330 
+      331 	already_balanced = "0"b;		/* set flag saying have not yet called balance */
+      332 retry_after_balance:			/* re-enter here after balance is called, already_balanced will be "1"b */
+      333 	mapx = 1;				/* start searching from root of tree, looking for place to drop bead */
+      334 
+      335 tree_search_loop:
+      336 	if string (map (mapx)) = ""b			/* found a leaf, drop this bead in */
+      337 	then do;
+      338 		map(mapx).rel_loc = p_rel_loc;
+      339 		map(mapx).size = bit(fixed(s, 18), 18);
+      340 		seg_map.last_entry_used = max(seg_map.last_entry_used, mapx);
+      341 		which_free = 2;				/* TRACE; 2 = WITH MAP */
+      342 		go to tree_search_exit;
+      343 	     end;
+      344 	else if p_rel_loc < map (mapx).rel_loc		/* new bead is to the left of current one */
+      345 	     then if binary (map (mapx).rel_loc, 18) = binary (p_rel_loc, 18) + s
+      346 		then do;				/* combine on the left */
+      347 			map (mapx).rel_loc = p_rel_loc;
+      348 			map (mapx).size = bit (binary (binary (map (mapx).size) + s, 18), 18);
+      349 			other = left_neighbor (mapx);	/* try to combine further on the left */
+      350 
+      351 			if other ^= mapx
+      352 			then if binary (p_rel_loc) = binary (map (other).rel_loc) + binary (map (other).size)
+      353 			     then do;		/* join beads, discard neighbor */
+      354 				     map (mapx).rel_loc = map (other).rel_loc;
+      355 				     map (mapx).size = bit (binary (binary (map (mapx).size)
+      356 					+ binary (map (other).size), 18), 18);
+      357 				     which_free = 3;	/* TRACE; 3 = LEFT MERGE */
+      358 				     go to fill_hole;
+      359 				end;
+      360 			which_free = 4;				/* TRACE; 4 = LEFT MERGE SIMPLE */
+      361 			go to tree_search_exit;
+      362 		     end;
+      363 		else do;				/* not adjacent, move left */
+      364 			mapx = 2*mapx;
+      365 			if mapx > seg_map.number_of_entries
+      366 			then go to balance;
+      367 			else go to tree_search_loop;
+      368 		     end;
+      369 	     else if p_rel_loc = map (mapx).rel_loc
+      370 		then do;				/* new bead is same as current one!!! */
+      371 			call apl_system_error_ (apl_error_table_$bead_already_free);
+      372 			which_free = 8;
+      373 			go to tree_search_exit;
+      374 		     end;
+      375 		else				/* new bead is to the right of current one */
+      376 		     if binary (p_rel_loc) = binary (map (mapx).rel_loc) + binary (map (mapx).size)
+      377 		     then do;			/* combine on the left */
+      378 			     map (mapx).size = bit (binary (binary (map (mapx).size) + s, 18), 18);
+      379 
+      380 			     /* see if can combine further on the right */
+      381 
+      382 			     other = right_neighbor (mapx);	/* other := leftmost bead to right of mapx */
+      383 			     if other ^= mapx
+      384 			     then if binary (map (other).rel_loc) = binary (p_rel_loc) + s
+      385 				then do;
+      386 					map (mapx).size = bit (binary (binary (map (mapx).size)
+      387 					     + binary (map (other).size), 18), 18);
+      388 					which_free = 5; /* TRACE; 5 = RIGHT MERGE */
+      389 
+      390 					go to fill_hole;
+      391 				     end;
+      392 			     which_free = 6;	/* TRACE; 6 = RIGHT MERGE SIMPLE */
+      393 			     go to tree_search_exit;
+      394 			end;
+      395 		     else do;			/* not adjacent, move right */
+      396 			     mapx = 2 * mapx + 1;
+      397 			     if mapx > seg_map.number_of_entries
+      398 			     then go to balance;
+      399 			     else go to tree_search_loop;
+      400 			end;
+      401 
+      402 fill_hole:
+      403 	neighbor = left_neighbor (other);
+      404 
+      405 	if neighbor = other
+      406 	then neighbor = right_neighbor (other);
+      407 
+      408 	if neighbor ^= other
+      409 	then do;
+      410 		string (map (other)) = string (map (neighbor));
+      411 		other = neighbor;
+      412 		go to fill_hole;
+      413 	     end;
+      414 	else string (map (other)) = ""b;
+      415 
+      416 /* come here when the new bead has been successfully dropped into the tree */
+      417 
+      418 tree_search_exit:
+      419 	if trace_flags & trace_free
+      420 	then call ioa_$ioa_stream ("apl_trace_", "free(^d) ^d (^o) ^p", which_free, s, s, p);
+      421 
+      422 	if trace_flags & check_storage_manager
+      423 	then call check_storage_manager_$free (p, s);
+      424 
+      425 	seg_list(sli).words_free = seg_list(sli).words_free + s;
+      426 
+      427 	/* METER */
+      428 
+      429 	if ws_info.meter_mode
+      430 	then do;
+      431 		call compute_range;
+      432 		metric.range(rangex).free_time = metric.range(rangex).free_time + (vclock() - enter_time);
+      433 		metric.range(rangex).free_count = metric.range(rangex).free_count + 1;
+      434 		if mapx ^= 0 then metric.range(rangex).map_free_count = metric.range(rangex).map_free_count + 1;
+      435 		metric.range(rangex).words_freed = metric.range(rangex).words_freed + s;
+      436 	     end;
+      437 
+      438 	ws_info.dont_interrupt_storage_manager = "0"b;
+      439 	if ws_info.dirty_interrupt_pending then signal apl_dirty_stop_;
+      440 	return;
+      441 
+      442 /*** routine to balance the tree -- returns to retry_after_balance ***/
+      443 
+      444 balance:
+      445 	if already_balanced				/* damn! no space left in tree. throw this bead away. */
+      446 	then do;
+      447 		if ws_info.meter_mode
+      448 		then if s < BreakSize		/* meter this */
+      449 		     then do;
+      450 			     metric.little_seg_balance.thrown_away = metric.little_seg_balance.thrown_away + 1;
+      451 			     metric.little_seg_balance.amt_thrown_away = metric.little_seg_balance.amt_thrown_away + s;
+      452 			end;
+      453 		     else do;
+      454 			     metric.big_seg_balance.thrown_away = metric.big_seg_balance.thrown_away + 1;
+      455 			     metric.big_seg_balance.amt_thrown_away = metric.big_seg_balance.amt_thrown_away + s;
+      456 			end;
+      457 		which_free = 7;			/* TRACE; 7 = DISCARD */
+      458 		go to tree_search_exit;
+      459 	     end;
+      460 
+      461 	already_balanced = "1"b;
+      462 
+      463 	if trace_flags & trace_balancer
+      464 	then call ioa_$ioa_stream ("apl_trace_", "balancing");
+      465 
+      466 	if ws_info.meter_mode
+      467 	then enter_balance_time = vclock ();
+      468 
+      469 	begin;			/* need a begin block to get copy-space to make balancing tree easy */
+      470 
+      471       dcl	1 map_copy (0:seg_map.last_entry_used+1) aligned automatic like seg_map.map,
+      472 				/* 2 extra entries at begin and end are used in linked-list hack below */
+      473 	link_map(0:seg_map.last_entry_used+1) fixed bin aligned based(addr(map_copy)),
+      474 
+      475 	left_link fixed bin,
+      476 	right_link fixed bin,
+      477 	new_link fixed bin,
+      478    	mapx fixed bin,
+      479 	copyx fixed bin;
+      480 
+      481 	/* move entries from map to map_copy, so that map_copy is sorted array of all of them.
+      482*	   tree is walked without the assistance of a stack.  With this peculiar storage order for
+      483*	   the tree a stack is not necessary */
+      484 
+      485 	copyx = 0;
+      486 	mapx = 1;
+      487 	depth = 0;				/* stack is empty. */
+      488 
+      489 copy_map_recurse_left:
+      490 	if mapx > seg_map.last_entry_used
+      491 	then go to copy_map_pop;
+      492 
+      493 	if string (map (mapx)) = ""b
+      494 	then go to copy_map_pop;
+      495 
+      496 	depth = depth + 1;				/* push current position onto stack */
+      497 	map_stack(depth) = mapx;
+      498 	mapx = 2 * mapx;				/* recurse to left son */
+      499 
+      500 	go to copy_map_recurse_left;
+      501 
+      502 copy_map_pop:
+      503 	if depth = 0
+      504 	then go to copy_map_done;
+      505 
+      506 	mapx = map_stack(depth);
+      507 	depth = depth - 1;				/* pop top element on stack */
+      508 
+      509 	copyx = copyx + 1;
+      510 	string (map_copy (copyx)) = string (map (mapx));
+      511 	string (map (mapx)) = ""b;			/* remove from original map */
+      512 
+      513 	mapx = 2 * mapx + 1;			/* now visit right son */
+      514 	go to copy_map_recurse_left;
+      515 
+      516 	/* At this point map_copy is sorted into order by increasing offsets.
+      517*	   Now we move it back into the real map such that the root of the
+      518*	   tree is the median, the left son of the root is the (1/4) quartile,
+      519*	   the right son of the root is the (3/4) quartile, etc.
+      520*
+      521*	   The way this works is by successive halving, quartering, etc. of copy_map
+      522*	   after each stage a linked, ordered list of all things taken so far is constructed
+      523*	   so that the next stage may be done without any recursion or anything */
+      524 
+      525 	/* first step is to link up a cell at left margin and a cell at right margin */
+      526 
+      527 copy_map_done:
+      528 	link_map(0) = copyx+1;
+      529 	link_map(copyx+1) = 0;
+      530 
+      531 	/* loop down the list and get the map entries in between the ones on the list */
+      532 
+      533 	mapx = 0;				/* outputting to orig map in linear order */
+      534 
+      535 	do while (mapx < 2*copyx);		/* put out enough rows of tree to consume all the entries */
+      536 					/* mapx doubles each time, last time through copyx <= mapx < 2*copyx */
+      537 
+      538 	 do left_link = 0 repeat right_link while("1"b);
+      539 
+      540 	   right_link = link_map(left_link);
+      541 	   if right_link = 0 then go to g0021;	/* come to end, exit out of this loop */
+      542 
+      543 	   new_link = divide(right_link-left_link, 2, 17, 0);	/* half way between left_link & right_link */
+      544 	     if new_link = 0			/* nothing here so put out a zero.  I can prove this works... */
+      545 	     then mapx = mapx + 1;
+      546 	     else do;				/* something here, put it out and change it to a link */
+      547 		     new_link = new_link + left_link;
+      548 		     mapx = mapx + 1;
+      549 		     string(map(mapx)) = string(map_copy(new_link));
+      550 		     link_map(left_link) = new_link;
+      551 		     link_map(new_link) = right_link;
+      552 		end;
+      553 	   end;
+      554 
+      555 g0021:
+      556 	end;
+      557 
+      558 	seg_map.last_entry_used = mapx;
+      559 
+      560 	/* METER THE BALANCER */
+      561 
+      562 	if ws_info.meter_mode
+      563 	then if s < BreakSize
+      564 	     then do;
+      565 		     metric.little_seg_balance.count = metric.little_seg_balance.count + 1;
+      566 		     metric.little_seg_balance.time_spent_balancing = metric.little_seg_balance.time_spent_balancing +
+      567 			(vclock() - enter_balance_time);
+      568 		     metric.little_seg_balance.space_left = metric.little_seg_balance.space_left + copyx;
+      569 		end;
+      570 	     else do;
+      571 		     metric.big_seg_balance.count = metric.big_seg_balance.count + 1;
+      572 		     metric.big_seg_balance.time_spent_balancing = metric.big_seg_balance.time_spent_balancing +
+      573 			(vclock() - enter_balance_time);
+      574 		     metric.big_seg_balance.space_left = metric.big_seg_balance.space_left + copyx;
+      575 		end;
+      576 
+      577 	end;			/* end of balancing the begin block */
+      578 
+      579 	go to retry_after_balance;
+      580 
+      581 /*** here is the allocation part ***/
+      582 
+      583 apl_allocate_words_:
+      584 	entry (alloc_amount, alloc_ptr_structure);
+      585 
+      586 	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+      587 
+      588 	s = alloc_amount;
+      589 	/* alloc_ptr is return arg, will be set from p */
+      590 
+      591 
+      592 	esw = 1;
+      593 	if ws_info.meter_mode
+      594 	then enter_time = vclock ();
+      595 
+      596 copy_value_alloc_join:
+      597 
+      598 	s = s + (s - 2 *  divide (s, 2, 19, 0));
+      599 	if s > sys_info$max_seg_size then call apl_system_error_(apl_error_table_$wsfull_alloc_too_big);
+      600 
+      601 	ws_info.dont_interrupt_storage_manager = "1"b;		/* inhibit interruptions while munging the map seg */
+      602 	endp, newp = 0;
+      603 	if s < BreakSize
+      604 	then do;
+      605 		sli = current_little_bead_seg;
+      606 		scan_pos = current_little_scan_pos;
+      607 	     end;
+      608 	else do;
+      609 		sli = current_big_bead_seg;
+      610 		scan_pos = current_big_scan_pos;
+      611 	     end;
+      612 
+      613 	if sli = 0
+      614 	then go to get_new_seg;
+      615 
+      616 	if seg_list (sli).usage ^> 2
+      617 	then call apl_system_error_ (apl_error_table_$tables_inconsistent);
+      618 
+      619 	/* try scanning through this seg's map for a free bead of suitable size */
+      620 
+      621 scan_for_bead_to_alloc:
+      622 	seg_map_p = seg_list (sli).pointer;
+      623 	if seg_list(sli).words_free < s then go to get_new_seg;	/* if hopeless */
+      624 
+      625 	/* Look in free map for a free bead of enough words to meet
+      626*	   allocation request.  We walk the tree in in-order to avoid
+      627*	   zero nodes (the tree is usually pretty sparse), and to favor
+      628*	   the beginning of the segment.  Someday we might want to remember
+      629*	   where we left off the last time. */
+      630 
+      631 	mapx = 1;					/* start at root node */
+      632 	depth = 0;				/* stack is empty. */
+      633 
+      634 search_recurse_left:
+      635 	if mapx > seg_map.last_entry_used		/* mapx increases until too big by one level */
+      636 	then go to search_pop;
+      637 
+      638 	if string (map (mapx)) = ""b			/* have gone too far...null leaf */
+      639 	then go to search_pop;
+      640 
+      641 	depth = depth + 1;				/* push current node onto stack */
+      642 	map_stack(depth) = mapx;
+      643 	mapx = 2 * mapx;				/* try left son */
+      644 	go to search_recurse_left;
+      645 
+      646 search_pop:
+      647 	if depth = 0				/* is stack empty? */
+      648 	then go to search_done;			/* then we have searched whole tree */
+      649 
+      650 	mapx = map_stack(depth);
+      651 	depth = depth - 1;				/* pop top element on stack */
+      652 
+      653 	n_left = binary (map (mapx).size, 18) - s;
+      654 	if n_left >= 0				/* if not hopeless, look more carefully */
+      655 	then do;
+      656 		p = addrel (seg_map.seg_ptr, map (mapx).rel_loc);
+      657 
+      658 		if n_left >= seg_map.smallest_piece	/* if amount left is big enough to go on its own */
+      659 		then do;
+      660 			map (mapx).rel_loc = rel (addrel (p, s));
+      661 			map (mapx).size = bit (fixed (n_left, 18), 18);
+      662 			go to end_alloc;
+      663 		     end;
+      664 		else do;				/* otherwise, use whole bead & move up its subtree */
+      665 			s = s + n_left;
+      666 
+      667 			if s < BreakSize		/* save scan pos for next time */
+      668 			then current_little_scan_pos = mapx;
+      669 			else current_big_scan_pos = mapx;
+      670 
+      671 alloc_fill_hole:
+      672 			other = left_neighbor (mapx);	/* try left first */
+      673 
+      674 			if other = mapx		/* nothing, try right */
+      675 			then other = right_neighbor (mapx);
+      676 
+      677 			if other ^= mapx		/* if neighbor exists */
+      678 			then do;
+      679 				string (map (mapx)) = string (map (other));
+      680 				mapx = other;
+      681 				go to alloc_fill_hole;
+      682 			     end;
+      683 			else string (map (mapx)) = ""b;
+      684 			go to end_alloc;
+      685 		     end;
+      686 	     end;
+      687 
+      688 	mapx = 2 * mapx + 1;			/* nothing here, try right son */
+      689 	go to search_recurse_left;
+      690 
+      691 search_done:					/* no place free, try taking end of seg */
+      692 	if seg_map.amount_of_seg_used + s <= sys_info$max_seg_size
+      693 	then do;
+      694 		p = addrel (seg_map.seg_ptr, seg_map.amount_of_seg_used);
+      695 		n_left = 0;			/* may be uninitialized */
+      696 		seg_map.amount_of_seg_used = seg_map.amount_of_seg_used + s;
+      697 		endp = 1;
+      698 		go to end_alloc;
+      699 	     end;
+      700 
+      701 /** can't alloc in this seg, try another one **/
+      702 
+      703 get_new_seg:
+      704 	newp = 1;
+      705 	/* find big (or small)_seg from list of such which has most words left */
+      706 
+      707 	n_left = 0;
+      708 	if s < BreakSize then required_usage = 3; else required_usage = 4;
+      709 	do i = lbound(seg_list, 1) to hbound(seg_list, 1);
+      710 	   if seg_list(i).usage = required_usage
+      711 	      then if seg_list(i).words_free > n_left
+      712 	         then do;	/* foud new max-free seg */
+      713 		  n_left = seg_list(i).words_free;
+      714 		  new_sli = i;
+      715 		  end;
+      716 	   end;
+      717 	if new_sli ^= sli
+      718 	   then if n_left >= s
+      719 	      then do;
+      720 
+      721 		/* found new seg with more room, try it */
+      722 
+      723 		sli = new_sli;
+      724 remember_new_seg:
+      725 		scan_pos = 1;
+      726 		if s < BreakSize then do;
+      727 		     current_little_bead_seg = sli;
+      728 		     current_little_scan_pos = 0;
+      729 		     end;
+      730 		else do;
+      731 		     current_big_bead_seg = sli;
+      732 		     current_big_scan_pos = 0;
+      733 		     end;
+      734 		go to scan_for_bead_to_alloc;
+      735 		end;
+      736 
+      737 
+      738 	/* no present segments, get a new one */
+      739 
+      740 
+      741 	call get_seg_for_apl;
+      742 	if s < BreakSize then do;
+      743 	   seg_list(sli).usage = 3;
+      744 	   map_size = LittleMapSize;
+      745 	   small_piece = LittleSmallPiece;
+      746 	   end;
+      747 	else do;
+      748 	   seg_list(sli).usage = 4;
+      749 	   map_size = BigMapSize;
+      750 	   small_piece = BigSmallPiece;
+      751 	   end;
+      752 	seg_list(sli).pointer, seg_map_p = last_map;
+      753 	seg_list(sli).words_free = sys_info$max_seg_size;
+      754 	temp_ptr = addrel(seg_map_p, size(seg_map));
+      755 	if fixed(rel(temp_ptr), 18) > sys_info$max_seg_size
+      756 	   then call apl_system_error_(apl_error_table_$wsfull_out_of_maps);	/* check for oob on map seg */
+      757 	else last_map = temp_ptr;		/* update ptr to next free loc in map seg */
+      758 
+      759 	seg_map.seg_ptr = segp;
+      760 	seg_map.smallest_piece = small_piece;
+      761 	seg_map.number_of_entries = map_size;
+      762 	seg_map.last_entry_used = 0;
+      763 	seg_map.amount_of_seg_used = 0;
+      764 	go to remember_new_seg;			/* go rejoin other case of get_new_seg */
+      765 
+      766 apl_copy_value_:
+      767 	entry (from_ptr_structure, to_ptr_structure);
+      768 
+      769 /* parameters */
+      770 
+      771 dcl 1 from_ptr_structure aligned parameter,
+      772       2 from_ptr pointer unaligned,
+      773     1 to_ptr_structure aligned parameter,
+      774       2 to_ptr pointer unaligned;
+      775 
+      776 	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+      777 
+      778 	if ws_info.meter_mode
+      779 	then enter_time = vclock ();
+      780 
+      781 	data_elements = from_ptr -> value_bead.total_data_elements;
+      782 
+      783 	if from_ptr -> value_bead.data_type.character_value
+      784 	then do;
+      785 		s = size(character_string_overlay);
+      786 		esw = -1;
+      787 	     end;
+      788 	else if from_ptr -> value_bead.data_type.numeric_value
+      789 	     then do;
+      790 		     s = size (numeric_datum) + 1;
+      791 		     esw = 0;
+      792 		end;
+      793 	     else call apl_system_error_(apl_error_table_$no_type_bits);
+      794 
+      795 	number_of_dimensions = from_ptr -> value_bead.rhorho;
+      796 	s = s + size (value_bead);			/* total number of words needed */
+      797 
+      798 	go to copy_value_alloc_join;
+      799 
+      800 /* come here with p -> bead that has been allocated, s = actual size */
+      801 
+      802 end_alloc:
+      803 	seg_list(sli).words_free = seg_list(sli).words_free - s;
+      804 	ws_info.dont_interrupt_storage_manager = "0"b;
+      805 	if ws_info.dirty_interrupt_pending then signal apl_dirty_stop_;
+      806 
+      807 	/* set up bead header */
+      808 
+      809 	p -> general_bead.reference_count = 1;			/* since our return argument (only) will point at it */
+      810 	p -> general_bead.size = bit(fixed(s, 18), 18);		/* actual number of words allocated */
+      811 		/* caller must set type field */
+      812 
+      813 	/* METER */
+      814 
+      815 	if ws_info.meter_mode
+      816 	then do;
+      817 		call compute_range;
+      818 		metric.range(rangex).alloc_time = metric.range(rangex).alloc_time + (vclock() - enter_time);
+      819 		metric.range(rangex).alloc_count = metric.range(rangex).alloc_count + 1;
+      820 		metric.range(rangex).words_alloced = metric.range(rangex).words_alloced + s;
+      821 		metric.range(rangex).alloc_end_count = metric.range(rangex).alloc_end_count + endp;
+      822 		metric.range(rangex).alloc_new_count = metric.range(rangex).alloc_new_count + newp;
+      823 	     end;
+      824 
+      825 	/* dispatch according to type of alloc */
+      826 
+      827 	go to end_alloc_tv (esw);
+      828 
+      829 end_alloc_tv (1):		/* apl_allocate_words_ */
+      830 
+      831 	if trace_flags & trace_allocate_words
+      832 	then call ioa_$ioa_stream ("apl_trace_", "alloc words ^d ^p", s, p);
+      833 
+      834 	if trace_flags & check_storage_manager
+      835 	then call check_storage_manager_$allocate (p, s);
+      836 
+      837 	alloc_ptr = p;		/* just returns the bead */
+      838 	return;
+      839 
+      840 end_alloc_tv (-1):		/* copy_apl_value_  (character) */
+      841 
+      842 	p -> value_bead.data_pointer = addr (p -> value_bead.rho (from_ptr -> value_bead.rhorho + 1));
+      843 	if data_elements ^= 0			/* avoid illegal procedure fault (kludge hardware) */
+      844 	then p -> value_bead.data_pointer -> character_string_overlay = 
+      845 	     from_ptr -> value_bead.data_pointer -> character_string_overlay;
+      846 	go to copy_apl_value_alloc_return;
+      847 
+      848 end_alloc_tv (0):		/* copy_apl_value_ (numeric) */
+      849 
+      850 	p -> value_bead.data_pointer = addr (p -> value_bead.rho (from_ptr -> value_bead.rhorho + 1));
+      851 	if substr (rel (p -> value_bead.data_pointer), 18, 1)
+      852 	then p -> value_bead.data_pointer = addrel (p -> value_bead.data_pointer, 1);
+      853 
+      854 	if data_elements ^= 0		/* avoid IPR fault */
+      855 	then p -> value_bead.data_pointer -> numeric_datum (*) =
+      856 	     from_ptr -> value_bead.data_pointer -> numeric_datum (*);
+      857 /*	go to copy_apl_value_alloc_return; */
+      858 
+      859 copy_apl_value_alloc_return:
+      860 
+      861 	if trace_flags & trace_copy_value
+      862 	then call ioa_$ioa_stream ("apl_trace_", "copy value ^p ^d ^p", from_ptr, s, p);
+      863 
+      864 	if trace_flags & check_storage_manager
+      865 	then call check_storage_manager_$allocate (p, s);
+      866 
+      867 	string (p -> value_bead.type) = string (from_ptr -> value_bead.type);	/* new bead has same type as old */
+      868 	p -> value_bead.rhorho = from_ptr -> value_bead.rhorho;
+      869 	if p -> value_bead.rhorho ^= 0	/* avoid IPR fault */
+      870 	then unspec (p -> value_bead.rho (*)) = unspec (from_ptr -> value_bead.rho (*));
+      871 
+      872 	p -> value_bead.total_data_elements = from_ptr -> value_bead.total_data_elements;
+      873 	to_ptr = p;			/* set return arg */
+      874 
+      875 	/* METER */
+      876 
+      877 	if ws_info.meter_mode
+      878 	then do;
+      879 		metric.copy_apl_value_calls = metric.copy_apl_value_calls + 1;
+      880 		metric.copy_apl_value_time = metric.copy_apl_value_time + (vclock () - enter_time);
+      881 	     end;
+      882 
+      883 	return;
+      884 
+      885 /* This entry is called by the apl command to initialize apl's working storage. */
+      886 
+      887 apl_initialize_storage_:
+      888 	entry ();
+      889 
+      890 						/* set up map & global-data segment */
+      891 	segp = apl_segment_manager_$get ();
+      892 	global_storage_system_data_pointer, ws_info.alloc_free_info_ptr = segp;
+      893 
+      894 						/* hash table is initially zero */
+      895 	last_map = addr (first_seg_map);		/* there are no maps, yet. */
+      896 
+      897 	/* Initialize some metering data (no matter what ws_info.meter_mode says,
+      898*	   because it probably hasn't been set yet). Only range.size needs to be inited. */
+      899 
+      900 	s = 2;
+      901 	do i = lbound (metric.range, 1) to hbound (metric.range, 1);
+      902 	     s = s * 2;
+      903 	     metric.range (i).size = s;
+      904 	end;
+      905 
+      906 	return;
+      907 
+      908 /* entry to destroy all of apl's free storage. called as dying gasp of an
+      909*   apl session. */
+      910 
+      911 apl_dispose_of_storage_:
+      912 	entry ();
+      913 
+      914 	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+      915 	do i = lbound (seg_list, 1) to hbound (seg_list, 1);
+      916 	     /* free up available segs & value stacks */
+      917 
+      918 	     if seg_list (i).usage = 1 | seg_list (i).usage = 2
+      919 	     then call apl_segment_manager_$free ((seg_list (i).pointer));
+      920 
+      921 	     /* free heaps of both kinds */
+      922 
+      923 	     else if seg_list (i).usage = 3 | seg_list (i).usage = 4
+      924 		then call apl_segment_manager_$free ((seg_list (i).pointer -> seg_map.seg_ptr));
+      925 	end;
+      926 
+      927 	/* flush the map & global-data segment */
+      928 
+      929 	call apl_segment_manager_$free ((ws_info.alloc_free_info_ptr));
+      930 
+      931 	/* flush ws_info */
+      932 
+      933 	call apl_segment_manager_$free ((ws_info_ptr));
+      934 	apl_static_$ws_info_ptr = null;
+      935 
+      936 	return;
+      937 
+      938 /* this entry is called by the )CLEAR command */
+      939 
+      940 apl_clear_storage_:
+      941 	entry ();
+      942 
+      943 	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+      944 
+      945 	if trace_flags & trace_clear_storage
+      946 	then call ioa_$ioa_stream ("apl_trace_", "storage cleared");
+      947 
+      948 	if trace_flags & check_storage_manager
+      949 	then call check_storage_manager_$clear ();
+      950 
+      951 	ws_info.dont_interrupt_storage_manager = "1"b;		/* inhibit interruptions while munging the map seg */
+      952 
+      953 	do i = lbound (seg_list, 1) to hbound (seg_list, 1);
+      954 	     if seg_list (i).usage > 2		/* a heap of either type? */
+      955 	     then seg_list (i).pointer = seg_list (i).pointer -> seg_map.seg_ptr;
+      956 
+      957 	     if seg_list (i).usage ^= 0		/* in use? */
+      958 	     then do;
+      959 		     call apl_segment_manager_$free ((seg_list (i).pointer));
+      960 		     seg_list (i).usage = 0;
+      961 		end;
+      962 	end;
+      963 
+      964 	/* get rid of the maps in the global-data segment. make sure they really go,
+      965*	   because re-used map space is assumed to be zero. */
+      966 
+      967 	last_map = addr (first_seg_map);
+      968 	call hcs_$truncate_seg (addr (last_map), binary (rel (last_map), 18), (0));
+      969 
+      970 	current_little_bead_seg, current_big_bead_seg = 0;
+      971 
+      972 	/* assign initial segment for the value stack */
+      973 
+      974 	i = lbound (seg_list, 1);			/* always use first seg for value stack root. */
+      975 	go to g0017;				/* since we just gave 'em all back, re-fetch one. */
+      976 
+      977 	/* entry to return number of words of storage in use */
+      978 
+      979 apl_get_storage_usage_:
+      980 	entry (storage_usage);
+      981 
+      982 dcl storage_usage fixed bin(30) aligned parameter;
+      983 dcl  seen_current_value_stack bit (1) aligned;
+      984 
+      985 	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+      986 
+      987 	storage_usage = 0;
+      988 	seen_current_value_stack = "0"b;
+      989 	p = ptr (value_stack_ptr, 0);			/* get ptr to base of current value stack */
+      990 	do sli = lbound(seg_list,1) to hbound(seg_list,1);
+      991 	     if seg_list (sli).usage > 2		/* big or little heaps */
+      992 	     then storage_usage = storage_usage + (sys_info$max_seg_size - seg_list (sli).words_free);
+      993 	     else if seg_list (sli).usage = 2		/* a stack segment */
+      994 		then if seen_current_value_stack	/* stacks are ordered: used used current free free */
+      995 		     then;			/* so ignore free value stacks */
+      996 		     else if p = seg_list (sli).pointer	/* if this is current */
+      997 			then do;
+      998 				storage_usage = storage_usage + fixed (rel (value_stack_ptr), 18);
+      999 				seen_current_value_stack = "1"b;
+     1000 			     end;
+     1001 			else storage_usage = storage_usage + (sys_info$max_seg_size - seg_list (sli).words_free);
+     1002 	end;
+     1003 
+     1004 	return;
+     1005 
+     1006 	/* this entry is called when a segment of value stack is filled */
+     1007 
+     1008 apl_get_value_stack_:
+     1009 apl_get_next_value_stack_seg_:
+     1010 	entry (amt_needed);
+     1011 
+     1012 dcl amt_needed fixed bin(18) parameter;
+     1013 
+     1014 	global_storage_system_data_pointer = ws_info.alloc_free_info_ptr;
+     1015 
+     1016 	if trace_flags & trace_get_stack_seg
+     1017 	then call ioa_$ioa_stream ("apl_trace_", "get stack seg ^d", amt_needed);
+     1018 
+     1019 	/* METER - (not worth checking ws_info.meter_mode for) */
+     1020 
+     1021 	metric.get_next_value_stack_seg_calls = metric.get_next_value_stack_seg_calls + 1;
+     1022 
+     1023 	if amt_needed > sys_info$max_seg_size
+     1024 	then call apl_system_error_ (apl_error_table_$wsfull_on_stack);
+     1025 
+     1026 	ws_info.dont_interrupt_storage_manager = "1"b;	/* don't allow interrupts while munging seg_list */
+     1027 
+     1028 	/* find current position in list of value_stack segs */
+     1029 
+     1030 	p = ptr(value_stack_ptr, 0);
+     1031 	do i = lbound(seg_list, 1) to hbound(seg_list, 1);
+     1032 	     if seg_list (i).usage = 2		/* a value stack */
+     1033 	     then if seg_list (i).pointer = p		/* this value stack */
+     1034 		then go to g0015;
+     1035 	end;
+     1036 
+     1037 	call apl_system_error_(apl_error_table_$non_existent_stack);	/* ???!? */
+     1038 
+     1039 g0015:						/* update for storage usage entry */
+     1040 	seg_list (i).words_free = (sys_info$max_seg_size - fixed (rel (value_stack_ptr), 18));
+     1041 	base = i+1;				/* remember first seg in list after current one */
+     1042 
+     1043 	do i = base to hbound(seg_list, 1);
+     1044 	     if seg_list (i).usage = 2		/* found old stack seg which can be re-used */
+     1045 	     then do;
+     1046 g0016:		     segp, value_stack_ptr = seg_list(i).pointer;
+     1047 		     seg_list(i).usage = 2;
+     1048 		     call hcs_$truncate_seg(segp, 0, (0));	/* may as well avoid extra paging */
+     1049 		     go to unmask_and_return;
+     1050 		end;
+     1051 	end;
+     1052 
+     1053 	do i = base to hbound(seg_list, 1);		/* need new seg */
+     1054 	     if seg_list (i).usage = 1		/* aha! existing segment that can be reused */
+     1055 	     then go to g0016;
+     1056 	     else if seg_list (i).usage = 0		/* empty slot, fill it in */
+     1057 		then do;
+     1058 g0017:
+     1059 			segp = apl_segment_manager_$get ();
+     1060 			value_stack_ptr, seg_list(i).pointer = segp;
+     1061 			seg_list(i).usage = 2;
+     1062 			sli = i;
+     1063 			call set_up_hash_table;
+     1064 			go to unmask_and_return;
+     1065 		     end;
+     1066 	end;
+     1067 
+     1068 	/* after a great struggle, still couldn't find any segments to use for a stack.  die die die */
+     1069 
+     1070 	call apl_system_error_(apl_error_table_$wsfull_no_stack_segs);
+     1071 	return;					/* will never be executed */
+     1072 
+     1073 unmask_and_return:
+     1074 	ws_info.dont_interrupt_storage_manager = "0"b;
+     1075 	if ws_info.dirty_interrupt_pending then signal apl_dirty_stop_;
+     1076 	return;
+     1077 
+     1078 /* Internal procedure to find the node that is just less
+     1079*   than (to the left of) the input node.  Knuth calls
+     1080*   this the symmetric predecessor.  See Knuth Vol 3, 6.2.2. */
+     1081 
+     1082 left_neighbor:
+     1083 	procedure (bv_mapx) returns (fixed bin);
+     1084 
+     1085 /* parameters */
+     1086 
+     1087 dcl  bv_mapx fixed bin parameter;
+     1088 
+     1089 /* automatic */
+     1090 
+     1091 dcl  nodex fixed bin;
+     1092 
+     1093 /* program */
+     1094 
+     1095 	found = "0"b;
+     1096 	nodex = 2 * bv_mapx;
+     1097 	do while (^found);				/* go left once, then right */
+     1098 	     if nodex > seg_map.last_entry_used
+     1099 	     then found = "1"b;
+     1100 	     else if string (map (nodex)) = ""b
+     1101 		then found = "1"b;
+     1102 		else nodex = 2 * nodex + 1;
+     1103 	end;
+     1104 	return (divide (nodex, 2, 18, 0));
+     1105 
+     1106      end left_neighbor;
+     1107 
+     1108 /* Internal procedure to find the node that is just greater
+     1109*   than (to the right of) the input node.  Knuth calls
+     1110*   this the symmetric successor.  See Knuth Vol 3, 6.2.2. */
+     1111 
+     1112 right_neighbor:
+     1113 	procedure (bv_mapx) returns (fixed bin);
+     1114 
+     1115 /* parameters */
+     1116 
+     1117 dcl  bv_mapx fixed bin parameter;
+     1118 
+     1119 /* automatic */
+     1120 
+     1121 dcl  nodex fixed bin;
+     1122 
+     1123 /* program */
+     1124 
+     1125 	found = "0"b;
+     1126 	nodex = 2 * bv_mapx + 1;
+     1127 	do while (^found);				/* go right once, then left */
+     1128 	     if nodex > seg_map.last_entry_used
+     1129 	     then found = "1"b;
+     1130 	     else if string (map (nodex)) = ""b
+     1131 		then found = "1"b;
+     1132 		else nodex = 2 * nodex;
+     1133 	end;
+     1134 	return (divide (nodex, 2, 18, 0));
+     1135 
+     1136      end right_neighbor;
+     1137 
+     1138 /* Internal procedure to help apl_free_bead_ "wash" pointers to beads */
+     1139 
+     1140 launder:
+     1141      procedure (afp);
+     1142 
+     1143 /* parameters */
+     1144 
+     1145 dcl  afp ptr unaligned parameter;
+     1146 
+     1147 /* automatic */
+     1148 
+     1149 dcl  fp ptr unaligned;
+     1150 
+     1151 /* entries */
+     1152 
+     1153 dcl  apl_free_bead_ entry (pointer unaligned);
+     1154 
+     1155 /* program */
+     1156 
+     1157 	fp = afp;					/* do losing unaligned copy only once */
+     1158 
+     1159 	if fp = null 				/* can get null localized_symbols in a lexed_function_bead */
+     1160 	then return;
+     1161 
+     1162 	if fp -> general_bead.type.operator		/* these read-only beads are not subject to freeing */
+     1163 	then return;
+     1164 
+     1165 	fp -> general_bead.reference_count = fp -> general_bead.reference_count - 1;	/* wash this reference */
+     1166 	afp = null;				/* .. */
+     1167 
+     1168 	if fp -> general_bead.reference_count < 1
+     1169 	then call apl_free_bead_ (fp);
+     1170 
+     1171      end launder;
+     1172 
+     1173 compute_range:
+     1174 	procedure;
+     1175 
+     1176 /* given size s, this routine computes proper metric.range entry, returns iss index in rangex */
+     1177 
+     1178 	do rangex = lbound (metric.range, 1) to hbound (metric.range, 1) - 1;
+     1179 	     if s < metric.range (rangex + 1).size	/* found proper range */
+     1180 	     then return;
+     1181 	end;
+     1182 
+     1183 	return;			/* rangex == hbound (metric.range, 1) */
+     1184 
+     1185 end compute_range;
+     1186 
+     1187 	/* finds a segment, returns segp and sli, and sets up hash_table if necessary. */
+     1188 
+     1189 get_seg_for_apl:
+     1190 	procedure;
+     1191 
+     1192 	new_slot = 0;
+     1193 	do sli = lbound(seg_list, 1) to hbound(seg_list, 1);
+     1194 	   if seg_list(sli).usage = 1 	/* available seg */
+     1195 	      then do;
+     1196 		segp = seg_list(sli).pointer;
+     1197 		return;
+     1198 		end;
+     1199 	   else if seg_list(sli).usage = 0 then new_slot = sli;	/* save loc of last free slot in seg_list */
+     1200 	   end;
+     1201 
+     1202 	/* evidently no usage = 1 segs, need to get a completely new one */
+     1203 
+     1204 	if new_slot = 0 then call apl_system_error_(apl_error_table_$wsfull_out_of_segs);
+     1205 
+     1206 	sli = new_slot;
+     1207 	segp = apl_segment_manager_$get ();
+     1208 	seg_list(sli).pointer = segp;
+     1209 	call set_up_hash_table;
+     1210 
+     1211 end get_seg_for_apl;
+     1212 
+     1213 set_up_hash_table:		/* put segment indicated by segp and sli into hash table */
+     1214 	procedure;
+     1215 
+     1216 dcl hash_index fixed bin,
+     1217     i fixed bin;
+     1218 
+     1219 	hash_index = mod(fixed(baseno(segp), 18), dim(seg_map_hash_table, 1));
+     1220 	do i = hash_index by 1 while (i <= hbound(seg_map_hash_table, 1)),
+     1221 	       lbound(seg_map_hash_table, 1) by 1 while (i < hash_index);
+     1222 	   if seg_map_hash_table(i).seg_list_idx = 0
+     1223 	      then do;
+     1224 		seg_map_hash_table(i).seg_list_idx = sli;
+     1225 		seg_map_hash_table(i).seg_baseno = baseno(segp);
+     1226 		return;
+     1227 		end;
+     1228 	   end;
+     1229 	call apl_system_error_(apl_error_table_$hash_table_full);	/* cannot happen! */
+     1230 end set_up_hash_table;
+     1231 
+     1232      end /* apl_storage_manager_ */;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    11/29/83  1347.2  apl_storage_manager_.pl1          >special_ldd>on>apl.1129>apl_storage_manager_.pl1
+171          1    03/27/82  0439.1  apl_storage_system_data.incl.pl1  >ldd>include>apl_storage_system_data.incl.pl1
+172          2    03/27/82  0429.8  apl_number_data.incl.pl1          >ldd>include>apl_number_data.incl.pl1
+173          3    03/27/82  0439.2  apl_ws_info.incl.pl1              >ldd>include>apl_ws_info.incl.pl1
+174          4    03/27/82  0439.2  apl_symbol_table.incl.pl1         >ldd>include>apl_symbol_table.incl.pl1
+175          5    03/27/82  0438.5  apl_bead_format.incl.pl1          >ldd>include>apl_bead_format.incl.pl1
+176          6    03/27/82  0439.2  apl_value_bead.incl.pl1           >ldd>include>apl_value_bead.incl.pl1
+177          7    03/27/82  0439.0  apl_operator_bead.incl.pl1        >ldd>include>apl_operator_bead.incl.pl1
+178          8    03/27/82  0439.2  apl_symbol_bead.incl.pl1          >ldd>include>apl_symbol_bead.incl.pl1
+179          9    03/27/82  0438.7  apl_function_bead.incl.pl1        >ldd>include>apl_function_bead.incl.pl1
+180         10    03/27/82  0438.7  apl_lexed_function_bead.incl.pl1  >ldd>include>apl_lexed_function_bead.incl.pl1
+181         11    03/27/82  0438.7  apl_group_bead.incl.pl1           >ldd>include>apl_group_bead.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+BigMapSize                             constant        fixed bin(17,0)          initial dcl 158 ref 749
+BigSmallPiece                          constant        fixed bin(18,0)          initial dcl 158 ref 750
+BreakSize                              constant        fixed bin(18,0)          initial dcl 158 ref 447 562 603 667 708 726 742
+LittleMapSize                          constant        fixed bin(17,0)          initial dcl 158 ref 744
+LittleSmallPiece                       constant        fixed bin(18,0)          initial dcl 158 ref 745
+addr                                                   builtin function         dcl 166 ref 527 529 540 550 551 840 848 895 967 968
+                                                                                  968
+addrel                                                 builtin function         dcl 166 ref 656 660 694 754 851
+afp                                    parameter       pointer                  unaligned dcl 1145 set ref 1140 1157 1166*
+alloc_amount                           parameter       fixed bin(18,0)          dcl 291 ref 288 298 583 588
+alloc_count             321            based           fixed bin(17,0)          array level 4 dcl 1-13 set ref 819* 819
+alloc_end_count         322            based           fixed bin(17,0)          array level 4 dcl 1-13 set ref 821* 821
+alloc_free_info_ptr      17            based           pointer                  level 3 packed unaligned dcl 3-16 set ref 201 295
+                                                                                  586 776 892* 914 929 943 985 1014
+alloc_new_count         323            based           fixed bin(17,0)          array level 4 dcl 1-13 set ref 822* 822
+alloc_ptr                              parameter       pointer                  level 2 packed unaligned dcl 291 set ref 297 837*
+alloc_ptr_structure                    parameter       structure                level 1 dcl 291 set ref 288 583
+alloc_time              324            based           fixed bin(71,0)          array level 4 dcl 1-13 set ref 818* 818
+already_balanced                000133 automatic       bit(1)                   unaligned dcl 74 set ref 331* 444 461*
+amount_of_seg_used        4            based           fixed bin(18,0)          level 2 dcl 1-64 set ref 323 324* 691 694 696* 696
+                                                                                  763*
+amt_needed                             parameter       fixed bin(18,0)          dcl 1012 set ref 1008 1008 1016* 1023
+amt_thrown_away         303            based           fixed bin(17,0)          level 4 in structure "global_storage_system_data"
+                                                                                  dcl 1-13 in procedure "apl_storage_manager_" set
+                                                                                  ref 451* 451
+amt_thrown_away         272            based           fixed bin(17,0)          level 4 in structure "global_storage_system_data"
+                                                                                  dcl 1-13 in procedure "apl_storage_manager_" set
+                                                                                  ref 455* 455
+apl_dirty_stop_                 000162 stack reference condition                dcl 107 ref 439 805 1075
+apl_error_table_$bead_already_free
+                                000040 external static fixed bin(35,0)          dcl 141 set ref 371*
+apl_error_table_$bead_not_known_to_apl
+                                000046 external static fixed bin(35,0)          dcl 141 set ref 313* 316*
+apl_error_table_$hash_table_full
+                                000056 external static fixed bin(35,0)          dcl 141 set ref 1229*
+apl_error_table_$invalid_free_bead
+                                000042 external static fixed bin(35,0)          dcl 141 set ref 215*
+apl_error_table_$no_type_bits   000060 external static fixed bin(35,0)          dcl 141 set ref 793*
+apl_error_table_$non_existent_stack
+                                000064 external static fixed bin(35,0)          dcl 141 set ref 1037*
+apl_error_table_$tables_inconsistent
+                                000070 external static fixed bin(35,0)          dcl 141 set ref 616*
+apl_error_table_$uninterned_symbol
+                                000044 external static fixed bin(35,0)          dcl 141 set ref 225* 241*
+apl_error_table_$wsfull_alloc_too_big
+                                000050 external static fixed bin(35,0)          dcl 141 set ref 599*
+apl_error_table_$wsfull_no_stack_segs
+                                000066 external static fixed bin(35,0)          dcl 141 set ref 1070*
+apl_error_table_$wsfull_on_stack
+                                000062 external static fixed bin(35,0)          dcl 141 set ref 1023*
+apl_error_table_$wsfull_out_of_maps
+                                000052 external static fixed bin(35,0)          dcl 141 set ref 755*
+apl_error_table_$wsfull_out_of_segs
+                                000054 external static fixed bin(35,0)          dcl 141 set ref 1204*
+apl_free_bead_                  000074 constant        entry                    external dcl 1153 ref 1168
+apl_get_symbol_                 000020 constant        entry                    external dcl 129 ref 224
+apl_segment_manager_$free       000016 constant        entry                    external dcl 129 ref 918 923 929 933 959
+apl_segment_manager_$get        000014 constant        entry                    external dcl 129 ref 891 1058 1207
+apl_static_$ws_info_ptr         000072 external static structure                level 1 dcl 3-11 set ref 934*
+apl_system_error_               000022 constant        entry                    external dcl 129 ref 215 225 241 313 316 371 599 616
+                                                                                  755 793 1023 1037 1070 1204 1229
+base                            000144 automatic       fixed bin(17,0)          dcl 74 set ref 1041* 1043 1053
+baseno                                                 builtin function         dcl 166 ref 308 311 1219 1225
+bead_type                              based           structure                level 3 packed unaligned dcl 5-3
+big_seg_balance         270            based           structure                level 3 dcl 1-13
+binary                                                 builtin function         dcl 166 ref 344 344 348 348 351 351 351 355 355 355
+                                                                                  375 375 375 378 378 383 383 386 386 386 653 968
+                                                                                  968
+bit                                                    builtin function         dcl 166 ref 339 348 355 378 386 661 810
+bits_for_parse            1            based           structure                level 2 packed unaligned dcl 7-3
+bv_mapx                                parameter       fixed bin(17,0)          dcl 1117 in procedure "right_neighbor" ref 1112 1126
+bv_mapx                                parameter       fixed bin(17,0)          dcl 1087 in procedure "left_neighbor" ref 1082 1096
+bv_trace_flags                         parameter       bit(36)                  dcl 188 ref 183 192
+character_string_overlay               based           char                     dcl 6-19 set ref 785 843* 843
+character_value           0(09)        based           bit(1)                   level 5 packed unaligned dcl 6-3 set ref 783
+check_storage_manager                  constant        bit(36)                  initial dcl 111 ref 422 834 864 948
+check_storage_manager_$allocate 000024 constant        entry                    external dcl 129 ref 834 864
+check_storage_manager_$clear    000030 constant        entry                    external dcl 129 ref 948
+check_storage_manager_$free     000026 constant        entry                    external dcl 129 ref 422
+class                     3            based           fixed bin(17,0)          level 2 dcl 9-5 ref 250
+copy_apl_value_calls    307            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 879* 879
+copy_apl_value_time     310            based           fixed bin(71,0)          level 3 dcl 1-13 set ref 880* 880
+copyx                           000104 automatic       fixed bin(17,0)          dcl 471 set ref 485* 509* 509 510 527 529 535 568
+                                                                                  574
+count                   270            based           fixed bin(17,0)          level 4 in structure "global_storage_system_data"
+                                                                                  dcl 1-13 in procedure "apl_storage_manager_" set
+                                                                                  ref 571* 571
+count                   300            based           fixed bin(17,0)          level 4 in structure "global_storage_system_data"
+                                                                                  dcl 1-13 in procedure "apl_storage_manager_" set
+                                                                                  ref 565* 565
+current_big_bead_seg    133            based           fixed bin(17,0)          level 2 dcl 1-13 set ref 609 731* 970*
+current_big_scan_pos    135            based           fixed bin(17,0)          level 2 dcl 1-13 set ref 610 669* 732*
+current_little_bead_seg
+                        132            based           fixed bin(17,0)          level 2 dcl 1-13 set ref 605 727* 970*
+current_little_scan_pos
+                        134            based           fixed bin(17,0)          level 2 dcl 1-13 set ref 606 667* 728*
+data_elements                   000161 automatic       fixed bin(21,0)          dcl 74 set ref 781* 785 785 790 843 843 843 854 854
+data_pointer              4            based           pointer                  level 2 packed unaligned dcl 6-3 set ref 840* 843
+                                                                                  843 848* 851 851* 851 854 854
+data_type                 0(08)        based           structure                level 4 packed unaligned dcl 6-3
+debug                           000032 constant        entry                    external dcl 129 ref 212
+depth                           000102 automatic       fixed bin(17,0)          dcl 69 set ref 487* 496* 496 497 502 506 507* 507
+                                                                                  632* 641* 641 642 646 650 651* 651
+dim                                                    builtin function         dcl 166 ref 308 1219
+dirty_interrupt_pending
+                        107            based           bit(1)                   level 3 dcl 3-16 ref 439 805 1075
+divide                                                 builtin function         dcl 166 ref 543 596 1104 1134
+dont_interrupt_storage_manager
+                        102            based           bit(1)                   level 3 dcl 3-16 set ref 300* 438* 601* 804* 951*
+                                                                                  1026* 1073*
+endp                            000140 automatic       fixed bin(1,0)           dcl 74 set ref 602* 697* 821
+enter_balance_time              000126 automatic       fixed bin(71,0)          dcl 74 set ref 466* 566 572
+enter_time                      000130 automatic       fixed bin(71,0)          dcl 74 set ref 303* 432 593* 778* 818 880
+esw                             000146 automatic       fixed bin(17,0)          dcl 74 set ref 592* 786* 791* 827
+first_seg_map           652            based           fixed bin(17,0)          level 2 dcl 1-13 set ref 895 967
+fixed                                                  builtin function         dcl 166 ref 203 308 323 324 339 661 755 810 998 1039
+                                                                                  1219
+found                           000116 automatic       bit(1)                   dcl 71 set ref 1095* 1097 1098* 1100* 1125* 1127
+                                                                                  1128* 1130*
+fp                              000232 automatic       pointer                  unaligned dcl 1149 set ref 1157* 1159 1162 1165 1165
+                                                                                  1168 1168*
+free_count              313            based           fixed bin(17,0)          array level 4 dcl 1-13 set ref 433* 433
+free_ptr                               parameter       pointer                  level 2 packed unaligned dcl 198 ref 202
+free_ptr_structure                     parameter       structure                level 1 dcl 198 ref 195
+free_time               316            based           fixed bin(71,0)          array level 4 dcl 1-13 set ref 432* 432
+from_ptr                               parameter       pointer                  level 2 packed unaligned dcl 771 set ref 781 783 788
+                                                                                  795 840 843 848 854 859* 867 868 869 872
+from_ptr_structure                     parameter       structure                level 1 dcl 771 set ref 766
+function                  0(03)        based           bit(1)                   level 4 packed unaligned dcl 5-3 ref 248
+function_bead                          based           structure                level 1 dcl 9-5
+general_bead                           based           structure                level 1 dcl 5-3
+get_next_value_stack_seg_calls
+                        306            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 1021* 1021
+global_storage_system_data             based           structure                level 1 dcl 1-13
+global_storage_system_data_pointer
+                                000120 automatic       pointer                  dcl 73 set ref 201* 295* 308 309 309 311 315 316 317
+                                                                                  425 425 432 432 433 433 434 434 435 435 450 450
+                                                                                  451 451 454 454 455 455 565 565 566 566 568 568
+                                                                                  571 571 572 572 574 574 586* 605 606 609 610 616
+                                                                                  621 623 667 669 709 709 710 710 713 727 728 731
+                                                                                  732 743 748 752 752 753 757 776* 802 802 818 818
+                                                                                  819 819 820 820 821 821 822 822 879 879 880 880
+                                                                                  892* 895 895 901 901 903 914* 915 915 918 918 918
+                                                                                  923 923 923 943* 953 953 954 954 954 957 959 960
+                                                                                  967 967 968 968 968 968 970 970 974 985* 990 990
+                                                                                  991 991 993 996 1001 1014* 1021 1021 1031 1031
+                                                                                  1032 1032 1039 1043 1044 1046 1047 1053 1054 1056
+                                                                                  1060 1061 1178 1178 1179 1193 1193 1194 1196 1199
+                                                                                  1208 1219 1220 1220 1222 1224 1225
+group                     0(04)        based           bit(1)                   level 4 packed unaligned dcl 5-3 ref 257
+group_bead                             based           structure                level 1 dcl 11-7
+hash_bucket_ptr           1            based           pointer                  array level 2 packed unaligned dcl 4-5 set ref 229
+                                                                                  232*
+hash_index                      000122 automatic       fixed bin(17,0)          dcl 74 in procedure "apl_storage_manager_" set ref
+                                                                                  308* 309 312
+hash_index                      000260 automatic       fixed bin(17,0)          dcl 1216 in procedure "set_up_hash_table" set ref
+                                                                                  1219* 1220 1228
+hash_link_pointer         2            based           pointer                  level 2 packed unaligned dcl 8-13 set ref 232 234*
+                                                                                  234 239
+hbound                                                 builtin function         dcl 166 ref 309 709 901 915 953 990 1031 1043 1053
+                                                                                  1178 1193 1220
+hcs_$truncate_seg               000036 constant        entry                    external dcl 129 ref 968 1048
+header                                 based           structure                level 2 dcl 6-3
+i                               000136 automatic       fixed bin(17,0)          dcl 74 in procedure "apl_storage_manager_" set ref
+                                                                                  224* 229 232 257* 259* 265* 266 266 266* 271* 272*
+                                                                                  278* 282* 309* 309 311* 312* 315 709* 710 710 713
+                                                                                  714* 901* 903* 915* 918 918 918 923 923 923* 953*
+                                                                                  954 954 954 957 959 960* 974* 1031* 1032 1032*
+                                                                                  1039 1041 1043* 1044 1046 1047* 1053* 1054 1056
+                                                                                  1060 1061 1062*
+i                               000261 automatic       fixed bin(17,0)          dcl 1216 in procedure "set_up_hash_table" set ref
+                                                                                  1220* 1220 1222 1224 1225* 1228*
+interrupt_info          100            based           structure                level 2 dcl 3-16
+ioa_$ioa_stream                 000034 constant        entry                    external dcl 129 ref 210 418 463 829 859 945 1016
+label_values_ptr          7            based           pointer                  level 2 packed unaligned dcl 10-6 ref 272
+last_entry_used           3            based           fixed bin(17,0)          level 2 dcl 1-64 set ref 340* 340 471 489 558* 634
+                                                                                  762* 1098 1128
+last_map                131            based           pointer                  level 2 packed unaligned dcl 1-13 set ref 752 757*
+                                                                                  895* 967* 968 968 968 968
+lbound                                                 builtin function         dcl 166 ref 309 709 901 915 953 974 990 1031 1178
+                                                                                  1193 1220
+left_link                       000100 automatic       fixed bin(17,0)          dcl 471 set ref 538* 540 543 547 550*
+lexed_function            0(07)        based           bit(1)                   level 4 packed unaligned dcl 5-3 ref 262
+lexed_function_bead                    based           structure                level 1 dcl 10-6
+lexed_function_bead_pointer
+                          2            based           pointer                  level 2 packed unaligned dcl 9-5 set ref 250*
+lexed_function_label_values            based           pointer                  array level 2 packed unaligned dcl 10-45 set ref
+                                                                                  272*
+lexed_function_label_values_structure  based           structure                level 1 dcl 10-45
+lexed_function_lexeme_array            based           pointer                  array level 2 packed unaligned dcl 10-45 set ref
+                                                                                  282*
+lexed_function_lexemes_structure       based           structure                level 1 dcl 10-45
+lexed_function_statement_map           based           fixed bin(18,0)          array dcl 10-45 ref 278
+lexeme_array_ptr         11            based           pointer                  level 2 packed unaligned dcl 10-6 ref 282
+link_map                               based           fixed bin(17,0)          array dcl 471 set ref 527* 529* 540 550* 551*
+little_seg_balance      300            based           structure                level 3 dcl 1-13
+localized_symbols        12            based           pointer                  array level 2 packed unaligned dcl 10-6 set ref 266
+                                                                                  266 266*
+map                       5            based           structure                array level 2 dcl 1-64 set ref 335 410* 410 414* 493
+                                                                                  510 511* 549* 638 679* 679 683* 1100 1130
+map_copy                        000100 automatic       structure                array level 1 dcl 471 set ref 510* 527 529 540 549
+                                                                                  550 551
+map_free_count          314            based           fixed bin(17,0)          array level 4 dcl 1-13 set ref 434* 434
+map_size                        000157 automatic       fixed bin(17,0)          dcl 74 set ref 744* 749* 754 761
+map_stack                       000103 automatic       fixed bin(17,0)          array dcl 70 set ref 497* 506 642* 650
+mapx                            000142 automatic       fixed bin(17,0)          dcl 74 in procedure "apl_storage_manager_" set ref
+                                                                                  325* 332* 335 338 339 340 344 344 347 348 348 349*
+                                                                                  351 354 355 355 364* 364 365 369 375 375 378 378
+                                                                                  382* 383 386 386 396* 396 397 434 631* 634 638 642
+                                                                                  643* 643 650* 653 656 660 661 667 669 671* 674
+                                                                                  674* 677 679 680* 683 688* 688
+mapx                            000103 automatic       fixed bin(17,0)          dcl 471 in begin block on line 469 set ref 486* 489
+                                                                                  493 497 498* 498 506* 510 511 513* 513 533* 535
+                                                                                  544* 544 548* 548 549 558
+max                                                    builtin function         dcl 166 ref 340
+meaning_pointer           3            based           pointer                  level 2 packed unaligned dcl 8-13 ref 221
+member                    3            based           pointer                  array level 2 packed unaligned dcl 11-7 set ref 259*
+meter_mode                1(12)        based           bit(1)                   level 3 packed unaligned dcl 3-16 ref 303 429 447
+                                                                                  466 562 593 778 815 877
+metric                  270            based           structure                level 2 dcl 1-13
+mod                                                    builtin function         dcl 166 ref 308 1219
+n_left                          000147 automatic       fixed bin(18,0)          dcl 74 set ref 653* 654 658 661 665 695* 707* 710
+                                                                                  713* 717
+name                      2            based           pointer                  level 2 in structure "lexed_function_bead" packed
+                                                                                  unaligned dcl 10-6 in procedure
+                                                                                  "apl_storage_manager_" set ref 264*
+name                      5            based           char                     level 2 in structure "symbol_bead" packed unaligned
+                                                                                  dcl 8-13 in procedure "apl_storage_manager_" set
+                                                                                  ref 224*
+name_length               4            based           fixed bin(17,0)          level 2 dcl 8-13 ref 224 224
+neighbor                        000117 automatic       fixed bin(17,0)          dcl 72 set ref 402* 405 405* 408 410 411
+new_link                        000102 automatic       fixed bin(17,0)          dcl 471 set ref 543* 544 547* 547 549 550 551
+new_sli                         000125 automatic       fixed bin(17,0)          dcl 74 set ref 714* 717 723
+new_slot                        000160 automatic       fixed bin(17,0)          dcl 74 set ref 1192* 1199* 1204 1206
+newp                            000141 automatic       fixed bin(1,0)           dcl 74 set ref 602* 703* 822
+nodex                           000212 automatic       fixed bin(17,0)          dcl 1091 in procedure "left_neighbor" set ref 1096*
+                                                                                  1098 1100 1102* 1102 1104
+nodex                           000222 automatic       fixed bin(17,0)          dcl 1121 in procedure "right_neighbor" set ref 1126*
+                                                                                  1128 1130 1132* 1132 1134
+null                                                   builtin function         dcl 166 ref 221 228 229 232 266 934 1159 1166
+number_of_dimensions            000174 automatic       fixed bin(17,0)          dcl 6-3 set ref 795* 796
+number_of_entries         2            based           fixed bin(17,0)          level 2 dcl 1-64 set ref 365 397 761*
+number_of_labels          6            based           fixed bin(17,0)          level 2 dcl 10-6 ref 271
+number_of_localized_symbols
+                          5            based           fixed bin(17,0)          level 2 dcl 10-6 ref 265
+number_of_members         2            based           fixed bin(17,0)          level 2 dcl 11-7 ref 257
+number_of_statements      4            based           fixed bin(17,0)          level 2 dcl 10-6 ref 278 278
+number_of_symbols        12            based           fixed bin(17,0)          level 3 dcl 3-16 set ref 243* 243
+numeric_datum                          based           float bin(63)            array dcl 6-23 set ref 790 854* 854
+numeric_value             0(10)        based           bit(1)                   level 5 packed unaligned dcl 6-3 set ref 788
+old_q                           000135 automatic       pointer                  unaligned dcl 74 set ref 228* 232 234 238* 239
+operator                               based           bit(1)                   level 4 packed unaligned dcl 5-3 ref 1162
+operator_bead                          based           structure                level 1 dcl 7-3
+other                           000143 automatic       fixed bin(17,0)          dcl 74 set ref 349* 351 351 351 354 355 382* 383 383
+                                                                                  386 402* 405 405* 408 410 411* 414 671* 674 674*
+                                                                                  677 679 680
+p                               000100 automatic       pointer                  unaligned dcl 67 set ref 202* 203 206 210 210* 221
+                                                                                  221 224 225 230 248 250 250 253 254 257 257 259
+                                                                                  262 264 265 266 266 266 271 272 278 278 278 282
+                                                                                  297* 308 311 319 418* 422* 656* 660 694* 809 810
+                                                                                  829* 834* 837 840 840 843 848 848 851 851 851 854
+                                                                                  859* 864* 867 868 869 869 872 873 989* 996 1030*
+                                                                                  1032
+p_rel_loc                       000132 automatic       bit(18)                  unaligned dcl 74 set ref 319* 323 324 338 344 344
+                                                                                  347 351 369 375 383
+pointer                 137            based           pointer                  array level 3 packed unaligned dcl 1-13 set ref 317
+                                                                                  621 752* 918 923 954* 954 959 996 1032 1046 1060*
+                                                                                  1196 1208*
+pointers                 14            based           structure                level 2 dcl 3-16
+ptr                                                    builtin function         dcl 166 ref 989 1030
+q                               000134 automatic       pointer                  unaligned dcl 74 set ref 224* 225 229* 229* 230 232
+                                                                                  234 238*
+range                   312            based           structure                array level 3 dcl 1-13 set ref 901 901 1178 1178
+rangex                          000137 automatic       fixed bin(17,0)          dcl 74 set ref 432 432 433 433 434 434 435 435 818
+                                                                                  818 819 819 820 820 821 821 822 822 1178* 1179*
+reference_count           1            based           fixed bin(29,0)          level 2 dcl 5-3 set ref 206 210* 809* 1165* 1165
+                                                                                  1168
+rel                                                    builtin function         dcl 166 ref 319 660 755 851 968 968 998 1039
+rel_loc                   5(18)        based           bit(18)                  array level 3 packed unaligned dcl 1-64 set ref 338*
+                                                                                  344 344 347* 351 354* 354 369 375 383 656 660*
+required_usage                  000150 automatic       fixed bin(17,0)          dcl 74 set ref 708* 708* 710
+rho                       5            based           fixed bin(21,0)          array level 2 dcl 6-3 set ref 840 848 869* 869
+rhorho                    3            based           fixed bin(17,0)          level 2 dcl 6-3 set ref 795 840 848 868* 868 869 869
+                                                                                  869
+right_link                      000101 automatic       fixed bin(17,0)          dcl 471 set ref 540* 541 543 551 553
+s                               000101 automatic       fixed bin(18,0)          dcl 67 set ref 203* 210* 298* 323 339 344 348 378
+                                                                                  383 418* 418* 422* 425 435 447 451 455 562 588*
+                                                                                  596* 596 596 596 599 603 623 653 660 665* 665 667
+                                                                                  691 696 708 717 726 742 785* 790* 796* 796 802 810
+                                                                                  820 829* 834* 859* 864* 900* 902* 902 903 1179
+scan_pos                        000145 automatic       fixed bin(17,0)          dcl 74 set ref 606* 610* 724*
+seen_current_value_stack        000175 automatic       bit(1)                   dcl 983 set ref 988* 993 999*
+seg_baseno                             based           bit(18)                  array level 3 packed unaligned dcl 1-13 set ref 311
+                                                                                  1225*
+seg_list                136            based           structure                array level 2 dcl 1-13 set ref 709 709 915 915 953
+                                                                                  953 974 990 990 1031 1031 1043 1053 1193 1193
+seg_list_idx              0(18)        based           fixed bin(17,0)          array level 3 packed unaligned dcl 1-13 set ref 315
+                                                                                  1222 1224*
+seg_map                                based           structure                level 1 dcl 1-64 set ref 754
+seg_map_hash_table                     based           structure                array level 2 dcl 1-13 set ref 308 309 309 1219 1220
+                                                                                  1220
+seg_map_p                       000170 automatic       pointer                  dcl 1-76 set ref 317* 323 324 335 338 339 340 340
+                                                                                  344 344 347 348 348 351 351 354 354 355 355 355
+                                                                                  365 369 375 375 378 378 383 386 386 386 397 410
+                                                                                  410 414 471 489 493 510 511 549 558 621* 634 638
+                                                                                  653 656 656 658 660 661 679 679 683 691 694 694
+                                                                                  696 696 752* 754 754 759 760 761 762 763 1098 1100
+                                                                                  1128 1130
+seg_ptr                                based           pointer                  level 2 packed unaligned dcl 1-64 set ref 656 694
+                                                                                  759* 923 954
+segp                            000154 automatic       pointer                  dcl 74 set ref 759 891* 892 1046* 1048* 1058* 1060
+                                                                                  1196* 1207* 1208 1219 1225
+size                                                   builtin function         dcl 166 in procedure "apl_storage_manager_" ref 754
+                                                                                  785 790 796
+size                    312            based           fixed bin(18,0)          array level 4 in structure
+                                                                                  "global_storage_system_data" dcl 1-13 in procedure
+                                                                                  "apl_storage_manager_" set ref 903* 1179
+size                      5            based           bit(18)                  array level 3 in structure "seg_map" packed
+                                                                                  unaligned dcl 1-64 in procedure
+                                                                                  "apl_storage_manager_" set ref 339* 348* 348 351
+                                                                                  355* 355 355 375 378* 378 386* 386 386 653 661*
+size                      0(18)        based           bit(18)                  level 2 in structure "general_bead" packed unaligned
+                                                                                  dcl 5-3 in procedure "apl_storage_manager_" set
+                                                                                  ref 203 810*
+sli                             000124 automatic       fixed bin(17,0)          dcl 74 set ref 315* 316 317 425 425 605* 609* 613
+                                                                                  616 621 623 717 723* 727 731 743 748 752 753 802
+                                                                                  802 990* 991 991 993 996 1001* 1062* 1193* 1194
+                                                                                  1196 1199 1199* 1206* 1208 1224
+small_piece                     000156 automatic       fixed bin(18,0)          dcl 74 set ref 745* 750* 760
+smallest_piece            1            based           fixed bin(18,0)          level 2 dcl 1-64 set ref 658 760*
+space_left              302            based           fixed bin(30,0)          level 4 in structure "global_storage_system_data"
+                                                                                  dcl 1-13 in procedure "apl_storage_manager_" set
+                                                                                  ref 568* 568
+space_left              276            based           fixed bin(30,0)          level 4 in structure "global_storage_system_data"
+                                                                                  dcl 1-13 in procedure "apl_storage_manager_" set
+                                                                                  ref 574* 574
+statement_map_ptr        10            based           pointer                  level 2 packed unaligned dcl 10-6 ref 278
+static_ws_info_ptr              000072 external static pointer                  level 2 packed unaligned dcl 3-11 set ref 3-7
+stop_control_pointer      4            based           pointer                  level 2 packed unaligned dcl 9-5 set ref 253*
+storage_usage                          parameter       fixed bin(30,0)          dcl 982 set ref 979 987* 991* 991 998* 998 1001*
+                                                                                  1001
+string                                                 builtin function         dcl 166 set ref 335 410* 410 414* 493 510* 510 511*
+                                                                                  549* 549 638 679* 679 683* 867* 867 1100 1130
+substr                                                 builtin function         dcl 166 ref 851
+switches                  1            based           structure                level 2 packed unaligned dcl 3-16
+symbol                    0(01)        based           bit(1)                   level 4 packed unaligned dcl 5-3 ref 221 266
+symbol_bead                            based           structure                level 1 dcl 8-13
+symbol_table                           based           structure                level 1 dcl 4-5
+symbol_table_ptr         14            based           pointer                  level 3 packed unaligned dcl 3-16 ref 229 232
+sys_info$max_seg_size           000012 external static fixed bin(18,0)          dcl 125 ref 599 691 753 755 991 1001 1023 1039
+temp_ptr                        000152 automatic       pointer                  dcl 74 set ref 754* 755 757
+thrown_away             271            based           fixed bin(17,0)          level 4 in structure "global_storage_system_data"
+                                                                                  dcl 1-13 in procedure "apl_storage_manager_" set
+                                                                                  ref 454* 454
+thrown_away             301            based           fixed bin(17,0)          level 4 in structure "global_storage_system_data"
+                                                                                  dcl 1-13 in procedure "apl_storage_manager_" set
+                                                                                  ref 450* 450
+time_spent_balancing    304            based           fixed bin(71,0)          level 4 in structure "global_storage_system_data"
+                                                                                  dcl 1-13 in procedure "apl_storage_manager_" set
+                                                                                  ref 566* 566
+time_spent_balancing    274            based           fixed bin(71,0)          level 4 in structure "global_storage_system_data"
+                                                                                  dcl 1-13 in procedure "apl_storage_manager_" set
+                                                                                  ref 572* 572
+to_ptr                                 parameter       pointer                  level 2 packed unaligned dcl 771 set ref 873*
+to_ptr_structure                       parameter       structure                level 1 dcl 771 set ref 766
+total_data_elements       2            based           fixed bin(21,0)          level 2 dcl 6-3 set ref 781 872* 872
+trace_allocate_words                   constant        bit(36)                  initial dcl 111 ref 829
+trace_balancer                         constant        bit(36)                  initial dcl 111 ref 463
+trace_clear_storage                    constant        bit(36)                  initial dcl 111 ref 945
+trace_control_pointer
+                          5            based           pointer                  level 2 packed unaligned dcl 9-5 set ref 254*
+trace_copy_value                       constant        bit(36)                  initial dcl 111 ref 859
+trace_flags                     000010 internal static bit(36)                  initial dcl 111 set ref 192* 208 418 422 463 829 834
+                                                                                  859 864 945 948 1016
+trace_free                             constant        bit(36)                  initial dcl 111 ref 418
+trace_get_stack_seg                    constant        bit(36)                  initial dcl 111 ref 1016
+trace_reference_count_errors           constant        bit(36)                  initial dcl 111 ref 208
+type                                   based           structure                level 3 in structure "symbol_bead" packed unaligned
+                                                                                  dcl 8-13 in procedure "apl_storage_manager_"
+type                                   based           structure                level 3 in structure "function_bead" packed
+                                                                                  unaligned dcl 9-5 in procedure
+                                                                                  "apl_storage_manager_"
+type                                   based           structure                level 3 in structure "group_bead" packed unaligned
+                                                                                  dcl 11-7 in procedure "apl_storage_manager_"
+type                                   based           structure                level 3 in structure "lexed_function_bead" packed
+                                                                                  unaligned dcl 10-6 in procedure
+                                                                                  "apl_storage_manager_"
+type                                   based           structure                level 3 in structure "value_bead" packed unaligned
+                                                                                  dcl 6-3 in procedure "apl_storage_manager_" set
+                                                                                  ref 867* 867
+type                                   based           structure                level 2 in structure "general_bead" packed unaligned
+                                                                                  dcl 5-3 in procedure "apl_storage_manager_"
+unspec                                                 builtin function         dcl 166 set ref 869* 869
+usage                   140            based           fixed bin(17,0)          array level 3 dcl 1-13 set ref 316 616 710 743* 748*
+                                                                                  918 918 923 923 954 957 960* 991 993 1032 1044
+                                                                                  1047* 1054 1056 1061* 1194 1199
+value_bead                             based           structure                level 1 dcl 6-3 set ref 796
+value_stack_ptr          16            based           pointer                  level 3 packed unaligned dcl 3-16 set ref 989 998
+                                                                                  1030 1039 1046* 1060*
+values                    2            based           structure                level 2 dcl 3-16
+vclock                                                 builtin function         dcl 166 ref 303 432 466 566 572 593 778 818 880
+which_free                      000123 automatic       fixed bin(17,0)          dcl 74 set ref 326* 341* 357* 360* 372* 388* 392*
+                                                                                  418* 457*
+words_alloced           326            based           fixed bin(24,0)          array level 4 dcl 1-13 set ref 820* 820
+words_free              136            based           fixed bin(18,0)          array level 3 dcl 1-13 set ref 425* 425 623 710 713
+                                                                                  753* 802* 802 991 1001 1039*
+words_freed             320            based           fixed bin(24,0)          array level 4 dcl 1-13 set ref 435* 435
+ws_info                                based           structure                level 1 dcl 3-16
+ws_info_ptr                     000172 automatic       pointer                  initial dcl 3-7 set ref 201 229 232 243 243 295 300
+                                                                                  303 429 438 439 447 466 586 593 601 776 778 804
+                                                                                  805 815 877 892 914 929 933 943 951 985 989 998
+                                                                                  1014 1026 1030 1039 1046 1060 1073 1075 3-7* 562
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+Binary                                 internal static bit(1)                   initial dcl 2-16
+LeftArgSymbol                          internal static fixed bin(17,0)          initial dcl 10-36
+MAX_VALUE_BEAD_SIZE                    internal static fixed bin(19,0)          initial dcl 6-28
+NumberSize                             internal static fixed bin(4,0)           initial dcl 2-25
+ReturnSymbol                           internal static fixed bin(17,0)          initial dcl 10-36
+RightArgSymbol                         internal static fixed bin(17,0)          initial dcl 10-36
+TheBiggestNumberWeveGot                internal static float bin(63)            initial dcl 2-16
+TheSmallestNumberWeveGot               internal static float bin(63)            initial dcl 2-16
+character_data_structure               based           structure                level 1 dcl 6-15
+character_value_type                   internal static bit(18)                  initial unaligned dcl 5-30
+complex_datum                          based           complex float bin(63)    array dcl 6-26
+complex_value_type                     internal static bit(18)                  initial unaligned dcl 5-30
+function_type                          internal static bit(18)                  initial unaligned dcl 5-30
+group_type                             internal static bit(18)                  initial unaligned dcl 5-30
+initial_size                           internal static fixed bin(17,0)          initial dcl 4-5
+integral_value_type                    internal static bit(18)                  initial unaligned dcl 5-30
+label_type                             internal static bit(18)                  initial unaligned dcl 5-30
+lexed_function_type                    internal static bit(18)                  initial unaligned dcl 5-30
+list_value_type                        internal static bit(18)                  initial unaligned dcl 5-30
+max_parse_stack_depth                  internal static fixed bin(17,0)          initial dcl 3-98
+not_integer_mask                       internal static bit(18)                  initial unaligned dcl 5-30
+not_zero_or_one_mask                   internal static bit(18)                  initial unaligned dcl 5-30
+numeric_value_type                     internal static bit(18)                  initial unaligned dcl 5-30
+operator_type                          internal static bit(18)                  initial unaligned dcl 5-30
+output_buffer                          based           char                     unaligned dcl 3-94
+shared_variable_type                   internal static bit(18)                  initial unaligned dcl 5-30
+statement_count                        automatic       fixed bin(17,0)          dcl 10-45
+symbol_type                            internal static bit(18)                  initial unaligned dcl 5-30
+value_type                             internal static bit(18)                  initial unaligned dcl 5-30
+zero_or_one_value_type                 internal static bit(18)                  initial unaligned dcl 5-30
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+alloc_fill_hole                 002051 constant        label                    dcl 671 ref 681
+apl_allocate_words_             001633 constant        entry                    external dcl 583
+apl_clear_storage_              003117 constant        entry                    external dcl 940
+apl_copy_value_                 002312 constant        entry                    external dcl 766
+apl_dispose_of_storage_         003005 constant        entry                    external dcl 911
+apl_free_bead_                  000140 constant        entry                    external dcl 195
+apl_free_words_                 000566 constant        entry                    external dcl 288
+apl_get_next_value_stack_seg_   003373 constant        entry                    external dcl 1008
+apl_get_storage_usage_          003273 constant        entry                    external dcl 979
+apl_get_value_stack_            003404 constant        entry                    external dcl 1008
+apl_initialize_storage_         002733 constant        entry                    external dcl 887
+apl_storage_manager_            000110 constant        entry                    external dcl 10
+balance                         001360 constant        label                    dcl 444 ref 365 397
+compute_range                   004040 constant        entry                    internal dcl 1173 ref 431 817
+copy_apl_value_alloc_return     002604 constant        label                    dcl 859 ref 846
+copy_map_done                   001521 constant        label                    dcl 527 ref 502
+copy_map_pop                    001500 constant        label                    dcl 502 ref 489 493
+copy_map_recurse_left           001463 constant        label                    dcl 489 ref 500 514
+copy_value_alloc_join           001657 constant        label                    dcl 596 ref 798
+end_alloc                       002375 constant        label                    dcl 802 ref 662 684 698
+end_alloc_tv                    000000 constant        label                    array(-1:1) dcl 829 ref 827
+escape                          000360 constant        label                    dcl 243 ref 236
+fill_hole                       001206 constant        label                    dcl 402 ref 358 390 412
+free_something                  000604 constant        label                    dcl 300 ref 286
+g0001                           000665 constant        label                    dcl 315 ref 311
+g0015                           003530 constant        label                    dcl 1039 ref 1032
+g0016                           003562 constant        label                    dcl 1046 ref 1054
+g0017                           003633 constant        label                    dcl 1058 ref 975
+g0021                           001570 constant        label                    dcl 555 ref 541
+get_new_seg                     002122 constant        label                    dcl 703 ref 613 623
+get_seg_for_apl                 004063 constant        entry                    internal dcl 1189 ref 741
+launder                         003774 constant        entry                    internal dcl 1140 ref 250 253 254 259 264 266 272
+                                                                                  282
+left_neighbor                   003702 constant        entry                    internal dcl 1082 ref 349 402 671
+remember_new_seg                002172 constant        label                    dcl 724 ref 764
+retry_after_balance             000732 constant        label                    dcl 332 ref 579
+right_neighbor                  003737 constant        entry                    internal dcl 1112 ref 382 405 674
+scan_for_bead_to_alloc          001740 constant        label                    dcl 621 ref 734
+search_done                     002102 constant        label                    dcl 691 ref 646
+search_pop                      001770 constant        label                    dcl 646 ref 634 638
+search_recurse_left             001754 constant        label                    dcl 634 ref 644 689
+set_up_hash_table               004145 constant        entry                    internal dcl 1213 ref 1063 1209
+trace_storage_manager           000122 constant        entry                    external dcl 183
+tree_search_exit                001231 constant        label                    dcl 418 ref 327 342 361 373 393 458
+tree_search_loop                000734 constant        label                    dcl 335 ref 367 399
+unmask_and_return               003672 constant        label                    dcl 1073 ref 1049 1064
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      4742        5040    4242        4752
+Length      5564    4242        76         507     477           2
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+apl_storage_manager_                290 external procedure  is an external procedure.  
+begin block on line 469              73 begin block         uses auto adjustable storage.  
+left_neighbor                           internal procedure  shares stack frame of external procedure apl_storage_manager_.  
+right_neighbor                          internal procedure  shares stack frame of external procedure apl_storage_manager_.  
+launder                                 internal procedure  shares stack frame of external procedure apl_storage_manager_.  
+compute_range                           internal procedure  shares stack frame of external procedure apl_storage_manager_.  
+get_seg_for_apl                         internal procedure  shares stack frame of external procedure apl_storage_manager_.  
+set_up_hash_table                       internal procedure  shares stack frame of external procedure apl_storage_manager_.  
+
+STORAGE FOR INTERNAL STATIC VARIABLES.
+
+   LOC IDENTIFIER                  BLOCK NAME
+000010 trace_flags                 apl_storage_manager_
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+apl_storage_manager_     000100 p                           apl_storage_manager_
+                         000101 s                           apl_storage_manager_
+                         000102 depth                       apl_storage_manager_
+                         000103 map_stack                   apl_storage_manager_
+                         000116 found                       apl_storage_manager_
+                         000117 neighbor                    apl_storage_manager_
+                         000120 global_storage_system_data_pointer
+                                                            apl_storage_manager_
+                         000122 hash_index                  apl_storage_manager_
+                         000123 which_free                  apl_storage_manager_
+                         000124 sli                         apl_storage_manager_
+                         000125 new_sli                     apl_storage_manager_
+                         000126 enter_balance_time          apl_storage_manager_
+                         000130 enter_time                  apl_storage_manager_
+                         000132 p_rel_loc                   apl_storage_manager_
+                         000133 already_balanced            apl_storage_manager_
+                         000134 q                           apl_storage_manager_
+                         000135 old_q                       apl_storage_manager_
+                         000136 i                           apl_storage_manager_
+                         000137 rangex                      apl_storage_manager_
+                         000140 endp                        apl_storage_manager_
+                         000141 newp                        apl_storage_manager_
+                         000142 mapx                        apl_storage_manager_
+                         000143 other                       apl_storage_manager_
+                         000144 base                        apl_storage_manager_
+                         000145 scan_pos                    apl_storage_manager_
+                         000146 esw                         apl_storage_manager_
+                         000147 n_left                      apl_storage_manager_
+                         000150 required_usage              apl_storage_manager_
+                         000152 temp_ptr                    apl_storage_manager_
+                         000154 segp                        apl_storage_manager_
+                         000156 small_piece                 apl_storage_manager_
+                         000157 map_size                    apl_storage_manager_
+                         000160 new_slot                    apl_storage_manager_
+                         000161 data_elements               apl_storage_manager_
+                         000170 seg_map_p                   apl_storage_manager_
+                         000172 ws_info_ptr                 apl_storage_manager_
+                         000174 number_of_dimensions        apl_storage_manager_
+                         000175 seen_current_value_stack    apl_storage_manager_
+                         000212 nodex                       left_neighbor
+                         000222 nodex                       right_neighbor
+                         000232 fp                          launder
+                         000260 hash_index                  set_up_hash_table
+                         000261 i                           set_up_hash_table
+begin block on line 469  000100 map_copy                    begin block on line 469
+                         000100 left_link                   begin block on line 469
+                         000101 right_link                  begin block on line 469
+                         000102 new_link                    begin block on line 469
+                         000103 mapx                        begin block on line 469
+                         000104 copyx                       begin block on line 469
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+enter_begin         leave_begin         call_ext_out_desc   call_ext_out        return              alloc_auto_adj
+mod_fx1             signal              ext_entry           vclock
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+apl_free_bead_                apl_get_symbol_               apl_segment_manager_$free     apl_segment_manager_$get
+apl_system_error_             check_storage_manager_$allocate                             check_storage_manager_$clear
+check_storage_manager_$free   debug                         hcs_$truncate_seg             ioa_$ioa_stream
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+apl_error_table_$bead_already_free                          apl_error_table_$bead_not_known_to_apl
+apl_error_table_$hash_table_full                            apl_error_table_$invalid_free_bead
+apl_error_table_$no_type_bits apl_error_table_$non_existent_stack
+apl_error_table_$tables_inconsistent                        apl_error_table_$uninterned_symbol
+apl_error_table_$wsfull_alloc_too_big                       apl_error_table_$wsfull_no_stack_segs
+apl_error_table_$wsfull_on_stack                            apl_error_table_$wsfull_out_of_maps
+apl_error_table_$wsfull_out_of_segs                         apl_static_$ws_info_ptr       sys_info$max_seg_size
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+ 3    7 000102        10 000107       183 000116       192 000130       193 000134       195 000135       201 000146
+    202 000151       203 000154       206 000160       208 000162       210 000166       212 000226       215 000233
+    221 000242       224 000252       225 000276       228 000310       229 000312       230 000323       232 000325
+    234 000337       236 000343       238 000344       239 000345       241 000351       243 000360       245 000363
+    246 000364       248 000366       250 000371       253 000402       254 000411       255 000420       257 000421
+    259 000433       260 000442       262 000445       264 000450       265 000456       266 000467       270 000506
+    271 000510       272 000521       273 000531       278 000533       282 000547       283 000557       286 000561
+    288 000562       295 000574       297 000577       298 000602       300 000604       303 000607       308 000614
+    309 000622       311 000631       312 000641       313 000656       315 000665       316 000672       317 000707
+    319 000713       323 000716       324 000722       325 000725       326 000726       327 000730       331 000731
+    332 000732       335 000734       338 000740       339 000744       340 000752       341 000757       342 000761
+    344 000762       347 001000       348 001004       349 001015       351 001017       354 001041       355 001046
+    357 001063       358 001065       360 001066       361 001070       364 001071       365 001074       367 001076
+    369 001077       371 001100       372 001107       373 001111       375 001112       378 001125       382 001135
+    383 001137       386 001154       388 001171       390 001173       392 001174       393 001176       396 001177
+    397 001203       399 001205       402 001206       405 001210       408 001215       410 001220       411 001224
+    412 001225       414 001226       418 001231       422 001302       425 001316       429 001324       431 001330
+    432 001331       433 001341       434 001342       435 001346       438 001350       439 001352       440 001357
+    444 001360       447 001362       450 001371       451 001373       452 001374       454 001375       455 001377
+    457 001400       458 001402       461 001403       463 001405       466 001436       469 001444       471 001447
+    485 001457       486 001460       487 001462       489 001463       493 001470       496 001472       497 001473
+    498 001475       500 001477       502 001500       506 001502       507 001504       509 001506       510 001507
+    511 001513       513 001514       514 001520       527 001521       529 001524       533 001527       535 001530
+    538 001534       540 001536       541 001541       543 001542       544 001545       547 001550       548 001552
+    549 001553       550 001561       551 001563       553 001565       555 001570       558 001571       562 001575
+    565 001604       566 001606       568 001613       569 001615       571 001616       572 001620       574 001625
+    577 001627       579 001630       583 001631       586 001641       588 001644       592 001647       593 001651
+    596 001657       599 001666       601 001700       602 001703       603 001705       605 001710       606 001713
+    607 001715       609 001716       610 001721       613 001723       616 001725       621 001740       623 001745
+    631 001751       632 001753       634 001754       638 001760       641 001762       642 001763       643 001765
+    644 001767       646 001770       650 001772       651 001774       653 001776       654 002003       656 002004
+    658 002012       660 002016       661 002026       662 002035       665 002036       667 002037       669 002046
+    671 002051       674 002053       677 002060       679 002063       680 002067       681 002070       683 002071
+    684 002074       688 002075       689 002101       691 002102       694 002107       695 002114       696 002115
+    697 002117       698 002121       703 002122       707 002124       708 002125       708 002133       709 002135
+    710 002143       713 002155       714 002156       716 002160       717 002162       723 002170       724 002172
+    726 002174       727 002177       728 002202       729 002203       731 002204       732 002207       734 002210
+    741 002211       742 002212       743 002215       744 002223       745 002225       746 002227       748 002230
+    749 002236       750 002240       752 002242       753 002247       754 002253       755 002260       757 002273
+    759 002274       760 002276       761 002301       762 002303       763 002304       764 002305       766 002306
+    776 002320       778 002323       781 002331       783 002335       785 002341       786 002344       787 002346
+    788 002347       790 002352       791 002355       792 002356       793 002357       795 002366       796 002372
+    798 002374       802 002375       804 002405       805 002407       809 002414       810 002417       815 002424
+    817 002430       818 002431       819 002441       820 002442       821 002444       822 002446       827 002450
+    829 002452       834 002512       837 002526       838 002531       840 002532       843 002540       846 002550
+    848 002551       851 002557       854 002573       859 002604       864 002655       867 002671       868 002676
+    869 002700       872 002713       873 002715       877 002717       879 002723       880 002725       883 002731
+    887 002732       891 002741       892 002750       895 002754       900 002760       901 002762       902 002770
+    903 002773       904 003001       906 003003       911 003004       914 003013       915 003016       918 003023
+    923 003046       925 003065       929 003067       933 003101       934 003112       936 003115       940 003116
+    943 003125       945 003130       948 003161       951 003171       953 003174       954 003201       957 003213
+    959 003216       960 003227       962 003232       967 003234       968 003240       970 003262       974 003265
+    975 003267       979 003270       985 003301       987 003304       988 003306       989 003307       990 003313
+    991 003323       993 003340       996 003344       998 003350       999 003355      1000 003357      1001 003360
+   1002 003365      1004 003367      1008 003370      1014 003412      1016 003415      1021 003453      1023 003455
+   1026 003470      1030 003473      1031 003476      1032 003505      1035 003517      1037 003521      1039 003530
+   1041 003545      1043 003550      1044 003555      1046 003562      1047 003571      1048 003575      1049 003612
+   1051 003613      1053 003615      1054 003623      1056 003631      1058 003633      1060 003642      1061 003651
+   1062 003654      1063 003656      1064 003657      1066 003660      1070 003662      1071 003671      1073 003672
+   1075 003674      1076 003701      1082 003702      1095 003704      1096 003705      1097 003710      1098 003712
+   1100 003721      1102 003726      1103 003731      1104 003732      1112 003737      1125 003741      1126 003742
+   1127 003746      1128 003750      1130 003757      1132 003764      1133 003766      1134 003767      1140 003774
+   1157 003776      1159 004005      1162 004010      1165 004016      1166 004020      1168 004025      1171 004037
+   1173 004040      1178 004041      1179 004051      1181 004060      1183 004062      1189 004063      1192 004064
+   1193 004065      1194 004073      1196 004101      1197 004104      1199 004105      1200 004112      1204 004114
+   1206 004125      1207 004127      1208 004136      1209 004143      1211 004144      1213 004145      1219 004146
+   1220 004154      1222 004163      1224 004170      1225 004173      1226 004177      1228 004200      1229 004214
+   1230 004223
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

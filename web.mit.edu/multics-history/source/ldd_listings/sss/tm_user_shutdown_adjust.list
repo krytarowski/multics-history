@@ -1,0 +1,728 @@
+	COMPILATION LISTING OF SEGMENT tm_user_shutdown_adjust
+	Compiled by: Multics PL/I Compiler, Release 28e, of February 14, 1985
+	Compiled at: Honeywell Multics Op. - System M
+	Compiled on: 04/04/85  0949.5 mst Thu
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        4*   *                                                         *
+        5*   *********************************************************** */
+        6 
+        7 /* DESCRIPTION:
+        8*
+        9*	This entry walks through the entire TDT adjusting any
+       10*     transactions held by the calling process.  The tm_user_shutdown_info
+       11*     structure is allocated and filled in by this procedure in an area
+       12*     supplied by the calling process (see the dm_tm_shutdown_info.incl.pl1
+       13*     include file).  This entry is only available in the DM ring for DM
+       14*     user shutdown and assumes its caller (tm_user_shutdown) has guaranteed
+       15*     TDT entries owned by the user process will not disappear out from
+       16*     under it.  It does not free any TDT entries owned by the process, but
+       17*     leaves them for transaction_manager_$user_shutdown_free in a later
+       18*     part of user shutdown.  The program has the following steps:
+       19*
+       20*	1) loops through the TDT to find out how many TDT entries the
+       21*     calling process owns to allocate the tm_shutdown_info structure.
+       22*
+       23*	2) For each user TDT entry, calls tm_cleanup$restart_error on the
+       24*     transaction therein and fills in the shutdown info for that TDT entry.
+       25*     If the tm_cleanup call fails, abandons the transaction.
+       26**/
+       27 
+       28 /* HISTORY:
+       29*
+       30*Written by Steve Herbst, 05/01/84.
+       31*Modified:
+       32*05/10/84 by Lee A. Newcomb:  to match on user process id instead of
+       33*	  user name.project to prevent multi-process conflicts.
+       34*05/16/84 by S. Herbst:  Changed to adjust TDT entry and add an element
+       35*	  to tm_shutdown_info only when there's a transaction.
+       36*	  Added "tm_shutdown_info.op_completed = ABANDONED".
+       37*10/19/84 by Steve Herbst: Changed in response to audit comments.
+       38*02/20/85 by Lee A. Newcomb:  Fixed to call transaction_manager_$get_state_info
+       39*            instead of tm_=; the latter is in a different bound module.
+       40*02/25/85 by Lee A. Newcomb:  Fixed to not be missing a ";" after the "do" in
+       41*            the version check.
+       42*03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+       43**/
+       44 /* format: style4,ifthenstmt,^indproc,^indcomtxt */
+       45 
+       46 tm_user_shutdown_adjust:
+       47      proc (A_area_ptr, A_tm_shutdown_info_ptr, A_code);
+       48 
+       49 /* DECLARATIONS */
+       50 
+       51 /* Parameters */
+       52 
+       53 dcl  (A_area_ptr, A_tm_shutdown_info_ptr) ptr parameter;
+       54 dcl  A_code fixed bin (35);
+       55 
+       56 /* Constants */
+       57 
+       58 dcl  ME char (32) int static options (constant) init ("tm_user_shutdown_adjust");
+       59 
+       60 /* Based */
+       61 
+       62 dcl  based_area area based;
+       63 
+       64 /* Static */
+       65 
+       66 /* Automatic */
+       67 dcl  (
+       68      code fixed bin (35) init (0),
+       69      my_process_id bit (36) init (""b),
+       70      op_name char (32) init (""),
+       71      (txn_index, tix_index, tix_count) fixed bin init (0)
+       72      ) automatic;
+       73 
+       74 /* External */
+       75 
+       76 dcl  dm_data_$tm_tdt_ptr ptr ext;
+       77 dcl  error_table_$unimplemented_version fixed bin (35) ext;
+       78 
+       79 /* Entries */
+       80 
+       81 dcl  dm_misc_util_$log entry options (variable);
+       82 dcl  get_process_id_ entry () returns (bit (36));
+       83 dcl  tm_abandon entry (bit (36) aligned, fixed bin (35));
+       84 dcl  tm_cleanup$restart_error entry (ptr, fixed bin);
+       85 dcl  transaction_manager_$get_state_info entry (fixed bin, char (*), fixed bin (35));
+       86 
+       87 /* Builtins */
+       88 
+       89 dcl  (addr, null, unspec) builtin;
+       90 
+       91 /* Conditions */
+       92 
+       93 dcl  cleanup condition;
+       94 
+       95 /* END OF DECLARATIONS */
+       96 
+       97 	A_code = 0;
+       98 	A_tm_shutdown_info_ptr = null;
+       99 
+      100 	on cleanup call CLEAN_UP;
+      101 
+      102 	tm_tdt_ptr = dm_data_$tm_tdt_ptr;
+      103 
+      104 	if tm_tdt.version ^= TM_TDT_VERSION_3 then do;
+      105 	     A_code = error_table_$unimplemented_version;
+      106 	     return;
+      107 	end;
+      108 
+      109 	my_process_id = get_process_id_ ();		/* to match our TDTE's */
+      110 
+      111 /* Walk through the TDT to see how many entries the user owns. */
+      112 
+      113 	tm_shutdown_alloc_count = 0;
+      114 
+      115 	do txn_index = 1 to tm_tdt.entry_count;
+      116 	     if tm_tdt.process_id (txn_index) = my_process_id & ^tm_tdt.abandoned_sw (txn_index) then
+      117 		tm_shutdown_alloc_count = tm_shutdown_alloc_count + 1;
+      118 	end;
+      119 
+      120 /* Now get storage for the returned info and initialize it. */
+      121 
+      122 	allocate tm_shutdown_info in (A_area_ptr -> based_area) set (tm_shutdown_info_ptr);
+      123 	unspec (tm_shutdown_info) = "0"b;
+      124 	tm_shutdown_info.version = TM_SHUTDOWN_INFO_VERSION_1;
+      125 
+      126 /* This begin block allocates a temporary array of TDT indices to be */
+      127 /* acted upon. This array, not the TDT itself, is looped through when */
+      128 /* adjusting transactions since if we need to abandon a transaction, */
+      129 /* we don't want to adjust and return shutdown_info about the new slot */
+      130 /* created by the abandon. */
+      131 
+      132 ADJUST_USER_TRANSACTIONS: begin;
+      133 
+      134 dcl  tix_array (tm_shutdown_alloc_count) fixed bin;
+      135 
+      136 	     tix_count = 0;
+      137 
+      138 	     do txn_index = 1 to tm_tdt.entry_count;
+      139 
+      140 		tm_tdt_entry_ptr = addr (tm_tdt.entry (txn_index));
+      141 
+      142 		if tm_tdt_entry.process_id = my_process_id & tm_tdt_entry.txn_id ^= "0"b &
+      143 		     ^tm_tdt_entry.abandoned_sw then do;
+      144 		     tix_count = tix_count + 1;
+      145 		     tix_array (tix_count) = txn_index;
+      146 		end;
+      147 	     end;
+      148 
+      149 	     tm_shutdown_info.count = 0;
+      150 
+      151 	     do tix_index = 1 to tix_count;
+      152 
+      153 		txn_index = tix_array (tix_index);
+      154 		tm_tdt_entry_ptr = addr (tm_tdt.entry (txn_index));
+      155 
+      156 		tm_shutdown_info.count = tm_shutdown_info.count + 1;
+      157 		tm_shutdown_info.txn_id (tm_shutdown_info.count) = tm_tdt.txn_id (txn_index);
+      158 
+      159 		call transaction_manager_$get_state_info ((tm_tdt_entry.state), op_name, (0));
+      160 		if op_name = "commit" then
+      161 		     tm_shutdown_info.op_completed (tm_shutdown_info.count) = FINISHED_COMMIT;
+      162 		else if op_name = "abort" then
+      163 		     tm_shutdown_info.op_completed (tm_shutdown_info.count) = FINISHED_ABORT;
+      164 		else do;				/* convert all other unfinished ops and */
+      165 						/* in-progress state into an abort */
+      166 		     tm_shutdown_info.op_completed (tm_shutdown_info.count) = ABORTED;
+      167 		     tm_tdt_entry.state = TM_ABORT_FLUSHING_TXN_STATE;
+      168 		end;
+      169 
+      170 		call tm_cleanup$restart_error (tm_tdt_ptr, txn_index);
+      171 
+      172 		tm_shutdown_info.state (tm_shutdown_info.count) = tm_tdt.state (txn_index);
+      173 		tm_shutdown_info.error_code (tm_shutdown_info.count) = tm_tdt.error_code (txn_index);
+      174 
+      175 		if tm_tdt_entry.state ^= 0 then do;	/* could not adjust it; let the Daemon try */
+      176 		     tm_shutdown_info.op_completed (tm_shutdown_info.count) = ABANDONED;
+      177 		     call tm_abandon (tm_tdt_entry.txn_id, code);
+      178 		     if code ^= 0 then call dm_misc_util_$log (ERROR_SV, code, ME,
+      179 			     "Abandoning TDT entry ^d for user ^a", txn_index, tm_tdt_entry.owner_name);
+      180 		end;
+      181 	     end;
+      182 
+      183 	end ADJUST_USER_TRANSACTIONS;			/* begin block */
+      184 
+      185 	A_tm_shutdown_info_ptr = tm_shutdown_info_ptr;
+      186 
+      187 	return;
+      188 
+      189 CLEAN_UP: proc;
+      190 
+      191 	if tm_shutdown_info_ptr ^= null then
+      192 	     free tm_shutdown_info in (A_area_ptr -> based_area);
+      193 
+      194      end CLEAN_UP;
+      195 
+  1     1 /* BEGIN INCLUDE FILE dm_tm_shutdown_info.incl.pl1 */
+  1     2 
+  1     3 /* DESCRIPTION:
+  1     4*
+  1     5*	This contains the structure used to pass information from
+  1     6*     the DM ring to the user ring about a process' transactions that
+  1     7*     existed when the process terminated its usage of a Data
+  1     8*     Management System.
+  1     9**/
+  1    10 
+  1    11 /* HISTORY:
+  1    12*Written by Steve Herbst, 11/22/83.
+  1    13*Modified:
+  1    14*04/27/84 by L. A. Newcomb:  Renamed structure shutdown_info to
+  1    15*            tm_shutdown_info to prevent collision with system shutdown info
+  1    16*            structure.
+  1    17*05/16/84 by Steve Herbst:  Added ABANDONED constant.
+  1    18*09/20/84 by Lee A. Newcomb:  Added an abandoned entry to the OP_NAME array,
+  1    19*            aligned the version, and init'd tm_shutdown_info_ptr to null.
+  1    20**/
+  1    21 
+  1    22 /* format: style4,indattr,^indcomtxt,idind33 */
+  1    23 
+  1    24 dcl  1 tm_shutdown_info	        aligned based (tm_shutdown_info_ptr),
+  1    25        2 version		        char (8) aligned,	/* = "TMSHUT 1" */
+  1    26        2 count		        fixed bin,
+  1    27        2 transaction	        (tm_shutdown_alloc_count refer (tm_shutdown_info.count)),
+  1    28          3 txn_id		        bit (36) aligned,
+  1    29          3 op_completed	        fixed bin,
+  1    30          3 state		        fixed bin,
+  1    31          3 error_code	        fixed bin (35);
+  1    32 
+  1    33 dcl  tm_shutdown_info_ptr	        ptr init (null ());
+  1    34 dcl  tm_shutdown_alloc_count	        fixed bin;
+  1    35 
+  1    36 dcl  (						/* constants */
+  1    37      TM_SHUTDOWN_INFO_VERSION_1       char (8) aligned init ("TMSHUT 1"),
+  1    38      (ABORTED		        init (1),
+  1    39      FINISHED_ABORT		        init (2),
+  1    40      FINISHED_COMMIT	        init (3),
+  1    41      ABANDONED		        init (4)) fixed bin,
+  1    42      OP_NAME		        (4) char (32) init
+  1    43 			        ("Aborted", "Finished aborting", "Finished committing", "Abandoned")
+  1    44      )			        int static options (constant);
+  1    45 
+  1    46 /* END INCLUDE FILE - dm_tm_shutdown_info.incl.pl1 */
+      196 
+      197 
+  2     1 /*  START OF:	dm_tm_tdt.incl.pl1		*/
+  2     2 
+  2     3 /* Transaction Definition Table for transaction_manager_ */
+  2     4 /* This structure is used to reference the TDT. The process_id field for the
+  2     5*   i'th TDT entry, for example, is usually referenced as tm_tdt.process_id (i).
+  2     6*   A TDT entry is in use by a process when its process_id field is nonzero.
+  2     7*   An entry is reserved by using the stacq builtin to set process_id, if and
+  2     8*   only if it is already zero. The entry is being used for a transaction when
+  2     9*   tm_tdt.txn_id (i) is nonzero. The possible values of tm_tdt.state (i) are
+  2    10*   listed in dm_tm_states.incl.pl1. If state = 0, no operation has been
+  2    11*   performed yet on the transaction. */
+  2    12 
+  2    13 
+  2    14 /* HISTORY:
+  2    15*Designed by Matt Pierret, 01/26/82.
+  2    16*Coded by Steve Herbst, 07/27/82.
+  2    17*Modified:
+  2    18*08/05/82 by Steve Herbst: Added tm_tdt.operation and padded last_uid to full word.
+  2    19*08/05/82 by Steve Herbst: Changed creator_process_id to bit (36).
+  2    20*08/16/82 by Steve Herbst: Added contents of dm_tm_tdt_entry.incl.pl1.
+  2    21*09/09/82 by Steve Herbst: Removed in_use flag from TDT entry and rearranged fields.
+  2    22*09/20/82 by Steve Herbst: Removed tm_tdt.operation.
+  2    23*11/01/82 by Steve Herbst: Added event_channel and error_sw to tm_tdt_entry.
+  2    24*11/05/82 by Steve Herbst: Added suspended_sw and error_code to tm_tdt_entry.
+  2    25*11/11/82 by Steve Herbst: Deleted tm_tdt_entry.alloc_complete.
+  2    26*11/23/82 by Steve Herbst: Compacted, changed some numbers to unsigned.
+  2    27*12/14/82 by Steve Herbst: Added tm_tdt_entry.daemon_error_sw.
+  2    28*01/11/83 by Steve Herbst: Added owner_name, abandoned_sw & kill_sw to tm_tdt_entry.
+  2    29*01/24/83 by Steve Herbst: Replaced daemon_error_sw with daemon_adjust_count.
+  2    30*01/25/83 by Steve Herbst: Moved abandoned_sw from transaction portion to entry header portion.
+  2    31*05/13/83 by Steve Herbst: Version 3, changed all fixed bin (18) unal uns numbers to fixed bin (17) unaligned.
+  2    32*05/26/83 by Steve Herbst: Added rollback_count and checkpoint_id.
+  2    33**/
+  2    34 
+  2    35 dcl	tm_tdt_ptr	ptr;
+  2    36 dcl	tdt_max_count	fixed bin;
+  2    37 
+  2    38 dcl TM_TDT_VERSION_3 char (8) int static options (constant) init ("TM-TDT 3");
+  2    39 
+  2    40 
+  2    41 dcl  1	tm_tdt		aligned based (tm_tdt_ptr),
+  2    42       2	version char (8),				/* = "TM-TDT 3" */
+  2    43       2	lock fixed bin (71),			/* (currently not used) */
+  2    44       2	last_uid		bit (27) aligned,		/* last transaction uid assigned */
+  2    45       2	flags,
+  2    46        3	no_begins		bit (1) unaligned,		/* ON => only priv process can begin transaction */
+  2    47        3	mbz1		bit (35) unaligned,
+  2    48       2	entry_count	fixed bin,		/* number of slots allocated */
+  2    49       2	mbz2		fixed bin,		/* for even word boundary */
+  2    50       2	entry  (tdt_max_count refer (tm_tdt.entry_count))
+  2    51 			like tm_tdt_entry;
+  2    52 
+  2    53 
+  2    54 
+  2    55 /* TDT entries: */
+  2    56 
+  2    57 dcl	tm_tdt_entry_ptr	ptr;
+  2    58 
+  2    59 dcl  1	tm_tdt_entry	aligned based (tm_tdt_entry_ptr),
+  2    60       2	event_channel	fixed bin (71),		/* for communication with the process */
+  2    61       2	process_id	bit (36) aligned,		/* process for which this entry is reserved */
+  2    62       2	owner_name	char (32),		/* person.project of owner process */
+  2    63       2	entry_flags,
+  2    64        3	abandoned_sw	bit (1) unaligned,		/* ON => owner has called tm_$abandon on this entry */
+  2    65        3	mbz3		bit (35) unaligned,
+  2    66       2	transaction	unaligned,
+  2    67        3	txn_id		bit (36) aligned,		/* unique identifier assigned at begin time */
+  2    68        3	date_time_created	fixed bin (71) aligned,
+  2    69        3	mode		fixed bin (17) unaligned,	/* mode specified with transaction begin */
+  2    70        3	state		fixed bin (17) unaligned,	/* state transaction is currently in */
+  2    71        3  error_code	fixed bin (35) aligned,	/* goes along with error_sw and error state */
+  2    72        3 	checkpoint_id	fixed bin (17) unaligned,	/* identifier of the current rollback checkpoint */
+  2    73        3	rollback_count	fixed bin (17) unaligned,	/* number of times bjm_$rollback has been called */
+  2    74        3	daemon_adjust_count	fixed bin (17) unaligned,	/* number of times daemon has tried to adjust since user */
+  2    75        3	return_idx	fixed bin (17) unaligned,	/* parent transaction, or zero */
+  2    76        3	flags,
+  2    77         4 dead_process_sw	bit (1) unaligned,		/* ON => treat process as dead even if it isn't yet */
+  2    78         4 suspended_sw	bit (1) unaligned,		/* ON => suspended by tm_$suspend_txn */
+  2    79         4 error_sw		bit (1) unaligned,		/* ON => state is one of the error states */
+  2    80         4 kill_sw		bit (1) unaligned,		/* ON => being processed by tm_$kill */
+  2    81         4	mbz4		bit (29) unaligned,
+  2    82        3	post_commit_flags,
+  2    83         4 (fmgr,
+  2    84 	 bjmgr,
+  2    85 	 ajmgr)	 	 bit (1) unaligned,
+  2    86        3	mbz4		fixed bin;
+  2    87 
+  2    88 
+  2    89 /*  END OF:	dm_tm_tdt.incl.pl1		*/
+      198 
+      199 
+  3     1 /*  START OF:	dm_tm_states.incl.pl1	*/
+  3     2 
+  3     3 /* HISTORY:
+  3     4*
+  3     5*Designed by Matthew Pierret, 01/26/82.
+  3     6*Coded by Steve Herbst, 08/05/82.
+  3     7*Modified:
+  3     8*09/20/82 by Steve Herbst: States renames for distinct operations.
+  3     9*10/05/82 by Steve Herbst: Added TM_ABORT_POST_COMMIT_STATE.
+  3    10*01/14/83 by Steve Herbst: Added TM_ERROR_INCREMENT.
+  3    11*01/18/83 by Steve Herbst: Added HIGHEST_ABORT_STATE, etc.
+  3    12*08/23/84 by Steve Herbst: Added OP_NAME... constants.
+  3    13**/
+  3    14 
+  3    15 
+  3    16 /* NOTE: Changing this file necessitates changes tm_cleanup */
+  3    17 
+  3    18 dcl (HIGHEST_STATE init (96),
+  3    19      LOWEST_ABORT_STATE init (21),
+  3    20      HIGHEST_ABORT_STATE init (30),
+  3    21      LOWEST_COMMIT_STATE init (31),
+  3    22      HIGHEST_COMMIT_STATE init (40),
+  3    23      LOWEST_ROLLBACK_STATE init (41),
+  3    24      HIGHEST_ROLLBACK_STATE init (50)) fixed bin int static options (constant);
+  3    25 
+  3    26 dcl TM_ERROR_INCREMENT fixed bin int static options (constant) init (50);
+  3    27 						/* error state = corresponding pre-call state + 50 */
+  3    28 
+  3    29 
+  3    30 dcl (	TM_IN_PROGRESS_STATE		init (1),
+  3    31 
+  3    32 	TM_BEGIN_STARTING_STATE		init (11),
+  3    33 
+  3    34 	TM_ABORT_FLUSHING_TXN_STATE		init (21),
+  3    35 	TM_ABORT_FLUSHING_TXN_ERROR		init (71),
+  3    36 	TM_ABORT_ROLLING_BACK_STATE		init (22),
+  3    37 	TM_ABORT_ROLLING_BACK_ERROR		init (72),
+  3    38 	TM_ABORT_FLUSHING_CI_STATE		init (23),
+  3    39 	TM_ABORT_FLUSHING_CI_ERROR		init (73),
+  3    40 	TM_ABORT_WRITING_MARK_STATE		init (24),
+  3    41 	TM_ABORT_WRITING_MARK_ERROR		init (74),
+  3    42 	TM_ABORT_UNLOCKING_STATE		init (25),
+  3    43 	TM_ABORT_UNLOCKING_ERROR		init (75),
+  3    44 	TM_ABORT_METERING_STATE		init (26),
+  3    45 	TM_ABORT_METERING_ERROR		init (76),
+  3    46 
+  3    47 	TM_COMMIT_FLUSHING_TXN_STATE		init (31),
+  3    48 	TM_COMMIT_FLUSHING_TXN_ERROR		init (81),
+  3    49 	TM_COMMIT_FLUSHING_CI_STATE		init (32),
+  3    50 	TM_COMMIT_FLUSHING_CI_ERROR		init (82),
+  3    51 	TM_COMMIT_WRITING_MARK_STATE		init (33),
+  3    52 	TM_COMMIT_WRITING_MARK_ERROR		init (83),
+  3    53 	TM_COMMIT_POST_COMMIT_STATE		init (34),
+  3    54 	TM_COMMIT_POST_COMMIT_ERROR		init (84),
+  3    55 	TM_COMMIT_UNLOCKING_STATE		init (35),
+  3    56 	TM_COMMIT_UNLOCKING_ERROR		init (85),
+  3    57 	TM_COMMIT_METERING_STATE		init (36),
+  3    58 	TM_COMMIT_METERING_ERROR		init (86),
+  3    59 
+  3    60 	TM_ROLLBACK_FLUSHING_TXN_STATE	init (41),
+  3    61 	TM_ROLLBACK_FLUSHING_TXN_ERROR	init (91),
+  3    62 	TM_ROLLBACK_ROLLING_BACK_STATE	init (42),
+  3    63 	TM_ROLLBACK_ROLLING_BACK_ERROR	init (92),
+  3    64 	TM_ROLLBACK_FLUSHING_CI_STATE		init (43),
+  3    65 	TM_ROLLBACK_FLUSHING_CI_ERROR		init (93),
+  3    66 	TM_ROLLBACK_WRITING_MARK_STATE	init (44),
+  3    67 	TM_ROLLBACK_WRITING_MARK_ERROR	init (94),
+  3    68 	TM_ROLLBACK_UNLOCKING_STATE		init (45),
+  3    69 	TM_ROLLBACK_UNLOCKING_ERROR		init (95),
+  3    70 	TM_ROLLBACK_METERING_STATE		init (46),
+  3    71 	TM_ROLLBACK_METERING_ERROR		init (96))
+  3    72 
+  3    73 			fixed bin int static options (constant);
+  3    74 
+  3    75 dcl (OP_NAME_ABORT init ("abort"),
+  3    76      OP_NAME_COMMIT init ("commit"),
+  3    77      OP_NAME_ROLLBACK init ("rollback")) char (32) int static options (constant);
+  3    78 
+  3    79 /* END OF:	dm_tm_states.incl.pl1	*/
+      200 
+      201 
+  4     1 /* BEGIN INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+  4     2 
+  4     3 /* format: ^indcom */
+  4     4 
+  4     5 /* DESCRIPTION:
+  4     6*   These are the severity codes used by the dms daemon when calling its logger.
+  4     7*   The severity is ranked thusly:
+  4     8*
+  4     9*   severity log write situation
+  4    10*   -------- --- ----- ---------
+  4    11*          0 no  yes   standard output, query, etc.
+  4    12*          1 yes yes   fatal error, terminate dms daemon.
+  4    13*          2 yes yes   nonfatal error.
+  4    14*          3 yes yes   informative message.
+  4    15*          4 yes no    log information only.
+  4    16**/
+  4    17 
+  4    18 /* HISTORY:
+  4    19*
+  4    20*Written by M. Pandolf, 10/06/82.
+  4    21*Modified:
+  4    22*12/10/84 by R. Michael Tague: Rename and reformat description/history.
+  4    23*01/13/85 by Lee A. Newcomb:  Renamed to dm_log_sv_codes from
+  4    24*            dm_daemon_sv_codes as the severity codes for the DM log are not
+  4    25*            restrained to the DM Daemon's use.
+  4    26*01/24/85 by Lee A. Newcomb:  Fixed to say dm_log_sv_codes.incl.pl1 in the
+  4    27*            BEGIN and END INCLUDE comments, instead of dm_daemon_sv_codes.==.
+  4    28**/
+  4    29 
+  4    30 /* format: style5 */
+  4    31 
+  4    32      dcl	   (PRINT_SV, QUERY_SV)    fixed bin internal static
+  4    33 			       options (constant) init (0);
+  4    34      dcl	   (CRASH_SV, FATAL_SV)    fixed bin internal static
+  4    35 			       options (constant) init (1);
+  4    36      dcl	   ERROR_SV	       fixed bin internal static
+  4    37 			       options (constant) init (2);
+  4    38      dcl	   INFORM_SV	       fixed bin internal static
+  4    39 			       options (constant) init (3);
+  4    40      dcl	   LOG_SV		       fixed bin internal static
+  4    41 			       options (constant) init (4);
+  4    42 
+  4    43 /* END INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+      202 
+      203 
+      204 
+      205      end tm_user_shutdown_adjust;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/04/85  0827.2  tm_user_shutdown_adjust.pl1       >spec>on>7192.pbf-04/04/85>tm_user_shutdown_adjust.pl1
+196          1    01/07/85  0900.0  dm_tm_shutdown_info.incl.pl1      >ldd>include>dm_tm_shutdown_info.incl.pl1
+198          2    01/07/85  0900.1  dm_tm_tdt.incl.pl1                >ldd>include>dm_tm_tdt.incl.pl1
+200          3    01/07/85  0900.1  dm_tm_states.incl.pl1             >ldd>include>dm_tm_states.incl.pl1
+202          4    03/06/85  1031.1  dm_log_sv_codes.incl.pl1          >ldd>include>dm_log_sv_codes.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+ABANDONED                              constant        fixed bin(17,0)          initial dcl 1-36 ref 176
+ABORTED                                constant        fixed bin(17,0)          initial dcl 1-36 ref 166
+A_area_ptr                             parameter       pointer                  dcl 53 ref 46 122 191
+A_code                                 parameter       fixed bin(35,0)          dcl 54 set ref 46 97* 105*
+A_tm_shutdown_info_ptr                 parameter       pointer                  dcl 53 set ref 46 98* 185*
+ERROR_SV                        000022 constant        fixed bin(17,0)          initial dcl 4-36 set ref 178*
+FINISHED_ABORT                         constant        fixed bin(17,0)          initial dcl 1-36 ref 162
+FINISHED_COMMIT                        constant        fixed bin(17,0)          initial dcl 1-36 ref 160
+ME                              000004 constant        char(32)                 initial unaligned dcl 58 set ref 178*
+TM_ABORT_FLUSHING_TXN_STATE            constant        fixed bin(17,0)          initial dcl 3-30 ref 167
+TM_SHUTDOWN_INFO_VERSION_1      000002 constant        char(8)                  initial dcl 1-36 ref 124
+TM_TDT_VERSION_3                000000 constant        char(8)                  initial unaligned dcl 2-38 ref 104
+abandoned_sw             13            based           bit(1)                   level 3 in structure "tm_tdt_entry" packed unaligned
+                                                                                  dcl 2-59 in procedure "tm_user_shutdown_adjust"
+                                                                                  ref 142
+abandoned_sw             23            based           bit(1)                   array level 4 in structure "tm_tdt" packed unaligned
+                                                                                  dcl 2-41 in procedure "tm_user_shutdown_adjust"
+                                                                                  set ref 116
+addr                                                   builtin function         dcl 89 ref 140 154
+based_area                             based           area(1024)               dcl 62 ref 122 191
+cleanup                         000116 stack reference condition                dcl 93 ref 100
+code                            000100 automatic       fixed bin(35,0)          initial dcl 67 set ref 67* 177* 178 178*
+count                     2            based           fixed bin(17,0)          level 2 dcl 1-24 set ref 122* 123 149* 156* 156 157
+                                                                                  160 162 166 172 173 176 191
+dm_data_$tm_tdt_ptr             000010 external static pointer                  dcl 76 ref 102
+dm_misc_util_$log               000014 constant        entry                    external dcl 81 ref 178
+entry                    10            based           structure                array level 2 dcl 2-41 set ref 140 154
+entry_count               6            based           fixed bin(17,0)          level 2 dcl 2-41 ref 115 138
+entry_flags              13            based           structure                level 2 in structure "tm_tdt_entry" dcl 2-59
+                                                                                  in procedure "tm_user_shutdown_adjust"
+entry_flags              23            based           structure                array level 3 in structure "tm_tdt" dcl 2-41
+                                                                                  in procedure "tm_user_shutdown_adjust"
+error_code               31            based           fixed bin(35,0)          array level 4 in structure "tm_tdt" dcl 2-41
+                                                                                  in procedure "tm_user_shutdown_adjust" set ref 173
+error_code                6            based           fixed bin(35,0)          array level 3 in structure "tm_shutdown_info"
+                                                                                  dcl 1-24 in procedure "tm_user_shutdown_adjust"
+                                                                                  set ref 173*
+error_table_$unimplemented_version
+                                000012 external static fixed bin(35,0)          dcl 77 ref 105
+get_process_id_                 000016 constant        entry                    external dcl 82 ref 109
+my_process_id                   000101 automatic       bit(36)                  initial unaligned dcl 67 set ref 67* 109* 116 142
+null                                                   builtin function         dcl 89 ref 98 1-33 191
+op_completed              4            based           fixed bin(17,0)          array level 3 dcl 1-24 set ref 160* 162* 166* 176*
+op_name                         000102 automatic       char(32)                 initial unaligned dcl 67 set ref 67* 159* 160 162
+owner_name                3            based           char(32)                 level 2 dcl 2-59 set ref 178*
+process_id                2            based           bit(36)                  level 2 in structure "tm_tdt_entry" dcl 2-59
+                                                                                  in procedure "tm_user_shutdown_adjust" ref 142
+process_id               12            based           bit(36)                  array level 3 in structure "tm_tdt" dcl 2-41
+                                                                                  in procedure "tm_user_shutdown_adjust" set ref 116
+state                     5            based           fixed bin(17,0)          array level 3 in structure "tm_shutdown_info"
+                                                                                  dcl 1-24 in procedure "tm_user_shutdown_adjust"
+                                                                                  set ref 172*
+state                    30(18)        based           fixed bin(17,0)          array level 4 in structure "tm_tdt" packed unaligned
+                                                                                  dcl 2-41 in procedure "tm_user_shutdown_adjust"
+                                                                                  set ref 172
+state                    20(18)        based           fixed bin(17,0)          level 3 in structure "tm_tdt_entry" packed unaligned
+                                                                                  dcl 2-59 in procedure "tm_user_shutdown_adjust"
+                                                                                  set ref 159 167* 175
+tix_array                       000100 automatic       fixed bin(17,0)          array dcl 134 set ref 145* 153
+tix_count                       000114 automatic       fixed bin(17,0)          initial dcl 67 set ref 67* 136* 144* 144 145 151
+tix_index                       000113 automatic       fixed bin(17,0)          initial dcl 67 set ref 67* 151* 153*
+tm_abandon                      000020 constant        entry                    external dcl 83 ref 177
+tm_cleanup$restart_error        000022 constant        entry                    external dcl 84 ref 170
+tm_shutdown_alloc_count         000126 automatic       fixed bin(17,0)          dcl 1-34 set ref 113* 116* 116 122 122 134
+tm_shutdown_info                       based           structure                level 1 dcl 1-24 set ref 122 123* 191
+tm_shutdown_info_ptr            000124 automatic       pointer                  initial dcl 1-33 set ref 122* 123 124 185 1-33* 149
+                                                                                  156 156 157 157 160 160 162 162 166 166 172 172
+                                                                                  173 173 176 176 191 191
+tm_tdt                                 based           structure                level 1 dcl 2-41
+tm_tdt_entry                           based           structure                level 1 dcl 2-59
+tm_tdt_entry_ptr                000132 automatic       pointer                  dcl 2-57 set ref 140* 142 142 142 154* 159 167 175
+                                                                                  177 178
+tm_tdt_ptr                      000130 automatic       pointer                  dcl 2-35 set ref 102* 104 115 116 116 138 140 154
+                                                                                  157 170* 172 173
+transaction              24            based           structure                array level 3 in structure "tm_tdt" unaligned
+                                                                                  dcl 2-41 in procedure "tm_user_shutdown_adjust"
+transaction               3            based           structure                array level 2 in structure "tm_shutdown_info"
+                                                                                  dcl 1-24 in procedure "tm_user_shutdown_adjust"
+transaction              14            based           structure                level 2 in structure "tm_tdt_entry" unaligned
+                                                                                  dcl 2-59 in procedure "tm_user_shutdown_adjust"
+transaction_manager_$get_state_info
+                                000024 constant        entry                    external dcl 85 ref 159
+txn_id                   14            based           bit(36)                  level 3 in structure "tm_tdt_entry" dcl 2-59
+                                                                                  in procedure "tm_user_shutdown_adjust" set ref 142
+                                                                                  177*
+txn_id                   24            based           bit(36)                  array level 4 in structure "tm_tdt" dcl 2-41
+                                                                                  in procedure "tm_user_shutdown_adjust" set ref 157
+txn_id                    3            based           bit(36)                  array level 3 in structure "tm_shutdown_info"
+                                                                                  dcl 1-24 in procedure "tm_user_shutdown_adjust"
+                                                                                  set ref 157*
+txn_index                       000112 automatic       fixed bin(17,0)          initial dcl 67 set ref 67* 115* 116 116* 138* 140
+                                                                                  145* 153* 154 157 170* 172 173 178*
+unspec                                                 builtin function         dcl 89 set ref 123*
+version                                based           char(8)                  level 2 in structure "tm_tdt" dcl 2-41 in procedure
+                                                                                  "tm_user_shutdown_adjust" ref 104
+version                                based           char(8)                  level 2 in structure "tm_shutdown_info" dcl 1-24
+                                                                                  in procedure "tm_user_shutdown_adjust" set ref
+                                                                                  124*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+CRASH_SV                               internal static fixed bin(17,0)          initial dcl 4-34
+FATAL_SV                               internal static fixed bin(17,0)          initial dcl 4-34
+HIGHEST_ABORT_STATE                    internal static fixed bin(17,0)          initial dcl 3-18
+HIGHEST_COMMIT_STATE                   internal static fixed bin(17,0)          initial dcl 3-18
+HIGHEST_ROLLBACK_STATE                 internal static fixed bin(17,0)          initial dcl 3-18
+HIGHEST_STATE                          internal static fixed bin(17,0)          initial dcl 3-18
+INFORM_SV                              internal static fixed bin(17,0)          initial dcl 4-38
+LOG_SV                                 internal static fixed bin(17,0)          initial dcl 4-40
+LOWEST_ABORT_STATE                     internal static fixed bin(17,0)          initial dcl 3-18
+LOWEST_COMMIT_STATE                    internal static fixed bin(17,0)          initial dcl 3-18
+LOWEST_ROLLBACK_STATE                  internal static fixed bin(17,0)          initial dcl 3-18
+OP_NAME                                internal static char(32)                 initial array unaligned dcl 1-36
+OP_NAME_ABORT                          internal static char(32)                 initial unaligned dcl 3-75
+OP_NAME_COMMIT                         internal static char(32)                 initial unaligned dcl 3-75
+OP_NAME_ROLLBACK                       internal static char(32)                 initial unaligned dcl 3-75
+PRINT_SV                               internal static fixed bin(17,0)          initial dcl 4-32
+QUERY_SV                               internal static fixed bin(17,0)          initial dcl 4-32
+TM_ABORT_FLUSHING_CI_ERROR             internal static fixed bin(17,0)          initial dcl 3-30
+TM_ABORT_FLUSHING_CI_STATE             internal static fixed bin(17,0)          initial dcl 3-30
+TM_ABORT_FLUSHING_TXN_ERROR            internal static fixed bin(17,0)          initial dcl 3-30
+TM_ABORT_METERING_ERROR                internal static fixed bin(17,0)          initial dcl 3-30
+TM_ABORT_METERING_STATE                internal static fixed bin(17,0)          initial dcl 3-30
+TM_ABORT_ROLLING_BACK_ERROR            internal static fixed bin(17,0)          initial dcl 3-30
+TM_ABORT_ROLLING_BACK_STATE            internal static fixed bin(17,0)          initial dcl 3-30
+TM_ABORT_UNLOCKING_ERROR               internal static fixed bin(17,0)          initial dcl 3-30
+TM_ABORT_UNLOCKING_STATE               internal static fixed bin(17,0)          initial dcl 3-30
+TM_ABORT_WRITING_MARK_ERROR            internal static fixed bin(17,0)          initial dcl 3-30
+TM_ABORT_WRITING_MARK_STATE            internal static fixed bin(17,0)          initial dcl 3-30
+TM_BEGIN_STARTING_STATE                internal static fixed bin(17,0)          initial dcl 3-30
+TM_COMMIT_FLUSHING_CI_ERROR            internal static fixed bin(17,0)          initial dcl 3-30
+TM_COMMIT_FLUSHING_CI_STATE            internal static fixed bin(17,0)          initial dcl 3-30
+TM_COMMIT_FLUSHING_TXN_ERROR           internal static fixed bin(17,0)          initial dcl 3-30
+TM_COMMIT_FLUSHING_TXN_STATE           internal static fixed bin(17,0)          initial dcl 3-30
+TM_COMMIT_METERING_ERROR               internal static fixed bin(17,0)          initial dcl 3-30
+TM_COMMIT_METERING_STATE               internal static fixed bin(17,0)          initial dcl 3-30
+TM_COMMIT_POST_COMMIT_ERROR            internal static fixed bin(17,0)          initial dcl 3-30
+TM_COMMIT_POST_COMMIT_STATE            internal static fixed bin(17,0)          initial dcl 3-30
+TM_COMMIT_UNLOCKING_ERROR              internal static fixed bin(17,0)          initial dcl 3-30
+TM_COMMIT_UNLOCKING_STATE              internal static fixed bin(17,0)          initial dcl 3-30
+TM_COMMIT_WRITING_MARK_ERROR           internal static fixed bin(17,0)          initial dcl 3-30
+TM_COMMIT_WRITING_MARK_STATE           internal static fixed bin(17,0)          initial dcl 3-30
+TM_ERROR_INCREMENT                     internal static fixed bin(17,0)          initial dcl 3-26
+TM_IN_PROGRESS_STATE                   internal static fixed bin(17,0)          initial dcl 3-30
+TM_ROLLBACK_FLUSHING_CI_ERROR          internal static fixed bin(17,0)          initial dcl 3-30
+TM_ROLLBACK_FLUSHING_CI_STATE          internal static fixed bin(17,0)          initial dcl 3-30
+TM_ROLLBACK_FLUSHING_TXN_ERROR         internal static fixed bin(17,0)          initial dcl 3-30
+TM_ROLLBACK_FLUSHING_TXN_STATE         internal static fixed bin(17,0)          initial dcl 3-30
+TM_ROLLBACK_METERING_ERROR             internal static fixed bin(17,0)          initial dcl 3-30
+TM_ROLLBACK_METERING_STATE             internal static fixed bin(17,0)          initial dcl 3-30
+TM_ROLLBACK_ROLLING_BACK_ERROR         internal static fixed bin(17,0)          initial dcl 3-30
+TM_ROLLBACK_ROLLING_BACK_STATE         internal static fixed bin(17,0)          initial dcl 3-30
+TM_ROLLBACK_UNLOCKING_ERROR            internal static fixed bin(17,0)          initial dcl 3-30
+TM_ROLLBACK_UNLOCKING_STATE            internal static fixed bin(17,0)          initial dcl 3-30
+TM_ROLLBACK_WRITING_MARK_ERROR         internal static fixed bin(17,0)          initial dcl 3-30
+TM_ROLLBACK_WRITING_MARK_STATE         internal static fixed bin(17,0)          initial dcl 3-30
+tdt_max_count                          automatic       fixed bin(17,0)          dcl 2-36
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+ADJUST_USER_TRANSACTIONS        000207 constant        label                    dcl 132
+CLEAN_UP                        000526 constant        entry                    internal dcl 189 ref 100
+tm_user_shutdown_adjust         000051 constant        entry                    external dcl 46
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0       702         730     543         712
+Length      1202     543        26         236     137           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+tm_user_shutdown_adjust              98 external procedure  is an external procedure.  
+on unit on line 100                  70 on unit               
+begin block on line 132             112 begin block         uses auto adjustable storage.  
+CLEAN_UP                                internal procedure  shares stack frame of on unit on line 100.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+begin block on line 132  000100 tix_array                   begin block on line 132
+tm_user_shutdown_adjust  000100 code                        tm_user_shutdown_adjust
+                         000101 my_process_id               tm_user_shutdown_adjust
+                         000102 op_name                     tm_user_shutdown_adjust
+                         000112 txn_index                   tm_user_shutdown_adjust
+                         000113 tix_index                   tm_user_shutdown_adjust
+                         000114 tix_count                   tm_user_shutdown_adjust
+                         000124 tm_shutdown_info_ptr        tm_user_shutdown_adjust
+                         000126 tm_shutdown_alloc_count     tm_user_shutdown_adjust
+                         000130 tm_tdt_ptr                  tm_user_shutdown_adjust
+                         000132 tm_tdt_entry_ptr            tm_user_shutdown_adjust
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+enter_begin         leave_begin         call_ext_out_desc   call_ext_out        return              alloc_auto_adj
+enable              ext_entry           int_entry           alloc_based         free_based
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+dm_misc_util_$log             get_process_id_               tm_abandon                    tm_cleanup$restart_error
+transaction_manager_$get_state_info
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+dm_data_$tm_tdt_ptr           error_table_$unimplemented_version
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     46 000045        67 000056    1   33 000066        97 000070        98 000072       100 000073       102 000111
+    104 000115       105 000122       106 000125       109 000126       113 000134       115 000135       116 000145
+    118 000157       122 000161       123 000174       124 000204       132 000207       134 000212       136 000217
+    138 000220       140 000232       142 000236       144 000246       145 000247       147 000253       149 000255
+    151 000257       153 000270       154 000273       156 000277       157 000301       159 000311       160 000337
+    162 000353       166 000366       167 000374       170 000377       172 000410       173 000424       175 000433
+    176 000440       177 000442       178 000453       181 000516       183 000521       185 000522       187 000525
+    189 000526       191 000527       194 000542
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

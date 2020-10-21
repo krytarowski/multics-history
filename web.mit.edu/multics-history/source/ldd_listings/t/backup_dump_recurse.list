@@ -1,0 +1,2414 @@
+	COMPILATION LISTING OF SEGMENT backup_dump_recurse
+	Compiled by: Multics PL/I Compiler, Release 29, of July 28, 1986
+	Compiled at: Honeywell Bull, Phx. Az., Sys-M 
+	Compiled on: 07/16/87  1326.0 mst Thu
+	    Options: optimize map
+
+        1 /****^  ***********************************************************
+        2*        *                                                         *
+        3*        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        4*        *                                                         *
+        5*        * Copyright (c) 1972 by Massachusetts Institute of        *
+        6*        * Technology and Honeywell Information Systems, Inc.      *
+        7*        *                                                         *
+        8*        *********************************************************** */
+        9 
+       10 
+       11 
+       12 /* Dumps a branch to tape and, optionally, dumps the contents of the subtree if the branch is a directory */
+       13 
+       14 
+       15 /*   Modified: 10 January 1972 by A. Kobziar to use special status entry instead of branch_info for actime,actind
+       16*     Modified: 01 March 1973 by A. Downing to make all calls to (area_,alloc_,freen_) be made to the old area package
+       17*     Modified: 15 December 1974 by A. Kobziar to set up sec_directory_list record with security info
+       18*     Modified: April 1976 by R. Bratt for tpd stuff and pv dump
+       19*     Modified: September 1976 by R. Bratt to no longer terminate directories
+       20*     Modified: ? by B. Greenberg for VTOC errors
+       21*     Modified: 26 June 1979 by S. Herbst to make incremental dumps ignore ring-0 entries
+       22*     Modified: 17 November 1980 by G. Palter to honor bk_ss_$no_primary and to always sort branches to allow restart bit to
+       23*     work properly
+       24*     Modified: 24 February 1981 by S. Herbst to retry dump twice after error_table_$device_attention
+       25*     Modified: 1 July 1981 by S. Herbst to add support -setdtd and -nosetdtd
+       26*     Modified: 4 August 1981 by G. Palter to properly handle dumping of top-level directories in the control file
+       27*     Modified: July 1982 by G. Palter to add features for IMFT support of AIM: enforce a maximum access class for dumping,
+       28*     refuse to dump upgraded directories, and check a user's effective access to each branch before dumping
+       29*     Modified: February 1983 by E. N. Kittlitz for 256K segs
+       30*     Modified: August 1983 by Robert Coren to enforce minimum access class for dumping
+       31*     Modified: November 1983 by Robert Coren to upgrade object access class to user's authorization if requested
+       32*     Modified 1985-03-21, BIM: fixed prehistoric busted condition handler.
+       33*     -------- -- Fixed not to force access in no-reload mode.
+       34*     phx17078 -- bks is not correctly zeroed.
+       35*     phx18650 -- does not reset transparency switches.
+       36*     phx17329 -- mishandling empty acls.
+       37*     phx17310 -- unitialized variables in cross-dumping.
+       38*     phx16651 -- rqovers on the map do not always get to level 2.
+       39*     phx13714 -- catching command_
+       40*
+       41*/****^  HISTORY COMMENTS:
+       42*  1) change(86-06-16,Lippard), approve(86-06-02,MCR7427),
+       43*     audit(86-06-16,Farley), install(86-06-17,MR12.0-1077):
+       44*      To not use status_for_backup.(actime actind).
+       45*  2) change(86-10-15,GWMay), approve(86-10-15,MCR7320), audit(86-11-19,GDixon),
+       46*     install(86-11-21,MR12.0-1223):
+       47*     changed to return a fatal error to the caller when a tape error occurs.
+       48*  3) change(87-07-15,GDixon), approve(87-07-15,MCR7617),
+       49*     audit(87-07-16,RBarstad), install(87-07-16,MR12.1-1040):
+       50*     Modified for change to backup_record_types.incl.pl1.
+       51*                                                   END HISTORY COMMENTS */
+       52 
+       53 
+       54 /* format: style4,delnl,insnl,ifthenstmt,ifthen */
+       55 
+       56 
+       57 backup_dump_recurse: proc (A_cross_dump_dn,
+       58 		       A_cross_dump_en,
+       59 		       P_force_dump,
+       60 		       Sfatal_error,
+       61 		       A_code);
+       62 
+       63 dcl  P_force_dump bit (1) aligned parameter;		/* ON => dump this entry no matter what */
+       64 
+       65 dcl  A_code fixed binary (35);			/* returned non-zero if dump aborted */
+       66 
+       67 dcl  Sfatal_error bit (1) aligned;			/* used to signal a fatal tape error */
+       68 						/* there are other errors which will */
+       69 						/* stop only the current line in the */
+       70 						/* control file from being dumped    */
+       71 						/* For those, the flag should not be set */
+       72 
+       73 dcl  (i, j, used) fixed binary,			/* temporary storage */
+       74      retry_count fixed bin,
+       75      code fixed bin (35),
+       76      ignore fixed bin (35),				/* ignored error code */
+       77      found fixed bin,				/* Used in restarting a dump */
+       78      (havent_output_dirname, found_object) bit (1) aligned,
+       79      (bc, lc, dircount, curl, name_len) fixed binary,
+       80      (np, bp, lp, hnp, hbp, aclp, ix, jx) pointer,
+       81      pp pointer,			                    /* used within an incl file       */
+       82      nssp ptr,					/* -> bk_nss_info struct, in area */
+       83      dqip ptr,					/* -> bk_dq_info struct, in area */
+       84      (dtd, dtu, dtem, dtsm, cutoff_time) fixed binary (52), /* Temporaries for date-time values. */
+       85      blocks fixed binary (9),
+       86      ring fixed bin (3),
+       87      ac_stg char (256),				/* converted access class */
+       88      ac_stg_octal character (32) aligned,
+       89      name_line char (200),				/* dir name followed by access class */
+       90      sv_label label;
+       91 
+       92 dcl  (A_cross_dump_dn, cross_dump_dn, restore_dn) char (168);
+       93 dcl  (A_cross_dump_en, cross_dump_en, restore_en, temp_en) char (32);
+       94 dcl  (restore_dlen, restore_elen) fixed bin;
+       95 
+       96 dcl  (
+       97      incr_sw,
+       98      incr_sw_set init ("0"b)
+       99      ) bit (1) int static;
+      100 
+      101 dcl  initialize static bit (1) initial ("1"b),		/* Static storage. */
+      102      (header_areap, list_areap, hdp) static pointer,	/* Pointers to selected items in headers. */
+      103      br_size fixed binary static,			/* Number of words in branch info. */
+      104      1 ksta aligned like kst_attributes static;
+      105 
+      106 dcl  mover (curl) based;				/* For fast block moves. */
+      107 
+      108 dcl  (
+      109      error_table_$ai_restricted,
+      110      error_table_$device_attention,
+      111      error_table_$segknown,
+      112      error_table_$moderr,
+      113      error_table_$noentry,
+      114      error_table_$root
+      115      ) fixed binary (35) external;			/*  error code. */
+      116 
+      117 dcl  sys_info$seg_size_256K fixed bin (19) external,
+      118      sys_info$page_size fixed bin ext static,
+      119      max_length_list_area fixed bin (19) static,
+      120      max_length_header_area fixed bin (19) static;
+      121 
+      122 dcl  old_alloc_ entry (fixed bin, ptr, ptr),
+      123      old_area_ entry (fixed bin (19), ptr),
+      124      mdc_$find_volname entry (bit (36) aligned, char (*) aligned, char (*) aligned, fixed bin (35)),
+      125      aim_check_$greater_or_equal entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned),
+      126      convert_authorization_$to_string_short entry (bit (72) aligned, char (*), fixed bin (35)),
+      127      convert_aim_attributes_ entry (bit (72) aligned, char (32) aligned),
+      128      expand_pathname_ entry (char (*), char (*) aligned, char (*) aligned, fixed bin (35)),
+      129      (
+      130      hcs_$list_acl,
+      131      hcs_$list_dir_acl
+      132      ) ext entry (char (*) aligned, char (*) aligned, ptr, ptr, ptr, fixed bin, fixed bin (35)),
+      133      hcs_$get_max_length entry (char(*), char(*), fixed bin(19), fixed bin(35)),
+      134      hcs_$get_max_length_seg entry (ptr, fixed bin(19), fixed bin(35)),
+      135      hcs_$get_user_effmode entry (char (*), char (*), char (*), fixed bin, fixed bin (5), fixed bin (35)),
+      136      hcs_$initiate
+      137 	entry (char (*) aligned, char (*) aligned, char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35)),
+      138      hcs_$list_dir entry (char (*) aligned, (*) fixed bin, ptr, fixed bin, ptr, fixed bin, fixed bin (35)),
+      139      hcs_$quota_get
+      140 	entry (char (*) aligned, fixed bin, fixed bin (35), fixed bin (35), fixed bin, fixed bin (1), fixed bin,
+      141 	fixed bin (35)),
+      142      hcs_$dir_quota_read
+      143 	entry (char (*) aligned, fixed bin, fixed bin (71), bit (36) aligned, fixed bin, fixed bin (1), fixed bin,
+      144 	fixed bin (35)),
+      145      hcs_$get_access_class entry (char (*) aligned, char (*) aligned, bit (72) aligned, fixed bin (35)),
+      146      hcs_$status_long entry (char (*) aligned, char (*) aligned, fixed bin (1), ptr, ptr, fixed bin (35)),
+      147      pathname_ entry (char (*), char (*)) returns (char (168)),
+      148      phcs_$deactivate entry (ptr, fixed bin (35)),
+      149      hphcs_$set_kst_attributes entry (fixed bin (17), ptr, fixed bin (35)),
+      150      hphcs_$set_backup_dump_time entry (char (*) aligned, char (*) aligned, fixed bin (52), fixed bin (35)),
+      151      hcs_$terminate_noname entry (ptr, fixed bin (35)),
+      152      hcs_$list_inacl_all entry (char (*) aligned, ptr, ptr, ptr, fixed bin (35)),
+      153      hcs_$status_for_backup entry (char (*) aligned, char (*) aligned, ptr, fixed bin (35)),
+      154      ioa_$rsnnl entry options (variable);
+      155 
+      156 dcl  infoptr ptr;
+      157 
+      158 dcl  1 inacl_info based aligned,
+      159        2 sia_relp (0:7) bit (18),
+      160        2 sia_count (0:7) fixed bin,
+      161        2 dia_relp (0:7) bit (18),
+      162        2 dia_count (0:7) fixed bin;
+      163 
+  1     1 /* --------------- BEGIN include file status_for_backup.incl.pl1 --------------- */
+  1     2 
+  1     3 
+  1     4 /****^  HISTORY COMMENTS:
+  1     5*  1) change(86-05-20,Lippard), approve(86-06-02,MCR7427),
+  1     6*     audit(86-06-17,Farley), install(86-06-17,MR12.0-1077):
+  1     7*      Change non-returned information into pad fields.
+  1     8*                                                   END HISTORY COMMENTS */
+  1     9 
+  1    10 
+  1    11 dcl 1 status_for_backup aligned based,
+  1    12     2 version fixed bin,
+  1    13     2 pad1 bit (108),
+  1    14     2 switches unaligned,
+  1    15       3 safety bit (1) unaligned,
+  1    16       3 entrypt bit (1) unaligned,
+  1    17       3 security_oosw bit (1) unaligned,
+  1    18       3 audit_flag bit (1) unaligned,
+  1    19       3 multiple_class bit (1) unaligned,
+  1    20       3 pad2 bit (2) unaligned,
+  1    21       3 master_dir bit (1) unaligned,
+  1    22       3 tpd bit (1) unaligned,
+  1    23       3 pad13 bit (13) unaligned,
+  1    24     2 entrypt_bound bit (14) unaligned,
+  1    25     2 access_class bit (72),
+  1    26     2 spad bit (36),
+  1    27     2 author char (32),
+  1    28     2 bc_author char (32),
+  1    29     2 lvid bit (36),
+  1    30     2 pvid bit (36),
+  1    31     2 pad3 bit (216);
+  1    32 
+  1    33 dcl  status_for_backup_version_2 fixed bin initial (2) static options (constant);
+  1    34 
+  1    35 /* ---------------- END include file status_for_backup.incl.pl1 ---------------- */
+      164 
+      165 
+      166 dcl  1 bks aligned automatic like status_for_backup;
+      167 
+      168 dcl  backup_map_$detail_line2
+      169 	entry (char (32) aligned, fixed bin (9), char (10) aligned, fixed bin (52), fixed bin (52), fixed bin (52),
+      170 	fixed bin (52), fixed bin (52)),
+      171      backup_map_$error_line entry () options (variable),
+      172      backup_map_$fs_error_line entry (fixed bin (35), char (*) aligned, char (*) aligned, char (*) aligned),
+      173      (
+      174      backup_map_$directory_line,
+      175      backup_map_$name_line
+      176      ) entry (ptr, fixed bin),
+      177      bk_output$wr_tape entry (ptr, fixed bin (18), ptr, fixed bin, fixed bin (35));
+      178 dcl  sort_branches entry (ptr, fixed bin) external;
+      179 dcl  (addr, addrel, baseno, binary, bit, divide, fixed, index, length) builtin;
+      180 dcl  (max, min, null, pointer, ptr, rel, rtrim, substr, unspec) builtin;
+      181 dcl  clock builtin;
+      182 dcl  size builtin;	
+      183 
+      184 
+      185 
+      186 /*	INITIALIZE	*/
+      187 
+      188 	if initialize then do;			/* Is this the first time? */
+      189 	     bp = null;				/* Compute branch info size. */
+      190 	     br_size = fixed (rel (addr (bp -> br (2))), 18) - fixed (rel (bp), 18);
+      191 	     header_areap = addr (bk_ss_$hp -> h.list_area);
+      192 						/* Compute pointers to areas in headers. */
+      193 	     list_areap = addr (bk_ss_$areap -> h.list_area);
+      194 						/* .. */
+      195 	     call hcs_$get_max_length_seg (list_areap, max_length_list_area, code);
+      196 	     if code ^= 0 then do;
+      197 		call backup_map_$fs_error_line (code, "get_max_length_seg", "list_areap", "");
+      198 		go to terminate_dump;
+      199 	     end;
+      200 	     call hcs_$get_max_length_seg (header_areap, max_length_header_area, code);
+      201 	     if code ^= 0 then do;
+      202 		call backup_map_$fs_error_line (code, "get_max_length_seg", "header_areap", "");
+      203 		go to terminate_dump;
+      204 	     end;
+      205 	     hdp = addr (bk_ss_$hp -> h.dname);		/* Get pointer to directory name. */
+      206 	     bk_ss_$areap -> h.elen = 0;		/* No entry name in "directory list" records. */
+      207 	     bk_ss_$areap -> h.ename = "";
+      208 	     bk_ss_$areap -> h.record_type = ndc_directory_list;
+      209 						/* Set up type code. */
+      210 	     unspec (ksta) = "0"b;
+      211 	     ksta.set.tms, ksta.value.tms = "1"b;
+      212 	     ksta.set.tus, ksta.value.tus = "1"b;
+      213 	     ksta.set.tpd, ksta.value.tpd = "1"b;
+      214 	     ksta.set.explicit_deactivate_ok, ksta.value.explicit_deactivate_ok = "1"b;
+      215 	     ksta.set.allow_write = "1"b;
+      216 	     ksta.value.allow_write = "0"b;
+      217 	     initialize = ""b;
+      218 	end;
+      219 
+      220 	retry_count = 0;
+      221 retry_dump:
+      222 	cross_dump_dn = A_cross_dump_dn;
+      223 	cross_dump_en = A_cross_dump_en;
+      224 	A_code = 0;
+      225 	havent_output_dirname = "1"b;
+      226 	bk_ss_$hp -> h.elen = 0;			/* Reset entry name to null. */
+      227 	bk_ss_$hp -> h.ename = "";
+      228 	sv_label = bk_ss_$err_label;			/* save previous error return label */
+      229 	bk_ss_$err_label = dump_rtn;			/* set up error return label variable */
+      230 	call old_area_ (max_length_list_area - 128, list_areap);
+      231 						/* initialize empty area */
+      232 	bk_ss_$areap -> h.dtd = clock ();		/* Get time data gathered. */
+      233 	bk_ss_$error = 2;				/* Inform idump_signal to expect signals. */
+      234 
+      235 /* LIST THE DIRECTORY	*/
+      236 
+      237 	call hcs_$list_dir (bk_ss_$hp -> h.dname, bk_ss_$areap -> h.list_area, bp, bc, lp, lc, code);
+      238 	bk_ss_$error = 0;				/* Signals are now fatal again. */
+      239 	if code ^= 0 then do;
+      240 	     call backup_map_$fs_error_line (code, "list_dir", bk_ss_$hp -> h.dname, "");
+      241 	     if bk_ss_$tapesw | bk_ss_$mapsw then go to dump_rtn;
+      242 						/* Are we still doing something? */
+      243 terminate_dump:
+      244 	     if code = error_table_$device_attention & retry_count < 3 then do;
+      245 		retry_count = retry_count + 1;
+      246 		go to retry_dump;
+      247 	     end;
+      248 	     if code = 0 then code = 1;
+      249 	     A_code = code;
+      250 	     go to dump_rtn;
+      251 	end;
+      252 
+      253 	if bk_ss_$namesw then do;			/* we are dumping only a single record */
+      254 	     found_object = "0"b;
+      255 	     go to do_it;
+      256 	end;
+      257 	if bk_ss_$pvsw then go to do_it;		/*  only dump segments for pv dump */
+      258 	if bk_ss_$restart_dumpsw then do;		/* Find comparison name for restart */
+      259 	     found = 0;
+      260 	     i = index (substr (bk_ss_$restart_path, bk_ss_$rlen + 1, bk_ss_$restart_plen), ">");
+      261 						/* Find next ">" */
+      262 	     if i > 0 then do;			/* Found one */
+      263 		bk_ss_$ename = substr (bk_ss_$restart_path, bk_ss_$rlen + 1, i - 1);
+      264 						/* Save compare name */
+      265 		bk_ss_$rlen = bk_ss_$rlen + i;	/* Reset restart length */
+      266 	     end;
+      267 	     else do;
+      268 		bk_ss_$ename = substr (bk_ss_$restart_path, bk_ss_$rlen + 1, bk_ss_$restart_plen - bk_ss_$rlen);
+      269 		bk_ss_$rlen = 0;			/* This signals last name */
+      270 	     end;
+      271 	end;
+      272 
+      273 	cross_dump_dn = pathname_ (A_cross_dump_dn, A_cross_dump_en);
+      274 
+      275 	if bk_ss_$tapesw then do;			/* Is tape writing enabled? */
+      276 	     bk_ss_$areap -> h.dlen = bk_ss_$hp -> h.dlen;/* Copy directory name */
+      277 	     bk_ss_$areap -> h.dname = bk_ss_$hp -> h.dname;
+      278 	     if bc > 0 then bk_ss_$areap -> h.bp = rel (bp);
+      279 						/* Set up pointers in header if not garbage. */
+      280 	     bk_ss_$areap -> h.bc = bc;		/* Set up counts. */
+      281 	     if lc > 0 then bk_ss_$areap -> h.lp = rel (lp);
+      282 	     bk_ss_$areap -> h.lc = lc;
+      283 	     bk_ss_$areap -> h.aclc = 0;		/* Indicate no CACL. */
+      284 	     bk_ss_$areap -> h.aclp = ""b;
+      285 
+      286 /* GET ACCESS CLASS AND VOLUME INFO */
+      287 
+      288 	     bk_ss_$areap -> h.nss_info_relp = "0"b;
+      289 	     bk_ss_$error = 20;
+      290 
+      291 	     unspec (bks) = ""b;
+      292 	     bks.version = status_for_backup_version_2;
+      293 
+      294 	     call hcs_$status_for_backup (bk_ss_$hp -> h.dname, "", addr (bks), code);
+      295 						/* get access class */
+      296 	     bk_ss_$error = 0;
+      297 	     if code ^= 0 then
+      298 		if code = error_table_$root then do;
+      299 		     bks.access_class = "0"b;		/* root starts low */
+      300 		     bks.switches.multiple_class = "0"b;
+      301 		end;
+      302 		else do;
+      303 		     call backup_map_$fs_error_line (code, "hcs_$status_for_backup", bk_ss_$hp -> h.dname, "");
+      304 		     go to terminate_dump;
+      305 		end;
+      306 	     else do;
+      307 		curl = size (bk_nss_info);
+      308 		call old_alloc_ (curl, list_areap, nssp);
+      309 		bk_ss_$areap -> h.nss_info_relp = rel (nssp);
+      310 		nssp -> bk_nss_info.version = 1;
+      311 		nssp -> bk_nss_info.lvid = bks.lvid;
+      312 		nssp -> bk_nss_info.pvid = bks.pvid;
+      313 		call mdc_$find_volname (bks.pvid, nssp -> bk_nss_info.pvname, nssp -> bk_nss_info.lvname, ignore);
+      314 	     end;
+      315 
+      316 	     if bk_ss_$upgrade_to_user_auth then	/* dump segment at user's authorization (hopefully >= access class) */
+      317 		bks.access_class = bk_ss_$user_authorization;
+      318 
+      319 	     bk_ss_$areap -> h.switches = bks.switches;
+      320 	     bk_ss_$areap -> h.access_class = bks.access_class;
+      321 	     bk_ss_$areap -> h.status_version = bks.version;
+      322 						/* pass thru version for reloader */
+      323 
+      324 /* GET THE INITIAL ACLS */
+      325 
+      326 	     infoptr = addr (bk_ss_$areap -> h.inaclp (0));
+      327 	     bk_ss_$error = 4;
+      328 	     call hcs_$list_inacl_all (bk_ss_$hp -> h.dname, list_areap, aclp, infoptr, code);
+      329 	     bk_ss_$error = 0;
+      330 	     if code ^= 0 then do;
+      331 		call backup_map_$fs_error_line (code, "hcs_$list_inacl_all", bk_ss_$hp -> h.dname, "");
+      332 		if ^(bk_ss_$tapesw | bk_ss_$mapsw) then go to terminate_dump;
+      333 		unspec (infoptr -> inacl_info) = ""b;
+      334 	     end;
+      335 	     else do;				/* make ia_relp's relative to base of seg */
+      336 		do ring = 0 to 7;
+      337 		     if infoptr -> inacl_info.sia_count (ring) ^= 0 then
+      338 			infoptr -> inacl_info.sia_relp (ring) =
+      339 			     rel (addrel (aclp, infoptr -> inacl_info.sia_relp (ring)));
+      340 		     if infoptr -> inacl_info.dia_count (ring) ^= 0 then
+      341 			infoptr -> inacl_info.dia_relp (ring) =
+      342 			     rel (addrel (aclp, infoptr -> inacl_info.dia_relp (ring)));
+      343 		end;
+      344 	     end;
+      345 
+      346 /* GET QUOTA AND ACCOUNTING INFO. */
+      347 
+      348 	     bk_ss_$error = 6;			/* Set up to try error recovery. */
+      349 	     call hcs_$quota_get (bk_ss_$hp -> h.dname, bk_ss_$areap -> h.quota, bk_ss_$areap -> h.trp,
+      350 		bk_ss_$areap -> h.tlu, bk_ss_$areap -> h.inf_acct, bk_ss_$areap -> h.term_acct, used, code);
+      351 	     bk_ss_$error = 0;			/* Clear recovery indicator. */
+      352 	     if code ^= 0 then do;
+      353 		call backup_map_$fs_error_line (code, "quota_get", bk_ss_$hp -> h.dname, "");
+      354 		bk_ss_$areap -> h.quota, bk_ss_$areap -> h.trp, bk_ss_$areap -> h.tlu, bk_ss_$areap -> h.inf_acct,
+      355 		     bk_ss_$areap -> h.term_acct = 0;
+      356 	     end;
+      357 	     curl = size (bk_dq_info);
+      358 	     call old_alloc_ (curl, list_areap, dqip);	/* make room for dirquota */
+      359 	     bk_ss_$areap -> h.dq_info_relp = rel (dqip); /* set relp for reloader */
+      360 	     dqip -> bk_dq_info.version = 1;
+      361 	     bk_ss_$error = 21;			/* Set up to try error recovery. */
+      362 	     call hcs_$dir_quota_read (bk_ss_$hp -> h.dname, dqip -> bk_dq_info.quota, dqip -> bk_dq_info.ltrp,
+      363 		dqip -> bk_dq_info.tlu, dqip -> bk_dq_info.inf_acct, dqip -> bk_dq_info.term_acct, used, code);
+      364 	     bk_ss_$error = 0;			/* Clear recovery indicator. */
+      365 	     if code ^= 0 then do;
+      366 		call backup_map_$fs_error_line (code, "dir_quota_read", bk_ss_$hp -> h.dname, "");
+      367 		bk_ss_$areap -> h.dq_info_relp = ""b;
+      368 	     end;
+      369 
+      370 /* WRITE OUT THE PREAMBLE, LIST_DIR AND ACCOUNTING INFO for a DIRECTORY */
+      371 
+      372 	     cross_dump_en = "";
+      373 	     call output (bk_ss_$areap, null, 0, code);
+      374 	     if code ^= 0 then go to terminate_dump;
+      375 	end;
+      376 
+      377 	if bk_ss_$mapsw then do;			/* if map option is on */
+      378 	     if ^bk_ss_$tapesw then do;		/* get access class if -notape */
+      379 		call hcs_$get_access_class (bk_ss_$hp -> h.dname, "", bks.access_class, code);
+      380 		if code ^= 0 then bks.access_class = "0"b;
+      381 	     end;
+      382 	     if bks.access_class ^= "0"b then do;	/* format access class */
+      383 		call convert_authorization_$to_string_short (bks.access_class, ac_stg, code);
+      384 		if code ^= 0 then do;		/* couldn't get the conversion */
+      385 		     call convert_aim_attributes_ (bks.access_class, ac_stg_octal);
+      386 		     ac_stg = ac_stg_octal;
+      387 		end;
+      388 		call ioa_$rsnnl ("^a[ac:^a]", name_line, name_len, bk_ss_$hp -> h.dname, ac_stg);
+      389 		call directory_line (addr (name_line), name_len);
+      390 	     end;
+      391 	     else call directory_line (hdp, bk_ss_$hp -> h.dlen);
+      392 	end;
+      393 
+      394 /* PROCESS THE BRANCHES */
+      395 
+      396 do_it:
+      397 	if bc >= 15 then
+      398 	     call sort_branches (bp, bc);		/* sort the branches in order of primary name */
+      399 	else call sort_small (bp, bc);
+      400 
+      401 	bk_ss_$err_label = skip_branch;		/* Set up label for skipping segments. */
+      402 	bk_ss_$hp -> h.lp = ""b;			/* Reset link pointer. */
+      403 	bk_ss_$hp -> h.lc = 0;			/* Reset link count. */
+      404 	bk_ss_$hp -> h.bc = 1;			/* Set branch count. */
+      405 	dircount = 0;
+      406 
+      407 	if ^incr_sw_set then do;
+      408 	     if bk_ss_$myname ^= "backup_dump" & bk_ss_$myname ^= "backup_dump_" then
+      409 		incr_sw = "1"b;
+      410 	     else incr_sw = "0"b;
+      411 	     incr_sw_set = "1"b;
+      412 	end;
+      413 
+      414 /* GET TIMES AND COMPARE FOR OUTPUTTING */
+      415 
+      416 	do i = 1 to bc;				/* scan through all branches */
+      417 	     ix = pointer (bp, bp -> br (i).ix);	/* Get effective index. */
+      418 	     np = pointer (bp, ix -> br (1).namerp);	/* Get pointer to names. */
+      419 	     if bk_ss_$namesw			/* Are we looking to dump a single branch? */
+      420 	     then do;
+      421 		do j = 1 to binary (ix -> br (1).nnames, 17, 0);
+      422 		     if (bk_ss_$ename = np -> name (j).string) then do;
+      423 			found_object = "1"b;
+      424 			go to dump_me;
+      425 		     end;
+      426 		end;
+      427 		go to skip_branch;			/* here iff no match */
+      428 	     end;
+      429 	     else if bk_ss_$restart_dumpsw		/* only if dumping more than branches */
+      430 		then
+      431 		if bk_ss_$ename > np -> name (1).string then go to skip_branch;
+      432 						/* skip all already dumped */
+      433 		else if found > 0			/* Passed dir or branches already dumped */
+      434 		     then
+      435 		     if ^ix -> br (1).dirsw then
+      436 			go to skip_branch;		/* only want dirs till last level */
+      437 		     else ;
+      438 		else if bk_ss_$ename = np -> name (1).string
+      439 						/* Found it? */
+      440 		     then
+      441 		     if bk_ss_$rlen = 0 then
+      442 			bk_ss_$restart_dumpsw = ""b;	/* Done restarting, normal dump */
+      443 		     else found = 1;		/* Found it but continue restart to lower level */
+      444 		else if bk_ss_$rlen = 0 then bk_ss_$restart_dumpsw = ""b;
+      445 						/* Done restarting */
+      446 		else found = 2;			/* Didn't find name, beyond it. Bad dir. End restart */
+      447 
+      448 dump_me:
+      449 	     if incr_sw then			/* incremental dumps ignore ring 0 */
+      450 		if ix -> br (1).rb2 = "0"b then go to skip_branch;
+      451 	     if ix -> br (1).vtoc_error then
+      452 		begin;				/* handle vtoc error case */
+      453 
+      454 dcl  1 brst like branch_status aligned;
+      455 dcl  mxl fixed bin (19);
+      456 dcl  cleanup condition;
+      457 
+      458 		on cleanup ;			/* Force non-quick */
+      459 
+      460 		np = ptr (bp, ix -> br (1).namerp);	/* Get names ptr */
+      461 		bk_ss_$error = 40;
+      462 		call hcs_$status_long (bk_ss_$hp -> h.dname, np -> name (1).string, 0, addr (brst), null (), code);
+      463 		bk_ss_$error = 0;
+      464 		if code = 0 then do;		/* Lucked out */
+      465 		     ix -> br (1).cl = bit (fixed (fixed (brst.current_length, 12), 9), 9);
+      466 		     ix -> br (1).dtu = brst.date_time_used;
+      467 		     ix -> br (1).dtm = brst.date_time_modified;
+      468 		     call hcs_$get_max_length ((bk_ss_$hp -> h.dname), (np -> name (1).string), mxl, code);
+      469 		     if code = 0 then ix -> br (1).ml = bit (divide (mxl, sys_info$page_size, 9, 0), 9);
+      470 		end;
+      471 		if code ^= 0 then do;		/* Could be bad from max-length */
+      472 		     call backup_map_$fs_error_line (code, "VTOCE error on segment", bk_ss_$hp -> h.dname,
+      473 			np -> name (1).string);
+      474 		     go to skip_branch;
+      475 		end;
+      476 	     end;
+      477 	     if bk_ss_$pvsw & ix -> br (1).dirsw then do; /* skip dirs on pvdump (must still count) */
+      478 		dircount = dircount + 1;
+      479 		go to skip_branch;
+      480 	     end;
+      481 	     dtem = fixed (ix -> br (1).dtbm, 52);	/* Extract modification times. */
+      482 	     dtsm = fixed (ix -> br (1).dtm, 52);
+      483 	     dtd = fixed (ix -> br (1).dtd, 52);	/* Extract time last dumped. */
+      484 	     ix -> br (1).dump_me = ""b;		/* Clear dump indicator. */
+      485 	     if bk_ss_$datesw then do;		/* Are we dumping by date? */
+      486 		if bk_ss_$dtdsw then		/* Are we dumping by dtd as well? */
+      487 		     cutoff_time = min (bk_ss_$date, dtd);
+      488 						/* Get earliest cutoff time. */
+      489 		else cutoff_time = bk_ss_$date;	/* By date, get it. */
+      490 		go to compare;			/* Go compare criteria. */
+      491 	     end;
+      492 	     if bk_ss_$dtdsw then do;			/* Are we dumping only by dtd? */
+      493 		cutoff_time = dtd;			/* Get cutoff time. */
+      494 compare:
+      495 		if ^P_force_dump then		/* don't have to dump this branch unless ... */
+      496 		     if max (dtem, dtsm) < cutoff_time then go to skip_branch;
+      497 	     end;					/* ... it has changed since last time */
+      498 
+      499 /* STORE RECORD TYPE IN PREAMBLE HEADER */
+      500 
+      501 	     if bk_ss_$enforce_max_access_class | bk_ss_$enforce_min_access_class | bk_ss_$dont_dump_upgraded_dirs
+      502 		| bk_ss_$check_effective_access then
+      503 		call perform_access_checks ();	/* only returns if OK ... */
+      504 
+      505 	     ix -> br (1).dump_me = "1"b;		/* Dumpable, set indicator. */
+      506 	     if ix -> br (1).dirsw then do;		/* Is this a directory? */
+      507 		dircount = dircount + 1;		/* Count directory branches. */
+      508 		bk_ss_$hp -> h.record_type = sec_dir;	/* Insert record type in header. */
+      509 	     end;
+      510 	     else bk_ss_$hp -> h.record_type = sec_seg;	/* Insert record type in header. */
+      511 	     blocks =
+      512 		min (fixed (ix -> br (1).cl, 9),
+      513 		divide (sys_info$seg_size_256K + sys_info$page_size - 1, sys_info$page_size, 17, 0));
+      514 						/* Get current length (in 1024-word blocks) */
+      515 	     nnames = fixed (ix -> br (1).nnames, 17);	/* Extract number of names. */
+      516 	     bk_ss_$hp -> h.dtd = clock ();		/* Get time this branch processed. */
+      517 
+      518 /* SET UP THE PREAMBLE */
+      519 
+      520 	     call old_area_ (max_length_header_area - 128, header_areap);
+      521 						/* Reset and reinitialize buffer area. */
+      522 	     call old_alloc_ (br_size, header_areap, hbp);/* Make room for branch in preamble. */
+      523 	     bk_ss_$hp -> h.bp = rel (hbp);		/* Insert pointer to it in preamble. */
+      524 	     curl = br_size;
+      525 	     hbp -> mover = ix -> mover;		/* Compute number of words taken by name array. */
+      526 	     curl = fixed (rel (addr (np -> name (nnames + 1))), 18) - fixed (rel (np), 18);
+      527 	     call old_alloc_ (curl, header_areap, hnp);	/* Make room for the names. */
+      528 	     hbp -> br (1).namerp = rel (hnp);		/* Insert pointer to name list. */
+      529 	     hnp -> mover = np -> mover;
+      530 
+      531 	     if bk_ss_$namesw & bk_ss_$no_primary then do;/* put on tape name user supplied */
+      532 		bk_ss_$hp -> h.elen = length (rtrim (bk_ss_$ename));
+      533 		bk_ss_$hp -> h.ename = bk_ss_$ename;
+      534 	     end;
+      535 	     else do;
+      536 		bk_ss_$hp -> h.elen = length (rtrim (np -> name (1).string));
+      537 		bk_ss_$hp -> h.ename = np -> name (1).string;
+      538 	     end;
+      539 
+      540 	     bk_ss_$hp -> h.nss_info_relp = ""b;	/* assume volid's not known */
+      541 	     bk_ss_$error = 11;			/* Enable error recovery attempt */
+      542 
+      543 	     unspec (bks) = ""b;
+      544 	     bks.version = status_for_backup_version_2;
+      545 
+      546 	     call hcs_$status_for_backup (bk_ss_$hp -> h.dname, bk_ss_$hp -> h.ename, addr (bks), code);
+      547 	     bk_ss_$error = 0;			/* Disable error recovery */
+      548 	     if code ^= 0 then do;
+      549 		call backup_map_$fs_error_line (code, "hcs_$status_for_backup", bk_ss_$hp -> h.dname,
+      550 		     bk_ss_$hp -> h.ename);		/* Now zero or default all fields */
+      551 		unspec (bks) = ""b;
+      552 		bks.author = "";
+      553 		bks.bc_author = "";
+      554 	     end;
+      555 	     else do;
+      556 		curl = size (bk_nss_info);
+      557 		call old_alloc_ (curl, header_areap, nssp);
+      558 		bk_ss_$hp -> h.nss_info_relp = rel (nssp);
+      559 		nssp -> bk_nss_info.version = 1;
+      560 		nssp -> bk_nss_info.lvid = bks.lvid;
+      561 		nssp -> bk_nss_info.pvid = bks.pvid;
+      562 		call mdc_$find_volname (bks.pvid, nssp -> bk_nss_info.pvname, nssp -> bk_nss_info.lvname, ignore);
+      563 		if bk_ss_$pvsw & bk_ss_$pvname ^= nssp -> bk_nss_info.pvname then go to skip_branch;
+      564 	     end;
+      565 
+      566 	     if bk_ss_$upgrade_to_user_auth then	/* dump segment at user's authorization (hopefully >= access class) */
+      567 		bks.access_class = bk_ss_$user_authorization;
+      568 
+      569 	     if bk_ss_$tapesw then do;
+      570 		bk_ss_$hp -> h.status_version = bks.version;
+      571 						/* pass thru version so reloader
+      572*						   knws how much to believe */
+      573 		bk_ss_$hp -> h.actime = ""b;
+      574 		bk_ss_$hp -> h.actind = ""b;
+      575 						/* with NSS, maxl on page bndry */
+      576 		bk_ss_$hp -> h.max_length = fixed (ix -> br (1).ml) * sys_info$page_size;
+      577 		bk_ss_$hp -> h.switches = bks.switches;
+      578 		bk_ss_$hp -> h.entrypt_bound = bks.entrypt_bound;
+      579 		addr (bk_ss_$hp -> h.quota) -> author = bks.author;
+      580 						/* is quota only for dir_list recs */
+      581 		bk_ss_$hp -> h.bitcount_author = bks.bc_author;
+      582 		bk_ss_$hp -> h.switches.multiple_class = bks.switches.multiple_class;
+      583 		bk_ss_$hp -> h.access_class = bks.access_class;
+      584 
+      585 		bk_ss_$error = 7;			/* Enable error recovery for reading ACL. */
+      586 		if ix -> br (1).dirsw then
+      587 		     call hcs_$list_dir_acl (bk_ss_$hp -> h.dname, bk_ss_$hp -> h.ename, header_areap, aclp, null (),
+      588 			bk_ss_$hp -> h.aclc, code);
+      589 		else call hcs_$list_acl (bk_ss_$hp -> h.dname, bk_ss_$hp -> h.ename, header_areap, aclp, null (),
+      590 			bk_ss_$hp -> h.aclc, code);
+      591 		bk_ss_$error = 0;			/* Disable error recovery attempts. */
+      592 		if code ^= 0 then do;
+      593 		     call backup_map_$fs_error_line (code, "hcs_$list_acl", bk_ss_$hp -> h.dname,
+      594 			bk_ss_$hp -> h.ename);
+      595 		     if code = error_table_$noentry then go to skip_branch;
+      596 		     bk_ss_$hp -> h.aclc = 0;		/* Indicate no ACL. */
+      597 		     bk_ss_$hp -> h.aclp = ""b;
+      598 		end;
+      599 		else if bk_ss_$hp -> h.aclc > 0 then	/* Are we safe from evaluating garbage? */
+      600 		     bk_ss_$hp -> h.aclp = rel (aclp);	/* Yes, insert pointer to it. */
+      601 		bk_ss_$hp -> h.bitcnt = fixed (ix -> br (1).bc, 24);
+      602 						/* pick up segment bit count */
+      603 
+      604 /* WRITE THE PREAMBLE IF A DIRECTORY -- this is the branch info for a directory */
+      605 
+      606 		if ix -> br (1).dirsw then do;
+      607 		     if bk_ss_$namesw then
+      608 			cross_dump_en = A_cross_dump_en;
+      609 		     else cross_dump_en = np -> name (1).string;
+      610 		     call output (bk_ss_$hp, null, 0, code);
+      611 		     if code ^= 0 then go to terminate_dump;
+      612 		end;
+      613 		else do;				/* Non-directory segment. */
+      614 		     bk_ss_$error = 8;		/* Enable error recovery attempt. */
+      615 		     call hcs_$initiate (bk_ss_$hp -> h.dname, bk_ss_$hp -> h.ename, "", 0, 1, bk_ss_$segptr, code);
+      616 		     bk_ss_$error = 0;		/* Disable error recovery. */
+      617 		     if code ^= 0 then
+      618 			if code ^= error_table_$segknown then do;
+      619 			     call backup_map_$fs_error_line (code, "initiate", bk_ss_$hp -> h.dname,
+      620 				bk_ss_$hp -> h.ename);
+      621 			     if ^(bk_ss_$tapesw | bk_ss_$mapsw) then go to terminate_dump;
+      622 						/* Still doing anything? */
+      623 			     go to skip_branch;	/* Yes, just skip this branch. */
+      624 			end;
+      625 			else ;
+      626 		     else if ^bk_ss_$debugsw then
+      627 			call hphcs_$set_kst_attributes (binary (baseno (bk_ss_$segptr), 18), addr (ksta), (0));
+      628 						/* unless we use it treat carefully */
+      629 		     bk_ss_$wasnt_known = "1"b;	/* We have pointer to segment. */
+      630 		     curl = min (blocks * sys_info$page_size, bk_ss_$hp -> h.max_length);
+      631 						/* get length of segment in words */
+      632 
+      633 
+      634 /* OUTPUT PREAMBLE (branch info) AND DATA SEGMENT IF NOT A DIRECTORY */
+      635 /* NOTE: a ptr to the segment is passed to bk_output which will copy one record */
+      636 /* at a time into a one record buffer, and then write the buffer to tape. */
+      637 /* Formerly the whole segment was copied at once to the buffer, and then */
+      638 /* the whole buffer was written.  Now, if a user deletes the segment during */
+      639 /* one of the mini-copys, bk_output will write zeroes for the rest of the */
+      640 /* segment.  (Iff that happens the fault catcher will have reset bk_ss_$wasnt_known.) */
+      641 /* It is known that this strategy will cause fewer page faults on the buffer */
+      642 /* and in addition reduce backups working set.  It may also be  advantageous */
+      643 /* that page faults from disk are more spread out, rather than coming in bursts. */
+      644 
+      645 /* It may be that a two record buffer would be more efficiently written to tape */
+      646 /* while still maintaining a small working set---but the needed metering */
+      647 /* has not been pursued.  REM */
+      648 
+      649 		     cross_dump_en = np -> name (1).string;
+      650 
+      651 		     call output (bk_ss_$hp, bk_ss_$segptr, curl, code);
+      652 						/* Write segment out. */
+      653 		     if code ^= 0 then go to terminate_dump;
+      654 		     if ^bk_ss_$wasnt_known then	/* fault & termination must have occured */
+      655 			go to terminate_branch;	/* forget about this segment */
+      656 
+      657 		     bk_ss_$wasnt_known = ""b;	/* Reset indicator for safety. */
+      658 		     bk_ss_$error = 10;		/* Enable error recovery attempt. */
+      659 		     if ^bk_ss_$debugsw then call phcs_$deactivate (bk_ss_$segptr, (0));
+      660 						/* try to deactivate it */
+      661 		     call hcs_$terminate_noname (bk_ss_$segptr, code);
+      662 						/* Terminate original segment. */
+      663 		     bk_ss_$error = 0;		/* Disable error recovery. */
+      664 		     if code ^= 0 then
+      665 			call backup_map_$fs_error_line (code, "hcs_$terminate_noname", bk_ss_$hp -> h.dname,
+      666 			     bk_ss_$hp -> h.ename);
+      667 		end;
+      668 
+      669 		if ix -> br (1).dirsw		/* Is this a directory? */
+      670 		     then
+      671 		     ix -> br (1).dtd = bit (bk_ss_$hp -> h.dtd, 52);
+      672 						/* Yes, stash the time the dump started. */
+      673 		else call set_dtd (bk_ss_$hp -> h.dname, bk_ss_$hp -> h.ename, bk_ss_$hp -> h.dtd, 30);
+      674 	     end;
+      675 	     if bk_ss_$mapsw then do;
+      676 		if bk_ss_$pvsw & havent_output_dirname then do;
+      677 						/* identify the directory we are in */
+      678 		     call directory_line (hdp, bk_ss_$hp -> h.dlen);
+      679 		     havent_output_dirname = "0"b;
+      680 		end;
+      681 		dtu = fixed (ix -> br (1).dtu, 52);
+      682 		if A_cross_dump_dn ^= "" then
+      683 		     temp_en = cross_dump_en;
+      684 		else temp_en = np -> name (1).string;
+      685 		call backup_map_$detail_line2 ((temp_en), blocks, RECORD_TYPE (bk_ss_$hp -> h.record_type),
+      686 		     bk_ss_$hp -> h.dtd, dtem, dtd, dtu, dtsm);
+      687 		do j = 2 to nnames;			/* Write all the entry names. */
+      688 		     if ^bk_ss_$mapsw then go to terminate_branch;
+      689 		     jx = addr (np -> name (j));
+      690 		     call backup_map_$name_line (addr (jx -> name (1).string), fixed (jx -> name (1).size, 17));
+      691 		end;
+      692 terminate_branch:
+      693 		if ^(bk_ss_$tapesw | bk_ss_$mapsw) then go to terminate_dump;
+      694 						/* Still doing something? */
+      695 	     end;
+      696 skip_branch:
+      697 	end;
+      698 
+      699 /* PROCESS INFERIOR DIRECTORIES */
+      700 
+      701 	if bk_ss_$restart_dumpsw & found = 2 then bk_ss_$restart_dumpsw = ""b;
+      702 						/* Finish restart for this level then normal dump */
+      703 	if bk_ss_$namesw then do;
+      704 	     if ^found_object then do;
+      705 		code = error_table_$noentry;
+      706 		call backup_map_$fs_error_line (code, "Searching for object.", bk_ss_$hp -> h.dname, bk_ss_$ename);
+      707 	     end;
+      708 	     go to terminate_dump;
+      709 	end;
+      710 	if ^bk_ss_$onlysw & dircount > 0		/* dump inferior directories */
+      711 	     then
+      712 	     call dir_scan (dircount);
+      713 dump_rtn:
+      714 	bk_ss_$err_label = sv_label;			/* restore error label */
+      715 	return;					/* Return to caller. */
+      716 
+      717 /**/
+      718 
+      719 /* Performs several access checks required by IMFT */
+      720 
+      721 perform_access_checks:
+      722      procedure ();
+      723 
+      724 dcl  the_dirname character (168);
+      725 dcl  the_ename character (32);
+      726 
+      727 dcl  (other_access_class_text, object_access_class_text) character (256);
+      728 dcl  access_class_octal character (32) aligned;
+      729 dcl  object_access_class bit (72) aligned;
+      730 dcl  (code, aim_code) fixed binary (35);
+      731 dcl  user_mode fixed binary (5);
+      732 
+      733 
+      734 	the_dirname = bk_ss_$hp -> h.dname;		/* makes life simpler */
+      735 
+      736 	if bk_ss_$namesw & bk_ss_$no_primary then	/* use name provided by user */
+      737 	     the_ename = bk_ss_$ename;
+      738 	else the_ename = np -> name (1).string;		/* random branch in a subtree: use primary name */
+      739 
+      740 	call hcs_$get_access_class ((the_dirname), (the_ename), object_access_class, code);
+      741 	if code ^= 0 then do;
+      742 	     call backup_map_$error_line (code, bk_ss_$myname, "Getting access class of ^a.",
+      743 		pathname_ (the_dirname, the_ename));
+      744 	     go to skip_branch;
+      745 	end;
+      746 
+      747 	if bk_ss_$enforce_max_access_class then
+      748 	     if ^aim_check_$greater_or_equal (bk_ss_$maximum_access_class, object_access_class) then do;
+      749 		call convert_authorization_$to_string_short (bk_ss_$maximum_access_class, other_access_class_text,
+      750 		     aim_code);
+      751 		if aim_code ^= 0 then do;		/* couldn't convert it: get octal representation */
+      752 		     call convert_aim_attributes_ (bk_ss_$maximum_access_class, access_class_octal);
+      753 		     other_access_class_text = access_class_octal;
+      754 		end;
+      755 		call convert_authorization_$to_string_short (object_access_class, object_access_class_text, aim_code);
+      756 		if aim_code ^= 0 then do;		/* couldn't convert it: get octal representation */
+      757 		     call convert_aim_attributes_ (object_access_class, access_class_octal);
+      758 		     object_access_class_text = access_class_octal;
+      759 		end;
+      760 		call backup_map_$error_line (error_table_$ai_restricted, bk_ss_$myname,
+      761 		     "Access class of ^a (^[^a^;^ssystem_low^]) exceeds the maximum permitted for this dump (^[^a^;^ssystem_low^]).",
+      762 		     pathname_ (the_dirname, the_ename), (object_access_class_text ^= ""), object_access_class_text,
+      763 		     (other_access_class_text ^= ""), other_access_class_text);
+      764 		go to skip_branch;
+      765 	     end;
+      766 
+      767 	if bk_ss_$enforce_min_access_class then
+      768 	     if ^aim_check_$greater_or_equal (object_access_class, bk_ss_$minimum_access_class) then do;
+      769 		call convert_authorization_$to_string_short (bk_ss_$minimum_access_class, other_access_class_text,
+      770 		     aim_code);
+      771 		if aim_code ^= 0 then do;		/* couldn't convert it: get octal representation */
+      772 		     call convert_aim_attributes_ (bk_ss_$minimum_access_class, access_class_octal);
+      773 		     other_access_class_text = access_class_octal;
+      774 		end;
+      775 		call convert_authorization_$to_string_short (object_access_class, object_access_class_text, aim_code);
+      776 		if aim_code ^= 0 then do;		/* couldn't convert it: get octal representation */
+      777 		     call convert_aim_attributes_ (object_access_class, access_class_octal);
+      778 		     object_access_class_text = access_class_octal;
+      779 		end;
+      780 		call backup_map_$error_line (error_table_$ai_restricted, bk_ss_$myname,
+      781 		     "Access class of ^a (^[^a^;^ssystem_low^]) is below the minimum permitted for this dump (^[^a^;^ssystem_low^]).",
+      782 		     pathname_ (the_dirname, the_ename), (object_access_class_text ^= ""), object_access_class_text,
+      783 		     (other_access_class_text ^= ""), other_access_class_text);
+      784 		go to skip_branch;
+      785 	     end;
+      786 
+      787 	if bk_ss_$dont_dump_upgraded_dirs & (ix -> br (1).dirsw) then
+      788 	     if ^aim_check_$greater_or_equal (bk_ss_$maximum_dir_access_class, object_access_class) then do;
+      789 		call convert_authorization_$to_string_short (bk_ss_$maximum_dir_access_class, other_access_class_text,
+      790 		     aim_code);
+      791 		if aim_code ^= 0 then do;		/* couldn't convert it: get octal representation */
+      792 		     call convert_aim_attributes_ (bk_ss_$maximum_dir_access_class, access_class_octal);
+      793 		     other_access_class_text = access_class_octal;
+      794 		end;
+      795 		call convert_authorization_$to_string_short (object_access_class, object_access_class_text, aim_code);
+      796 		if aim_code ^= 0 then do;		/* couldn't convert it: get octal representation */
+      797 		     call convert_aim_attributes_ (object_access_class, access_class_octal);
+      798 		     object_access_class_text = access_class_octal;
+      799 		end;
+      800 		call backup_map_$error_line (error_table_$ai_restricted, bk_ss_$myname,
+      801 		     "Access class of ^a (^[^a^;^ssystem_low^]) exceeds the maximum permitted for a directory for this dump (^[^a^;^ssystem_low^]).",
+      802 		     pathname_ (the_dirname, the_ename), (object_access_class_text ^= ""), object_access_class_text,
+      803 		     (other_access_class_text ^= ""), other_access_class_text);
+      804 		go to skip_branch;
+      805 	     end;
+      806 
+      807 	if bk_ss_$check_effective_access then do;
+      808 	     call hcs_$get_user_effmode (the_dirname, the_ename, bk_ss_$user_id, bk_ss_$user_ring, user_mode, code);
+      809 	     if code ^= 0 then do;
+      810 		call backup_map_$error_line (code, bk_ss_$myname, "Attempting to determine ^a's access to ^a.",
+      811 		     bk_ss_$user_id, pathname_ (the_dirname, the_ename));
+      812 		go to skip_branch;
+      813 	     end;
+      814 	     if ^((bit (user_mode, 5) & bit (R_ACCESS_BIN, 5)) = bit (R_ACCESS_BIN, 5)) then do;
+      815 		call backup_map_$error_line (error_table_$moderr, bk_ss_$myname,
+      816 		     "^a does not have at least ""^[s^;r^]"" access to ^a.", bk_ss_$user_id,
+      817 		     (ix -> br (1).dirsw & (ix -> br (1).bc = ""b)), pathname_ (the_dirname, the_ename));
+      818 		go to skip_branch;
+      819 	     end;
+      820 
+      821 	     if ^aim_check_$greater_or_equal (bk_ss_$maximum_dir_access_class, object_access_class) then do;
+      822 		call convert_authorization_$to_string_short (bk_ss_$user_authorization, other_access_class_text,
+      823 		     aim_code);
+      824 		if aim_code ^= 0 then do;		/* couldn't convert it: get octal representation */
+      825 		     call convert_aim_attributes_ (bk_ss_$user_authorization, access_class_octal);
+      826 		     other_access_class_text = access_class_octal;
+      827 		end;
+      828 		call backup_map_$error_line (error_table_$ai_restricted, bk_ss_$myname,
+      829 		     "^a (at authorization ^[^a^;^ssystem_low^]) can not ^[examine^;read^] ^a.", bk_ss_$user_id,
+      830 		     (object_access_class_text ^= ""), object_access_class_text,
+      831 		     (ix -> br (1).dirsw & (ix -> br (1).bc = ""b)), pathname_ (the_dirname, the_ename));
+      832 		go to skip_branch;
+      833 	     end;
+      834 	end;
+      835 
+      836 	return;					/* here iff everything's OK */
+      837 
+      838      end perform_access_checks;
+      839 
+      840 /**/
+      841 
+      842 /* SCAN INFERIOR DIRECTORIES */
+      843 
+      844 dir_scan:
+      845      procedure (dcount);
+      846 
+      847 dcl  (
+      848      dcount,
+      849      i,
+      850      j init (0),
+      851      save_dlen
+      852      ) fixed bin,					/* Additional temporary storage for dir_scan. */
+      853      code fixed bin (35),
+      854      (ix, jx, np) pointer,				/* Declare inside block to speed up execution. */
+      855      save_dname character (168) aligned;		/* Temporary storage for directory path name. */
+      856 
+      857 dcl  1 save (dcount) aligned,				/* One adjustable structure. */
+      858        2 ename character (32),			/* temporary storage for directory names */
+      859        2 dtd fixed binary (52);			/* Time directory dump began. */
+      860 
+      861 dcl  1 save1 based (jx) aligned,
+      862        2 ename character (32),			/* temporary storage for directory names */
+      863        2 dtd fixed binary (52);
+      864 	do i = 1 to bc;				/* pick up all first directory names */
+      865 	     ix = pointer (bp, bp -> br (i).ix);	/* Get effective index. */
+      866 	     if ix -> br (1).dirsw & (ix -> br (1).dump_me | bk_ss_$pvsw) then do;
+      867 						/* Is this a dumpable directory? */
+      868 		j = j + 1;			/* Count directory names. */
+      869 		jx = addr (save (j));
+      870 		np = pointer (bp, ix -> br (1).namerp); /* get pointer to directory name array */
+      871 		jx -> save1.ename = np -> name (1).string;
+      872 						/* Pick up directory entry name. */
+      873 		jx -> save1.dtd = fixed (ix -> br (1).dtd, 52);
+      874 						/* Copy time directory dump started. */
+      875 	     end;
+      876 	end;
+      877 	save_dlen = bk_ss_$hp -> h.dlen;		/* Save current path name length. */
+      878 	save_dname = bk_ss_$hp -> h.dname;		/* Save the name. */
+      879 						/* DUMP INFERIOR DIRECTORYS */
+      880 	do i = 1 to j;
+      881 	     jx = addr (save (i));			/* Get pointer to structure element. */
+      882 	     call ioa_$rsnnl ("^a^[>^]^a", bk_ss_$hp -> h.dname, bk_ss_$hp -> h.dlen, save_dname, save_dlen ^= 1,
+      883 		jx -> save1.ename);
+      884 	     if A_cross_dump_dn = "" then
+      885 		cross_dump_dn, cross_dump_en = "";
+      886 	     else do;
+      887 		cross_dump_dn = pathname_ (A_cross_dump_dn, A_cross_dump_en);
+      888 		cross_dump_en = jx -> save1.ename;
+      889 	     end;
+      890 
+      891 	     call backup_dump_recurse (cross_dump_dn, cross_dump_en, "0"b, Sfatal_error, code);
+      892 	     if code ^= 0 then do;
+      893 		A_code = code;
+      894 		go to scan_rtn;
+      895 	     end;
+      896 	     call set_dtd (save_dname, jx -> save1.ename, jx -> save1.dtd, 31);
+      897 	end;
+      898 scan_rtn:
+      899 	bk_ss_$hp -> h.dlen = save_dlen;		/* Restore directory name. */
+      900 	bk_ss_$hp -> h.dname = save_dname;
+      901 	return;
+      902      end dir_scan;
+      903 
+      904 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+      905 
+      906 set_dtd:
+      907      procedure (dirname, ename, dtd, bk_ss_error_value);
+      908 
+      909 dcl  dirname character (*) aligned parameter;
+      910 dcl  ename character (*) aligned parameter;
+      911 dcl  dtd fixed binary (52) parameter;
+      912 dcl  bk_ss_error_value fixed binary parameter;
+      913 
+      914 dcl  local_code fixed binary (35);
+      915 
+      916 	if ^bk_ss_$debugsw then			/* don't set DTD without hphcs_ */
+      917 	     if bk_ss_$set_dtd_explicit & bk_ss_$set_dtd then go to SET_DTD;
+      918 						/* caller asked for it */
+      919 
+      920 	     else if ^bk_ss_$set_dtd_explicit & (bk_ss_$datesw | bk_ss_$dtdsw) then
+      921 						/* otherwise, only set it for incremental dumps */
+      922 		if bk_ss_$myname ^= "catchup_dump" then /* but never for catchup dumps */
+      923 		     if ^bk_ss_$no_output & bk_ss_$tapesw then do;
+      924 						/* and only if writing a tape */
+      925 SET_DTD:
+      926 			bk_ss_$error = bk_ss_error_value;
+      927 			call hphcs_$set_backup_dump_time (dirname, ename, dtd, local_code);
+      928 			bk_ss_$error = 0;
+      929 			if local_code ^= 0 then
+      930 			     call backup_map_$fs_error_line (code, "hphcs_$set_backup_dump_time", dirname, ename);
+      931 		     end;
+      932 
+      933 	return;
+      934 
+      935      end set_dtd;
+      936 
+      937 
+      938 set_directory_dtd:					/* for backup_dump */
+      939      entry (P_dirname, P_dtd);
+      940 
+      941 dcl  P_dirname character (*) aligned parameter;
+      942 dcl  P_dtd fixed binary (52) parameter;
+      943 
+      944 	begin;
+      945 dcl  dirname character (168) aligned;
+      946 dcl  ename character (32) aligned;
+      947 
+      948 	     call expand_pathname_ ((P_dirname), dirname, ename, (0));
+      949 	     call set_dtd (dirname, ename, P_dtd, 30);
+      950 	end;
+      951 
+      952 	return;
+      953 
+      954 
+      955 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+      956 
+      957 output:
+      958      procedure (area_pointer, seg_pointer, seg_count, code);/* Compute preamble length and write record. */
+      959 dcl  (area_pointer, seg_pointer, p) pointer;
+      960 dcl  seg_count fixed bin,
+      961      code fixed bin (35),
+      962      n fixed bin (18);
+      963 
+      964 
+      965           Sfatal_error = "0"b;
+      966 	if A_cross_dump_dn ^= "" then do;		/* fake pathname in preamble */
+      967 	     restore_dlen = area_pointer -> h.dlen;
+      968 	     restore_dn = area_pointer -> h.dname;
+      969 	     restore_elen = area_pointer -> h.elen;
+      970 	     restore_en = area_pointer -> h.ename;
+      971 	     area_pointer -> h.dname = cross_dump_dn;
+      972 	     area_pointer -> h.ename = cross_dump_en;
+      973 	     area_pointer -> h.dlen = length (rtrim (area_pointer -> h.dname));
+      974 	     area_pointer -> h.elen = length (rtrim (area_pointer -> h.ename));
+      975 	end;
+      976 	call old_alloc_ (1, addr (area_pointer -> h.list_area), p);
+      977 						/* Compute length of preamble. */
+      978 	if p ^= null then n = fixed (rel (p), 18);
+      979 	else if area_pointer = bk_ss_$hp		/* Pointer to header area */
+      980 	     then
+      981 	     n = max_length_header_area;
+      982 	else n = max_length_list_area;		/* Otherwise pointer to list area */
+      983 	call bk_output$wr_tape (area_pointer, n, seg_pointer, seg_count, code);
+      984 						/* Write the record. */
+      985 	if code ^= 0 then Sfatal_error = "1"b;
+      986 
+      987 	if A_cross_dump_dn ^= "" then do;
+      988 	     area_pointer -> h.dlen = restore_dlen;
+      989 	     area_pointer -> h.dname = restore_dn;
+      990 	     area_pointer -> h.elen = restore_elen;
+      991 	     area_pointer -> h.ename = restore_en;
+      992 	end;
+      993      end output;
+      994 
+      995 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+      996 
+      997 directory_line:
+      998      proc (P_ptr, P_len);
+      999 
+     1000 dcl  P_ptr ptr;
+     1001 dcl  P_len fixed bin;
+     1002 
+     1003 	if A_cross_dump_dn ^= "" then
+     1004 	     call backup_map_$directory_line (addr (cross_dump_dn), length (rtrim (cross_dump_dn)));
+     1005 
+     1006 	else call backup_map_$directory_line (P_ptr, P_len);
+     1007 
+     1008      end directory_line;
+     1009 
+     1010 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+     1011 
+     1012 sort_small:
+     1013      proc (aap, ac);				/* Proceedure to shell sort less than 15 branches */
+     1014 						/* Actually sort an array of indices of the branches */
+     1015 						/* Then insert pointers in order of the sorted indices */
+     1016 dcl  (aap, ap, pxk) ptr,
+     1017      (
+     1018      ac,
+     1019      count,
+     1020      d,
+     1021      i,
+     1022      j,
+     1023      k,
+     1024      n,
+     1025      xj,
+     1026      xk,
+     1027      x (14)
+     1028      ) fixed bin;
+     1029 
+     1030 	ap = aap;					/* copy args, pointer to branch array */
+     1031 	count = ac;
+     1032 	if count = 1 then do;
+     1033 	     ap -> br (1).ix = rel (addr (ap -> br (1)));
+     1034 	     return;
+     1035 	end;
+     1036 	do n = 1 to count;				/* loop over all branches */
+     1037 	     x (n) = n;				/* place index in index list */
+     1038 	end;
+     1039 	d = count;				/* initialize distance for shell sort */
+     1040 	do;					/* do the shell sort */
+     1041 down:
+     1042 	     d = 2 * divide (d, 4, 17, 0) + 1;		/* set the distance for the sort */
+     1043 	     do i = 1 to count - d;
+     1044 		k = i + d;			/* higher index */
+     1045 		xk = x (k);			/* index from index array */
+     1046 		pxk = ptr (ap, ap -> br (xk).namerp);	/* pointer for name comparixon */
+     1047 up:
+     1048 		j = k - d;			/* lower index */
+     1049 		xj = x (j);			/* lower index from index array */
+     1050 		if ptr (ap, ap -> br (xj).namerp) -> name (1).string <= pxk -> name (1).string then go to ok;
+     1051 						/* no change if ok */
+     1052 		x (k) = xj;			/* swap in index array */
+     1053 		k = j;				/* check next lower in steps of size d */
+     1054 		if k > d then go to up;		/* if there is a lower element */
+     1055 ok:
+     1056 		x (k) = xk;			/* finish, put highest index in its proper place */
+     1057 	     end;
+     1058 	     if d > 1 then go to down;		/* sort with smaller distance */
+     1059 	end;
+     1060 	do i = 1 to count;				/* now thread branches according to index array */
+     1061 	     xk = x (i);
+     1062 	     ap -> br (i).ix = rel (addr (ap -> br (xk)));
+     1063 	end;
+     1064 	return;
+     1065      end sort_small;
+     1066 
+     1067 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+     1068 
+     1069 /**/
+     1070 
+  2     1 /* BEGIN INCLUDE FILE  kst_attributes.incl.pl1 WRITTEN 03/26/76  by  R. Bratt */
+  2     2 
+  2     3 dcl  kstap ptr;
+  2     4 
+  2     5 dcl 1 kst_attributes aligned based (kstap),
+  2     6     2 set unaligned,				/* SPECIFIES WHICH ATTRIBUTES TO SET */
+  2     7       3 (allow_write,
+  2     8      tms,
+  2     9      tus,
+  2    10      tpd,
+  2    11      audit,
+  2    12      explicit_deactivate_ok) bit (1),
+  2    13       3 pad bit (39),
+  2    14     2 value unaligned,				/* SPECIFIES THE VALUE OF THE ATTRIBUTES TO BE SET */
+  2    15       3 (allow_write,				/* allow write permission in sdw */
+  2    16      tms,						/* don't update dtm */
+  2    17      tus,						/* don't update dtu */
+  2    18      tpd,						/* don't put on PD */
+  2    19      audit,					/* audit */
+  2    20      explicit_deactivate_ok) bit (1),			/* allow demand deactivation */
+  2    21       3 pad bit (30);
+  2    22 
+  2    23 /* END INCLUDE FILE kst_attributes.incl.pl1                      */
+     1071 
+     1072 
+  3     1 
+  3     2 /* . . . BEGIN INCLUDE FILE . . . bk_nss_info . . . */
+  3     3 
+  3     4 /* Created Fall '75 RE Mullen for intrim NSS dumper */
+  3     5 /* This structure is allocated in each dump record. */
+  3     6 
+  3     7 dcl 1 bk_nss_info aligned based,
+  3     8     2 version fixed bin,
+  3     9     2 lvname char (32) aligned,
+  3    10     2 pvname char (32) aligned,
+  3    11     2 lvid bit (36) aligned,
+  3    12     2 pvid bit (36) aligned;				/* limit of version = 1 struct */
+  3    13 
+  3    14 
+  3    15 dcl 1 bk_dq_info aligned based,
+  3    16     2 version fixed bin,
+  3    17     2 quota fixed bin,
+  3    18     2 ltrp fixed bin (71),
+  3    19     2 tlu bit (36) aligned,
+  3    20     2 inf_acct fixed bin,
+  3    21     2 term_acct fixed bin (1),
+  3    22     2 used fixed bin;
+  3    23 
+  3    24 
+  3    25 
+  3    26 /* . . . END INCLUDE FILE  bk_nss_info . . . */
+  3    27 
+  3    28 
+     1073 
+  4     1 /* include backup_dir_list */
+  4     2 /* Created by R H Campbell. */
+  4     3 /* Modified 15 June 1970, R H Campbell, 30 March l971, R A Tilden. */
+  4     4 /* Last modified by Kobziar 2/10/75 to add access_class */
+  4     5 /* Last modified by Greenberg 11/4/76 for vtoc_error bit */
+  4     6 dcl 1 br (1000) based aligned,			/* branch array returned by list_dir */
+  4     7     2 (vtoc_error bit (1),				/* Vtoc error on this entry */
+  4     8      pad1 bit (1), uid bit (70),
+  4     9      pad2 bit (20), dtu bit (52),
+  4    10      pad3 bit (20), dtm bit (52),
+  4    11      pad4 bit (20), dtd bit (52),
+  4    12      pad5 bit (20), dtbm bit (52),
+  4    13      access_class bit (72),
+  4    14      dirsw bit (1), optionsw bit (2), bc bit (24), consistsw bit (2), mode bit (5), usage bit (2),
+  4    15      usagect bit (17), nomore bit (1), (cl, ml) bit (9),
+  4    16      acct bit (36),
+  4    17     (hlim, llim) bit (17),
+  4    18      multiple_class bit (1), pad7 bit (1),
+  4    19     (rb1, rb2, rb3) bit (6), pad8 bit (18),
+  4    20     (pad9, namerp) bit (18),
+  4    21      ix bit (18), dump_me bit (1), nnames bit (17)) unaligned;  /* ix is pointer to i'th (sorted) entry. */
+  4    22 
+  4    23 dcl  nnames fixed bin;				/* Number of elements in name array. */
+  4    24 
+  4    25 dcl 1 name (1000 /* nnames */) based aligned,
+  4    26     2 size bit (17),
+  4    27     2 string character (32);
+  4    28 
+  4    29 dcl 1 lk (1) based aligned,				/* link array returned by list_dir */
+  4    30     2 (pad1 bit (2), uid bit (70),
+  4    31      pad2 bit (20), dtu bit (52),
+  4    32      pad3 bit (20), dtm bit (52),
+  4    33      pad4 bit (20), dtd bit (52),
+  4    34     (pathnamerp, namerp) bit (18),
+  4    35      ix bit (18), dump_me bit (1), nnames bit (17)) unaligned;  /* ix is pointer to i'th (sorted) entry. */
+  4    36 
+  4    37 dcl 1 path based (pp) aligned, 			/* path name structure from list_dir (one per link) */
+  4    38     2 size bit (17),
+  4    39     2 author character(32),				/* author of link, and */
+  4    40     2 name character (168);				/* path name. */
+  4    41 
+  4    42 dcl 1 old_path based (pp) aligned,			/* path name as it existed prior to inclusion of author */
+  4    43     2 size bit (17),
+  4    44     2 name character (168);
+  4    45 						/* end backup_dir_list */
+     1074 
+  5     1 /* include backup_fs_times */
+  5     2 /* Created by R H Campbell. */
+  5     3 /* Modified 15 June 1970, R H Campbell. */
+  5     4 dcl 1 times, 					/* Structure of times for set$backup_times. */
+  5     5     2 (dtem, 					/* Time entry last modified. */
+  5     6      dtd, 					/* Time entry last dumped. */
+  5     7      dtu, 					/* Time segment last used. */
+  5     8      dtm) fixed binary (52); 				/* Time segment last modified. */
+  5     9 						/* end backup_fs_times */
+     1075 
+  6     1 
+  6     2 /* Begin include file ... backup_preamble_header.incl.pl1 */
+  6     3 /* Modified 1/29/73 by N. I. Morris */
+  6     4 /* Modified 7/15/74 by R. E. Mullen */
+  6     5 /* Modified 10/10/74 by A. Kobziar */
+  6     6 
+  6     7 dcl 1 h based aligned,				/* backup preamble (segment header) */
+  6     8 
+  6     9     2 dlen fixed binary,
+  6    10     2 dname character (168),
+  6    11     2 elen fixed binary,
+  6    12     2 ename character (32),
+  6    13     2 bitcnt fixed binary (24),
+  6    14     2 record_type fixed binary,			/* Logical record type. */
+  6    15     2 dtd fixed binary (52),				/* Date and time dump occurred. */
+  6    16     2 dumper_id character (32),			/* Identification of dumper procedure. */
+  6    17 
+  6    18     2 bp bit (18),					/* Pointer to branches. */
+  6    19     2 bc fixed binary,				/* Branch count. */
+  6    20     2 lp bit (18),					/* Pointer to links. */
+  6    21     2 lc fixed binary,				/* Link count. */
+  6    22     2 aclp bit (18),				/* Pointer to ACL or CACL */
+  6    23     2 aclc fixed binary,				/* ACL count. */
+  6    24     2 actind bit (18),				/* File activity indicator */
+  6    25     2 actime bit (36),				/* File activity time */
+  6    26 
+  6    27     2 quota fixed binary,				/* Record quota for directory_list record. */
+  6    28     2 trp fixed binary (35),				/* Time-record product .. */
+  6    29     2 tlu fixed binary (35),				/* Time last updated .. */
+  6    30     2 inf_acct fixed binary,				/* Inferior account switch .. */
+  6    31     2 term_acct fixed binary (1),			/* Terminal account switch .. */
+  6    32     2 pad1 (3),					/* To even out area to 0 mod 8 */
+  6    33 
+  6    34     2 max_length fixed bin (18),			/* Max. length of segment */
+  6    35     2 switches unal,
+  6    36       3 safety_sw bit (1) unal,			/* Segment safety switch */
+  6    37       3 entrypt_sw bit (1) unal,			/* "1"b -> call limiter enabled */
+  6    38       3 security_oosw bit(1) unal,			/* security out-of-service */
+  6    39       3 audit_flag bit(1) unal,			/* flag for seg reference auditing */
+  6    40       3 multiple_class bit (1) unal,			/* system segment: access class may be higher than parent's */
+  6    41       3 pad2 bit(2) unal,				/* =pad2 in dir_entry */
+  6    42       3 master_dir bit (1) unal,			/* "1"b => was master dir */
+  6    43       3 tpd bit (1) unal,				/* TRUE => never put on paging device */
+  6    44       3 sw_pad bit (13) unal,				/* padding in this structure */
+  6    45     2 entrypt_bound bit (14) unal,			/* Call limiter. */
+  6    46     2 access_class bit(72),				/* access class of entry */
+  6    47     2 spad bit(36),					/* last word of dir entry */
+  6    48     2 status_version fixed bin,			/* version of status_for_backup struct */
+  6    49     2 nss_info_relp bit (18) aligned,			/* NONZERO => NSS INFO */
+  6    50     2 dq_info_relp bit (18) aligned,				/* NONZERO => DIRQUOTA INFO */
+  6    51 
+  6    52     2 inaclp (0:7) bit (18),				/* Pointer to initial ACL for each ring. */
+  6    53     2 inaclc (0:7) fixed bin,				/* Initial ACL count for each ring. */
+  6    54     2 dir_inaclp (0:7) bit (18),			/* Directory initial ACL pointer for each ring. */
+  6    55     2 dir_inaclc (0:7) fixed bin,			/* Directory initial ACL count for each ring. */
+  6    56 
+  6    57     2 bitcount_author char (32),			/* last modifier of the bit count */
+  6    58 
+  6    59     2 list_area /* area */ (65408);			/* Area for list_dir and readacl. */
+  6    60 
+  6    61 dcl  author char (32) aligned based;			/* Author of entry */
+  6    62 						/* N. B.  Author is an overlay starting at h.quota */
+  6    63 
+  6    64 /* End of include file ... backup_preamble_header.incl.pl1 */
+  6    65 
+     1076 
+  7     1 /*  BEGIN:   backup_record_types.incl.pl1		  *  *  *  *  *  */
+  7     2 
+  7     3 
+  7     4 /****^  HISTORY COMMENTS:
+  7     5*  1) change(87-01-05,GDixon), approve(87-04-15,MCR7617),
+  7     6*     audit(87-06-22,RBarstad), install(87-07-15,MR12.1-1040):
+  7     7*     Converted internal static variables to named constants.  Renamed
+  7     8*     record_type array to RECORD_TYPE, to avoid naming conflict with
+  7     9*     backup_preamble_header.incl.pl1's h.record_type variable.
+  7    10*                                                   END HISTORY COMMENTS */
+  7    11 
+  7    12 
+  7    13 /* Created June 1970, R H Campbell. */
+  7    14 /* Modified 1/16/73 by N. I. Morris	*/
+  7    15 /* Modified 7/17/75 by R. Bratt */
+  7    16 /* Modified 11/04/83 by G. Dixon - better comments */
+  7    17 
+  7    18 dcl  ndc_segment fixed binary int static options(constant) initial (1);
+  7    19 						/* Record of segment with NDC attributes */
+  7    20 dcl  ndc_directory fixed binary int static options(constant) initial (2);
+  7    21 						/* Record of directory with NDC attributes */
+  7    22 dcl  ndc_directory_list fixed binary int static options(constant) initial (3);
+  7    23 						/* Record of directory list with initial ACL */
+  7    24 dcl  sec_seg fixed binary int static options(constant) initial(19);
+  7    25 						/* Seg with security & call_limiter */
+  7    26 dcl  sec_dir fixed binary int static options(constant) initial(20);
+  7    27 						/* Dir with security & call_limiter */
+  7    28 
+  7    29 dcl  RECORD_TYPE (0: 20) character (10) aligned		/* Name of the record types. */
+  7    30      int static options(constant)
+  7    31      initial (*, "NDC seg", "NDC dir", "NDC dirlst", *, *, *, *,
+  7    32 	    *, *, *, *, *, *, *, *,
+  7    33 	    *, *, *, "SEG", "DIR");
+  7    34 
+  7    35 /* The following is an excerpt from a backup map showing the relationship
+  7    36*   between entries in the backup map and the named constants given above.
+  7    37*   I don't know under what conditions the ndc_seg and ndc_dir named constants
+  7    38*   are ever used.  (G. Dixon)
+  7    39*
+  7    40*			        Map Excerpt
+  7    41*   		 ---------------------------------------------
+  7    42*Named Constant       ENTRY NAME                   BLOCKS REC_TYPE  
+  7    43*
+  7    44*sec_dir		 >library_dir_dir>system_library_unbundled
+  7    45*		  object			     0 directory 
+  7    46*			 o
+  7    47*sec_dir		  source			     0 directory
+  7    48*		           s
+  7    49*
+  7    50*ndc_directory_list	 >library_dir_dir>system_library_unbundled>object
+  7    51*				               0 directory 
+  7    52*sec_seg		  bound_gcos_tss_.1.archive	   104 segment   
+  7    53*
+  7    54*
+  7    55*ndc_directory_list   >library_dir_dir>system_library_unbundled>source
+  7    56*				               0 directory
+  7    57*sec_seg               bound_gcos_tss_.1.s.archive	   134 segment
+  7    58*
+  7    59*
+  7    60*						          */
+  7    61 
+  7    62 
+  7    63 /*  END OF:  backup_record_types.incl.pl1		  *  *  *  *  *  */
+     1077 
+  8     1 /* BEGIN INCLUDE FILE ... bk_ss_.incl.pl1 */
+  8     2 
+  8     3 
+  8     4 /****^  HISTORY COMMENTS:
+  8     5*  1) change(87-03-03,GWMay), approve(87-03-03,MCR7627), audit(87-03-13,Farley),
+  8     6*     install(87-03-30,MR12.1-1018):
+  8     7*     added a writing_map switch to indicate when the dump map is being written.
+  8     8*                                                   END HISTORY COMMENTS */
+  8     9 
+  8    10 
+  8    11 /* Modified: July 1982 by G. Palter to add data for true AIM support in IMFT */
+  8    12 /* Modified: August 1983 by Robert Coren to add minimum access class */
+  8    13 /* Modified: November 1983 by Robert Coren to add "upgrade_to_user_auth" flag */
+  8    14 
+  8    15 /* Hierarchy dumper/reloader static data */
+  8    16 
+  8    17 dcl (bk_ss_$allow_dir_overwrite bit (1) aligned,		/* ON => allow reloaded seg to overwrite dir */
+  8    18      bk_ss_$areap pointer,				/* pointer to list dir area */
+  8    19      bk_ss_$brief_mapsw bit (1) aligned,		/* no form-feed for each control file entry */
+  8    20      bk_ss_$caller_handles_conditions bit (1) aligned,	/* ON => caller has an any_other handler (for IMFT Daemon) */
+  8    21      bk_ss_$control_name char(168),			/* control file path for dumping */
+  8    22      bk_ss_$control_ptr pointer,			/* Ptr to control structure for sub entries */
+  8    23      bk_ss_$cross_retrievesw bit (1) aligned,		/* ON => cross-retrieving this entry */
+  8    24      bk_ss_$data_iocb pointer,			/* IOCB for dumping/reloading if bk_ss_$preattached */
+  8    25      bk_ss_$date fixed binary (52),			/* dump all modified since this date */
+  8    26      bk_ss_$datesw bit (1) aligned,			/* Flags presence of a date input */
+  8    27      bk_ss_$debugsw bit (1) aligned,			/* Flag to prevent calls to hphcs_ */
+  8    28      bk_ss_$dir_trim bit (1) aligned,			/* Flag to allow deletion of directories */
+  8    29      bk_ss_$dprint_destination char (24),		/* for start_dump and reload, -ds for dprinting maps */
+  8    30      bk_ss_$dprint_destination_setsw bit (1) aligned,
+  8    31      bk_ss_$dprint_heading char (64),			/* for start_dump and reload, -he for dprinting maps */
+  8    32      bk_ss_$dprint_heading_setsw bit (1) aligned,
+  8    33      bk_ss_$dprint_queue fixed bin,			/* Queue number for dprinting maps and error files */
+  8    34      bk_ss_$dprint_request_type char (24),		/* for start_dump and reload, -rqt for dprinting maps */
+  8    35      bk_ss_$dprint_request_type_setsw bit (1) aligned,
+  8    36      bk_ss_$dprintsw bit (1) aligned,			/* Whether to dprint maps for start_dump and reload */
+  8    37      bk_ss_$dtdsw bit (1) aligned,			/* Flag to check if modified since last dumped */
+  8    38      bk_ss_$ename char(32) aligned,			/* Branch entry to dump */
+  8    39      bk_ss_$err_label label,				/* Place to go to attempt error recovery */
+  8    40      bk_ss_$err_onlinesw bit(1) aligned,		/* Flag error output to be online, default to a file */
+  8    41      bk_ss_$error fixed binary,			/* Code for location from which signal expected */
+  8    42      bk_ss_$holdsw bit(1) aligned,			/* controls dismounting of tape for dumper */
+  8    43      bk_ss_$hp pointer,				/* Pointer to preamble header */
+  8    44      bk_ss_$ignore_dates bit (1) aligned,		/* Flag to skip check if have older info on tape */
+  8    45      bk_ss_$mapsw bit (1) aligned,			/* Flag map output */
+  8    46      bk_ss_$myname char(16),				/* Name by which backup was called */
+  8    47      bk_ss_$namesw bit (1) aligned,			/* Flag to dump named branch only */
+  8    48      bk_ss_$no_contin bit (1) aligned,			/* Flag to end dump after catchup dump. */
+  8    49      bk_ss_$no_output bit (1) aligned,			/* Flag test run or dbugging dumper.  No tape output.*/
+  8    50      bk_ss_$no_primary bit (1) aligned,			/* Flag saying do not use primary pathnames */
+  8    51      bk_ss_$no_reload bit (1) aligned,			/* Flag debuging reloader.  Do not write in hierarchy. */
+  8    52      bk_ss_$no_setlvid bit (1) aligned,			/* Flag to surpress setting of sons lvid on reload */
+  8    53      bk_ss_$ntapes fixed bin,				/* number of tape copies for dumper */
+  8    54      bk_ss_$onlysw bit (1) aligned,			/* ON => disable hiearchy sweep (dumping) or stop when all
+  8    55*						   requests satisfied (loading) */
+  8    56      bk_ss_$operator char(32),			/* operator name */
+  8    57      bk_ss_$path_index fixed bin,			/* index of entry in backup_control structure */
+  8    58      bk_ss_$pathsw bit(1) aligned,			/* starting directory path given to dumper */
+  8    59      bk_ss_$preattached bit(1) aligned,			/* ON => caller has setup I/O switch for dumping/reloading */
+  8    60      bk_ss_$pvsw  bit(1) aligned,			/* Flag to enable physical volume recovery */
+  8    61      bk_ss_$pvname char(32) aligned,			/* Physical volume name */
+  8    62      bk_ss_$qchecksw bit(1) aligned,			/* Flag to prevent suspension of quota checking */
+  8    63      bk_ss_$quotasw bit(1) aligned,			/* Flag to allow quota setting */
+  8    64      bk_ss_$restart_dumpsw bit(1) aligned,		/* restarting complete or catchup from given point */
+  8    65      bk_ss_$restart_path char(168) aligned,		/* where to restart complete or catchup dump */
+  8    66      bk_ss_$restart_plen fixed bin,			/* length of restart pathname */
+  8    67      bk_ss_$retrieval_index fixed bin,			/* Index of entry in bk_retrieve's structure */
+  8    68      bk_ss_$retrievesw bit (1) aligned,			/* Flags retrieval */
+  8    69      bk_ss_$rlen fixed bin,				/* Length if current restart dir for recursion */
+  8    70      bk_ss_$rname char(168),				/* retrieval file name */
+  8    71      bk_ss_$rsize fixed bin,				/* length of retrieval file name */
+  8    72      bk_ss_$save_path char(168),			/* starting directory for dump */
+  8    73      bk_ss_$save_plen fixed bin,			/* length of starting directory name */
+  8    74      bk_ss_$save_time fixed bin(52),			/* date, time of start of dump */
+  8    75      bk_ss_$segptr pointer,
+  8    76      bk_ss_$set_dtd bit (1) aligned,			/* ON to always set dtd when dumping, OFF never */
+  8    77      bk_ss_$set_dtd_explicit bit (1) aligned,		/* ON to follow bk_ss_$set_dtd, OFF usual algorithm */
+  8    78      bk_ss_$sp pointer,
+  8    79      bk_ss_$sub_entry bit(1) aligned,			/* ON for backup_dump_ and backup_load_ */
+  8    80      bk_ss_$sub_entry_errfile bit(1) aligned,		/* ON => backup_dump_ and backup_load_ should create error files */
+  8    81      bk_ss_$tapesw bit(1) aligned,			/* Flag to indicate tape output */
+  8    82      bk_ss_$trimsw bit(1) aligned,			/* Flag to trim directories on reload */
+  8    83      bk_ss_$volume_set_name char (32),			/* For future arg -volume_set_name */
+  8    84      bk_ss_$wakeup_interval fixed bin(52),		/* interval between wakeups of dumper in micro secs. */
+  8    85      bk_ss_$wasnt_known bit(1) aligned,			/* Flag for segment termination */
+  8    86      bk_ss_$enforce_max_access_class bit (1) aligned,	/* ON => don't dump anything above give access class */
+  8    87      bk_ss_$maximum_access_class bit (72) aligned,	/* the access class to enforce on all branches */
+  8    88      bk_ss_$enforce_min_access_class bit (1) aligned,	/* ON => don't dump anything below give access class */
+  8    89      bk_ss_$minimum_access_class bit (72) aligned,	/* the minimum access class to enforce on all branches */
+  8    90      bk_ss_$dont_dump_upgraded_dirs bit (1) aligned,	/* ON => don't dump any directory above given access class */
+  8    91      bk_ss_$maximum_dir_access_class bit (72) aligned,	/* the access class to enforce on directories */
+  8    92      bk_ss_$check_effective_access bit (1) aligned,	/* ON => don't dump branches given user can't access */
+  8    93      bk_ss_$upgrade_to_user_auth bit (1) aligned,		/* ON => set access class of branch being dumped to user's authorization */
+  8    94      bk_ss_$user_id character (32) unaligned,		/* the user's Person.Project.tag */
+  8    95      bk_ss_$user_authorization bit (72) aligned,		/* the user's process authorization */
+  8    96      bk_ss_$user_ring fixed binary,			/* the user's ring of execution */
+  8    97      bk_ss_$restore_access_class bit (1) aligned,		/* ON => restore access class even when debugging */
+  8    98      bk_ss_$enforce_minimum_ring bit (1) aligned,		/* ON => don't give anything lower ring bracket */
+  8    99      bk_ss_$minimum_ring fixed binary,			/* the minimum ring bracket to be used */
+  8   100      bk_ss_$translate_access_class bit (1) aligned,	/* ON => translate access classes read from tape */
+  8   101      bk_ss_$source_attributes_ptr pointer,		/* -> source system's AIM attributes */
+  8   102      bk_ss_$target_attributes_ptr pointer,		/* -> target system's AIM attributes */
+  8   103      bk_ss_$writing_map bit (1) aligned)                    /* ON => in backup_map$try_write */
+  8   104 	external static;
+  8   105 
+  8   106 /* END INCLUDE FILE ... bk_ss_.incl.pl1 */
+     1078 
+     1079 
+  9     1      declare		/* Structure returned by hcs_$status_long */
+  9     2 
+  9     3 	1 branch_status aligned,				/* automatic: hcs_$status uses a pointer */
+  9     4 
+  9     5 	  2 type bit(2) unaligned,				/* type of entry: link, segment, dir */
+  9     6 	  2 number_names bit(16) unaligned,			/* unused by directory_status_ */
+  9     7 	  2 names_rel_pointer bit(18) unaligned,		/* unused by directory_status_ */
+  9     8 	  2 date_time_modified bit(36) unaligned,		/* date time modified */
+  9     9 	  2 date_time_used bit(36) unaligned,			/* date time entry used */
+  9    10 	  2 mode bit(5) unaligned,				/* effective access of caller */
+  9    11 	  2 raw_mode bit(5) unaligned,
+  9    12 	  2 pad1 bit(8) unaligned,
+  9    13 	  2 records bit(18) unaligned,			/* number of records in use */
+  9    14 	  2 date_time_dumped bit(36) unaligned,			/* date time last dumped */
+  9    15 	  2 date_time_entry_modified bit(36) unaligned,		/* date time entry modified */
+  9    16 	  2 lvid bit(36) unaligned,				/* logical volume id */
+  9    17 	  2 current_length bit(12) unaligned,			/* number of blocks currently allocated */
+  9    18 	  2 bit_count bit(24) unaligned,			/* bit count of entry */
+  9    19 	  2 pad3 bit(8) unaligned,
+  9    20 	  2 copy_switch bit(1) unaligned,			/* the copy switch */
+  9    21 	  2 tpd bit(1) unaligned,				/* transparent to paging device */
+  9    22 	  2 mdir bit(1) unaligned,				/* master directory switch */
+  9    23 	  2 damaged_switch bit (1) unaligned,			/* true if contents damaged */
+  9    24 	  2 synchronized_switch bit (1) unaligned,		/* true if a DM synchronized file */
+  9    25 	  2 pad4 bit(5) unaligned,
+  9    26 	  2 ring_brackets (0:2) bit(6) unaligned,		/* branch ring brackets */
+  9    27 	  2 unique_id bit(36) unaligned,			/* entry unique id */
+  9    28 
+  9    29 
+  9    30 	     /* The types of each class of branch */
+  9    31 	segment_type bit(2) aligned internal static initial ("01"b),
+  9    32 	directory_type bit(2) aligned internal static initial ("10"b),
+  9    33 	msf_type bit(2) aligned internal static initial ("10"b),	/* will eventually be different */
+  9    34 	link_type bit(2) aligned internal static initial ("00"b);
+  9    35 
+  9    36 
+     1080 
+     1081 
+ 10     1 /* BEGIN INCLUDE FILE ... access_mode_values.incl.pl1
+ 10     2*
+ 10     3*   Values for the "access mode" argument so often used in hardcore
+ 10     4*   James R. Davis 26 Jan 81  MCR 4844
+ 10     5*   Added constants for SM access 4/28/82 Jay Pattin
+ 10     6*   Added text strings 03/19/85 Chris Jones
+ 10     7**/
+ 10     8 
+ 10     9 
+ 10    10 /* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+ 10    11 dcl	(
+ 10    12 	N_ACCESS		   init ("000"b),
+ 10    13 	R_ACCESS		   init ("100"b),
+ 10    14 	E_ACCESS		   init ("010"b),
+ 10    15 	W_ACCESS		   init ("001"b),
+ 10    16 	RE_ACCESS		   init ("110"b),
+ 10    17 	REW_ACCESS	   init ("111"b),
+ 10    18 	RW_ACCESS		   init ("101"b),
+ 10    19 	S_ACCESS		   init ("100"b),
+ 10    20 	M_ACCESS		   init ("010"b),
+ 10    21 	A_ACCESS		   init ("001"b),
+ 10    22 	SA_ACCESS		   init ("101"b),
+ 10    23 	SM_ACCESS		   init ("110"b),
+ 10    24 	SMA_ACCESS	   init ("111"b)
+ 10    25 	)		   bit (3) internal static options (constant);
+ 10    26 
+ 10    27 /* The following arrays are meant to be accessed by doing either 1) bin (bit_value) or
+ 10    28*   2) divide (bin_value, 2) to come up with an index into the array. */
+ 10    29 
+ 10    30 dcl	SEG_ACCESS_MODE_NAMES  (0:7) init ("null", "W", "E", "EW", "R", "RW", "RE", "REW") char (4) internal
+ 10    31 			   static options (constant);
+ 10    32 
+ 10    33 dcl	DIR_ACCESS_MODE_NAMES  (0:7) init ("null", "A", "M", "MA", "S", "SA", "SM", "SMA") char (4) internal
+ 10    34 			   static options (constant);
+ 10    35 
+ 10    36 dcl	(
+ 10    37 	N_ACCESS_BIN	   init (00000b),
+ 10    38 	R_ACCESS_BIN	   init (01000b),
+ 10    39 	E_ACCESS_BIN	   init (00100b),
+ 10    40 	W_ACCESS_BIN	   init (00010b),
+ 10    41 	RW_ACCESS_BIN	   init (01010b),
+ 10    42 	RE_ACCESS_BIN	   init (01100b),
+ 10    43 	REW_ACCESS_BIN	   init (01110b),
+ 10    44 	S_ACCESS_BIN	   init (01000b),
+ 10    45 	M_ACCESS_BIN	   init (00010b),
+ 10    46 	A_ACCESS_BIN	   init (00001b),
+ 10    47 	SA_ACCESS_BIN	   init (01001b),
+ 10    48 	SM_ACCESS_BIN	   init (01010b),
+ 10    49 	SMA_ACCESS_BIN	   init (01011b)
+ 10    50 	)		   fixed bin (5) internal static options (constant);
+ 10    51 
+ 10    52 /* END INCLUDE FILE ... access_mode_values.incl.pl1 */
+     1082 
+     1083 
+     1084      end backup_dump_recurse;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    07/16/87  1312.4  backup_dump_recurse.pl1           >special_ldd>install>MR12.1-1040>backup_dump_recurse.pl1
+164          1    06/17/86  1513.1  status_for_backup.incl.pl1        >ldd>include>status_for_backup.incl.pl1
+1071         2    04/29/76  1104.2  kst_attributes.incl.pl1           >ldd>include>kst_attributes.incl.pl1
+1073         3    06/11/76  1057.9  bk_nss_info.incl.pl1              >ldd>include>bk_nss_info.incl.pl1
+1074         4    12/07/76  1740.3  backup_dir_list.incl.pl1          >ldd>include>backup_dir_list.incl.pl1
+1075         5    05/06/74  1741.7  backup_fs_times.incl.pl1          >ldd>include>backup_fs_times.incl.pl1
+1076         6    04/29/76  1058.2  backup_preamble_header.incl.pl1   >ldd>include>backup_preamble_header.incl.pl1
+1077         7    07/15/87  1546.5  backup_record_types.incl.pl1      >spec>install>1040>backup_record_types.incl.pl1
+1078         8    04/02/87  2006.7  bk_ss_.incl.pl1                   >ldd>include>bk_ss_.incl.pl1
+1080         9    11/22/82  0955.6  branch_status.incl.pl1            >ldd>include>branch_status.incl.pl1
+1082        10    04/11/85  1452.6  access_mode_values.incl.pl1       >ldd>include>access_mode_values.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+A_code                                 parameter       fixed bin(35,0)          dcl 65 set ref 57 224* 249* 893*
+A_cross_dump_dn                        parameter       char(168)                unaligned dcl 92 set ref 57 221 273* 682 884 887*
+                                                                                  966 987 1003
+A_cross_dump_en                        parameter       char(32)                 unaligned dcl 93 set ref 57 223 273* 607 887*
+P_dirname                              parameter       char                     dcl 941 ref 938 948
+P_dtd                                  parameter       fixed bin(52,0)          dcl 942 set ref 938 949*
+P_force_dump                           parameter       bit(1)                   dcl 63 ref 57 494
+P_len                                  parameter       fixed bin(17,0)          dcl 1001 set ref 997 1006*
+P_ptr                                  parameter       pointer                  dcl 1000 set ref 997 1006*
+RECORD_TYPE                     000000 constant        char(10)                 initial array dcl 7-29 set ref 685*
+R_ACCESS_BIN                           constant        fixed bin(5,0)           initial dcl 10-36 ref 814 814
+Sfatal_error                           parameter       bit(1)                   dcl 67 set ref 57 891* 965* 985*
+aap                                    parameter       pointer                  dcl 1016 ref 1012 1030
+ac                                     parameter       fixed bin(17,0)          dcl 1016 ref 1012 1031
+ac_stg                          000156 automatic       char(256)                unaligned dcl 73 set ref 383* 386* 388*
+ac_stg_octal                    000256 automatic       char(32)                 dcl 73 set ref 385* 386
+access_class              5     000534 automatic       bit(72)                  level 2 in structure "bks" dcl 166 in procedure
+                                                                                  "backup_dump_recurse" set ref 299* 316* 320 379*
+                                                                                  380* 382 383* 385* 566* 583
+access_class            122            based           bit(72)                  level 2 in structure "h" dcl 6-7 in procedure
+                                                                                  "backup_dump_recurse" set ref 320* 583*
+access_class_octal              001102 automatic       char(32)                 dcl 728 set ref 752* 753 757* 758 772* 773 777* 778
+                                                                                  792* 793 797* 798 825* 826
+aclc                    105            based           fixed bin(17,0)          level 2 dcl 6-7 set ref 283* 586* 589* 596* 599
+aclp                            000130 automatic       pointer                  dcl 73 in procedure "backup_dump_recurse" set ref
+                                                                                  328* 337 340 586* 589* 599
+aclp                    104            based           bit(18)                  level 2 in structure "h" dcl 6-7 in procedure
+                                                                                  "backup_dump_recurse" set ref 284* 597* 599*
+actime                  107            based           bit(36)                  level 2 dcl 6-7 set ref 573*
+actind                  106            based           bit(18)                  level 2 dcl 6-7 set ref 574*
+addr                                                   builtin function         dcl 179 ref 190 191 193 205 294 294 326 389 389 462
+                                                                                  462 526 546 546 579 626 626 689 690 690 869 881
+                                                                                  976 976 1003 1003 1033 1062
+addrel                                                 builtin function         dcl 179 ref 337 340
+aim_check_$greater_or_equal     000056 constant        entry                    external dcl 122 ref 747 767 787 821
+aim_code                        001115 automatic       fixed bin(35,0)          dcl 730 set ref 749* 751 755* 756 769* 771 775* 776
+                                                                                  789* 791 795* 796 822* 824
+allow_write               1(09) 000023 internal static bit(1)                   level 3 in structure "ksta" packed unaligned dcl 101
+                                                                                  in procedure "backup_dump_recurse" set ref 216*
+allow_write                     000023 internal static bit(1)                   level 3 in structure "ksta" packed unaligned dcl 101
+                                                                                  in procedure "backup_dump_recurse" set ref 215*
+ap                              001230 automatic       pointer                  dcl 1016 set ref 1030* 1033 1033 1046 1046 1050 1050
+                                                                                  1062 1062
+area_pointer                           parameter       pointer                  dcl 959 set ref 957 967 968 969 970 971 972 973 973
+                                                                                  974 974 976 976 979 983* 988 989 990 991
+author                   10     000534 automatic       char(32)                 level 2 in structure "bks" dcl 166 in procedure
+                                                                                  "backup_dump_recurse" set ref 552* 579
+author                                 based           char(32)                 dcl 6-61 in procedure "backup_dump_recurse" set ref
+                                                                                  579*
+backup_map_$detail_line2        000134 constant        entry                    external dcl 168 ref 685
+backup_map_$directory_line      000142 constant        entry                    external dcl 168 ref 1003 1006
+backup_map_$error_line          000136 constant        entry                    external dcl 168 ref 742 760 780 800 810 815 828
+backup_map_$fs_error_line       000140 constant        entry                    external dcl 168 ref 197 202 240 303 331 353 366 472
+                                                                                  549 593 619 664 706 929
+backup_map_$name_line           000144 constant        entry                    external dcl 168 ref 690
+baseno                                                 builtin function         dcl 179 ref 626 626
+bc                              000111 automatic       fixed bin(17,0)          dcl 73 in procedure "backup_dump_recurse" set ref
+                                                                                  237* 278 280 396 396* 399* 416 864
+bc                       14(03)        based           bit(24)                  array level 2 in structure "br" packed unaligned
+                                                                                  dcl 4-6 in procedure "backup_dump_recurse" set ref
+                                                                                  601 815 828
+bc                      101            based           fixed bin(17,0)          level 2 in structure "h" dcl 6-7 in procedure
+                                                                                  "backup_dump_recurse" set ref 280* 404*
+bc_author                20     000534 automatic       char(32)                 level 2 dcl 166 set ref 553* 581
+binary                                                 builtin function         dcl 179 ref 421 626 626
+bit                                                    builtin function         dcl 179 ref 465 469 669 814 814 814
+bitcnt                   64            based           fixed bin(24,0)          level 2 dcl 6-7 set ref 601*
+bitcount_author         170            based           char(32)                 level 2 dcl 6-7 set ref 581*
+bk_dq_info                             based           structure                level 1 dcl 3-15 set ref 357
+bk_nss_info                            based           structure                level 1 dcl 3-7 set ref 307 556
+bk_output$wr_tape               000146 constant        entry                    external dcl 168 ref 983
+bk_ss_$areap                    000152 external static pointer                  dcl 8-17 set ref 193 206 207 208 232 237 276 277 278
+                                                                                  280 281 282 283 284 288 309 319 320 321 326 349
+                                                                                  349 349 349 349 354 354 354 354 354 359 367 373*
+bk_ss_$check_effective_access   000252 external static bit(1)                   dcl 8-17 ref 501 807
+bk_ss_$date                     000154 external static fixed bin(52,0)          dcl 8-17 ref 486 489
+bk_ss_$datesw                   000156 external static bit(1)                   dcl 8-17 ref 485 920
+bk_ss_$debugsw                  000160 external static bit(1)                   dcl 8-17 ref 626 659 916
+bk_ss_$dont_dump_upgraded_dirs  000246 external static bit(1)                   dcl 8-17 ref 501 787
+bk_ss_$dtdsw                    000162 external static bit(1)                   dcl 8-17 ref 486 492 920
+bk_ss_$ename                    000164 external static char(32)                 dcl 8-17 set ref 263* 268* 422 429 438 532 533 706*
+                                                                                  736
+bk_ss_$enforce_max_access_class 000236 external static bit(1)                   dcl 8-17 ref 501 747
+bk_ss_$enforce_min_access_class 000242 external static bit(1)                   dcl 8-17 ref 501 767
+bk_ss_$err_label                000166 external static label variable           dcl 8-17 set ref 228 229* 401* 713*
+bk_ss_$error                    000170 external static fixed bin(17,0)          dcl 8-17 set ref 233* 238* 289* 296* 327* 329* 348*
+                                                                                  351* 361* 364* 461* 463* 541* 547* 585* 591* 614*
+                                                                                  616* 658* 663* 925* 928*
+bk_ss_$hp                       000172 external static pointer                  dcl 8-17 set ref 191 205 226 227 237 240 276 277 294
+                                                                                  303 328 331 349 353 362 366 379 388 391 402 403
+                                                                                  404 462 468 472 508 510 516 523 532 533 536 537
+                                                                                  540 546 546 549 549 558 570 573 574 576 577 578
+                                                                                  579 581 582 583 586 586 586 589 589 589 593 593
+                                                                                  596 597 599 599 601 610* 615 615 619 619 630 651*
+                                                                                  664 664 669 673 673 673 678 685 685 706 734 877
+                                                                                  878 882 882 898 900 979
+bk_ss_$mapsw                    000174 external static bit(1)                   dcl 8-17 ref 241 332 377 621 675 688 692
+bk_ss_$maximum_access_class     000240 external static bit(72)                  dcl 8-17 set ref 747* 749* 752*
+bk_ss_$maximum_dir_access_class 000250 external static bit(72)                  dcl 8-17 set ref 787* 789* 792* 821*
+bk_ss_$minimum_access_class     000244 external static bit(72)                  dcl 8-17 set ref 767* 769* 772*
+bk_ss_$myname                   000176 external static char(16)                 unaligned dcl 8-17 set ref 408 408 742* 760* 780*
+                                                                                  800* 810* 815* 828* 920
+bk_ss_$namesw                   000200 external static bit(1)                   dcl 8-17 ref 253 419 531 607 703 736
+bk_ss_$no_output                000202 external static bit(1)                   dcl 8-17 ref 920
+bk_ss_$no_primary               000204 external static bit(1)                   dcl 8-17 ref 531 736
+bk_ss_$onlysw                   000206 external static bit(1)                   dcl 8-17 ref 710
+bk_ss_$pvname                   000212 external static char(32)                 dcl 8-17 ref 563
+bk_ss_$pvsw                     000210 external static bit(1)                   dcl 8-17 ref 257 477 563 676 866
+bk_ss_$restart_dumpsw           000214 external static bit(1)                   dcl 8-17 set ref 258 429 438* 444* 701 701*
+bk_ss_$restart_path             000216 external static char(168)                dcl 8-17 ref 260 263 268
+bk_ss_$restart_plen             000220 external static fixed bin(17,0)          dcl 8-17 ref 260 268
+bk_ss_$rlen                     000222 external static fixed bin(17,0)          dcl 8-17 set ref 260 263 265* 265 268 268 269* 438
+                                                                                  444
+bk_ss_$segptr                   000224 external static pointer                  dcl 8-17 set ref 615* 626 626 651* 659* 661*
+bk_ss_$set_dtd                  000226 external static bit(1)                   dcl 8-17 ref 916
+bk_ss_$set_dtd_explicit         000230 external static bit(1)                   dcl 8-17 ref 916 920
+bk_ss_$tapesw                   000232 external static bit(1)                   dcl 8-17 ref 241 275 332 378 569 621 692 920
+bk_ss_$upgrade_to_user_auth     000254 external static bit(1)                   dcl 8-17 ref 316 566
+bk_ss_$user_authorization       000260 external static bit(72)                  dcl 8-17 set ref 316 566 822* 825*
+bk_ss_$user_id                  000256 external static char(32)                 unaligned dcl 8-17 set ref 808* 810* 815* 828*
+bk_ss_$user_ring                000262 external static fixed bin(17,0)          dcl 8-17 set ref 808*
+bk_ss_$wasnt_known              000234 external static bit(1)                   dcl 8-17 set ref 629* 654 657*
+bk_ss_error_value                      parameter       fixed bin(17,0)          dcl 912 ref 906 925
+bks                             000534 automatic       structure                level 1 dcl 166 set ref 291* 294 294 543* 546 546
+                                                                                  551*
+blocks                          000154 automatic       fixed bin(9,0)           dcl 73 set ref 511* 630 685*
+bp                      100            based           bit(18)                  level 2 in structure "h" dcl 6-7 in procedure
+                                                                                  "backup_dump_recurse" set ref 278* 523*
+bp                              000120 automatic       pointer                  dcl 73 in procedure "backup_dump_recurse" set ref
+                                                                                  189* 190 190 237* 278 396* 399* 417 417 418 460
+                                                                                  865 865 870
+br                                     based           structure                array level 1 dcl 4-6 set ref 190 1033 1062
+br_size                         000022 internal static fixed bin(17,0)          dcl 101 set ref 190* 522* 524
+branch_status                   000575 automatic       structure                level 1 dcl 9-1
+brst                            000100 automatic       structure                level 1 dcl 454 set ref 462 462
+cl                       15(18)        based           bit(9)                   array level 2 packed unaligned dcl 4-6 set ref 465*
+                                                                                  511
+cleanup                         000114 stack reference condition                dcl 456 ref 458
+clock                                                  builtin function         dcl 181 ref 232 516
+code                            000104 automatic       fixed bin(35,0)          dcl 73 in procedure "backup_dump_recurse" set ref
+                                                                                  195* 196 197* 200* 201 202* 237* 239 240* 243 248
+                                                                                  248* 249 294* 297 297 303* 328* 330 331* 349* 352
+                                                                                  353* 362* 365 366* 373* 374 379* 380 383* 384 462*
+                                                                                  464 468* 469 471 472* 546* 548 549* 586* 589* 592
+                                                                                  593* 595 610* 611 615* 617 617 619* 651* 653 661*
+                                                                                  664 664* 705* 706* 929*
+code                            001114 automatic       fixed bin(35,0)          dcl 730 in procedure "perform_access_checks" set ref
+                                                                                  740* 741 742* 808* 809 810*
+code                                   parameter       fixed bin(35,0)          dcl 960 in procedure "output" set ref 957 983* 985
+code                            000103 automatic       fixed bin(35,0)          dcl 847 in procedure "dir_scan" set ref 891* 892 893
+convert_aim_attributes_         000062 constant        entry                    external dcl 122 ref 385 752 757 772 777 792 797 825
+convert_authorization_$to_string_short
+                                000060 constant        entry                    external dcl 122 ref 383 749 755 769 775 789 795 822
+count                           001234 automatic       fixed bin(17,0)          dcl 1016 set ref 1031* 1032 1036 1039 1043 1060
+cross_dump_dn                   000354 automatic       char(168)                unaligned dcl 92 set ref 221* 273* 884* 887* 891*
+                                                                                  971 1003 1003 1003 1003
+cross_dump_en                   000500 automatic       char(32)                 unaligned dcl 93 set ref 223* 372* 607* 609* 649*
+                                                                                  682 884* 888* 891* 972
+curl                            000114 automatic       fixed bin(17,0)          dcl 73 set ref 307* 308* 357* 358* 524* 525 526*
+                                                                                  527* 529 556* 557* 630* 651*
+current_length            7     000100 automatic       bit(12)                  level 2 packed unaligned dcl 454 set ref 465
+cutoff_time                     000152 automatic       fixed bin(52,0)          dcl 73 set ref 486* 489* 493* 494
+d                               001235 automatic       fixed bin(17,0)          dcl 1016 set ref 1039* 1041* 1041 1043 1044 1047
+                                                                                  1054 1058
+date_time_modified        1     000100 automatic       bit(36)                  level 2 packed unaligned dcl 454 set ref 467
+date_time_used            2     000100 automatic       bit(36)                  level 2 packed unaligned dcl 454 set ref 466
+dcount                                 parameter       fixed bin(17,0)          dcl 847 ref 844 857
+dia_count                30            based           fixed bin(17,0)          array level 2 dcl 158 set ref 340
+dia_relp                 20            based           bit(18)                  array level 2 dcl 158 set ref 340* 340
+dircount                        000113 automatic       fixed bin(17,0)          dcl 73 set ref 405* 478* 478 507* 507 710 710*
+dirname                                parameter       char                     dcl 909 in procedure "set_dtd" set ref 906 927* 929*
+dirname                         001117 automatic       char(168)                dcl 945 in begin block on line 944 set ref 948* 949*
+dirsw                    14            based           bit(1)                   array level 2 packed unaligned dcl 4-6 set ref 433
+                                                                                  477 506 586 606 669 787 815 828 866
+divide                                                 builtin function         dcl 179 ref 469 511 1041
+dlen                                   based           fixed bin(17,0)          level 2 dcl 6-7 set ref 276* 276 391* 678* 877 882*
+                                                                                  898* 967 973* 988*
+dname                     1            based           char(168)                level 2 dcl 6-7 set ref 205 237* 240* 277* 277 294*
+                                                                                  303* 328* 331* 349* 353* 362* 366* 379* 388* 462*
+                                                                                  468 472* 546* 549* 586* 589* 593* 615* 619* 664*
+                                                                                  673* 706* 734 878 882* 900* 968 971* 973 989*
+dq_info_relp            127            based           bit(18)                  level 2 dcl 6-7 set ref 359* 367*
+dqip                            000140 automatic       pointer                  dcl 73 set ref 358* 359 360 362 362 362 362 362
+dtbm                     10(20)        based           bit(52)                  array level 2 packed unaligned dcl 4-6 set ref 481
+dtd                             000142 automatic       fixed bin(52,0)          dcl 73 in procedure "backup_dump_recurse" set ref
+                                                                                  483* 486 493 685*
+dtd                       6(20)        based           bit(52)                  array level 2 in structure "br" packed unaligned
+                                                                                  dcl 4-6 in procedure "backup_dump_recurse" set ref
+                                                                                  483 669* 873
+dtd                                    parameter       fixed bin(52,0)          dcl 911 in procedure "set_dtd" set ref 906 927*
+dtd                      10            based           fixed bin(52,0)          level 2 in structure "save1" dcl 861 in procedure
+                                                                                  "dir_scan" set ref 873* 896*
+dtd                      66            based           fixed bin(52,0)          level 2 in structure "h" dcl 6-7 in procedure
+                                                                                  "backup_dump_recurse" set ref 232* 516* 669 673*
+                                                                                  685*
+dtem                            000146 automatic       fixed bin(52,0)          dcl 73 set ref 481* 494 685*
+dtm                       4(20)        based           bit(52)                  array level 2 packed unaligned dcl 4-6 set ref 467*
+                                                                                  482
+dtsm                            000150 automatic       fixed bin(52,0)          dcl 73 set ref 482* 494 685*
+dtu                       2(20)        based           bit(52)                  array level 2 in structure "br" packed unaligned
+                                                                                  dcl 4-6 in procedure "backup_dump_recurse" set ref
+                                                                                  466* 681
+dtu                             000144 automatic       fixed bin(52,0)          dcl 73 in procedure "backup_dump_recurse" set ref
+                                                                                  681* 685*
+dump_me                  22(18)        based           bit(1)                   array level 2 packed unaligned dcl 4-6 set ref 484*
+                                                                                  505* 866
+elen                     53            based           fixed bin(17,0)          level 2 dcl 6-7 set ref 206* 226* 532* 536* 969 974*
+                                                                                  990*
+ename                                  parameter       char                     dcl 910 in procedure "set_dtd" set ref 906 927* 929*
+ename                           001171 automatic       char(32)                 dcl 946 in begin block on line 944 set ref 948* 949*
+ename                                  based           char(32)                 level 2 in structure "save1" dcl 861 in procedure
+                                                                                  "dir_scan" set ref 871* 882* 888 896*
+ename                    54            based           char(32)                 level 2 in structure "h" dcl 6-7 in procedure
+                                                                                  "backup_dump_recurse" set ref 207* 227* 533* 537*
+                                                                                  546* 549* 586* 589* 593* 615* 619* 664* 673* 970
+                                                                                  972* 974 991*
+entrypt_bound           121(22)        based           bit(14)                  level 2 in structure "h" packed unaligned dcl 6-7
+                                                                                  in procedure "backup_dump_recurse" set ref 578*
+entrypt_bound             4(22) 000534 automatic       bit(14)                  level 2 in structure "bks" packed unaligned dcl 166
+                                                                                  in procedure "backup_dump_recurse" set ref 578
+error_table_$ai_restricted      000030 external static fixed bin(35,0)          dcl 108 set ref 760* 780* 800* 828*
+error_table_$device_attention   000032 external static fixed bin(35,0)          dcl 108 ref 243
+error_table_$moderr             000036 external static fixed bin(35,0)          dcl 108 set ref 815*
+error_table_$noentry            000040 external static fixed bin(35,0)          dcl 108 ref 595 705
+error_table_$root               000042 external static fixed bin(35,0)          dcl 108 ref 297
+error_table_$segknown           000034 external static fixed bin(35,0)          dcl 108 ref 617
+expand_pathname_                000064 constant        entry                    external dcl 122 ref 948
+explicit_deactivate_ok
+                          1(14) 000023 internal static bit(1)                   level 3 in structure "ksta" packed unaligned dcl 101
+                                                                                  in procedure "backup_dump_recurse" set ref 214*
+explicit_deactivate_ok
+                          0(05) 000023 internal static bit(1)                   level 3 in structure "ksta" packed unaligned dcl 101
+                                                                                  in procedure "backup_dump_recurse" set ref 214*
+fixed                                                  builtin function         dcl 179 ref 190 190 465 465 481 482 483 511 515 526
+                                                                                  526 576 601 681 690 690 873 978
+found                           000106 automatic       fixed bin(17,0)          dcl 73 set ref 259* 433 443* 446* 701
+found_object                    000110 automatic       bit(1)                   dcl 73 set ref 254* 423* 704
+h                                      based           structure                level 1 dcl 6-7
+havent_output_dirname           000107 automatic       bit(1)                   dcl 73 set ref 225* 676 679*
+hbp                             000126 automatic       pointer                  dcl 73 set ref 522* 523 525 528
+hcs_$dir_quota_read             000106 constant        entry                    external dcl 122 ref 362
+hcs_$get_access_class           000110 constant        entry                    external dcl 122 ref 379 740
+hcs_$get_max_length             000072 constant        entry                    external dcl 122 ref 468
+hcs_$get_max_length_seg         000074 constant        entry                    external dcl 122 ref 195 200
+hcs_$get_user_effmode           000076 constant        entry                    external dcl 122 ref 808
+hcs_$initiate                   000100 constant        entry                    external dcl 122 ref 615
+hcs_$list_acl                   000066 constant        entry                    external dcl 122 ref 589
+hcs_$list_dir                   000102 constant        entry                    external dcl 122 ref 237
+hcs_$list_dir_acl               000070 constant        entry                    external dcl 122 ref 586
+hcs_$list_inacl_all             000126 constant        entry                    external dcl 122 ref 328
+hcs_$quota_get                  000104 constant        entry                    external dcl 122 ref 349
+hcs_$status_for_backup          000130 constant        entry                    external dcl 122 ref 294 546
+hcs_$status_long                000112 constant        entry                    external dcl 122 ref 462
+hcs_$terminate_noname           000124 constant        entry                    external dcl 122 ref 661
+hdp                             000020 internal static pointer                  dcl 101 set ref 205* 391* 678*
+header_areap                    000014 internal static pointer                  dcl 101 set ref 191* 200* 520* 522* 527* 557* 586*
+                                                                                  589*
+hnp                             000124 automatic       pointer                  dcl 73 set ref 527* 528 529
+hphcs_$set_backup_dump_time     000122 constant        entry                    external dcl 122 ref 927
+hphcs_$set_kst_attributes       000120 constant        entry                    external dcl 122 ref 626
+i                               000100 automatic       fixed bin(17,0)          dcl 847 in procedure "dir_scan" set ref 864* 865*
+                                                                                  880* 881*
+i                               000100 automatic       fixed bin(17,0)          dcl 73 in procedure "backup_dump_recurse" set ref
+                                                                                  260* 262 263 265 416* 417*
+i                               001236 automatic       fixed bin(17,0)          dcl 1016 in procedure "sort_small" set ref 1043*
+                                                                                  1044* 1060* 1061 1062*
+ignore                          000105 automatic       fixed bin(35,0)          dcl 73 set ref 313* 562*
+inacl_info                             based           structure                level 1 dcl 158 set ref 333*
+inaclp                  130            based           bit(18)                  array level 2 dcl 6-7 set ref 326
+incr_sw                         000010 internal static bit(1)                   unaligned dcl 96 set ref 408* 410* 448
+incr_sw_set                     000011 internal static bit(1)                   initial unaligned dcl 96 set ref 407 411*
+index                                                  builtin function         dcl 179 ref 260
+inf_acct                113            based           fixed bin(17,0)          level 2 in structure "h" dcl 6-7 in procedure
+                                                                                  "backup_dump_recurse" set ref 349* 354*
+inf_acct                  5            based           fixed bin(17,0)          level 2 in structure "bk_dq_info" dcl 3-15
+                                                                                  in procedure "backup_dump_recurse" set ref 362*
+infoptr                         000532 automatic       pointer                  dcl 156 set ref 326* 328* 333 337 337 337 340 340
+                                                                                  340
+initialize                      000012 internal static bit(1)                   initial unaligned dcl 101 set ref 188 217*
+ioa_$rsnnl                      000132 constant        entry                    external dcl 122 ref 388 882
+ix                              000132 automatic       pointer                  dcl 73 in procedure "backup_dump_recurse" set ref
+                                                                                  417* 418 421 433 448 451 460 465 466 467 469 477
+                                                                                  481 482 483 484 505 506 511 515 525 576 586 601
+                                                                                  606 669 669 681 787 815 815 828 828
+ix                              000104 automatic       pointer                  dcl 847 in procedure "dir_scan" set ref 865* 866 866
+                                                                                  870 873
+ix                       22            based           bit(18)                  array level 2 in structure "br" packed unaligned
+                                                                                  dcl 4-6 in procedure "backup_dump_recurse" set ref
+                                                                                  417 865 1033* 1062*
+j                               000101 automatic       fixed bin(17,0)          initial dcl 847 in procedure "dir_scan" set ref 847*
+                                                                                  868* 868 869 880
+j                               000101 automatic       fixed bin(17,0)          dcl 73 in procedure "backup_dump_recurse" set ref
+                                                                                  421* 422* 687* 689*
+j                               001237 automatic       fixed bin(17,0)          dcl 1016 in procedure "sort_small" set ref 1047*
+                                                                                  1049 1053
+jx                              000134 automatic       pointer                  dcl 73 in procedure "backup_dump_recurse" set ref
+                                                                                  689* 690 690 690 690
+jx                              000106 automatic       pointer                  dcl 847 in procedure "dir_scan" set ref 869* 871 873
+                                                                                  881* 882 888 896 896
+k                               001240 automatic       fixed bin(17,0)          dcl 1016 set ref 1044* 1045 1047 1052 1053* 1054
+                                                                                  1055
+kst_attributes                         based           structure                level 1 dcl 2-5
+ksta                            000023 internal static structure                level 1 dcl 101 set ref 210* 626 626
+lc                      103            based           fixed bin(17,0)          level 2 in structure "h" dcl 6-7 in procedure
+                                                                                  "backup_dump_recurse" set ref 282* 403*
+lc                              000112 automatic       fixed bin(17,0)          dcl 73 in procedure "backup_dump_recurse" set ref
+                                                                                  237* 281 282
+length                                                 builtin function         dcl 179 ref 532 536 973 974 1003 1003
+list_area               200            based           fixed bin(17,0)          array level 2 dcl 6-7 set ref 191 193 237* 976 976
+list_areap                      000016 internal static pointer                  dcl 101 set ref 193* 195* 230* 308* 328* 358*
+local_code                      000100 automatic       fixed bin(35,0)          dcl 914 set ref 927* 929
+lp                              000122 automatic       pointer                  dcl 73 in procedure "backup_dump_recurse" set ref
+                                                                                  237* 281
+lp                      102            based           bit(18)                  level 2 in structure "h" dcl 6-7 in procedure
+                                                                                  "backup_dump_recurse" set ref 281* 402*
+ltrp                      2            based           fixed bin(71,0)          level 2 dcl 3-15 set ref 362*
+lvid                     21            based           bit(36)                  level 2 in structure "bk_nss_info" dcl 3-7
+                                                                                  in procedure "backup_dump_recurse" set ref 311*
+                                                                                  560*
+lvid                     30     000534 automatic       bit(36)                  level 2 in structure "bks" dcl 166 in procedure
+                                                                                  "backup_dump_recurse" set ref 311 560
+lvname                    1            based           char(32)                 level 2 dcl 3-7 set ref 313* 562*
+max                                                    builtin function         dcl 180 ref 494
+max_length              120            based           fixed bin(18,0)          level 2 dcl 6-7 set ref 576* 630
+max_length_header_area          000027 internal static fixed bin(19,0)          dcl 117 set ref 200* 520 979
+max_length_list_area            000026 internal static fixed bin(19,0)          dcl 117 set ref 195* 230 982
+mdc_$find_volname               000054 constant        entry                    external dcl 122 ref 313 562
+min                                                    builtin function         dcl 180 ref 486 511 630
+ml                       15(27)        based           bit(9)                   array level 2 packed unaligned dcl 4-6 set ref 469*
+                                                                                  576
+mover                                  based           fixed bin(17,0)          array dcl 106 set ref 525* 525 529* 529
+multiple_class          121(04)        based           bit(1)                   level 3 in structure "h" packed unaligned dcl 6-7
+                                                                                  in procedure "backup_dump_recurse" set ref 582*
+multiple_class            4(04) 000534 automatic       bit(1)                   level 3 in structure "bks" packed unaligned dcl 166
+                                                                                  in procedure "backup_dump_recurse" set ref 300*
+                                                                                  582
+mxl                             000112 automatic       fixed bin(19,0)          dcl 455 set ref 468* 469
+n                               001241 automatic       fixed bin(17,0)          dcl 1016 in procedure "sort_small" set ref 1036*
+                                                                                  1037 1037*
+n                               001212 automatic       fixed bin(18,0)          dcl 960 in procedure "output" set ref 978* 979* 982*
+                                                                                  983*
+name                                   based           structure                array level 1 dcl 4-25 set ref 526 689
+name_len                        000115 automatic       fixed bin(17,0)          dcl 73 set ref 388* 389*
+name_line                       000266 automatic       char(200)                unaligned dcl 73 set ref 388* 389 389
+namerp                   21(18)        based           bit(18)                  array level 2 packed unaligned dcl 4-6 set ref 418
+                                                                                  460 528* 870 1046 1050
+ndc_directory_list                     constant        fixed bin(17,0)          initial dcl 7-22 ref 208
+nnames                          000574 automatic       fixed bin(17,0)          dcl 4-23 in procedure "backup_dump_recurse" set ref
+                                                                                  515* 526 687
+nnames                   22(19)        based           bit(17)                  array level 2 in structure "br" packed unaligned
+                                                                                  dcl 4-6 in procedure "backup_dump_recurse" set ref
+                                                                                  421 515
+np                              000116 automatic       pointer                  dcl 73 in procedure "backup_dump_recurse" set ref
+                                                                                  418* 422 429 438 460* 462 468 472 526 526 529 536
+                                                                                  537 609 649 684 689 738
+np                              000110 automatic       pointer                  dcl 847 in procedure "dir_scan" set ref 870* 871
+nss_info_relp           126            based           bit(18)                  level 2 dcl 6-7 set ref 288* 309* 540* 558*
+nssp                            000136 automatic       pointer                  dcl 73 set ref 308* 309 310 311 312 313 313 557* 558
+                                                                                  559 560 561 562 562 563
+null                                                   builtin function         dcl 180 ref 189 373 373 462 462 586 586 589 589 610
+                                                                                  610 978
+object_access_class             001112 automatic       bit(72)                  dcl 729 set ref 740* 747* 755* 757* 767* 775* 777*
+                                                                                  787* 795* 797* 821*
+object_access_class_text        001002 automatic       char(256)                unaligned dcl 727 set ref 755* 758* 760 760* 775*
+                                                                                  778* 780 780* 795* 798* 800 800* 828 828*
+old_alloc_                      000050 constant        entry                    external dcl 122 ref 308 358 522 527 557 976
+old_area_                       000052 constant        entry                    external dcl 122 ref 230 520
+other_access_class_text         000702 automatic       char(256)                unaligned dcl 727 set ref 749* 753* 760 760* 769*
+                                                                                  773* 780 780* 789* 793* 800 800* 822* 826*
+p                               001210 automatic       pointer                  dcl 959 set ref 976* 978 978
+pathname_                       000114 constant        entry                    external dcl 122 ref 273 742 742 760 760 780 780 800
+                                                                                  800 810 810 815 815 828 828 887
+phcs_$deactivate                000116 constant        entry                    external dcl 122 ref 659
+pointer                                                builtin function         dcl 180 ref 417 418 865 870
+ptr                                                    builtin function         dcl 180 ref 460 1046 1050
+pvid                     31     000534 automatic       bit(36)                  level 2 in structure "bks" dcl 166 in procedure
+                                                                                  "backup_dump_recurse" set ref 312 313* 561 562*
+pvid                     22            based           bit(36)                  level 2 in structure "bk_nss_info" dcl 3-7
+                                                                                  in procedure "backup_dump_recurse" set ref 312*
+                                                                                  561*
+pvname                   11            based           char(32)                 level 2 dcl 3-7 set ref 313* 562* 563
+pxk                             001232 automatic       pointer                  dcl 1016 set ref 1046* 1050
+quota                     1            based           fixed bin(17,0)          level 2 in structure "bk_dq_info" dcl 3-15
+                                                                                  in procedure "backup_dump_recurse" set ref 362*
+quota                   110            based           fixed bin(17,0)          level 2 in structure "h" dcl 6-7 in procedure
+                                                                                  "backup_dump_recurse" set ref 349* 354* 579
+rb2                      20(06)        based           bit(6)                   array level 2 packed unaligned dcl 4-6 set ref 448
+record_type              65            based           fixed bin(17,0)          level 2 dcl 6-7 set ref 208* 508* 510* 685
+rel                                                    builtin function         dcl 180 ref 190 190 278 281 309 337 340 359 523 526
+                                                                                  526 528 558 599 978 1033 1062
+restore_dlen                    000530 automatic       fixed bin(17,0)          dcl 94 set ref 967* 988
+restore_dn                      000426 automatic       char(168)                unaligned dcl 92 set ref 968* 989
+restore_elen                    000531 automatic       fixed bin(17,0)          dcl 94 set ref 969* 990
+restore_en                      000510 automatic       char(32)                 unaligned dcl 93 set ref 970* 991
+retry_count                     000103 automatic       fixed bin(17,0)          dcl 73 set ref 220* 243 245* 245
+ring                            000155 automatic       fixed bin(3,0)           dcl 73 set ref 336* 337 337 337 340 340 340*
+rtrim                                                  builtin function         dcl 180 ref 532 536 973 974 1003 1003
+save                            000164 automatic       structure                array level 1 dcl 857 set ref 869 881
+save1                                  based           structure                level 1 dcl 861
+save_dlen                       000102 automatic       fixed bin(17,0)          dcl 847 set ref 877* 882 898
+save_dname                      000112 automatic       char(168)                dcl 847 set ref 878* 882* 896* 900
+sec_dir                                constant        fixed bin(17,0)          initial dcl 7-26 ref 508
+sec_seg                                constant        fixed bin(17,0)          initial dcl 7-24 ref 510
+seg_count                              parameter       fixed bin(17,0)          dcl 960 set ref 957 983*
+seg_pointer                            parameter       pointer                  dcl 959 set ref 957 983*
+set                             000023 internal static structure                level 2 packed unaligned dcl 101
+sia_count                10            based           fixed bin(17,0)          array level 2 dcl 158 set ref 337
+sia_relp                               based           bit(18)                  array level 2 dcl 158 set ref 337* 337
+size                                                   builtin function         dcl 182 in procedure "backup_dump_recurse" ref 307
+                                                                                  357 556
+size                                   based           bit(17)                  array level 2 in structure "name" dcl 4-25
+                                                                                  in procedure "backup_dump_recurse" set ref 690 690
+sort_branches                   000150 constant        entry                    external dcl 178 ref 396
+status_for_backup                      based           structure                level 1 dcl 1-11
+status_for_backup_version_2            constant        fixed bin(17,0)          initial dcl 1-33 ref 292 544
+status_version          125            based           fixed bin(17,0)          level 2 dcl 6-7 set ref 321* 570*
+string                    1            based           char(32)                 array level 2 dcl 4-25 set ref 422 429 438 462* 468
+                                                                                  472* 536 537 609 649 684 690 690 738 871 1050 1050
+substr                                                 builtin function         dcl 180 ref 260 263 268
+sv_label                        000350 automatic       label variable           dcl 73 set ref 228* 713
+switches                121            based           structure                level 2 in structure "h" packed unaligned dcl 6-7
+                                                                                  in procedure "backup_dump_recurse" set ref 319*
+                                                                                  577*
+switches                  4     000534 automatic       structure                level 2 in structure "bks" packed unaligned dcl 166
+                                                                                  in procedure "backup_dump_recurse" set ref 319 577
+sys_info$page_size              000046 external static fixed bin(17,0)          dcl 117 ref 469 511 511 576 630
+sys_info$seg_size_256K          000044 external static fixed bin(19,0)          dcl 117 ref 511
+temp_en                         000520 automatic       char(32)                 unaligned dcl 93 set ref 682* 684* 685
+term_acct               114            based           fixed bin(1,0)           level 2 in structure "h" dcl 6-7 in procedure
+                                                                                  "backup_dump_recurse" set ref 349* 354*
+term_acct                 6            based           fixed bin(1,0)           level 2 in structure "bk_dq_info" dcl 3-15
+                                                                                  in procedure "backup_dump_recurse" set ref 362*
+the_dirname                     000620 automatic       char(168)                unaligned dcl 724 set ref 734* 740 742* 742* 760*
+                                                                                  760* 780* 780* 800* 800* 808* 810* 810* 815* 815*
+                                                                                  828* 828*
+the_ename                       000672 automatic       char(32)                 unaligned dcl 725 set ref 736* 738* 740 742* 742*
+                                                                                  760* 760* 780* 780* 800* 800* 808* 810* 810* 815*
+                                                                                  815* 828* 828*
+tlu                     112            based           fixed bin(35,0)          level 2 in structure "h" dcl 6-7 in procedure
+                                                                                  "backup_dump_recurse" set ref 349* 354*
+tlu                       4            based           bit(36)                  level 2 in structure "bk_dq_info" dcl 3-15
+                                                                                  in procedure "backup_dump_recurse" set ref 362*
+tms                       0(01) 000023 internal static bit(1)                   level 3 in structure "ksta" packed unaligned dcl 101
+                                                                                  in procedure "backup_dump_recurse" set ref 211*
+tms                       1(10) 000023 internal static bit(1)                   level 3 in structure "ksta" packed unaligned dcl 101
+                                                                                  in procedure "backup_dump_recurse" set ref 211*
+tpd                       0(03) 000023 internal static bit(1)                   level 3 in structure "ksta" packed unaligned dcl 101
+                                                                                  in procedure "backup_dump_recurse" set ref 213*
+tpd                       1(12) 000023 internal static bit(1)                   level 3 in structure "ksta" packed unaligned dcl 101
+                                                                                  in procedure "backup_dump_recurse" set ref 213*
+trp                     111            based           fixed bin(35,0)          level 2 dcl 6-7 set ref 349* 354*
+tus                       1(11) 000023 internal static bit(1)                   level 3 in structure "ksta" packed unaligned dcl 101
+                                                                                  in procedure "backup_dump_recurse" set ref 212*
+tus                       0(02) 000023 internal static bit(1)                   level 3 in structure "ksta" packed unaligned dcl 101
+                                                                                  in procedure "backup_dump_recurse" set ref 212*
+unspec                                                 builtin function         dcl 180 set ref 210* 291* 333* 543* 551*
+used                            000102 automatic       fixed bin(17,0)          dcl 73 set ref 349* 362*
+user_mode                       001116 automatic       fixed bin(5,0)           dcl 731 set ref 808* 814
+value                     1(09) 000023 internal static structure                level 2 packed unaligned dcl 101
+version                                based           fixed bin(17,0)          level 2 in structure "bk_nss_info" dcl 3-7
+                                                                                  in procedure "backup_dump_recurse" set ref 310*
+                                                                                  559*
+version                                based           fixed bin(17,0)          level 2 in structure "bk_dq_info" dcl 3-15
+                                                                                  in procedure "backup_dump_recurse" set ref 360*
+version                         000534 automatic       fixed bin(17,0)          level 2 in structure "bks" dcl 166 in procedure
+                                                                                  "backup_dump_recurse" set ref 292* 321 544* 570
+vtoc_error                             based           bit(1)                   array level 2 packed unaligned dcl 4-6 set ref 451
+x                               001244 automatic       fixed bin(17,0)          array dcl 1016 set ref 1037* 1045 1049 1052* 1055*
+                                                                                  1061
+xj                              001242 automatic       fixed bin(17,0)          dcl 1016 set ref 1049* 1050 1052
+xk                              001243 automatic       fixed bin(17,0)          dcl 1016 set ref 1045* 1046 1055 1061* 1062
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+A_ACCESS                               internal static bit(3)                   initial unaligned dcl 10-11
+A_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 10-36
+DIR_ACCESS_MODE_NAMES                  internal static char(4)                  initial array unaligned dcl 10-33
+E_ACCESS                               internal static bit(3)                   initial unaligned dcl 10-11
+E_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 10-36
+M_ACCESS                               internal static bit(3)                   initial unaligned dcl 10-11
+M_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 10-36
+N_ACCESS                               internal static bit(3)                   initial unaligned dcl 10-11
+N_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 10-36
+REW_ACCESS                             internal static bit(3)                   initial unaligned dcl 10-11
+REW_ACCESS_BIN                         internal static fixed bin(5,0)           initial dcl 10-36
+RE_ACCESS                              internal static bit(3)                   initial unaligned dcl 10-11
+RE_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 10-36
+RW_ACCESS                              internal static bit(3)                   initial unaligned dcl 10-11
+RW_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 10-36
+R_ACCESS                               internal static bit(3)                   initial unaligned dcl 10-11
+SA_ACCESS                              internal static bit(3)                   initial unaligned dcl 10-11
+SA_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 10-36
+SEG_ACCESS_MODE_NAMES                  internal static char(4)                  initial array unaligned dcl 10-30
+SMA_ACCESS                             internal static bit(3)                   initial unaligned dcl 10-11
+SMA_ACCESS_BIN                         internal static fixed bin(5,0)           initial dcl 10-36
+SM_ACCESS                              internal static bit(3)                   initial unaligned dcl 10-11
+SM_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 10-36
+S_ACCESS                               internal static bit(3)                   initial unaligned dcl 10-11
+S_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 10-36
+W_ACCESS                               internal static bit(3)                   initial unaligned dcl 10-11
+W_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 10-36
+bk_ss_$allow_dir_overwrite             external static bit(1)                   dcl 8-17
+bk_ss_$brief_mapsw                     external static bit(1)                   dcl 8-17
+bk_ss_$caller_handles_conditions       external static bit(1)                   dcl 8-17
+bk_ss_$control_name                    external static char(168)                unaligned dcl 8-17
+bk_ss_$control_ptr                     external static pointer                  dcl 8-17
+bk_ss_$cross_retrievesw                external static bit(1)                   dcl 8-17
+bk_ss_$data_iocb                       external static pointer                  dcl 8-17
+bk_ss_$dir_trim                        external static bit(1)                   dcl 8-17
+bk_ss_$dprint_destination              external static char(24)                 unaligned dcl 8-17
+bk_ss_$dprint_destination_setsw        external static bit(1)                   dcl 8-17
+bk_ss_$dprint_heading                  external static char(64)                 unaligned dcl 8-17
+bk_ss_$dprint_heading_setsw            external static bit(1)                   dcl 8-17
+bk_ss_$dprint_queue                    external static fixed bin(17,0)          dcl 8-17
+bk_ss_$dprint_request_type             external static char(24)                 unaligned dcl 8-17
+bk_ss_$dprint_request_type_setsw       external static bit(1)                   dcl 8-17
+bk_ss_$dprintsw                        external static bit(1)                   dcl 8-17
+bk_ss_$enforce_minimum_ring            external static bit(1)                   dcl 8-17
+bk_ss_$err_onlinesw                    external static bit(1)                   dcl 8-17
+bk_ss_$holdsw                          external static bit(1)                   dcl 8-17
+bk_ss_$ignore_dates                    external static bit(1)                   dcl 8-17
+bk_ss_$minimum_ring                    external static fixed bin(17,0)          dcl 8-17
+bk_ss_$no_contin                       external static bit(1)                   dcl 8-17
+bk_ss_$no_reload                       external static bit(1)                   dcl 8-17
+bk_ss_$no_setlvid                      external static bit(1)                   dcl 8-17
+bk_ss_$ntapes                          external static fixed bin(17,0)          dcl 8-17
+bk_ss_$operator                        external static char(32)                 unaligned dcl 8-17
+bk_ss_$path_index                      external static fixed bin(17,0)          dcl 8-17
+bk_ss_$pathsw                          external static bit(1)                   dcl 8-17
+bk_ss_$preattached                     external static bit(1)                   dcl 8-17
+bk_ss_$qchecksw                        external static bit(1)                   dcl 8-17
+bk_ss_$quotasw                         external static bit(1)                   dcl 8-17
+bk_ss_$restore_access_class            external static bit(1)                   dcl 8-17
+bk_ss_$retrieval_index                 external static fixed bin(17,0)          dcl 8-17
+bk_ss_$retrievesw                      external static bit(1)                   dcl 8-17
+bk_ss_$rname                           external static char(168)                unaligned dcl 8-17
+bk_ss_$rsize                           external static fixed bin(17,0)          dcl 8-17
+bk_ss_$save_path                       external static char(168)                unaligned dcl 8-17
+bk_ss_$save_plen                       external static fixed bin(17,0)          dcl 8-17
+bk_ss_$save_time                       external static fixed bin(52,0)          dcl 8-17
+bk_ss_$source_attributes_ptr           external static pointer                  dcl 8-17
+bk_ss_$sp                              external static pointer                  dcl 8-17
+bk_ss_$sub_entry                       external static bit(1)                   dcl 8-17
+bk_ss_$sub_entry_errfile               external static bit(1)                   dcl 8-17
+bk_ss_$target_attributes_ptr           external static pointer                  dcl 8-17
+bk_ss_$translate_access_class          external static bit(1)                   dcl 8-17
+bk_ss_$trimsw                          external static bit(1)                   dcl 8-17
+bk_ss_$volume_set_name                 external static char(32)                 unaligned dcl 8-17
+bk_ss_$wakeup_interval                 external static fixed bin(52,0)          dcl 8-17
+bk_ss_$writing_map                     external static bit(1)                   dcl 8-17
+directory_type                         internal static bit(2)                   initial dcl 9-1
+kstap                                  automatic       pointer                  dcl 2-3
+link_type                              internal static bit(2)                   initial dcl 9-1
+lk                                     based           structure                array level 1 dcl 4-29
+msf_type                               internal static bit(2)                   initial dcl 9-1
+ndc_directory                          internal static fixed bin(17,0)          initial dcl 7-20
+ndc_segment                            internal static fixed bin(17,0)          initial dcl 7-18
+old_path                               based           structure                level 1 dcl 4-42
+path                                   based           structure                level 1 dcl 4-37
+pp                                     automatic       pointer                  dcl 73
+segment_type                           internal static bit(2)                   initial dcl 9-1
+times                                  automatic       structure                level 1 unaligned dcl 5-4
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+SET_DTD                         006717 constant        label                    dcl 925 set ref 916
+backup_dump_recurse             000513 constant        entry                    external dcl 57 ref 891
+compare                         003031 constant        label                    dcl 494 ref 490
+dir_scan                        006330 constant        entry                    internal dcl 844 ref 710
+directory_line                  007201 constant        entry                    internal dcl 997 ref 389 391 678
+do_it                           002303 constant        label                    dcl 396 ref 255 257
+down                            007302 constant        label                    dcl 1041 ref 1058
+dump_me                         002475 constant        label                    dcl 448 ref 424
+dump_rtn                        004570 constant        label                    dcl 713 ref 229 241 250
+ok                              007362 constant        label                    dcl 1055 ref 1050
+output                          007005 constant        entry                    internal dcl 957 ref 373 610 651
+perform_access_checks           004706 constant        entry                    internal dcl 721 ref 501
+retry_dump                      000740 constant        label                    dcl 221 ref 246
+scan_rtn                        006640 constant        label                    dcl 898 ref 894
+set_directory_dtd               004603 constant        entry                    external dcl 938
+set_dtd                         006652 constant        entry                    internal dcl 906 ref 673 896 949
+skip_branch                     004502 constant        label                    dcl 696 ref 401 427 429 433 448 474 479 494 563 595
+                                                                                  623 744 764 784 804 812 818 832
+sort_small                      007252 constant        entry                    internal dcl 1012 ref 399
+terminate_branch                004475 constant        label                    dcl 692 ref 654 688
+terminate_dump                  001116 constant        label                    dcl 243 ref 198 203 304 332 374 611 621 653 692 708
+up                              007332 constant        label                    dcl 1047 ref 1054
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0     10562       11046    7442       10572
+Length     11772    7442       264         707    1120          20
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+backup_dump_recurse                1023 external procedure  is an external procedure.  
+begin block on line 451             174 begin block         enables or reverts conditions.  
+on unit on line 458                  64 on unit               
+perform_access_checks                   internal procedure  shares stack frame of external procedure backup_dump_recurse.  
+dir_scan                            152 internal procedure  uses auto adjustable storage.  
+set_dtd                             104 internal procedure  is called by several nonquick procedures.  
+begin block on line 944                 begin block         shares stack frame of external procedure backup_dump_recurse.  
+output                                  internal procedure  shares stack frame of external procedure backup_dump_recurse.  
+directory_line                          internal procedure  shares stack frame of external procedure backup_dump_recurse.  
+sort_small                              internal procedure  shares stack frame of external procedure backup_dump_recurse.  
+
+STORAGE FOR INTERNAL STATIC VARIABLES.
+
+   LOC IDENTIFIER                  BLOCK NAME
+000010 incr_sw                     backup_dump_recurse
+000011 incr_sw_set                 backup_dump_recurse
+000012 initialize                  backup_dump_recurse
+000014 header_areap                backup_dump_recurse
+000016 list_areap                  backup_dump_recurse
+000020 hdp                         backup_dump_recurse
+000022 br_size                     backup_dump_recurse
+000023 ksta                        backup_dump_recurse
+000026 max_length_list_area        backup_dump_recurse
+000027 max_length_header_area      backup_dump_recurse
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+backup_dump_recurse      000100 i                           backup_dump_recurse
+                         000101 j                           backup_dump_recurse
+                         000102 used                        backup_dump_recurse
+                         000103 retry_count                 backup_dump_recurse
+                         000104 code                        backup_dump_recurse
+                         000105 ignore                      backup_dump_recurse
+                         000106 found                       backup_dump_recurse
+                         000107 havent_output_dirname       backup_dump_recurse
+                         000110 found_object                backup_dump_recurse
+                         000111 bc                          backup_dump_recurse
+                         000112 lc                          backup_dump_recurse
+                         000113 dircount                    backup_dump_recurse
+                         000114 curl                        backup_dump_recurse
+                         000115 name_len                    backup_dump_recurse
+                         000116 np                          backup_dump_recurse
+                         000120 bp                          backup_dump_recurse
+                         000122 lp                          backup_dump_recurse
+                         000124 hnp                         backup_dump_recurse
+                         000126 hbp                         backup_dump_recurse
+                         000130 aclp                        backup_dump_recurse
+                         000132 ix                          backup_dump_recurse
+                         000134 jx                          backup_dump_recurse
+                         000136 nssp                        backup_dump_recurse
+                         000140 dqip                        backup_dump_recurse
+                         000142 dtd                         backup_dump_recurse
+                         000144 dtu                         backup_dump_recurse
+                         000146 dtem                        backup_dump_recurse
+                         000150 dtsm                        backup_dump_recurse
+                         000152 cutoff_time                 backup_dump_recurse
+                         000154 blocks                      backup_dump_recurse
+                         000155 ring                        backup_dump_recurse
+                         000156 ac_stg                      backup_dump_recurse
+                         000256 ac_stg_octal                backup_dump_recurse
+                         000266 name_line                   backup_dump_recurse
+                         000350 sv_label                    backup_dump_recurse
+                         000354 cross_dump_dn               backup_dump_recurse
+                         000426 restore_dn                  backup_dump_recurse
+                         000500 cross_dump_en               backup_dump_recurse
+                         000510 restore_en                  backup_dump_recurse
+                         000520 temp_en                     backup_dump_recurse
+                         000530 restore_dlen                backup_dump_recurse
+                         000531 restore_elen                backup_dump_recurse
+                         000532 infoptr                     backup_dump_recurse
+                         000534 bks                         backup_dump_recurse
+                         000574 nnames                      backup_dump_recurse
+                         000575 branch_status               backup_dump_recurse
+                         000620 the_dirname                 perform_access_checks
+                         000672 the_ename                   perform_access_checks
+                         000702 other_access_class_text     perform_access_checks
+                         001002 object_access_class_text    perform_access_checks
+                         001102 access_class_octal          perform_access_checks
+                         001112 object_access_class         perform_access_checks
+                         001114 code                        perform_access_checks
+                         001115 aim_code                    perform_access_checks
+                         001116 user_mode                   perform_access_checks
+                         001117 dirname                     begin block on line 944
+                         001171 ename                       begin block on line 944
+                         001210 p                           output
+                         001212 n                           output
+                         001230 ap                          sort_small
+                         001232 pxk                         sort_small
+                         001234 count                       sort_small
+                         001235 d                           sort_small
+                         001236 i                           sort_small
+                         001237 j                           sort_small
+                         001240 k                           sort_small
+                         001241 n                           sort_small
+                         001242 xj                          sort_small
+                         001243 xk                          sort_small
+                         001244 x                           sort_small
+begin block on line 451  000100 brst                        begin block on line 451
+                         000112 mxl                         begin block on line 451
+dir_scan                 000100 i                           dir_scan
+                         000101 j                           dir_scan
+                         000102 save_dlen                   dir_scan
+                         000103 code                        dir_scan
+                         000104 ix                          dir_scan
+                         000106 jx                          dir_scan
+                         000110 np                          dir_scan
+                         000112 save_dname                  dir_scan
+                         000164 save                        dir_scan
+set_dtd                  000100 local_code                  set_dtd
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+r_e_as              r_ne_as             alloc_char_temp     enter_begin_block   leave_begin_block   call_ext_in
+call_ext_out_desc   call_ext_out        call_int_this_desc  call_int_this       call_int_other_desc return_mac
+tra_ext_1           alloc_auto_adj      mpfx2               enable_op           shorten_stack       ext_entry
+ext_entry_desc      int_entry           int_entry_desc      clock_mac
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+aim_check_$greater_or_equal   backup_map_$detail_line2      backup_map_$directory_line    backup_map_$error_line
+backup_map_$fs_error_line     backup_map_$name_line         bk_output$wr_tape             convert_aim_attributes_
+convert_authorization_$to_string_short                      expand_pathname_              hcs_$dir_quota_read
+hcs_$get_access_class         hcs_$get_max_length           hcs_$get_max_length_seg       hcs_$get_user_effmode
+hcs_$initiate                 hcs_$list_acl                 hcs_$list_dir                 hcs_$list_dir_acl
+hcs_$list_inacl_all           hcs_$quota_get                hcs_$status_for_backup        hcs_$status_long
+hcs_$terminate_noname         hphcs_$set_backup_dump_time   hphcs_$set_kst_attributes     ioa_$rsnnl
+mdc_$find_volname             old_alloc_                    old_area_                     pathname_
+phcs_$deactivate              sort_branches
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+bk_ss_$areap                  bk_ss_$check_effective_access bk_ss_$date                   bk_ss_$datesw
+bk_ss_$debugsw                bk_ss_$dont_dump_upgraded_dirs                              bk_ss_$dtdsw
+bk_ss_$ename                  bk_ss_$enforce_max_access_class
+bk_ss_$enforce_min_access_class                             bk_ss_$err_label              bk_ss_$error
+bk_ss_$hp                     bk_ss_$mapsw                  bk_ss_$maximum_access_class
+bk_ss_$maximum_dir_access_class                             bk_ss_$minimum_access_class   bk_ss_$myname
+bk_ss_$namesw                 bk_ss_$no_output              bk_ss_$no_primary             bk_ss_$onlysw
+bk_ss_$pvname                 bk_ss_$pvsw                   bk_ss_$restart_dumpsw         bk_ss_$restart_path
+bk_ss_$restart_plen           bk_ss_$rlen                   bk_ss_$segptr                 bk_ss_$set_dtd
+bk_ss_$set_dtd_explicit       bk_ss_$tapesw                 bk_ss_$upgrade_to_user_auth   bk_ss_$user_authorization
+bk_ss_$user_id                bk_ss_$user_ring              bk_ss_$wasnt_known            error_table_$ai_restricted
+error_table_$device_attention error_table_$moderr           error_table_$noentry          error_table_$root
+error_table_$segknown         sys_info$page_size            sys_info$seg_size_256K
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     57 000506       188 000520       189 000522       190 000524       191 000535       193 000541       195 000545
+    196 000560       197 000562       198 000617       200 000620       201 000633       202 000635       203 000671
+    205 000672       206 000677       207 000702       208 000705       210 000707       211 000712       212 000716
+    213 000722       214 000726       215 000732       216 000734       217 000736       220 000737       221 000740
+    223 000745       224 000751       225 000752       226 000754       227 000760       228 000763       229 000770
+    230 000773       232 001006       233 001013       237 001015       238 001055       239 001057       240 001061
+    241 001111       243 001116       245 001125       246 001126       248 001127       249 001133       250 001135
+    253 001136       254 001140       255 001141       257 001142       258 001144       259 001146       260 001147
+    262 001163       263 001164       265 001171       266 001173       268 001174       269 001202       273 001203
+    275 001223       276 001226       277 001232       278 001237       280 001243       281 001244       282 001250
+    283 001251       284 001252       288 001253       289 001254       291 001256       292 001261       294 001263
+    296 001311       297 001313       299 001317       300 001322       301 001324       303 001325       304 001361
+    305 001362       307 001363       308 001365       309 001377       310 001404       311 001406       312 001411
+    313 001413       316 001436       319 001446       320 001457       321 001463       326 001465       327 001467
+    328 001471       329 001521       330 001523       331 001525       332 001561       333 001566       334 001572
+    336 001573       337 001577       340 001611       343 001622       348 001624       349 001627       351 001673
+    352 001675       353 001677       354 001732       357 001742       358 001744       359 001756       360 001763
+    361 001765       362 001767       364 002034       365 002036       366 002040       367 002072       372 002076
+    373 002101       374 002120       377 002122       378 002125       379 002127       380 002155       382 002162
+    383 002166       384 002207       385 002211       386 002222       388 002225       389 002264       390 002270
+    391 002271       396 002303       399 002320       401 002322       402 002327       403 002332       404 002333
+    405 002335       407 002336       408 002340       410 002354       411 002355       416 002357       417 002367
+    418 002376       419 002403       421 002406       422 002417       423 002430       424 002432       426 002433
+    427 002435       429 002436       433 002446       437 002453       438 002454       443 002464       444 002467
+    446 002473       448 002475       451 002503       458 002511       460 002526       461 002535       462 002540
+    463 002603       464 002605       465 002610       466 002622       467 002632       468 002642       469 002677
+    471 002714       472 002716       474 002754       476 002757       477 002760       478 002767       479 002770
+    481 002771       482 002776       483 003002       484 003006       485 003010       486 003012       489 003022
+    490 003024       492 003025       493 003027       494 003031       501 003043       505 003054       506 003057
+    507 003062       508 003063       509 003070       510 003071       511 003076       515 003112       516 003115
+    520 003117       522 003133       523 003146       524 003153       525 003155       526 003163       527 003175
+    528 003210       529 003214       531 003223       532 003230       533 003245       534 003250       536 003251
+    537 003265       540 003270       541 003273       543 003275       544 003300       546 003302       547 003330
+    548 003332       549 003334       551 003370       552 003373       553 003376       554 003401       556 003402
+    557 003404       558 003416       559 003423       560 003425       561 003430       562 003432       563 003455
+    566 003466       569 003476       570 003500       573 003504       574 003505       576 003506       577 003516
+    578 003525       579 003531       581 003534       582 003537       583 003543       585 003547       586 003551
+    589 003615       591 003655       592 003657       593 003661       595 003713       596 003717       597 003722
+    598 003723       599 003724       601 003732       606 003737       607 003742       609 003752       610 003756
+    611 003775       612 003777       614 004000       615 004002       616 004045       617 004047       619 004053
+    621 004103       623 004110       625 004111       626 004112       629 004137       630 004142       649 004152
+    651 004156       653 004172       654 004174       657 004177       658 004200       659 004202       661 004215
+    663 004226       664 004230       669 004266       673 004307       675 004340       676 004343       678 004347
+    679 004360       681 004361       682 004366       684 004400       685 004404       687 004440       688 004447
+    689 004452       690 004456       691 004473       692 004475       696 004502       701 004504       703 004513
+    704 004515       705 004517       706 004521       708 004555       710 004556       713 004570       715 004576
+    938 004577       948 004616       949 004655       952 004705       721 004706       734 004707       736 004715
+    738 004726       740 004732       741 004764       742 004766       744 005036       747 005037       749 005057
+    751 005100       752 005102       753 005113       755 005116       756 005137       757 005141       758 005152
+    760 005155       764 005255       767 005256       769 005276       771 005317       772 005321       773 005332
+    775 005335       776 005356       777 005360       778 005371       780 005374       784 005474       787 005475
+    789 005521       791 005542       792 005544       793 005555       795 005560       796 005601       797 005603
+    798 005614       800 005617       804 005717       807 005720       808 005723       809 005756       810 005760
+    812 006034       814 006035       815 006051       818 006142       821 006143       822 006161       824 006202
+    825 006204       826 006215       828 006220       832 006325       836 006326       844 006327       847 006335
+    857 006336       864 006344       865 006355       866 006365       868 006376       869 006377       870 006404
+    871 006411       873 006414       876 006420       877 006422       878 006426       880 006432       881 006441
+    882 006445       884 006514       887 006532       888 006552       891 006557       892 006600       893 006602
+    894 006605       896 006606       897 006636       898 006640       900 006644       901 006650       906 006651
+    916 006672       920 006700       925 006717       927 006722       928 006746       929 006750       933 007004
+    957 007005       965 007007       966 007011       967 007016       968 007021       969 007025       970 007027
+    971 007032       972 007035       973 007040       974 007052       976 007064       978 007105       979 007115
+    982 007126       983 007130       985 007150       987 007156       988 007164       989 007167       990 007173
+    991 007175       993 007200       997 007201      1003 007203      1006 007237      1008 007251      1012 007252
+   1030 007254      1031 007257      1032 007261      1033 007263      1034 007266      1036 007267      1037 007275
+   1038 007276      1039 007300      1041 007302      1043 007307      1044 007317      1045 007321      1046 007323
+   1047 007332      1049 007335      1050 007337      1052 007353      1053 007356      1054 007360      1055 007362
+   1057 007365      1058 007367      1060 007372      1061 007401      1062 007403      1063 007416      1064 007420
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

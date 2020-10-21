@@ -1,0 +1,1295 @@
+	COMPILATION LISTING OF SEGMENT imft_tty_
+	Compiled by: Multics PL/I Compiler, Release 31a, of October 12, 1988
+	Compiled at: Honeywell Bull, Phoenix AZ, SysM
+	Compiled on: 11/14/88  1512.0 mst Mon
+	    Options: optimize map
+
+        1 /****^  ********************************************
+        2*        *                                          *
+        3*        * Copyright, (C) Honeywell Bull Inc., 1988 *
+        4*        *                                          *
+        5*        ******************************************** */
+        6 
+        7 /*
+        8*   This I/O module is for data transfer between IMFT and a communications channel being managed by tty_.
+        9*   It converts between IMFT logical records and stream data in 8-bit characters.
+       10**/
+       11 
+       12 /* Written January 1983 by Robert Coren */
+       13 /* Modified:  June 1983 by Robert Coren to requote attach options when building attach description */
+       14 
+       15 
+       16 /****^  HISTORY COMMENTS:
+       17*  1) change(87-11-15,Oke), approve(88-08-01,MCR7948), audit(88-10-11,Farley),
+       18*     install(88-10-14,MR12.2-1165):
+       19*     Add support for in_dial/out_dial drivers by adding
+       20*     imft_tty_(get_line put_chars) entries.  Also add debug code.
+       21*  2) change(88-11-10,Beattie), approve(88-08-01,PBF7948),
+       22*     audit(88-11-14,Farley), install(88-11-14,MR12.2-1214):
+       23*     Changed version check to be independent of debug_output to catch
+       24*     unexpected IO traffic from causing trouble later on.
+       25*                                                   END HISTORY COMMENTS */
+       26 
+       27 
+       28 /* format: style4,delnl,insnl,^ifthendo */
+       29 
+       30 imft_tty_:
+       31      procedure;
+       32 
+       33 	return;					/* not an entry point */
+       34 
+       35 /* attach a switch for communication between imft and tty_ */
+       36 
+       37 imft_tty_attach:
+       38      entry (P_iocb_ptr, P_attach_options, P_loud_sw, P_code);
+       39 
+       40 	iocb_ptr = P_iocb_ptr;
+       41 	loud_sw = P_loud_sw;
+       42 	code = 0;
+       43 
+       44 	iad_ptr = null ();				/* avoid freeing garbage if I/O switch already attached */
+       45 
+       46 	if iocb_ptr -> iocb.attach_descrip_ptr ^= null ()
+       47 	then do;
+       48 	     P_code = error_table_$not_detached;
+       49 	     if loud_sw
+       50 	     then call com_err_ (P_code, IMFT_TTY_, "For switch ^a.", iocb_ptr -> iocb.name);
+       51 	     return;
+       52 	end;
+       53 
+       54 	system_area_ptr = get_system_free_area_ ();
+       55 
+       56 	on condition (cleanup) call cleanup_attachment (ignore_code);
+       57 
+       58 	allocate iad in (system_area) set (iad_ptr);
+       59 	iad.terminal_iocb_ptr = null ();		/* keeps cleanup handler happy */
+       60 	iad.record_buffer_ptr = null ();
+       61 
+       62 	iad.attach_description = "";
+       63 	iad.open_description = "";
+       64 
+       65 
+       66 	do arg_index = lbound (P_attach_options, 1) to hbound (P_attach_options, 1);
+       67 	     iad.attach_description = iad.attach_description || " " || requote_string_ ((P_attach_options (arg_index)));
+       68 	end;
+       69 
+       70 	terminal_switch_name = "tty_" || "." || rtrim (iocb_ptr -> iocb.name);
+       71 	terminal_attach_desc = "tty_" || iad.attach_description;
+       72 						/* note that iad.attach_description already has leading space */
+       73 
+       74 	call iox_$attach_ioname (terminal_switch_name, iad.terminal_iocb_ptr, terminal_attach_desc, code);
+       75 	if code ^= 0
+       76 	then call abort_attachment (code, "Unable to attach channel via: ^a", terminal_attach_desc);
+       77 
+       78 	size_of_unpacked_header = divide (36 * size (imft_logical_record_header) + 7, 8, 17, 0);
+       79 
+       80 	max_record_length = 4 * size (imft_logical_record_header) + IMFT_MAX_RECORD_LENGTH;
+       81 						/* this is maximum length of real record */
+       82 	max_record_length = divide (9 * max_record_length + 7, 8, 21, 0);
+       83 						/* this is unpacked maximum length as we might have to read or write it */
+       84 
+       85 	allocate record_buffer in (system_area) set (iad.record_buffer_ptr);
+       86 						/* Mask and complete construction of the IOCB */
+       87 
+       88 	ips_mask = ""b;
+       89 
+       90 	on condition (any_other) call any_other_handler ();
+       91 
+       92 	call hcs_$set_ips_mask (MASK_OFF, ips_mask);
+       93 
+       94 	iocb_ptr -> iocb.attach_descrip_ptr = addr (iad.attach_description);
+       95 	iocb_ptr -> iocb.attach_data_ptr = iad_ptr;
+       96 	iocb_ptr -> iocb.open = imft_tty_open;
+       97 	iocb_ptr -> iocb.detach_iocb = imft_tty_detach;
+       98 
+       99 	call iox_$propagate (iocb_ptr);
+      100 
+      101 	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+      102 
+      103 RETURN_FROM_ATTACH:
+      104 	P_code = code;
+      105 	return;
+      106 
+      107 /* Open an I/O switch for file transfer */
+      108 
+      109 imft_tty_open:
+      110      entry (P_iocb_ptr, P_open_mode, P_open_sw, P_code);
+      111 
+      112 	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+      113 	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+      114 
+      115 	if iocb_ptr -> iocb.open_descrip_ptr ^= null ()
+      116 	then do;
+      117 	     P_code = error_table_$not_closed;
+      118 	     return;
+      119 	end;
+      120 
+      121 	open_mode = P_open_mode;
+      122 	input_allowed, output_allowed = "0"b;		/* we don't know about either yet */
+      123 
+      124 	if open_mode = Sequential_input
+      125 	then do;
+      126 	     tty_open_mode = Stream_input;
+      127 	     input_allowed = "1"b;
+      128 	end;
+      129 
+      130 	else if open_mode = Sequential_output
+      131 	then do;
+      132 	     tty_open_mode = Stream_output;
+      133 	     output_allowed = "1"b;
+      134 	end;
+      135 
+      136 	else if open_mode = Sequential_input_output
+      137 	then do;
+      138 	     tty_open_mode = Stream_input_output;
+      139 	     input_allowed, output_allowed = "1"b;
+      140 	end;
+      141 
+      142 	else do;
+      143 	     P_code = error_table_$bad_mode;
+      144 	     return;
+      145 	end;
+      146 
+      147 	call iox_$open (iad.terminal_iocb_ptr, tty_open_mode, "0"b, P_code);
+      148 	if P_code ^= 0
+      149 	then return;
+      150 
+      151 	call iox_$modes (iad.terminal_iocb_ptr, "force,init,rawi,rawo,^blk_xfer,^breakall,^iflow,^oflow,^no_outp,8bit",
+      152 	     old_modes, ignore_code);			/* This allows us to use 8-bit characters */
+      153 
+      154 	iad.open_description = rtrim (iox_modes (open_mode));
+      155 
+      156 	ips_mask = ""b;
+      157 
+      158 	on condition (any_other) call any_other_handler ();
+      159 
+      160 	call hcs_$set_ips_mask (MASK_OFF, ips_mask);
+      161 
+      162 	iocb_ptr -> iocb.get_line = imft_tty_get_line;
+      163 	iocb_ptr -> iocb.put_chars = imft_tty_put_chars;
+      164 
+      165 	if input_allowed
+      166 	then iocb_ptr -> iocb.read_record = imft_tty_read_record;
+      167 
+      168 	if output_allowed
+      169 	then iocb_ptr -> iocb.write_record = imft_tty_write_record;
+      170 
+      171 	iocb_ptr -> iocb.control = imft_tty_control;
+      172 	iocb_ptr -> iocb.modes = imft_tty_modes;
+      173 
+      174 	iocb_ptr -> iocb.close = imft_tty_close;
+      175 	iocb_ptr -> iocb.detach_iocb = imft_tty_detach;
+      176 
+      177 	iocb_ptr -> iocb.open_descrip_ptr = addr (iad.open_description);
+      178 						/* it's now open */
+      179 
+      180 	call iox_$propagate (iocb_ptr);
+      181 
+      182 	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+      183 
+      184 	P_code = 0;
+      185 	return;
+      186 
+      187 /* Close an I/O switch used for file transfer */
+      188 
+      189 imft_tty_close:
+      190      entry (P_iocb_ptr, P_code);
+      191 
+      192 	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+      193 	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+      194 	code = 0;
+      195 
+      196 	if iocb_ptr -> iocb.open_descrip_ptr = null ()
+      197 	then do;
+      198 	     P_code = error_table_$not_open;
+      199 	     return;
+      200 	end;
+      201 
+      202 	call iox_$close (iad.terminal_iocb_ptr, code);
+      203 	if (code = error_table_$not_open) | (code = error_table_$not_attached)
+      204 	then code = 0;
+      205 
+      206 	ips_mask = ""b;
+      207 
+      208 	on condition (any_other) call any_other_handler ();
+      209 
+      210 	call hcs_$set_ips_mask (MASK_OFF, ips_mask);
+      211 
+      212 	iocb_ptr -> iocb.open_descrip_ptr = null ();
+      213 
+      214 	iocb_ptr -> iocb.open = imft_tty_open;
+      215 	iocb_ptr -> iocb.detach_iocb = imft_tty_detach;
+      216 
+      217 	iocb_ptr -> iocb.control, iocb_ptr -> iocb.modes, iocb_ptr -> iocb.read_record, iocb_ptr -> iocb.write_record =
+      218 	     iox_$err_no_operation;
+      219 
+      220 	call iox_$propagate (iocb_ptr);
+      221 
+      222 	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+      223 
+      224 	P_code = code;
+      225 
+      226 	return;
+      227 
+      228 /* Detach an I/O switch from file transfer */
+      229 
+      230 imft_tty_detach:
+      231      entry (P_iocb_ptr, P_code);
+      232 
+      233 	iocb_ptr = P_iocb_ptr;
+      234 	code = 0;
+      235 
+      236 	if iocb_ptr -> iocb.attach_descrip_ptr = null ()
+      237 	then do;
+      238 	     P_code = error_table_$not_attached;
+      239 	     return;
+      240 	end;
+      241 
+      242 	if iocb_ptr -> iocb.open_descrip_ptr ^= null ()
+      243 	then do;
+      244 	     P_code = error_table_$not_closed;
+      245 	     return;
+      246 	end;
+      247 
+      248 	system_area_ptr = get_system_free_area_ ();
+      249 
+      250 	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+      251 
+      252 	call cleanup_attachment (code);
+      253 
+      254 	ips_mask = ""b;
+      255 
+      256 	on condition (any_other) call any_other_handler ();
+      257 
+      258 	call hcs_$set_ips_mask (MASK_OFF, ips_mask);
+      259 
+      260 	iocb_ptr -> iocb.attach_descrip_ptr = null ();	/* it's detached */
+      261 
+      262 	call iox_$propagate (iocb_ptr);
+      263 
+      264 	call hcs_$reset_ips_mask (ips_mask, ips_mask);
+      265 
+      266 	P_code = code;				/* in case trouble freeing the channel */
+      267 	return;
+      268 
+      269 /* Perform control operations on an I/O switch attached for file transfer */
+      270 
+      271 imft_tty_control:
+      272      entry (P_iocb_ptr, P_order, P_info_ptr, P_code);
+      273 
+      274 	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+      275 	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+      276 	call iox_$control (iad.terminal_iocb_ptr, P_order, P_info_ptr, P_code);
+      277 						/* just pass all orders on */
+      278 	return;
+
+
+
+
+
+
+
+
+
+
+      279 
+      280 /* Change modes: no modes are supported */
+      281 
+      282 imft_tty_modes:
+      283      entry (P_iocb_ptr, P_new_modes, P_old_modes, P_code);
+      284 
+      285 	iocb_ptr = P_iocb_ptr -> iocb.actual_iocb_ptr;
+      286 	P_old_modes = "";				/* no modes are reflected to caller */
+      287 
+      288 	if P_new_modes = ""
+      289 	then P_code = 0;
+      290 	else P_code = error_table_$bad_mode;
+      291 
+      292 	return;
+      293 
+      294 /*
+      295*   Get a character line from the basic connection.  Used for protocol setup
+      296*   in the out_dial connection.
+      297**/
+      298 
+      299 imft_tty_get_line:
+      300      entry (P_iocb_ptr, P_buffer_ptr, P_buffer_max_length, P_data_lth, P_code);
+      301 
+      302 	iocb_ptr = P_iocb_ptr;
+      303 	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+      304 	call iox_$get_line (iad.terminal_iocb_ptr, P_buffer_ptr, P_buffer_max_length, P_data_lth, P_code);
+      305 	if debug_output
+      306 	then call debug_out ("get_line", P_buffer_ptr, (P_data_lth));
+      307 	return;
+
+
+
+
+
+
+
+
+
+
+      308 
+      309 /*
+      310*   Put a character string to the basic connection.  Used for potocol setup
+      311*   in the out_dial connection, and a prompt on the in_dial connection.
+      312**/
+      313 
+      314 imft_tty_put_chars:
+      315      entry (P_iocb_ptr, P_buffer_ptr, P_data_lth, P_code);
+      316 
+      317 	iocb_ptr = P_iocb_ptr;
+      318 	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+      319 	call iox_$put_chars (iad.terminal_iocb_ptr, P_buffer_ptr, P_data_lth, P_code);
+      320 	if debug_output
+      321 	then call debug_out ("put_chars", P_buffer_ptr, (P_data_lth));
+      322 	return;
+      323 
+      324 /* given an IMFT logical record, write it in stream mode, unpacked if necessary */
+      325 
+      326 imft_tty_write_record:
+      327      entry (P_iocb_ptr, P_record_ptr, P_record_length, P_code);
+      328 
+      329 	iocb_ptr = P_iocb_ptr;
+      330 	ilr_ptr = P_record_ptr;
+      331 	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+      332 	buffer_ptr = iad.record_buffer_ptr;
+      333 
+      334 /* header first, which is always binary, and so needs to be unpacked */
+      335 
+      336 	call unpack (ilr_ptr, buffer_ptr, 4 * size (imft_logical_record_header), unpacked_bytes);
+      337 
+      338 	if imft_logical_record.version ^= IMFT_LOGICAL_RECORD_VERSION_1
+      339 	then do;
+      340 	     if debug_output
+      341 	     then do;
+      342 		call ioa_ ("Version Sent: ^a^/Version Desired: ^a", imft_logical_record.version,
+      343 		     IMFT_LOGICAL_RECORD_VERSION_1);
+      344 		call debug_out ("write_record (header)", ilr_ptr, 4 * size (imft_logical_record_header));
+      345 		call debug_out ("unpacked header", buffer_ptr, (unpacked_bytes));
+      346 	     end;
+      347 	     P_code = error_table_$unimplemented_version;
+      348 	     return;
+      349 	end;
+      350 
+      351 	call iox_$put_chars (iad.terminal_iocb_ptr, buffer_ptr, unpacked_bytes, P_code);
+      352 	if debug_output
+      353 	then call debug_out ("write_record (header)", buffer_ptr, (unpacked_bytes));
+      354 	if P_code ^= 0
+      355 	then return;
+      356 
+      357 	if imft_logical_record.length > 0
+      358 	then do;
+      359 	     if imft_logical_record.binary
+      360 	     then do;				/* have to unpack it */
+      361 		call unpack (addr (imft_logical_record.contents), buffer_ptr, imft_logical_record.length,
+      362 		     unpacked_bytes);
+      363 		call iox_$put_chars (iad.terminal_iocb_ptr, buffer_ptr, unpacked_bytes, P_code);
+      364 		if debug_output
+      365 		then call debug_out ("write_record (binary body)", buffer_ptr, (unpacked_bytes));
+      366 	     end;
+      367 
+      368 	     else do;
+      369 		call iox_$put_chars (iad.terminal_iocb_ptr, addr (imft_logical_record.contents),
+      370 		     imft_logical_record.length, P_code);
+      371 		if debug_output
+      372 		then call debug_out ("write_record (char body)", addr (imft_logical_record.contents),
+      373 			(imft_logical_record.length));
+      374 	     end;
+      375 	end;
+      376 
+      377 	return;
+      378 
+      379 /* read characters from the switch and put them into a logical record to return to the caller */
+      380 
+      381 imft_tty_read_record:
+      382      entry (P_iocb_ptr, P_record_ptr, P_max_length, P_record_length, P_code);
+      383 
+      384 	iocb_ptr = P_iocb_ptr;
+      385 	iad_ptr = iocb_ptr -> iocb.attach_data_ptr;
+      386 	ilr_ptr = P_record_ptr;
+      387 	buffer_ptr = iad.record_buffer_ptr;
+      388 
+      389 	if P_max_length < 4 * size (imft_logical_record_header)
+      390 	then do;					/* can't even hold header, this is absurd */
+      391 	     code = error_table_$smallarg;		/* long_record would give the wrong idea */
+      392 	     return;
+      393 	end;
+      394 
+      395 /* read the header first -- it always has to be packed */
+      396 
+      397 	chars_read = 0;
+      398 	do while (chars_read < size_of_unpacked_header);
+      399 	     call iox_$get_chars (iad.terminal_iocb_ptr, addcharno (buffer_ptr, chars_read),
+      400 		size_of_unpacked_header - chars_read, chars_read_this_time, P_code);
+      401 	     if P_code ^= 0
+      402 	     then return;
+      403 
+      404 	     chars_read = chars_read + chars_read_this_time;
+      405 	end;
+      406 
+      407 	if debug_output
+      408 	then call debug_out ("read_record (header)", buffer_ptr, (chars_read));
+      409 	call pack (buffer_ptr, ilr_ptr, (size_of_unpacked_header), size_of_packed_header);
+      410 
+      411 	if imft_logical_record.version ^= IMFT_LOGICAL_RECORD_VERSION_1
+      412 	then do;
+      413 	     if debug_output
+      414 	     then do;
+      415 		call ioa_ ("Version Received: ^a^/Version Desired: ^a", imft_logical_record.version,
+      416 		     IMFT_LOGICAL_RECORD_VERSION_1);
+      417 		call debug_out ("read_record (header)", buffer_ptr, (chars_read));
+      418 		call debug_out ("packed header", ilr_ptr, (chars_read / 8) * 9);
+      419 	     end;
+      420 	     P_code = error_table_$unimplemented_version;
+      421 	     return;
+      422 	end;
+      423 
+      424 	if imft_logical_record.length = 0
+      425 	then do;					/* record consists of header only */
+      426 	     P_record_length = 4 * size (imft_logical_record_header);
+      427 	     return;
+      428 	end;
+      429 
+      430 	room_left = P_max_length - size_of_packed_header;
+      431 	chars_read = 0;
+      432 
+      433 	if imft_logical_record.binary
+      434 	then do;					/* we'll have to pack the rest, too */
+      435 	     raw_chars_read = 0;
+      436 	     chars_to_read = divide (9 * imft_logical_record.length + 7, 8, 21, 0);
+      437 	     max_unpacked_chars = divide (9 * room_left + 7, 8, 21, 0);
+      438 	     actual_limit = min (chars_to_read, max_unpacked_chars);
+      439 
+      440 	     do while (raw_chars_read < actual_limit);
+      441 		call iox_$get_chars (iad.terminal_iocb_ptr, addcharno (buffer_ptr, raw_chars_read),
+      442 		     actual_limit - raw_chars_read, chars_read_this_time, P_code);
+      443 		if P_code ^= 0
+      444 		then return;
+      445 
+      446 		if raw_chars_read + chars_read_this_time > max_unpacked_chars
+      447 		then do;
+      448 		     chars_read_this_time = max_unpacked_chars - raw_chars_read;
+      449 		     P_code = error_table_$long_record;
+      450 		end;
+      451 
+      452 		raw_chars_read = raw_chars_read + chars_read_this_time;
+      453 	     end;
+      454 	     if debug_output
+      455 	     then call debug_out ("read_record (binary body)", buffer_ptr, (raw_chars_read));
+      456 	     call pack (buffer_ptr, addr (imft_logical_record.contents), raw_chars_read, chars_read);
+      457 	end;
+      458 
+      459 	else do;					/* not binary data, doesn't need packing */
+      460 	     chars_to_read = imft_logical_record.length;
+      461 
+      462 	     do while (chars_read < imft_logical_record.length & room_left > 0);
+      463 		n_chars = min (chars_to_read, room_left);
+      464 		call iox_$get_chars (iad.terminal_iocb_ptr,
+      465 		     addcharno (addr (imft_logical_record.contents), chars_read), n_chars, chars_read_this_time,
+      466 		     P_code);
+      467 		if P_code ^= 0
+      468 		then return;
+      469 
+      470 		chars_read = chars_read + chars_read_this_time;
+      471 		chars_to_read = chars_to_read - chars_read_this_time;
+      472 		room_left = room_left - chars_read_this_time;
+      473 	     end;
+      474 
+      475 	     if chars_read < imft_logical_record.length
+      476 	     then P_code = error_table_$long_record;
+      477 	end;
+      478 
+      479 	if debug_output
+      480 	then call debug_out ("read_record (char body)", addr (imft_logical_record.contents), (chars_read));
+      481 	P_record_length = 4 * size (imft_logical_record_header) + chars_read;
+      482 	return;
+      483 
+      484 /* pair of subroutines for converting between 8 bits/byte and 9 bits/byte */
+      485 
+      486 pack_unpack:
+      487      procedure;
+      488 
+      489 	return;					/* not to be called */
+      490 
+      491 dcl  packed_byte_ptr pointer parameter;
+      492 dcl  unpacked_byte_ptr pointer parameter;
+      493 dcl  P_input_length fixed bin (21) parameter;
+      494 dcl  P_output_length fixed bin (21) parameter;
+      495 
+      496 dcl  unpacked_length fixed bin;
+      497 dcl  packed_bytes (unpacked_length) bit (8) unaligned based (packed_byte_ptr);
+      498 dcl  unpacked_bytes (unpacked_length) bit (9) unaligned based (unpacked_byte_ptr);
+      499 
+      500 pack:
+      501      entry (unpacked_byte_ptr, packed_byte_ptr, P_input_length, P_output_length);
+      502 
+      503 /* input has high-order bit of every 9 off, + 8 data bits; pack it into binary */
+      504 
+      505 	unpacked_length = P_input_length;
+      506 	P_output_length = divide (8 * unpacked_length, 9, 21, 0);
+      507 	packed_bytes = substr (unpacked_bytes, 2);	/* simple as that! */
+      508 	return;
+      509 
+      510 
+      511 unpack:
+      512      entry (packed_byte_ptr, unpacked_byte_ptr, P_input_length, P_output_length);
+      513 
+      514 /* input is binary; unpack it so that high-order bit of every 9 is 0 */
+      515 
+      516 	P_output_length, unpacked_length = divide (9 * P_input_length + 7, 8, 21, 0);
+      517 	string (unpacked_bytes) = ""b;
+      518 	substr (unpacked_bytes, 2) = packed_bytes;	/* it works in this direction, too */
+      519 	return;
+      520 
+      521      end pack_unpack;
+      522 
+      523 /* Cleanup whatever portion of an attachment exists */
+      524 
+      525 cleanup_attachment:
+      526      procedure (P_code);
+      527 
+      528 dcl  P_code fixed binary (35) parameter;		/* a parameter to allow callers to ignore it */
+      529 
+      530 	P_code = 0;
+      531 
+      532 	if iad_ptr ^= null ()
+      533 	then do;					/* there is an I/O switch */
+      534 
+      535 	     if iad.terminal_iocb_ptr ^= null ()
+      536 	     then do;
+      537 		call iox_$close (iad.terminal_iocb_ptr, ignore_code);
+      538 		call iox_$detach_iocb (iad.terminal_iocb_ptr, P_code);
+      539 		call iox_$destroy_iocb (iad.terminal_iocb_ptr, ignore_code);
+      540 		iad.terminal_iocb_ptr = null ();
+      541 	     end;
+      542 
+      543 	     if iad.record_buffer_ptr ^= null ()
+      544 	     then free iad.record_buffer_ptr -> record_buffer in (system_area);
+      545 
+      546 	     free iad in (system_area);
+      547 	     iad_ptr = null ();
+      548 
+      549 	end;
+      550 
+      551 	return;
+      552 
+      553      end cleanup_attachment;
+      554 
+      555 /* Wrapper to protect against errors while IPS interrupts are masked */
+      556 
+      557 any_other_handler:
+      558      procedure () options (non_quick);
+      559 
+      560 	if ips_mask
+      561 	then call hcs_$reset_ips_mask (ips_mask, ips_mask);
+      562 	ips_mask = ""b;
+      563 
+      564 	call continue_to_signal_ (ignore_code);		/* not interested, */
+      565 
+      566 	return;
+      567 
+      568      end any_other_handler;
+      569 
+      570 
+      571 
+      572 /* Abort a call to the attach entry:  print an error message if requested */
+      573 
+      574 abort_attachment:
+      575      procedure () options (variable, non_quick);
+      576 
+      577 dcl  the_code fixed binary (35) based (the_code_ptr);
+      578 dcl  the_code_ptr pointer;
+      579 
+      580 dcl  caller_message character (256);
+      581 
+      582 	call cu_$arg_ptr (1, the_code_ptr, ignore_fb21, ignore_code);
+      583 
+      584 	if loud_sw
+      585 	then do;					/* an error message is requested */
+      586 	     call ioa_$general_rs (cu_$arg_list_ptr (), 2, 3, caller_message, ignore_fb21, "1"b, "0"b);
+      587 	     call com_err_ (the_code, IMFT_TTY_, "For switch ^a: ^a", iocb_ptr -> iocb.name, caller_message);
+      588 	end;
+      589 
+      590 	call cleanup_attachment (ignore_code);		/* get rid of anything that was accomplished */
+      591 
+      592 	if the_code = 0
+      593 	then code = error_table_$action_not_performed;
+      594 	else code = the_code;			/* save the error code */
+      595 
+      596 	go to RETURN_FROM_ATTACH;
+      597 
+      598      end abort_attachment;
+      599 
+      600 
+      601 debug_out:
+      602      proc (me, buf_ptr, buf_len);
+      603 
+      604 dcl  me char (*);
+      605 dcl  buf_ptr ptr;
+      606 dcl  buf_len fixed bin;
+      607 dcl  str char (buf_len) unaligned based (buf_ptr);
+      608 dcl  stb bit (buf_len * 9) unaligned based (buf_ptr);
+      609 
+      610 	call ioa_ ("^a(^i) ^p: ""^a""", me, buf_len, buf_ptr, str);
+      611 	call ioa_ ("^vb", buf_len * 9, stb);
+      612 
+      613      end debug_out;
+
+
+
+
+      614 
+      615 dcl  debug_output bit (1) static initial ("0"b);
+      616 
+      617 debug_list:
+      618      entry;
+      619 
+      620 	debug_output = "1"b;
+      621 	return;
+      622 
+      623 
+      624 dcl  P_buffer_max_length fixed bin (21) parameter;	/* max length of IO */
+      625 dcl  P_buffer_ptr pointer parameter;			/* -> buffer */
+      626 dcl  P_data_lth fixed bin (21) parameter;		/* length of IO */
+      627 dcl  P_iocb_ptr pointer parameter;			/* -> IOCB */
+      628 dcl  P_attach_options (*) character (*) varying parameter;	/* attach: attachment arguments */
+      629 dcl  P_loud_sw bit (1) parameter;			/* attach: ON => attachment errors should call com_err_ */
+      630 
+      631 dcl  P_open_mode fixed binary parameter;		/* open: opening mode */
+      632 dcl  P_open_sw bit (1) parameter;			/* open: obsolete parameter */
+      633 
+      634 dcl  P_record_ptr pointer parameter;			/* (read write)_record: -> record */
+      635 dcl  P_record_length fixed bin (21) parameter;		/* read_record: actual length of record read */
+      636 						/* write_record: length of record to be written */
+      637 
+      638 dcl  P_max_length fixed bin (21) parameter;		/* read_record: length of caller-supplied buffer */
+      639 dcl  P_code fixed bin (35);				/* status code */
+      640 
+      641 
+      642 dcl  P_order character (*) parameter;			/* control: name of control order to be performed */
+      643 dcl  P_info_ptr pointer parameter;			/* control: -> additional information required to execute the
+      644*						   control order */
+      645 
+      646 dcl  P_new_modes character (*) parameter;		/* modes: new modes to be set */
+      647 dcl  P_old_modes character (*) parameter;		/* modes: set to modes in effect before change */
+      648 
+      649 /* Local copies of parameters */
+      650 
+      651 dcl  iocb_ptr pointer;
+      652 dcl  code fixed binary (35);
+      653 dcl  ignore_code fixed binary (35);
+      654 dcl  ignore_fb21 fixed binary (21);
+      655 dcl  loud_sw bit (1) aligned;
+      656 dcl  open_mode fixed binary;
+      657 
+      658 /* other declarations */
+      659 
+      660 /* AUTOMATIC */
+      661 
+      662 dcl  system_area area aligned based (system_area_ptr);
+      663 dcl  system_area_ptr pointer;
+      664 
+      665 dcl  arg_index fixed binary;				/* # of attach option being processed */
+      666 
+      667 dcl  terminal_attach_desc character (512);
+      668 dcl  terminal_switch_name character (32);
+      669 dcl  iad_ptr pointer;
+      670 dcl  max_record_length fixed bin (21);
+      671 dcl  tty_open_mode fixed bin;
+      672 dcl  input_allowed bit (1);
+      673 dcl  output_allowed bit (1);
+      674 dcl  old_modes char (256);
+      675 
+      676 dcl  unpacked_bytes fixed bin (21);
+      677 dcl  chars_read fixed bin (21);
+      678 dcl  chars_read_this_time fixed bin (21);
+      679 dcl  size_of_packed_header fixed bin (21);
+      680 dcl  room_left fixed bin (21);
+      681 dcl  raw_chars_read fixed bin (21);
+      682 dcl  chars_to_read fixed bin (21);
+      683 dcl  max_unpacked_chars fixed bin (21);
+      684 dcl  n_chars fixed bin (21);
+      685 dcl  buffer_ptr pointer;
+      686 dcl  actual_limit fixed bin;
+      687 dcl  ips_mask bit (36);
+      688 
+      689 /* BASED */
+      690 
+      691 dcl  record_buffer char (max_record_length) based;
+      692 
+      693 dcl  1 iad based (iad_ptr) aligned,
+      694        2 attach_description char (1024) varying,
+      695        2 open_description char (24) varying,
+      696        2 terminal_iocb_ptr pointer,
+      697        2 record_buffer_ptr pointer;
+      698 
+      699 /* ENTRIES */
+      700 
+      701 dcl  com_err_ entry () options (variable);
+      702 dcl  continue_to_signal_ entry (fixed binary (35));
+      703 dcl  cu_$arg_list_ptr entry () returns (pointer);
+      704 dcl  cu_$arg_ptr entry (fixed binary, pointer, fixed binary (21), fixed binary (35));
+      705 dcl  get_system_free_area_ entry () returns (pointer);
+      706 dcl  hcs_$reset_ips_mask entry (bit (36), bit (36));
+      707 dcl  hcs_$set_ips_mask entry (bit (36), bit (36));
+      708 dcl  ioa_ entry () options (variable);
+      709 dcl  ioa_$general_rs entry (pointer, fixed binary, fixed binary, character (*), fixed binary (21), bit (1), bit (1));
+      710 dcl  iox_$attach_ioname entry (character (*), pointer, character (*), fixed binary (35));
+      711 dcl  iox_$control entry (pointer, character (*), pointer, fixed binary (35));
+      712 dcl  iox_$close entry (pointer, fixed binary (35));
+      713 dcl  iox_$destroy_iocb entry (pointer, fixed binary (35));
+      714 dcl  iox_$detach_iocb entry (pointer, fixed binary (35));
+      715 dcl  iox_$err_no_operation entry () options (variable);
+      716 dcl  iox_$modes entry (ptr, char (*), char (*), fixed bin (35));
+      717 dcl  iox_$open entry (pointer, fixed binary, bit (1) aligned, fixed binary (35));
+      718 dcl  iox_$propagate entry (pointer);
+      719 dcl  iox_$get_chars entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+      720 dcl  iox_$get_line entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+      721 dcl  iox_$put_chars entry (ptr, ptr, fixed bin (21), fixed bin (35));
+      722 dcl  requote_string_ entry (char (*)) returns (char (*));
+      723 
+      724 /* EXTERNAL STATIC */
+      725 
+      726 dcl  (
+      727      error_table_$action_not_performed,
+      728      error_table_$bad_mode,
+      729      error_table_$long_record,
+      730      error_table_$not_attached,
+      731      error_table_$not_closed,
+      732      error_table_$not_detached,
+      733      error_table_$not_open,
+      734      error_table_$smallarg,
+      735      error_table_$unimplemented_version
+      736      ) fixed bin (35) external static;
+      737 
+      738 /* INTERNAL STATIC */
+      739 
+      740 dcl  IMFT_TTY_ character (32) static options (constant) initial ("imft_tty_");
+      741 dcl  MASK_OFF bit (36) init ((36)"0"b) internal static options (constant);
+      742 dcl  size_of_unpacked_header fixed bin internal static;
+      743 
+      744 /* BUILTINS & CONDITIONS */
+      745 
+      746 dcl  (addcharno, addr, divide, hbound, lbound, min, null, rtrim, size, string, substr) builtin;
+      747 
+      748 dcl  (any_other, cleanup) condition;
+      749 
+  1     1 /* BEGIN INCLUDE FILE ..... iocb.incl.pl1 ..... 13 Feb 1975, M. Asherman */
+  1     2 /* Modified 11/29/82 by S. Krupp to add new entries and to change
+  1     3*      version number to IOX2. */
+  1     4 /* format: style2 */
+  1     5 
+  1     6      dcl	   1 iocb		      aligned based,	/* I/O control block. */
+  1     7 	     2 version	      character (4) aligned,	/* IOX2 */
+  1     8 	     2 name	      char (32),		/* I/O name of this block. */
+  1     9 	     2 actual_iocb_ptr    ptr,		/* IOCB ultimately SYNed to. */
+  1    10 	     2 attach_descrip_ptr ptr,		/* Ptr to printable attach description. */
+  1    11 	     2 attach_data_ptr    ptr,		/* Ptr to attach data structure. */
+  1    12 	     2 open_descrip_ptr   ptr,		/* Ptr to printable open description. */
+  1    13 	     2 open_data_ptr      ptr,		/* Ptr to open data structure (old SDB). */
+  1    14 	     2 reserved	      bit (72),		/* Reserved for future use. */
+  1    15 	     2 detach_iocb	      entry (ptr, fixed (35)),/* detach_iocb(p,s) */
+  1    16 	     2 open	      entry (ptr, fixed, bit (1) aligned, fixed (35)),
+  1    17 						/* open(p,mode,not_used,s) */
+  1    18 	     2 close	      entry (ptr, fixed (35)),/* close(p,s) */
+  1    19 	     2 get_line	      entry (ptr, ptr, fixed (21), fixed (21), fixed (35)),
+  1    20 						/* get_line(p,bufptr,buflen,actlen,s) */
+  1    21 	     2 get_chars	      entry (ptr, ptr, fixed (21), fixed (21), fixed (35)),
+  1    22 						/* get_chars(p,bufptr,buflen,actlen,s) */
+  1    23 	     2 put_chars	      entry (ptr, ptr, fixed (21), fixed (35)),
+  1    24 						/* put_chars(p,bufptr,buflen,s) */
+  1    25 	     2 modes	      entry (ptr, char (*), char (*), fixed (35)),
+  1    26 						/* modes(p,newmode,oldmode,s) */
+  1    27 	     2 position	      entry (ptr, fixed, fixed (21), fixed (35)),
+  1    28 						/* position(p,u1,u2,s) */
+  1    29 	     2 control	      entry (ptr, char (*), ptr, fixed (35)),
+  1    30 						/* control(p,order,infptr,s) */
+  1    31 	     2 read_record	      entry (ptr, ptr, fixed (21), fixed (21), fixed (35)),
+  1    32 						/* read_record(p,bufptr,buflen,actlen,s) */
+  1    33 	     2 write_record	      entry (ptr, ptr, fixed (21), fixed (35)),
+  1    34 						/* write_record(p,bufptr,buflen,s) */
+  1    35 	     2 rewrite_record     entry (ptr, ptr, fixed (21), fixed (35)),
+  1    36 						/* rewrite_record(p,bufptr,buflen,s) */
+  1    37 	     2 delete_record      entry (ptr, fixed (35)),/* delete_record(p,s) */
+  1    38 	     2 seek_key	      entry (ptr, char (256) varying, fixed (21), fixed (35)),
+  1    39 						/* seek_key(p,key,len,s) */
+  1    40 	     2 read_key	      entry (ptr, char (256) varying, fixed (21), fixed (35)),
+  1    41 						/* read_key(p,key,len,s) */
+  1    42 	     2 read_length	      entry (ptr, fixed (21), fixed (35)),
+  1    43 						/* read_length(p,len,s) */
+  1    44 	     2 open_file	      entry (ptr, fixed bin, char (*), bit (1) aligned, fixed bin (35)),
+  1    45 						/* open_file(p,mode,desc,not_used,s) */
+  1    46 	     2 close_file	      entry (ptr, char (*), fixed bin (35)),
+  1    47 						/* close_file(p,desc,s) */
+  1    48 	     2 detach	      entry (ptr, char (*), fixed bin (35));
+  1    49 						/* detach(p,desc,s) */
+  1    50 
+  1    51      declare iox_$iocb_version_sentinel
+  1    52 			      character (4) aligned external static;
+  1    53 
+  1    54 /* END INCLUDE FILE ..... iocb.incl.pl1 ..... */
+      750 
+      751 
+  2     1 /* Begin include file ..... iox_modes.incl.pl1 */
+  2     2 
+  2     3 /* Written by C. D. Tavares, 03/17/75 */
+  2     4 /* Updated 10/31/77 by CDT to include short iox mode strings */
+  2     5 
+  2     6 dcl  iox_modes (13) char (24) int static options (constant) aligned initial
+  2     7     ("stream_input", "stream_output", "stream_input_output",
+  2     8      "sequential_input", "sequential_output", "sequential_input_output", "sequential_update",
+  2     9      "keyed_sequential_input", "keyed_sequential_output", "keyed_sequential_update",
+  2    10      "direct_input", "direct_output", "direct_update");
+  2    11 
+  2    12 dcl  short_iox_modes (13) char (4) int static options (constant) aligned initial
+  2    13     ("si", "so", "sio", "sqi", "sqo", "sqio", "squ", "ksqi", "ksqo", "ksqu", "di", "do", "du");
+  2    14 
+  2    15 dcl (Stream_input initial (1),
+  2    16      Stream_output initial (2),
+  2    17      Stream_input_output initial (3),
+  2    18      Sequential_input initial (4),
+  2    19      Sequential_output initial (5),
+  2    20      Sequential_input_output initial (6),
+  2    21      Sequential_update initial (7),
+  2    22      Keyed_sequential_input initial (8),
+  2    23      Keyed_sequential_output initial (9),
+  2    24      Keyed_sequential_update initial (10),
+  2    25      Direct_input initial (11),
+  2    26      Direct_output initial (12),
+  2    27      Direct_update initial (13)) fixed bin int static options (constant);
+  2    28 
+  2    29 /* End include file ..... iox_modes.incl.pl1 */
+      752 
+      753 
+  3     1 /* BEGIN INCLUDE FILE...imft_logical_record.incl.pl1 */
+  3     2 
+  3     3 /* Defines an IMFT logical record. Such records are passed by imft_io_ to the
+  3     4*   write_record entries of imft_COMM_ I/O modules, and returned by the read_record
+  3     5*   entries of such modules. */
+  3     6 
+  3     7 /* Written January 4, 1983 by Robert Coren */
+  3     8 
+  3     9 declare ilr_ptr pointer;
+  3    10 declare imft_logical_record_length fixed bin (21);
+  3    11 
+  3    12 declare 1 imft_logical_record aligned based (ilr_ptr),
+  3    13         2 header,
+  3    14 	3 version char (8),
+  3    15 	3 type fixed bin,				/* types are defined in _imft_std_commands.incl.pl1 */
+  3    16 	3 length fixed bin (21),			/* in characters */
+  3    17 	3 flags,
+  3    18 	  4 binary bit (1) unaligned,			/* ON => record contains characters with 9th bit on */
+  3    19 	  4 eight_bit bit (1) unaligned,		/* ON => record contains characters with 8th bit on */
+  3    20 	  4 pad bit (34) unaligned,
+  3    21         2 contents character (imft_logical_record_length refer (imft_logical_record.length));
+  3    22 
+  3    23 /* NOTE: flags.binary and flags.eight_bit should never both be on in the same
+  3    24*   record. If neither is on, every character in the record fits in 7 bits.
+  3    25**/
+  3    26 
+  3    27 dcl  1 imft_logical_record_header aligned like imft_logical_record.header;
+  3    28 						/* so we can use size builtin on it */
+  3    29 
+  3    30 declare  IMFT_LOGICAL_RECORD_VERSION_1 char (8) internal static options (constant) init ("ILR_0001");
+  3    31 
+  3    32 declare IMFT_MAX_RECORD_LENGTH fixed bin (21) internal static options (constant) init (4096);
+  3    33 
+  3    34 /* END INCLUDE FILE...imft_logical_record.incl.pl1 */
+      754 
+      755      end imft_tty_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    11/14/88  1510.8  imft_tty_.pl1                     >spec>install>MR12.2-1214>imft_tty_.pl1
+750          1    05/20/83  1846.4  iocb.incl.pl1                     >ldd>include>iocb.incl.pl1
+752          2    02/02/78  1229.7  iox_modes.incl.pl1                >ldd>include>iox_modes.incl.pl1
+754          3    04/12/83  1317.6  imft_logical_record.incl.pl1      >ldd>include>imft_logical_record.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+IMFT_LOGICAL_RECORD_VERSION_1   000000 constant        char(8)                  initial packed unaligned dcl 3-30 set ref 338 342*
+                                                                                  411 415*
+IMFT_MAX_RECORD_LENGTH                 constant        fixed bin(21,0)          initial dcl 3-32 ref 80
+IMFT_TTY_                       000120 constant        char(32)                 initial packed unaligned dcl 740 set ref 49* 587*
+MASK_OFF                        000163 constant        bit(36)                  initial packed unaligned dcl 741 set ref 92* 160*
+                                                                                  210* 258*
+P_attach_options                       parameter       varying char             array dcl 628 ref 37 66 66 67
+P_buffer_max_length                    parameter       fixed bin(21,0)          dcl 624 set ref 299 304*
+P_buffer_ptr                           parameter       pointer                  dcl 625 set ref 299 304* 305* 314 319* 320*
+P_code                                 parameter       fixed bin(35,0)          dcl 528 in procedure "cleanup_attachment" set ref
+                                                                                  525 530* 538*
+P_code                                 parameter       fixed bin(35,0)          dcl 639 in procedure "imft_tty_" set ref 37 48* 49*
+                                                                                  103* 109 117* 143* 147* 148 184* 189 198* 224* 230
+                                                                                  238* 244* 266* 271 276* 282 288* 290* 299 304* 314
+                                                                                  319* 326 347* 351* 354 363* 369* 381 399* 401 420*
+                                                                                  441* 443 449* 464* 467 475*
+P_data_lth                             parameter       fixed bin(21,0)          dcl 626 set ref 299 304* 305 314 319* 320
+P_info_ptr                             parameter       pointer                  dcl 643 set ref 271 276*
+P_input_length                         parameter       fixed bin(21,0)          dcl 493 ref 500 505 511 516
+P_iocb_ptr                             parameter       pointer                  dcl 627 ref 37 40 109 112 189 192 230 233 271 274
+                                                                                  282 285 299 302 314 317 326 329 381 384
+P_loud_sw                              parameter       bit(1)                   packed unaligned dcl 629 ref 37 41
+P_max_length                           parameter       fixed bin(21,0)          dcl 638 ref 381 389 430
+P_new_modes                            parameter       char                     packed unaligned dcl 646 ref 282 288
+P_old_modes                            parameter       char                     packed unaligned dcl 647 set ref 282 286*
+P_open_mode                            parameter       fixed bin(17,0)          dcl 631 ref 109 121
+P_open_sw                              parameter       bit(1)                   packed unaligned dcl 632 ref 109
+P_order                                parameter       char                     packed unaligned dcl 642 set ref 271 276*
+P_output_length                        parameter       fixed bin(21,0)          dcl 494 set ref 500 506* 511 516*
+P_record_length                        parameter       fixed bin(21,0)          dcl 635 set ref 326 381 426* 481*
+P_record_ptr                           parameter       pointer                  dcl 634 ref 326 330 381 386
+Sequential_input                       constant        fixed bin(17,0)          initial dcl 2-15 ref 124
+Sequential_input_output                constant        fixed bin(17,0)          initial dcl 2-15 ref 136
+Sequential_output                      constant        fixed bin(17,0)          initial dcl 2-15 ref 130
+Stream_input                           constant        fixed bin(17,0)          initial dcl 2-15 ref 126
+Stream_input_output                    constant        fixed bin(17,0)          initial dcl 2-15 ref 138
+Stream_output                          constant        fixed bin(17,0)          initial dcl 2-15 ref 132
+actual_iocb_ptr          12            based           pointer                  level 2 dcl 1-6 ref 112 192 274 285
+actual_limit                    000446 automatic       fixed bin(17,0)          dcl 686 set ref 438* 440 441
+addcharno                                              builtin function         dcl 746 ref 399 399 441 441 464 464
+addr                                                   builtin function         dcl 746 ref 94 177 361 361 369 369 371 371 456 456
+                                                                                  464 464 479 479
+any_other                       000450 stack reference condition                dcl 748 ref 90 158 208 256
+arg_index                       000112 automatic       fixed bin(17,0)          dcl 665 set ref 66* 67*
+attach_data_ptr          16            based           pointer                  level 2 dcl 1-6 set ref 95* 113 193 250 275 303 318
+                                                                                  331 385
+attach_descrip_ptr       14            based           pointer                  level 2 dcl 1-6 set ref 46 94* 236 260*
+attach_description                     based           varying char(1024)       level 2 dcl 693 set ref 62* 67* 67 71 94
+binary                    4            based           bit(1)                   level 4 packed packed unaligned dcl 3-12 ref 359 433
+buf_len                                parameter       fixed bin(17,0)          dcl 606 set ref 601 610* 610 610 611 611 611
+buf_ptr                                parameter       pointer                  dcl 605 set ref 601 610* 610 611
+buffer_ptr                      000444 automatic       pointer                  dcl 685 set ref 332* 336* 345* 351* 352* 361* 363*
+                                                                                  364* 387* 399 399 407* 409* 417* 441 441 454* 456*
+caller_message                  000102 automatic       char(256)                packed unaligned dcl 580 set ref 586* 587*
+chars_read                      000433 automatic       fixed bin(21,0)          dcl 677 set ref 397* 398 399 399 399 404* 404 407
+                                                                                  417 418 431* 456* 462 464 464 470* 470 475 479 481
+chars_read_this_time            000434 automatic       fixed bin(21,0)          dcl 678 set ref 399* 404 441* 446 448* 452 464* 470
+                                                                                  471 472
+chars_to_read                   000440 automatic       fixed bin(21,0)          dcl 682 set ref 436* 438 460* 463 471* 471
+cleanup                         000456 stack reference condition                dcl 748 ref 56
+close                    36            based           entry variable           level 2 dcl 1-6 set ref 174*
+code                            000102 automatic       fixed bin(35,0)          dcl 652 set ref 42* 74* 75 75* 103 194* 202* 203 203
+                                                                                  203* 224 234* 252* 266 391* 592* 594*
+com_err_                        000012 constant        entry                    external dcl 701 ref 49 587
+contents                  5            based           char                     level 2 dcl 3-12 set ref 361 361 369 369 371 371 456
+                                                                                  456 464 464 479 479
+continue_to_signal_             000014 constant        entry                    external dcl 702 ref 564
+control                  66            based           entry variable           level 2 dcl 1-6 set ref 171* 217*
+cu_$arg_list_ptr                000016 constant        entry                    external dcl 703 ref 586 586
+cu_$arg_ptr                     000020 constant        entry                    external dcl 704 ref 582
+debug_output                    000010 internal static bit(1)                   initial packed unaligned dcl 615 set ref 305 320 340
+                                                                                  352 364 371 407 413 454 479 620*
+detach_iocb              26            based           entry variable           level 2 dcl 1-6 set ref 97* 175* 215*
+divide                                                 builtin function         dcl 746 ref 78 82 436 437 506 516
+error_table_$action_not_performed
+                                000066 external static fixed bin(35,0)          dcl 726 ref 592
+error_table_$bad_mode           000070 external static fixed bin(35,0)          dcl 726 ref 143 290
+error_table_$long_record        000072 external static fixed bin(35,0)          dcl 726 ref 449 475
+error_table_$not_attached       000074 external static fixed bin(35,0)          dcl 726 ref 203 238
+error_table_$not_closed         000076 external static fixed bin(35,0)          dcl 726 ref 117 244
+error_table_$not_detached       000100 external static fixed bin(35,0)          dcl 726 ref 48
+error_table_$not_open           000102 external static fixed bin(35,0)          dcl 726 ref 198 203
+error_table_$smallarg           000104 external static fixed bin(35,0)          dcl 726 ref 391
+error_table_$unimplemented_version
+                                000106 external static fixed bin(35,0)          dcl 726 ref 347 420
+flags                     4            based           structure                level 3 dcl 3-12
+get_line                 42            based           entry variable           level 2 dcl 1-6 set ref 162*
+get_system_free_area_           000022 constant        entry                    external dcl 705 ref 54 248
+hbound                                                 builtin function         dcl 746 ref 66
+hcs_$reset_ips_mask             000024 constant        entry                    external dcl 706 ref 101 182 222 264 560
+hcs_$set_ips_mask               000026 constant        entry                    external dcl 707 ref 92 160 210 258
+header                                 based           structure                level 2 dcl 3-12
+iad                                    based           structure                level 1 dcl 693 set ref 58 546
+iad_ptr                         000324 automatic       pointer                  dcl 669 set ref 44* 58* 59 60 62 63 67 67 71 74 85
+                                                                                  94 95 113* 147 151 154 177 193* 202 250* 275* 276
+                                                                                  303* 304 318* 319 331* 332 351 363 369 385* 387
+                                                                                  399 441 464 532 535 537 538 539 540 543 543 546
+                                                                                  547*
+ignore_code                     000103 automatic       fixed bin(35,0)          dcl 653 set ref 56* 151* 537* 539* 564* 582* 590*
+ignore_fb21                     000104 automatic       fixed bin(21,0)          dcl 654 set ref 582* 586*
+ilr_ptr                         000464 automatic       pointer                  dcl 3-9 set ref 330* 336* 338 342 344* 357 359 361
+                                                                                  361 361 369 369 369 371 371 371 386* 409* 411 415
+                                                                                  418* 424 433 436 456 456 460 462 464 464 475 479
+                                                                                  479
+imft_logical_record                    based           structure                level 1 dcl 3-12
+imft_logical_record_header             automatic       structure                level 1 dcl 3-27 ref 78 80 336 344 389 426 481
+input_allowed                   000330 automatic       bit(1)                   packed unaligned dcl 672 set ref 122* 127* 139* 165
+ioa_                            000030 constant        entry                    external dcl 708 ref 342 415 610 611
+ioa_$general_rs                 000032 constant        entry                    external dcl 709 ref 586
+iocb                                   based           structure                level 1 dcl 1-6
+iocb_ptr                        000100 automatic       pointer                  dcl 651 set ref 40* 46 49 70 94 95 96 97 99* 112*
+                                                                                  113 115 162 163 165 168 171 172 174 175 177 180*
+                                                                                  192* 193 196 212 214 215 217 217 217 217 220* 233*
+                                                                                  236 242 250 260 262* 274* 275 285* 302* 303 317*
+                                                                                  318 329* 331 384* 385 587
+iox_$attach_ioname              000034 constant        entry                    external dcl 710 ref 74
+iox_$close                      000040 constant        entry                    external dcl 712 ref 202 537
+iox_$control                    000036 constant        entry                    external dcl 711 ref 276
+iox_$destroy_iocb               000042 constant        entry                    external dcl 713 ref 539
+iox_$detach_iocb                000044 constant        entry                    external dcl 714 ref 538
+iox_$err_no_operation           000046 constant        entry                    external dcl 715 ref 217
+iox_$get_chars                  000056 constant        entry                    external dcl 719 ref 399 441 464
+iox_$get_line                   000060 constant        entry                    external dcl 720 ref 304
+iox_$modes                      000050 constant        entry                    external dcl 716 ref 151
+iox_$open                       000052 constant        entry                    external dcl 717 ref 147
+iox_$propagate                  000054 constant        entry                    external dcl 718 ref 99 180 220 262
+iox_$put_chars                  000062 constant        entry                    external dcl 721 ref 319 351 363 369
+iox_modes                       000002 constant        char(24)                 initial array dcl 2-6 ref 154
+ips_mask                        000447 automatic       bit(36)                  packed unaligned dcl 687 set ref 88* 92* 101* 101*
+                                                                                  156* 160* 182* 182* 206* 210* 222* 222* 254* 258*
+                                                                                  264* 264* 560 560* 560* 562*
+lbound                                                 builtin function         dcl 746 ref 66
+length                    3            based           fixed bin(21,0)          level 3 dcl 3-12 set ref 357 361 361 361* 369 369
+                                                                                  369* 371 371 371 424 436 456 456 460 462 464 464
+                                                                                  475 479 479
+loud_sw                         000105 automatic       bit(1)                   dcl 655 set ref 41* 49 584
+max_record_length               000326 automatic       fixed bin(21,0)          dcl 670 set ref 80* 82* 82 85 85 543 543
+max_unpacked_chars              000441 automatic       fixed bin(21,0)          dcl 683 set ref 437* 438 446 448
+me                                     parameter       char                     packed unaligned dcl 604 set ref 601 610*
+min                                                    builtin function         dcl 746 ref 438 463
+modes                    56            based           entry variable           level 2 dcl 1-6 set ref 172* 217*
+n_chars                         000442 automatic       fixed bin(21,0)          dcl 684 set ref 463* 464*
+name                      1            based           char(32)                 level 2 dcl 1-6 set ref 49* 70 587*
+null                                                   builtin function         dcl 746 ref 44 46 59 60 115 196 212 236 242 260 532
+                                                                                  535 540 543 547
+old_modes                       000332 automatic       char(256)                packed unaligned dcl 674 set ref 151*
+open                     32            based           entry variable           level 2 dcl 1-6 set ref 96* 214*
+open_descrip_ptr         20            based           pointer                  level 2 dcl 1-6 set ref 115 177* 196 212* 242
+open_description        401            based           varying char(24)         level 2 dcl 693 set ref 63* 154* 177
+open_mode                       000106 automatic       fixed bin(17,0)          dcl 656 set ref 121* 124 130 136 154
+output_allowed                  000331 automatic       bit(1)                   packed unaligned dcl 673 set ref 122* 133* 139* 168
+packed_byte_ptr                        parameter       pointer                  dcl 491 ref 500 507 511 518
+packed_bytes                           based           bit(8)                   array packed unaligned dcl 497 set ref 507* 518
+put_chars                52            based           entry variable           level 2 dcl 1-6 set ref 163*
+raw_chars_read                  000437 automatic       fixed bin(21,0)          dcl 681 set ref 435* 440 441 441 441 446 448 452*
+                                                                                  452 454 456*
+read_record              72            based           entry variable           level 2 dcl 1-6 set ref 165* 217*
+record_buffer                          based           char                     packed unaligned dcl 691 ref 85 543
+record_buffer_ptr       412            based           pointer                  level 2 dcl 693 set ref 60* 85* 332 387 543 543
+requote_string_                 000064 constant        entry                    external dcl 722 ref 67
+room_left                       000436 automatic       fixed bin(21,0)          dcl 680 set ref 430* 437 462 463 472* 472
+rtrim                                                  builtin function         dcl 746 ref 70 154
+size                                                   builtin function         dcl 746 ref 78 80 336 344 389 426 481
+size_of_packed_header           000435 automatic       fixed bin(21,0)          dcl 679 set ref 409* 430
+size_of_unpacked_header         000011 internal static fixed bin(17,0)          dcl 742 set ref 78* 398 399 409
+stb                                    based           bit                      packed unaligned dcl 608 set ref 611*
+str                                    based           char                     packed unaligned dcl 607 set ref 610*
+string                                                 builtin function         dcl 746 set ref 517*
+substr                                                 builtin function         dcl 746 set ref 507 518*
+system_area                            based           area(1024)               dcl 662 ref 58 85 543 546
+system_area_ptr                 000110 automatic       pointer                  dcl 663 set ref 54* 58 85 248* 543 546
+terminal_attach_desc            000113 automatic       char(512)                packed unaligned dcl 667 set ref 71* 74* 75*
+terminal_iocb_ptr       410            based           pointer                  level 2 dcl 693 set ref 59* 74* 147* 151* 202* 276*
+                                                                                  304* 319* 351* 363* 369* 399* 441* 464* 535 537*
+                                                                                  538* 539* 540*
+terminal_switch_name            000313 automatic       char(32)                 packed unaligned dcl 668 set ref 70* 74*
+the_code                               based           fixed bin(35,0)          dcl 577 set ref 587* 592 594
+the_code_ptr                    000100 automatic       pointer                  dcl 578 set ref 582* 587 592 594
+tty_open_mode                   000327 automatic       fixed bin(17,0)          dcl 671 set ref 126* 132* 138* 147*
+unpacked_byte_ptr                      parameter       pointer                  dcl 492 ref 500 507 511 517 518
+unpacked_bytes                  000432 automatic       fixed bin(21,0)          dcl 676 in procedure "imft_tty_" set ref 336* 345
+                                                                                  351* 352 361* 363* 364
+unpacked_bytes                         based           bit(9)                   array packed unaligned dcl 498 in procedure
+                                                                                  "pack_unpack" set ref 507 517* 518*
+unpacked_length                 000504 automatic       fixed bin(17,0)          dcl 496 set ref 505* 506 507 507 516* 517 518 518
+version                                based           char(8)                  level 3 dcl 3-12 set ref 338 342* 411 415*
+write_record             76            based           entry variable           level 2 dcl 1-6 set ref 168* 217*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+Direct_input                           internal static fixed bin(17,0)          initial dcl 2-15
+Direct_output                          internal static fixed bin(17,0)          initial dcl 2-15
+Direct_update                          internal static fixed bin(17,0)          initial dcl 2-15
+Keyed_sequential_input                 internal static fixed bin(17,0)          initial dcl 2-15
+Keyed_sequential_output                internal static fixed bin(17,0)          initial dcl 2-15
+Keyed_sequential_update                internal static fixed bin(17,0)          initial dcl 2-15
+Sequential_update                      internal static fixed bin(17,0)          initial dcl 2-15
+imft_logical_record_length             automatic       fixed bin(21,0)          dcl 3-10
+iox_$iocb_version_sentinel             external static char(4)                  dcl 1-51
+short_iox_modes                        internal static char(4)                  initial array dcl 2-12
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+RETURN_FROM_ATTACH              001114 constant        label                    dcl 103 ref 596
+abort_attachment                003536 constant        entry                    internal dcl 574 ref 75
+any_other_handler               003504 constant        entry                    internal dcl 557 ref 90 158 208 256
+cleanup_attachment              003375 constant        entry                    internal dcl 525 ref 56 252 590
+debug_list                      003251 constant        entry                    external dcl 617
+debug_out                       003731 constant        entry                    internal dcl 601 ref 305 320 344 345 352 364 371 407
+                                                                                  417 418 454 479
+imft_tty_                       000365 constant        entry                    external dcl 30
+imft_tty_attach                 000400 constant        entry                    external dcl 37
+imft_tty_close                  001442 constant        entry                    external dcl 189 ref 174
+imft_tty_control                001772 constant        entry                    external dcl 271 ref 171
+imft_tty_detach                 001627 constant        entry                    external dcl 230 ref 97 175 215
+imft_tty_get_line               002130 constant        entry                    external dcl 299 ref 162
+imft_tty_modes                  002052 constant        entry                    external dcl 282 ref 172
+imft_tty_open                   001124 constant        entry                    external dcl 109 ref 96 214
+imft_tty_put_chars              002225 constant        entry                    external dcl 314 ref 163
+imft_tty_read_record            002615 constant        entry                    external dcl 381 ref 165
+imft_tty_write_record           002317 constant        entry                    external dcl 326 ref 168
+pack                            003264 constant        entry                    internal dcl 500 ref 409 456
+pack_unpack                     003262 constant        entry                    internal dcl 486
+unpack                          003324 constant        entry                    internal dcl 511 ref 336 361
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      5064        5174    4304        5074
+Length      5562    4304       110         352     557           2
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+imft_tty_                           437 external procedure  is an external procedure.  
+on unit on line 56                   70 on unit               
+on unit on line 90                   64 on unit               
+on unit on line 158                  64 on unit               
+on unit on line 208                  64 on unit               
+on unit on line 256                  64 on unit               
+pack_unpack                             internal procedure  shares stack frame of external procedure imft_tty_.  
+cleanup_attachment                   70 internal procedure  is called by several nonquick procedures.  
+any_other_handler                    70 internal procedure  is declared options(non_quick).  
+abort_attachment                    176 internal procedure  is declared options(non_quick), and is declared options(variable).  
+debug_out                               internal procedure  shares stack frame of external procedure imft_tty_.  
+
+STORAGE FOR INTERNAL STATIC VARIABLES.
+
+   LOC IDENTIFIER                  BLOCK NAME
+000010 debug_output                imft_tty_
+000011 size_of_unpacked_header     imft_tty_
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+abort_attachment         000100 the_code_ptr                abort_attachment
+                         000102 caller_message              abort_attachment
+imft_tty_                000100 iocb_ptr                    imft_tty_
+                         000102 code                        imft_tty_
+                         000103 ignore_code                 imft_tty_
+                         000104 ignore_fb21                 imft_tty_
+                         000105 loud_sw                     imft_tty_
+                         000106 open_mode                   imft_tty_
+                         000110 system_area_ptr             imft_tty_
+                         000112 arg_index                   imft_tty_
+                         000113 terminal_attach_desc        imft_tty_
+                         000313 terminal_switch_name        imft_tty_
+                         000324 iad_ptr                     imft_tty_
+                         000326 max_record_length           imft_tty_
+                         000327 tty_open_mode               imft_tty_
+                         000330 input_allowed               imft_tty_
+                         000331 output_allowed              imft_tty_
+                         000332 old_modes                   imft_tty_
+                         000432 unpacked_bytes              imft_tty_
+                         000433 chars_read                  imft_tty_
+                         000434 chars_read_this_time        imft_tty_
+                         000435 size_of_packed_header       imft_tty_
+                         000436 room_left                   imft_tty_
+                         000437 raw_chars_read              imft_tty_
+                         000440 chars_to_read               imft_tty_
+                         000441 max_unpacked_chars          imft_tty_
+                         000442 n_chars                     imft_tty_
+                         000444 buffer_ptr                  imft_tty_
+                         000446 actual_limit                imft_tty_
+                         000447 ips_mask                    imft_tty_
+                         000464 ilr_ptr                     imft_tty_
+                         000504 unpacked_length             pack_unpack
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+alloc_char_temp     cat_realloc_chars   call_ext_out_desc   call_ext_out        call_int_this_desc  call_int_this
+call_int_other      return_mac          tra_ext_1           mpfx2               enable_op           shorten_stack
+ext_entry           ext_entry_desc      int_entry           trunc_fx2           divide_fx1          op_alloc_
+op_freen_
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+com_err_                      continue_to_signal_           cu_$arg_list_ptr              cu_$arg_ptr
+get_system_free_area_         hcs_$reset_ips_mask           hcs_$set_ips_mask             ioa_
+ioa_$general_rs               iox_$attach_ioname            iox_$close                    iox_$control
+iox_$destroy_iocb             iox_$detach_iocb              iox_$err_no_operation         iox_$get_chars
+iox_$get_line                 iox_$modes                    iox_$open                     iox_$propagate
+iox_$put_chars                requote_string_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$action_not_performed                           error_table_$bad_mode         error_table_$long_record
+error_table_$not_attached     error_table_$not_closed       error_table_$not_detached     error_table_$not_open
+error_table_$smallarg         error_table_$unimplemented_version
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     30 000364        33 000372        37 000373        40 000416        41 000422        42 000427        44 000430
+     46 000432        48 000435        49 000440        51 000472        54 000473        56 000502        58 000527
+     59 000534        60 000536        62 000537        63 000540        66 000541        67 000553        68 000657
+     70 000662        71 000711        74 000730        75 000756        78 001003        80 001007        82 001011
+     85 001015        88 001025        90 001026        92 001050        94 001061        95 001064        96 001066
+     97 001072        99 001075       101 001104       103 001114       105 001116       109 001117       112 001134
+    113 001141       115 001143       117 001147       118 001152       121 001153       122 001155       124 001157
+    126 001161       127 001163       128 001165       130 001166       132 001170       133 001172       134 001174
+    136 001175       138 001177       139 001201       140 001204       143 001205       144 001210       147 001211
+    148 001230       151 001232       154 001263       156 001315       158 001316       160 001340       162 001351
+    163 001356       165 001361       168 001367       171 001375       172 001401       174 001404       175 001407
+    177 001412       180 001415       182 001424       184 001434       185 001435       189 001436       192 001452
+    193 001457       194 001461       196 001462       198 001466       199 001471       202 001472       203 001503
+    206 001512       208 001513       210 001535       212 001546       214 001551       215 001555       217 001560
+    220 001604       222 001612       224 001622       226 001624       230 001625       233 001637       234 001643
+    236 001644       238 001650       239 001653       242 001654       244 001660       245 001663       248 001664
+    250 001673       252 001676       254 001704       256 001705       258 001727       260 001740       262 001743
+    264 001752       266 001762       267 001764       271 001765       274 002010       275 002015       276 002017
+    278 002044       282 002045       285 002075       286 002102       288 002107       290 002117       292 002122
+    299 002123       302 002142       303 002146       304 002150       305 002167       307 002217       314 002220
+    317 002237       318 002243       319 002245       320 002262       322 002314       326 002315       329 002331
+    330 002335       331 002340       332 002342       336 002344       338 002351       340 002356       342 002361
+    344 002404       345 002417       347 002430       348 002433       351 002434       352 002452       354 002470
+    357 002472       359 002475       361 002500       363 002516       364 002534       366 002547       369 002550
+    371 002570       377 002612       381 002613       384 002627       385 002633       386 002635       387 002640
+    389 002642       391 002645       392 002650       397 002651       398 002652       399 002656       401 002703
+    404 002705       405 002707       407 002710       409 002722       411 002727       413 002734       415 002737
+    417 002762       418 002772       420 003014       421 003017       424 003020       426 003022       427 003024
+    430 003025       431 003031       433 003032       435 003035       436 003036       437 003043       438 003050
+    440 003054       441 003057       443 003105       446 003107       448 003113       449 003116       452 003121
+    453 003123       454 003124       456 003136       457 003143       460 003144       462 003146       463 003154
+    464 003160       467 003204       470 003206       471 003210       472 003212       473 003214       475 003215
+    479 003223       481 003244       482 003247       617 003250       620 003256       621 003261       486 003262
+    489 003263       500 003264       505 003272       506 003275       507 003300       508 003323       511 003324
+    516 003332       517 003341       518 003347       519 003373       525 003374       530 003402       532 003404
+    535 003411       537 003416       538 003426       539 003442       540 003455       543 003461       546 003474
+    547 003477       551 003502       557 003503       560 003511       562 003523       564 003525       566 003534
+    574 003535       582 003543       584 003562       586 003565       587 003644       590 003705       592 003715
+    594 003724       596 003726       601 003731       610 003742       611 004005       613 004042
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

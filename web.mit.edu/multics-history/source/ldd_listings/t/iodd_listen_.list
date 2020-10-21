@@ -1,0 +1,1394 @@
+	COMPILATION LISTING OF SEGMENT iodd_listen_
+	Compiled by: Multics PL/I Compiler, Release 31a, of October 12, 1988
+	Compiled at: Honeywell Bull, Phoenix AZ, SysM
+	Compiled on: 10/28/88  1328.4 mst Fri
+	    Options: optimize map
+
+        1 /****^  ***********************************************************
+        2*        *                                                         *
+        3*        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        4*        *                                                         *
+        5*        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        6*        *                                                         *
+        7*        * Copyright (c) 1972 by Massachusetts Institute of        *
+        8*        * Technology and Honeywell Information Systems, Inc.      *
+        9*        *                                                         *
+       10*        *********************************************************** */
+       11 
+       12 /* format: style4,delnl,insnl,^ifthenstmt */
+       13 
+       14 /* format: off */
+       15 
+       16 /* This is the central I/O daemon driver procedure, which "listens" for operator input and for wakeups from the
+       17*   coordinator (in general, whichever happens first). It avoids going blocked for input (unless needed) by using the
+       18*   iodd_get_cmd_ subroutine.  It will listen for requests to be processed for each of the minor devices assigned to the
+       19*   process (if currently active) and service them in a round-robin fashion. This procedure will normally be called once
+       20*   per session, except in case of reinitialization */
+       21 
+       22 /* Created:  September 1973 by Robert S. Coren */
+       23 /* Modified: January 1975 by J. C. Whitmore for generalization and access isolation */
+       24 /* Modified: October 1975 by J. C. Whitmore to check for active slave before printing message */
+       25 /* Modified: December 1975 by M. A. Braida to include default condition handler for restart from slave */
+       26 /* Modified: August 1977 by J. C. Whitmore to use iodd_get_cmd_ for reading command lines */
+       27 /* Modified: November 1977 by J. C. Whitmore to use iodd_msg_ for all operator messages */
+       28 /* Modified: July 1978 by J. C. Whitmore to support daemon_save condition and commands: next, go N */
+       29 /* Modified: November 1978 by J. C. Whitmore to implement inactivity logout */
+       30 /* Modified: October 1979 by J. C. Whitmore to signal when driver is idle */
+       31 /* Modified: 18 December 1981 by G. Palter to correct entry number 0033 (phx11367) on the io_daemon error list:
+       32*      When operating in test mode with the coordinator and a driver in the same process, if the operator types ahead the
+       33*      necessary commands to stop both the driver and coordinator while a request is running, the request will be finished
+       34*      normally but will remain in the queue and be reprocessed the next time that queue is run */
+       35 /* Modified: February 23, 1985 by C. Marker to use version 5 message segments */
+       36 
+       37 
+       38 /****^  HISTORY COMMENTS:
+       39*  1) change(88-08-19,Brunelle), approve(88-08-19,MCR7911),
+       40*     audit(88-10-25,Wallman), install(88-10-28,MR12.2-1199):
+       41*     Upgraded to version 5 iod tables.
+       42*                                                   END HISTORY COMMENTS */
+       43 
+       44 
+       45 /* format: on */
+       46 
+       47 
+       48 iodd_listen_:
+       49      procedure ();
+       50 
+       51 
+       52 /* Entries */
+       53 
+       54 dcl  clock_ entry () returns (fixed bin (71));
+       55 dcl  continue_to_signal_ entry (fixed bin (35));
+       56 dcl  convert_ipc_code_ entry (fixed bin (35));
+       57 dcl  hcs_$wakeup entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+       58 dcl  iodd_msg_ entry options (variable);
+       59 dcl  iodd_get_cmd_ entry (ptr, fixed bin, fixed bin, 1 aligned like ctl, char (*), fixed bin, fixed bin (35));
+       60 dcl  iodd_command_processor_ entry (fixed bin, fixed bin, char (*), fixed bin (35));
+       61 dcl  iodd_quit_handler_ entry ();
+       62 dcl  iox_$look_iocb entry (char (*) aligned, ptr, fixed bin (35));
+       63 dcl  iox_$control entry (ptr, char (*), ptr, fixed bin (35));
+       64 dcl  ipc_$block entry (ptr, ptr, fixed bin (35));
+       65 dcl  ipc_$drain_chn entry (fixed bin (71), fixed bin (35));
+       66 dcl  timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2), fixed bin (71));
+       67 dcl  timer_manager_$reset_alarm_wakeup entry (fixed bin (71));
+       68 dcl  timer_manager_$alarm_call entry (fixed bin (71), bit (2), entry);
+       69 dcl  timer_manager_$reset_alarm_call entry (entry);
+       70 dcl  timer_manager_$sleep entry (fixed bin (71), bit (2));
+       71 
+       72 
+       73 /* Automatic */
+       74 
+       75 dcl  wakeup_code fixed bin;				/* action for coord on wakeup */
+       76 dcl  wakeup_count fixed bin;				/* how many coord request wakeups to send before block */
+       77 dcl  dr_ptr ptr;					/* general pointer to a driver status seg */
+       78 dcl  desc_ptr ptr;					/* pointer to the request descriptor */
+       79 dcl  i fixed bin;					/* do loop index */
+       80 dcl  code fixed bin (35);
+       81 dcl  line char (132);				/* input from terminal */
+       82 dcl  nchars fixed bin;				/* number of chars read */
+       83 dcl  must_tell_coord bit (1);
+       84 dcl  idle_msg_sent bit (1);
+       85 
+       86 dcl  timer_channel fixed bin (71);			/* IPC channel to use for the timer */
+       87 
+       88 dcl  1 ctl aligned,					/* control flags for iodd_get_cmd_ */
+       89        2 wait_for_input bit (1) unal,			/* true if we should wait for a command */
+       90        2 prompt_master bit (1) unal,			/* true if we want to ask master for a cmd */
+       91        2 prompt_slave bit (1) unal,			/* true if we want to ask slave for a cmd */
+       92        2 pad bit (33) unal;
+       93 
+       94 dcl  state fixed bin;				/* state of command processing */
+       95 						/* 0 = not ready to handle requests */
+       96 						/* 1 = ready or processing requests */
+       97 						/* 2 & 3 are driver module defined cmd levels */
+       98 						/* 4 = handling a quit */
+       99 						/* 5 = unclaimed signal (test mode) */
+      100 
+      101 dcl  source fixed bin;				/* which terminal gave the command line */
+      102 dcl  last_cmd fixed bin;				/* which source (master or slave) gave the last cmd line */
+      103 dcl  master_cmd bit (1);				/* true if master gave a cmd at this level */
+      104 dcl  slave_cmd bit (1);				/* true if slave gave a cmd at this level */
+      105 
+      106 dcl  terminal (2) ptr;				/* iocb ptrs of the master and slave input devices */
+      107 
+      108 dcl  free_devices fixed bin;				/* counter for round robin loop */
+      109 dcl  driver_index fixed bin;				/* ptr list index of current minor dev driver */
+      110 dcl  now fixed bin (71);				/* current clock_ time */
+      111 
+      112 dcl  1 event_info aligned,				/* info about a wakeup received */
+      113        2 chan fixed bin (71),
+      114        2 ev_msg fixed bin (71),
+      115        2 sender bit (36),
+      116        2 origin fixed bin,
+      117        2 wait_list_index fixed bin;
+      118 
+      119 dcl  1 form_data aligned,				/* data from ctl_dim_ for form alignment */
+      120        2 page_length fixed bin,			/* length of logical page */
+      121        2 line_length fixed bin,			/* number of chars before folding line */
+      122        2 line_no fixed bin,				/* current line on the page */
+      123        2 carriage_pos fixed bin,			/* position of next char on the line */
+      124        2 aligned bit (1) unal,			/* "1"b if we are simulating form feeds */
+      125        2 pad bit (35) unal;
+      126 
+      127 
+      128 /* Constants */
+      129 
+      130 dcl  null_cmd_level fixed bin int static options (constant) init (0);
+      131 dcl  listen_cmd_level fixed bin int static options (constant) init (1);
+      132 dcl  none fixed bin int static options (constant) init (0); /* constant for no terminal giving cmd */
+      133 dcl  master fixed bin int static options (constant) init (1);
+      134 						/* constant  indicating input from master device */
+      135 dcl  slave fixed bin int static options (constant) init (2);/* constant indicating input from slave */
+      136 dcl  both fixed bin int static options (constant) init (0); /* constant indicating both the master and slave */
+      137 dcl  normal fixed bin int static options (constant) init (1);
+      138 						/* normal iodd_msg_ messages */
+      139 dcl  error fixed bin int static options (constant) init (2);/* error messages for iodd_msg_ */
+      140 dcl  new_request fixed bin int static options (constant) init (1);
+      141 						/* coord code for new request - done with current */
+      142 dcl  request_done fixed bin int static options (constant) init (0);
+      143 						/* coord code to take back current request */
+      144 
+      145 
+      146 /* Conditions */
+      147 
+      148 dcl  (quit, no_coord, daemon_again, daemon_again_slave, daemon_kill, daemon_cancel, daemon_unclaimed, daemon_save, resume,
+      149      re_init, daemon_logout, daemon_slave_logout, daemon_idle, cleanup) condition;
+      150 
+      151 
+      152 /* Builtins */
+      153 
+      154 dcl  (addr, null, substr, string) builtin;
+      155 
+      156 
+      157 /* Based structures */
+      158 
+      159 dcl  chan_list_ptr ptr;				/* pointer to event channel list */
+      160 
+      161 dcl  1 ev_chan_list aligned based (chan_list_ptr),	/* wait list for all drivers and consoles */
+      162        2 number fixed bin,
+      163        2 channel (12) fixed bin (71);
+      164 
+      165 
+      166 /* External static */
+      167 
+      168 dcl  iodd_stat_p ptr external static;
+      169 
+      170 /**/
+      171 
+      172 	stat_p = iodd_stat_p;			/* set the pointer to iodd_static */
+      173 	list_ptr = iodd_static.driver_list_ptr;		/* establish the list of driver status segs */
+      174 	chan_list_ptr = iodd_static.chan_list_ptr;	/* get pointer to list of event channels */
+      175 	timer_channel = ev_chan_list.channel (3);	/* timer uses the first minor dev chan */
+      176 
+      177 	call iox_$look_iocb (iodd_static.slave_input, iodd_static.slave_in, code);
+      178 	if code ^= 0
+      179 	then go to slave_err;
+      180 	call iox_$look_iocb (iodd_static.slave_output, iodd_static.slave_out, code);
+      181 						/* just checking */
+      182 	if code ^= 0 then do;
+      183 slave_err:
+      184 	     if iodd_static.slave.active
+      185 	     then					/* did we think there was a slave? */
+      186 		call iodd_msg_ (error, master, code, "iodd_listen_", "Slave functions terminated.");
+      187 	     iodd_static.slave.active = "0"b;
+      188 	     iodd_static.slave.accept_input = "0"b;
+      189 	     iodd_static.slave.print_errors = "0"b;
+      190 	     iodd_static.slave.allow_quits = "0"b;
+      191 	end;
+      192 
+      193 	iodd_static.requests_til_cmd = 0;		/* set for free running mode */
+      194 	iodd_static.quit_during_request = "0"b;		/* make sure initialization is correct */
+      195 	iodd_static.request_in_progress = "0"b;
+      196 	iodd_static.recursion_flag = "0"b;
+      197 	iodd_static.re_init_in_progress = "0"b;		/* any re_init is now done */
+      198 	iodd_static.logout_pending = "0"b;
+      199 	iodd_static.auto_logout_pending = "0"b;
+      200 	iodd_static.runout_requests = "0"b;
+      201 	iodd_static.current_devices = 0;		/* we will check for ready devices */
+      202 	idle_msg_sent = "0"b;			/* init flag for idle condition handler */
+      203 
+      204 	do i = 1 to iodd_static.assigned_devices;	/* check the data in driver status */
+      205 	     dr_ptr = driver_ptr_list.stat_segp (i);	/* next driver status ptr */
+      206 	     if ^dr_ptr -> driver_status.attached then do;/* not attached, can't be ready */
+      207 		dr_ptr -> driver_status.ready = "0"b;	/* correct the error */
+      208 		dr_ptr -> driver_status.request_pending = iodd_static.driver_proc_id;
+      209 						/* tell coord */
+      210 	     end;
+      211 	     else if dr_ptr -> driver_status.ready then do;
+      212 		iodd_static.current_devices = iodd_static.current_devices + 1;
+      213 						/* count it */
+      214 		dr_ptr -> driver_status.request_pending = (36)"0"b;
+      215 						/* tell coord */
+      216 	     end;
+      217 	     else dr_ptr -> driver_status.request_pending = iodd_static.driver_proc_id;
+      218 						/* not ready */
+      219 	     dr_ptr -> driver_status.busy = "0"b;	/* none busy yet */
+      220 	end;
+      221 
+      222 
+      223 /* Now set up the remaining condition handlers */
+      224 
+      225 	on cleanup call timer_manager_$reset_alarm_call (trigger_auto_logout);
+      226 
+      227 	on quit
+      228 	     begin;
+      229 	     call timer_manager_$reset_alarm_call (trigger_auto_logout);
+      230 	     iodd_static.auto_logout_pending = "0"b;
+      231 	     call iodd_quit_handler_;			/* to come to command level after quit */
+      232 	end;
+      233 
+      234 	on resume go to resume_operation;		/* clean up after unclaimed signal */
+      235 
+      236 	on daemon_save ;				/* make this a null condition */
+      237 
+      238 	on daemon_again call iodd_msg_ (normal, master, 0, "", "No current request to ""restart"".");
+      239 
+      240 	on daemon_again_slave call iodd_msg_ (normal, slave, 0, "", "No current request to ""restart"".");
+      241 
+      242 	on daemon_cancel call iodd_msg_ (normal, both, 0, "iodd_listen_", "No current request to ""cancel"".");
+      243 
+      244 	on daemon_kill call iodd_msg_ (normal, both, 0, "iodd_listen_", "No current request to ""kill"".");
+      245 
+      246 	on daemon_idle call idle_proc;
+      247 
+      248 
+      249 	if iodd_static.slave.allow_quits
+      250 	then call iox_$control (iodd_static.slave_in, "quit_enable", null, code);
+      251 
+      252 	terminal (master) = iodd_static.master_in;	/* internal copy of iocbp for easy logic */
+      253 
+      254 	must_tell_coord = ""b;			/* clear the send wakeup flag */
+      255 	string (ctl) = ""b;				/* clear all control flags */
+      256 	driver_index = 0;				/* so we start with index of 1st driver */
+      257 
+      258 /* Everything is initialized, start the listen function by checking for commands */
+      259 
+      260 check_for_cmd:
+      261 	ctl.wait_for_input = (iodd_static.step | iodd_static.master_hold | iodd_static.slave_hold);
+      262 	ctl.prompt_master = "0"b;			/* normally the slave will give commands */
+      263 	ctl.prompt_slave = "1"b;
+      264 	master_cmd = "0"b;				/* no cmd from the master yet */
+      265 	slave_cmd = "0"b;				/* likewise for the slave */
+      266 	last_cmd = none;
+      267 
+      268 	go to read;
+      269 
+      270 wait:
+      271 	ctl.wait_for_input = "1"b;			/* say we must wait for input */
+      272 
+      273 read:
+      274 	if iodd_static.current_devices > 0
+      275 	then state = listen_cmd_level;		/* get ready for iodd_command_processor_ */
+      276 	else state = null_cmd_level;
+      277 
+      278 	call iodd_get_cmd_ (addr (line), 128, nchars, ctl, "", source, code);
+      279 
+      280 	if must_tell_coord then do;			/* do we owe the coord a wakeup? */
+      281 	     if source = none then do;
+      282 		iodd_static.driver_ptr -> driver_status.last_wake_time = clock_ ();
+      283 		wakeup_code = new_request;		/* save an extra wakeup */
+      284 	     end;
+      285 	     else wakeup_code = request_done;		/* have a command, send this back and wait */
+      286 	     call wake_coord (wakeup_code);
+      287 	     must_tell_coord = ""b;
+      288 	end;
+      289 
+      290 	if source = none
+      291 	then go to find_work;			/* no command, go look for a request */
+      292 
+      293 	call timer_manager_$reset_alarm_call (trigger_auto_logout);
+      294 						/* this is some activity, cancel auto logout */
+      295 	iodd_static.auto_logout_pending = "0"b;
+      296 
+      297 	idle_msg_sent = "0"b;			/* we want a new idle message after commands */
+      298 
+      299 	if source = master then do;
+      300 	     if iodd_static.slave.active
+      301 	     then					/* don't let the slave interrupt the master */
+      302 		call iox_$control (iodd_static.slave_in, "quit_disable", null, (0));
+      303 	     master_cmd = "1"b;			/* if master gave a cmd */
+      304 	end;
+      305 	else slave_cmd = "1"b;			/* otherwise it was the slave */
+      306 	last_cmd = source;				/* who gave the last command? */
+      307 	ctl.wait_for_input = "0"b;			/* got some */
+      308 
+      309 	call iodd_command_processor_ (source, state, substr (line, 1, nchars), code);
+      310 
+      311 	if iodd_static.slave.allow_quits
+      312 	then					/* let slave get a chance */
+      313 	     call iox_$control (iodd_static.slave_in, "quit_enable", null, (0));
+      314 
+      315 	terminal (slave) = iodd_static.slave_in;	/* reset this, it may change */
+      316 	if code = 1
+      317 	then go to read;				/* go for a request... but first check for more input */
+      318 	if code = 0 | code = 2
+      319 	then go to wait;				/* we want more input .. no errors */
+      320 	call iox_$control (terminal (source), "resetread", null, (0));
+      321 						/* clear input after bad command */
+      322 	go to wait;				/* and wait for correct input */
+      323 
+      324 find_work:					/* ask coord for work if all is well */
+      325 	if iodd_static.forms
+      326 	then					/* be sure alignment is set when simulating forms */
+      327 	     if iodd_static.ctl_term.attached then do;	/* if the terminal is there */
+      328 		call iox_$control (iodd_static.slave_out, "form_status", addr (form_data), code);
+      329 		if code ^= 0 then do;		/* something was wrong */
+      330 		     iodd_static.forms = "0"b;	/* drop the forms */
+      331 
+      332 		     call iodd_msg_ (normal, both, code, "iodd_listen_",
+      333 			"Control terminal form simulation terminated.");
+      334 
+      335 		     ctl.prompt_master = "1"b;	/* force operator action */
+      336 		     ctl.prompt_slave = "1"b;		/* slave can also answer */
+      337 		     call iox_$control (iodd_static.master_in, "resetread", null, (0));
+      338 						/* but fresh answer */
+      339 		     call iox_$control (iodd_static.slave_in, "resetread", null, (0));
+      340 		     go to wait;
+      341 		end;
+      342 		if ^form_data.aligned then do;	/* dim says not aligned...so, */
+      343 		     call iodd_msg_ (normal, slave, 0, "", "Control forms not aligned.");
+      344 						/* tell someone */
+      345 		     go to wait;			/* must enable wakeups */
+      346 		end;
+      347 	     end;
+      348 	     else iodd_static.forms = "0"b;		/* not legal if no ctl term attached */
+      349 
+      350 
+      351 
+      352 	if last_cmd = slave
+      353 	then					/* do we owe the master a courtesy msg? */
+      354 	     if master_cmd
+      355 	     then call iodd_msg_ (normal, master, 0, "", "^a driver continuing.", iodd_static.major_device);
+      356 	     else ;
+      357 
+      358 	else if slave_cmd
+      359 	then if iodd_static.slave.active
+      360 	     then					/* be sure it wasn't detached by last command */
+      361 		call iodd_msg_ (normal, slave, 0, "", "^a driver continuing.", iodd_static.major_device);
+      362 
+      363 
+      364 	master_cmd = "0"b;
+      365 	slave_cmd = "0"b;
+      366 
+      367 	call timer_manager_$reset_alarm_wakeup (timer_channel);
+      368 						/* clear out any pending timeouts */
+      369 
+      370 	do i = 3 to ev_chan_list.number;		/* reset all wakeups from coord */
+      371 	     call ipc_$drain_chn (ev_chan_list.channel (i), code);
+      372 						/* can't afford to check code here */
+      373 	end;
+      374 
+      375 /**/
+      376 
+      377 /* This is the main loop for checking to see if the coordinator has given any requests to process.  We will go through the
+      378*   entire list of device drivers for this process and do any pending requests.  Start with the last driver to be checked
+      379*   (not necessarily the current driver) as indicated by the value of "driver_index".  If there is no request pending for
+      380*   an active driver, we will ask the coordinator for service if we have waited more than "wakeup_time" seconds with no
+      381*   word.  Otherwise, we will block for "wakeup_time" seconds to see if a request comes in or if a command arrives */
+      382 
+      383 	free_devices = 0;				/* clear the count of inactive devices */
+      384 	wakeup_count = iodd_static.current_devices;	/* max number of wakeups to send before block */
+      385 
+      386 	do while (free_devices < iodd_static.assigned_devices);
+      387 	     driver_index = driver_index + 1;		/* start with the next device */
+      388 	     if driver_index > iodd_static.assigned_devices
+      389 	     then driver_index = 1;
+      390 	     iodd_static.driver_ptr = driver_ptr_list.stat_segp (driver_index);
+      391 						/* set the current driver ptr */
+      392 	     iodd_static.output_device = driver_ptr -> driver_status.device_id;
+      393 						/* make things consistent */
+      394 
+      395 	     if runout_requests then do;		/* trying to flush pending requests from halted dev */
+      396 		free_devices = free_devices + 1;	/* only go around once */
+      397 		if ^driver_ptr -> driver_status.ready
+      398 		then				/* check pending for non-ready devices */
+      399 		     if driver_ptr -> driver_status.request_pending = iodd_static.coord_proc_id
+      400 		     then go to process_request;
+      401 	     end;
+      402 	     else if driver_ptr -> driver_status.request_pending then do;
+      403 						/* something waiting or driver inactive? */
+      404 		if driver_ptr -> driver_status.request_pending = iodd_static.coord_proc_id
+      405 		then go to process_request;		/* we found one that is valid */
+      406 
+      407 		free_devices = free_devices + 1;	/* not the coord, must be free */
+      408 		driver_ptr -> driver_status.busy = "0"b;
+      409 		driver_ptr -> driver_status.ready = "0"b;
+      410 						/* just to be sure */
+      411 	     end;
+      412 	     else do;				/* device driver is ready with nothing to do */
+      413 		now = clock_ ();			/* see what time it is */
+      414 		if last_cmd = none
+      415 		then				/* in automatic mode */
+      416 		     if driver_ptr -> driver_status.last_wake_time + 1000000 * iodd_static.wakeup_time > now
+      417 		     then go to block_for_all_events;
+      418 		if wakeup_count <= 0
+      419 		then go to block_for_all_events;	/* when all are serviced, wait */
+      420 
+      421 		call wake_coord (new_request);	/* request some service from the coord */
+      422 
+      423 		driver_ptr -> driver_status.last_wake_time = now;
+      424 						/* record the time */
+      425 		free_devices = 0;			/* reset the count...we found one */
+      426 		driver_ptr -> driver_status.ready = "1"b;
+      427 						/* keep it straight in case driver module goofs */
+      428 		wakeup_count = wakeup_count - 1;	/* say we sent one */
+      429 	     end;
+      430 	end;					/* that's all for the main loop */
+      431 						/* if we fall through, there was nothing to do */
+      432 	if iodd_static.runout_requests then do;		/* if we expected to stop everything */
+      433 	     iodd_static.runout_requests = "0"b;	/* change back to normal mode */
+      434 	     if iodd_static.logout_pending
+      435 	     then signal daemon_logout;		/* this is a clean way back */
+      436 	end;
+      437 	else call iodd_msg_ (normal, both, 0, "", "No ready device or pending requests.");
+      438 	iodd_static.slave_hold = "1"b;		/* force the issue */
+      439 	iodd_static.logout_pending = "0"b;		/* cancel the flag in case */
+      440 	go to check_for_cmd;			/* get a command and enable wakeups */
+      441 
+      442 /**/
+      443 
+      444 block_for_all_events:				/* Here we wait for something to happen */
+      445 	if iodd_static.auto_logout_interval > 0
+      446 	then					/* are we watching for inactivity? */
+      447 	     call timer_manager_$alarm_call ((iodd_static.auto_logout_interval), "11"b, trigger_auto_logout);
+      448 	call timer_manager_$alarm_wakeup (iodd_static.wakeup_time, "11"b, timer_channel);
+      449 						/* simulate a coord wakeup after N seconds */
+      450 	call ipc_$block (chan_list_ptr, addr (event_info), code);
+      451 	if code ^= 0 then do;
+      452 	     call convert_ipc_code_ (code);		/* get an error_table_ value */
+      453 	     call iodd_msg_ (error, master, code, "iodd_listen_", "Fatal error: main block point.");
+      454 	     if iodd_static.test_entry
+      455 	     then signal daemon_unclaimed;		/* let programmer peek */
+      456 	     else signal re_init;
+      457 	end;
+      458 
+      459 	if event_info.wait_list_index < 3
+      460 	then go to read;				/* if it was a terminal, go look for input */
+      461 
+      462 	driver_ptr = driver_ptr_list.stat_segp (event_info.wait_list_index - 2);
+      463 						/* set the current driver ptr */
+      464 	iodd_static.output_device = driver_ptr -> driver_status.device_id;
+      465 	if driver_ptr -> driver_status.request_pending ^= iodd_static.coord_proc_id
+      466 						/* really a request? */
+      467 	then if iodd_static.auto_logout_pending
+      468 	     then signal daemon_slave_logout;		/* No, are we to logout? */
+      469 	     else do;
+      470 		signal daemon_idle;			/* see if driver module wants to take action */
+      471 		go to check_for_cmd;		/* Nope! So poke around a bit */
+      472 	     end;
+      473 
+      474 
+      475 
+      476 process_request:					/* We have a valid request from the coordinator   */
+      477 	idle_msg_sent = "0"b;			/* give message again when we are next idle */
+      478 
+      479 	call timer_manager_$reset_alarm_call (trigger_auto_logout);
+      480 						/* this is some activity, cancel auto logout */
+      481 	iodd_static.auto_logout_pending = "0"b;
+      482 	driver_ptr -> driver_status.busy = "1"b;	/* be sure we tell the coord when done */
+      483 
+      484 	call iodd_static.driver_request;		/* pass it off to the driver module for action */
+      485 
+      486 	iodd_static.requests_til_cmd = iodd_static.requests_til_cmd - 1;
+      487 						/* decrement the go N value */
+      488 
+      489 /**/
+      490 
+      491 resume_operation:					/* pass it back to coord if done or "resume" signalled */
+      492 	if iodd_static.requests_til_cmd = 0
+      493 	then iodd_static.slave_hold = "1"b;		/* force cmd hold after N done */
+      494 	desc_ptr = addr (driver_ptr -> driver_status.descriptor);
+      495 
+      496 	if iodd_static.driver_ptr -> driver_status.busy | desc_ptr -> request_descriptor.finished then do;
+      497 	     if driver_ptr -> driver_status.ready
+      498 	     then driver_ptr -> driver_status.request_pending = (36)"0"b;
+      499 						/* ready for next one */
+      500 	     else driver_ptr -> driver_status.request_pending = iodd_static.driver_proc_id;
+      501 
+      502 	     desc_ptr -> request_descriptor.finished = "1"b;
+      503 						/* force the done flag */
+      504 
+      505 	     if iodd_static.step
+      506 	     then wakeup_code = request_done;		/* step mode, ask for request later */
+      507 	     else if iodd_static.master_hold
+      508 	     then wakeup_code = request_done;		/* in hold, ask later */
+      509 	     else if iodd_static.slave_hold
+      510 	     then wakeup_code = request_done;
+      511 	     else if driver_ptr -> driver_status.ready
+      512 	     then wakeup_code = new_request;		/* we want more service */
+      513 	     else wakeup_code = request_done;		/*  we don't want another request right now */
+      514 
+      515 	     if wakeup_code = new_request
+      516 	     then must_tell_coord = "1"b;		/* tell coord after checking for cmd */
+      517 	     else do;
+      518 		call wake_coord (wakeup_code);
+      519 		must_tell_coord = ""b;		/* we already told it */
+      520 	     end;
+      521 	     driver_ptr -> driver_status.busy = "0"b;	/* all done */
+      522 	end;
+      523 	iodd_static.request_in_progress, iodd_static.recursion_flag, iodd_static.quit_during_request,
+      524 	     iodd_static.quit_signaled = "0"b;
+      525 	iodd_static.segptr = null;			/* reset current segment pointer */
+      526 	go to check_for_cmd;			/* See if there is a command, or wait for step */
+      527 
+      528 /**/
+      529 
+      530 /* Send "ready/done" wakeup to coordinator */
+      531 
+      532 wake_coord:
+      533      procedure (wakeup_code);
+      534 
+      535 dcl  ec fixed bin (35);				/* temp error code */
+      536 dcl  wakeup_code fixed bin;				/* what action is wanted */
+      537 						/* 1 = done and give me another */
+      538 						/* 0 = done and don't bug me */
+      539 
+      540 	event_message = 0;
+      541 	addr (event_message) -> ev_msg.code = wakeup_code;
+      542 	addr (event_message) -> ev_msg.seq_id = 0;
+      543 	addr (event_message) -> ev_msg.minor_dev_index = driver_ptr -> driver_status.dev_index;
+      544 
+      545 	call hcs_$wakeup (coord_proc_id, driver_ptr -> driver_status.coord_chan, event_message, code);
+      546 
+      547 	if code ^= 0 then do;
+      548 	     ec = code;				/* if error_table_ code...report */
+      549 	     call convert_ipc_code_ (ec);
+      550 	     call iodd_msg_ (error, master, ec, "iodd_listen_", "Fatal error:  Unable to send wakeup to coord.");
+      551 	     if code = 1 | code = 3
+      552 	     then signal no_coord;
+      553 	     else signal re_init;			/* must be bad args */
+      554 	end;
+      555 
+      556 	if iodd_static.test_entry			/* give coordinator (which may be us) a chance to wakeup */
+      557 	then call timer_manager_$sleep (1, "11"b);	/* 1 second should be enough */
+      558 
+      559 	return;
+      560 
+      561      end wake_coord;
+      562 
+      563 /**/
+      564 
+      565 /* Handles the daemon_idle condition */
+      566 
+      567 idle_proc:
+      568      procedure ();
+      569 
+      570 	if ^idle_msg_sent
+      571 	then					/* if not told already about idle condition... */
+      572 	     call iodd_msg_ (normal, slave, 0, "", "^a driver: No requests, driver is idle.", iodd_static.major_device);
+      573 
+      574 	idle_msg_sent = "1"b;			/* don't repeat the message */
+      575 
+      576 	call continue_to_signal_ (0);			/* let the driver module know about this */
+      577 
+      578 	return;
+      579 
+      580      end idle_proc;
+      581 
+      582 
+      583 
+      584 /* Sets the auto logout bit in iodd_static so the driver will logout after N minutes of inactivity, where N is defined by
+      585*   iodd_static.auto_logout_interval */
+      586 
+      587 trigger_auto_logout:
+      588      procedure ();
+      589 
+      590 	iodd_static.auto_logout_pending = "1"b;
+      591 
+      592 /* if no command or request is present after returning from the main block point, the driver will logout */
+      593 
+      594 	return;
+      595 
+      596      end trigger_auto_logout;
+      597 
+  1     1 /* BEGIN INCLUDE FILE ... driver_ptr_list.incl.pl1   */
+  1     2 
+  1     3 /* This is a list of pointers to the driver status segments used by this process */
+  1     4 
+  1     5 
+  1     6 
+  1     7 dcl list_ptr pointer;		/* should be set to iodd_static.driver_list_ptr */
+  1     8 
+  1     9 dcl 1 driver_ptr_list based(list_ptr),
+  1    10        2 number fixed bin,		/* number of pointer entries */
+  1    11        2 list_pad fixed bin,		/* pad to even word boundry */
+  1    12        2 stat_seg(0 refer(driver_ptr_list.number)),
+  1    13           3 stat_segp ptr;		/* pointer to driver status seg(i) */
+  1    14 
+  1    15 
+  1    16 /* END INCLUDE FILE ... driver_ptr_list.incl.pl1  */
+      598 
+      599 
+  2     1 /* BEGIN INCLUDE FILE...driver_status.incl.pl1 */
+  2     2 
+  2     3 
+  2     4 
+  2     5 /****^  HISTORY COMMENTS:
+  2     6*  1) change(88-01-27,Brunelle), approve(), audit(), install():
+  2     7*     Ancient History
+  2     8*     Coded by Robert S. Coren August 1973
+  2     9*     Modified by J. Whitmore to structure data for the Access Isolation Mechanism
+  2    10*     Modified by J. C. Whitmore, 5/78, for IO Daemon extensions
+  2    11*     Modified by J. C. Whitmore, 8/79, to add the generic_type variable
+  2    12*  2) change(88-08-19,Brunelle), approve(88-08-19,MCR7911),
+  2    13*     audit(88-09-29,Wallman), install(88-10-28,MR12.2-1199):
+  2    14*     Upgraded for version 5 iod tables.  Changed the minor_args ftom string to
+  2    15*     text_offset. Changed acct_ptr to acct_entry.  Added have_accounting bit
+  2    16*     to denote accounting ^= nothing.
+  2    17*                                                   END HISTORY COMMENTS */
+  2    18 
+  2    19 
+  2    20 /* status data for a logical device driver */
+  2    21 
+  2    22 /* format: style4 */
+  2    23 
+  2    24 dcl  driver_status_ptr ptr;
+  2    25 dcl  1 driver_status aligned based (driver_status_ptr),
+  2    26        2 req_type_label char (32),			/* string to describe the request type */
+  2    27        2 dev_name_label char (32),			/* string to describe the device */
+  2    28        2 device_id char (32),				/* minor device name used by this logical driver */
+  2    29        2 device_class_id char (32),			/* device class name used by this logical driver */
+  2    30        2 coord_chan fixed bin (71),			/* ipc event channel for signals to coord. */
+  2    31        2 driver_chan fixed bin (71),			/* ipc event channel for signals from coord. */
+  2    32        2 last_wake_time fixed bin (71),			/* time last wakeup sent to coord */
+  2    33        2 request_pending bit (36),			/* locking word for communication with coord */
+  2    34 						/* 0 = ready for a request  */
+  2    35 						/* driver pid = don't bug me */
+  2    36 						/* coord  pid = got a request */
+  2    37        2 status_flags,
+  2    38          3 attached bit (1) unal,			/* minor device is attached for i/o */
+  2    39          3 busy bit (1) unal,				/* driver doing request..tell coord when done */
+  2    40          3 ready bit (1) unal,			/* driver is ready to handle requests */
+  2    41          3 acknowledge bit (1) unal,			/* coordinator must reply to all wakeups */
+  2    42          3 have_accounting bit (1) unal,		/* ON if accounting ^= nothing */
+  2    43          3 pad bit (31) unal,
+  2    44        2 list_index fixed bin,			/* index of this driver in the driver ptr list */
+  2    45        2 dev_index fixed bin,				/* index in iod_device_tab of this minor device */
+  2    46        2 maj_index fixed bin,				/* index in iod_device_tab of the corresponding major device */
+  2    47        2 dev_class_index fixed bin,			/* index of device_class entry */
+  2    48        2 minor_args unaligned like text_offset,		/* descriptive string for this minor device */
+  2    49        2 min_banner bit (72) aligned,			/* min banner access class for marking output */
+  2    50        2 acct_entry entry (char (*), char (*), ptr, fixed bin (35)) variable, /* entry variable to accounting procedure */
+  2    51 						/* for this logical driver */
+  2    52        2 rqti_ptr ptr,				/* pointer to the request type info seg */
+  2    53        2 dev_out_iocbp ptr,				/* iocb pointer for dev_out_stream */
+  2    54        2 dev_in_iocbp ptr,				/* iocb pointer for dev_in_stream */
+  2    55        2 dev_out_stream char (32),			/* output stream for minor device */
+  2    56        2 dev_in_stream char (32),			/* input stream for minor device */
+  2    57        2 elem_size fixed bin,				/* element size for the stream */
+  2    58        2 message_type fixed bin,			/* expected format of user request */
+  2    59        2 form_wait_time fixed bin (71),			/* average time needed to write ctl term msg */
+  2    60        2 forms_validation_ptr ptr,			/* forms validation data */
+  2    61        2 dev_ptr1 ptr,				/* another one */
+  2    62        2 dev_fb1 fixed bin,				/* a spare fixed bin variable for the driver */
+  2    63        2 dev_fb2 fixed bin,				/* and another */
+  2    64        2 dev_fb3 fixed bin,				/* and another */
+  2    65        2 dev_fb4 fixed bin,				/* and the last spare fixed bin */
+  2    66        2 dev_fb71 fixed bin (71),			/* a spare fixed bin  71  variable */
+  2    67        2 dev_ctl_ptr ptr,				/* pointer to control structure for this device */
+  2    68        2 bit_rate_est fixed bin (35),			/* output rate estimate - bits per second */
+  2    69        2 defer_time_limit fixed bin (35),		/* max time allowed for a request - in seconds (0 = no limit) */
+  2    70        2 generic_type char (32),			/* generic type of this minor device */
+  2    71        2 status_pad (2) fixed bin (35),			/* save some room for later */
+  2    72        2 descriptor like request_descriptor,		/* copy of request descriptor */
+  2    73        2 desc_pad (13) fixed bin,
+  2    74        2 message fixed bin;				/* place-holder for copy of request message */
+  2    75 
+  2    76 
+  2    77 /* END INCLUDE FILE...driver_status.incl.pl1 */
+      600 
+      601 
+  3     1 /* BEGIN INCLUDE FILE. . . iod_event_message.incl.pl1 */
+  3     2 
+  3     3 /* Format of event message used to signal io_daemon coordinator */
+  3     4 /* and the acknowledge message for signalling the driver */
+  3     5 
+  3     6 dcl event_message fixed bin(71);
+  3     7 
+  3     8 dcl 1 ev_msg based aligned,
+  3     9 	2 code fixed bin(17) unal,		/* Purpose of wakeup: */
+  3    10 					/* 0 = request completed */
+  3    11 					/* 1 = request completed, new request wanted */
+  3    12 					/* 2 = restart */
+  3    13 					/* 3 = save  */
+  3    14 					/* 4 = logout */
+  3    15 	2 minor_dev_index fixed bin(17) unal,	/* minor device index for driver sending this message */
+  3    16 	2 seq_id fixed bin(35);		/* id of request to be restarted/saved */
+  3    17 
+  3    18 dcl 1 ack_msg aligned based,			/* driver command acknowledgement message */
+  3    19 	2 code fixed bin (35),		/* error_table_ code */
+  3    20 	2 num fixed bin (35);		/* number for further info */
+  3    21 
+  3    22 /* END INCLUDE FILE. . . iod_event_message.incl.pl1 */
+      602 
+      603 
+  4     1 /* BEGIN INCLUDE FILE ... iod_tables_hdr.incl.pl1 */
+  4     2 
+  4     3 
+  4     4 
+  4     5 /****^  HISTORY COMMENTS:
+  4     6*  1) change(88-01-27,Brunelle), approve(), audit(), install():
+  4     7*     Ancient History
+  4     8*     Created by J. Stern, 1/20/75
+  4     9*     Modified by J. C. Whitmore April 1978 for enhancements
+  4    10*     Modified by J. C. Whitmore, 10/78, for version 3 iod_tables format.
+  4    11*     Modified by E. N. Kittlitz, 6/81, for version 4 iod_tables with expanded
+  4    12*     q_group_tab
+  4    13*  2) change(88-02-18,Brunelle), approve(88-08-31,MCR7911),
+  4    14*     audit(88-09-29,Wallman), install(88-10-28,MR12.2-1199):
+  4    15*     Change version number to reflect changes in q_group_tab and
+  4    16*     iod_device_tab for laser printer support.  Added font tables.
+  4    17*                                                   END HISTORY COMMENTS */
+  4    18 
+  4    19 
+  4    20 /* format: style4 */
+  4    21 
+  4    22 dcl  ithp ptr;					/* ptr to io daemon dables and it's header */
+  4    23 dcl  1 iod_tables_hdr aligned based (ithp),		/* header of data segment compiled by iod_table_compiler */
+  4    24        2 version char (8),				/* version of this structure */
+  4    25        2 date_time_compiled fixed bin (71),
+  4    26        2 grace_time fixed bin (71),			/* grace time before deleting finished segment */
+  4    27        2 max_queues fixed bin (17),			/* default number of priority queues per queue group */
+  4    28        2 line_tab_offset fixed bin (18),		/* offset of line id table */
+  4    29        2 device_tab_offset fixed bin (18),		/* offset of device table */
+  4    30        2 minor_device_tab_offset fixed bin (18),		/* offset of minor device table */
+  4    31        2 dev_class_tab_offset fixed bin (18),		/* offset of device class table */
+  4    32        2 q_group_tab_offset fixed bin (18),		/* offset of queue group table */
+  4    33        2 forms_info_tab_offset fixed bin (18),		/* offset of forms info tables */
+  4    34        2 text_strings_offset fixed bin (18),
+  4    35        2 start_of_tables fixed bin;			/* beginning of above tables, MUST start on even word boundry */
+  4    36 
+  4    37 /* Defines common text block to store virtually all text in the I/O daemon tables */
+  4    38 dcl  text_strings_ptr ptr;
+  4    39 dcl  1 text_strings aligned based (text_strings_ptr),
+  4    40        2 length fixed bin,
+  4    41        2 chars char (1 refer (text_strings.length)) unaligned;
+  4    42 
+  4    43 /* this defines text offsets used to locate i/o daemon tables strings in
+  4    44*   the text_strings structure */
+  4    45 dcl  1 text_offset based,
+  4    46        2 first_char fixed bin (18) unsigned unaligned,
+  4    47        2 total_chars fixed bin (18) unsigned unaligned;
+  4    48 
+  4    49 dcl  IODT_VERSION_5 char (8) int static options (constant) init ("IODT0005"); /* current version number */
+  4    50 
+  4    51 
+  4    52 /* END INCLUDE FILE ... iod_tables_hdr.incl.pl1 */
+      604 
+      605 
+  5     1 /* BEGIN INCLUDE FILE...iodd_static.incl.pl1 */
+  5     2 
+  5     3 
+  5     4 /****^  HISTORY COMMENTS:
+  5     5*  1) change(85-02-14,Homan), approve(87-04-06,MCR7656),
+  5     6*     audit(87-06-13,Beattie), install(87-08-06,MR12.1-1068):
+  5     7*     Add support for logout_on_hangup option.
+  5     8*  2) change(88-02-18,Brunelle), approve(88-08-31,MCR7911),
+  5     9*     audit(88-09-29,Wallman), install(88-10-28,MR12.2-1199):
+  5    10*     Add head/tail_sheet entry variables and paper_type variable.
+  5    11*                                                   END HISTORY COMMENTS */
+  5    12 
+  5    13 /* format: style4 */
+  5    14 
+  5    15 dcl  stat_p int static ptr;
+  5    16 
+  5    17 dcl  1 iodd_static based (stat_p) aligned,
+  5    18 
+  5    19 /*    The first part is set only once for a device driver */
+  5    20 
+  5    21        2 ithp ptr,					/* pointer to iod tables header */
+  5    22        2 ltp ptr,					/* pointer to line table */
+  5    23        2 idtp ptr,					/* pointer to device tab */
+  5    24        2 mdtp ptr,					/* pointer to minor device table */
+  5    25        2 qgtp ptr,					/* pointer to q_group table */
+  5    26        2 dev_class_ptr ptr,				/* pointer to device class table */
+  5    27        2 text_strings_ptr ptr,			/* pointer to iod tables text strings */
+  5    28        2 driver_list_ptr ptr,				/* pointer to list of driver status seg pointers */
+  5    29        2 chan_list_ptr ptr,				/* pointer to list of event channels for blocking */
+  5    30        2 sys_dir_ptr ptr,				/* ptr to 168 char string defining sys_dir */
+  5    31        2 coord_proc_id bit (36),			/* process id of coordinator for wakeups */
+  5    32        2 driver_proc_id bit (36),			/* process id of driver for locking */
+  5    33        2 re_init_label label,				/* where to go after "re_init" or "slave_logout" */
+  5    34        2 no_coord_label label,			/* where to go for a no_coord condition */
+  5    35        2 log_stream char (32),			/* stream name used for log output */
+  5    36        2 master_input char (32),			/* master console input stream for commands */
+  5    37        2 master_output char (32),			/* master console output stream for messages */
+  5    38        2 master_out ptr,				/* master output iocbp */
+  5    39        2 master_in ptr,				/* master input iocbp */
+  5    40        2 log_iocbp ptr,				/* log output iocbp */
+  5    41        2 error_io ptr,				/* error i/o iocbp */
+  5    42        2 dev_io_stream char (32),			/* stream used to attach the major device */
+  5    43        2 dev_in_stream char (32),			/* input stream if different from dev_io_stream */
+  5    44        2 dev_out_stream char (32),			/* output stream if different from dev_io_stream */
+  5    45        2 device_dim char (32),			/* dim which drives the major device */
+  5    46        2 attach_name char (32),			/* channel or dial id for attaching major device */
+  5    47        2 attach_type fixed bin,			/* what previous is: 1 = iom, 2 = tty, 3 = dial, 4 = variable line */
+  5    48        2 dev_dial_id char (8),			/* non null if device is to be dialed to driver */
+  5    49        2 line_tab_idx fixed bin,			/* for attach type 4, this is the entry index, else 0 */
+  5    50        2 dial_ev_chan fixed bin (71),			/* IPC chan for dial control */
+  5    51        2 major_device char (32),			/* name of the major device */
+  5    52        2 major_args unaligned like text_offset,		/* descriptive string for the major device */
+  5    53        2 coord_cmd_chan fixed bin (71),			/* IPC chan to send commands to coord through coord_comm.ms */
+  5    54        2 cmd_ack_chan fixed bin (71),			/* IPC chan for coord to return command status code */
+  5    55        2 timer_chan fixed bin (71),			/* IPC chan for unblocking if nothing happens */
+  5    56        2 io_daemon_version char (8),			/* current version number of the io daemon driver */
+  5    57        2 extra_static (8) fixed bin (35),		/* unused space - non_dynamic */
+  5    58        2 dummy_ptr ptr,				/* a dummy pointer for the driver module */
+  5    59 
+  5    60 /*    driver module entrypoints are defined by the following entry variables */
+  5    61 
+  5    62        2 driver_init entry variable options (variable),
+  5    63        2 driver_request entry variable options (variable),
+  5    64        2 driver_command entry variable options (variable),
+  5    65        2 driver_default_handler entry variable options (variable),
+  5    66 
+  5    67 /*    entrypoints for head/tail_sheet_ entries */
+  5    68        2 print_head_sheet entry (ptr, ptr, ptr, fixed bin (35)) variable,
+  5    69        2 print_head_separator entry (ptr, ptr, char (*), fixed bin (35)) variable,
+  5    70        2 print_tail_sheet entry (ptr, ptr, ptr, fixed bin (35)) variable,
+  5    71 
+  5    72        2 paper_type fixed bin,			/* type of paper being used */
+  5    73 						/* 1 = single sheet */
+  5    74 						/* 2 = continuous forms */
+  5    75 
+  5    76 /*   The remainder of the data may be dynamic during the device driver's existence */
+  5    77 
+  5    78        2 extra_dynamic (14) fixed bin (35),		/* unused space - dynamic */
+  5    79        2 auto_logout_interval fixed bin,		/* minutes to wait for inactivity logout */
+  5    80        2 requests_til_cmd fixed bin,			/* number of requests to go before returning to cmd level */
+  5    81        2 assigned_devices fixed bin,			/* number of minor devices assigned to major device */
+  5    82        2 current_devices fixed bin,			/* number of devices currently active in process */
+  5    83        2 output_device char (32),			/* name of minor device currently in use */
+  5    84        2 wakeup_time fixed bin (71),			/* time interval between timer wakeups */
+  5    85        2 auto_start_delay fixed bin (71),		/* time to wait before performing an auto-start after quit */
+  5    86        2 driver_ptr ptr,				/* pointer to driver status seg currently in use */
+  5    87        2 segptr ptr,				/* ptr to current user segment being processed */
+  5    88        2 flags,					/* control flags */
+  5    89          3 initialized bit (1) unal,			/* all driver data bases are initialized */
+  5    90          3 test_entry bit (1) unal,			/* driver test entry was called */
+  5    91          3 request_in_progress bit (1) unal,		/* driver executing a request */
+  5    92          3 recursion_flag bit (1) unal,			/* recursive unclaimed signal */
+  5    93          3 no_coord_flag bit (1) unal,			/* process is ready to accept a no_coord signal */
+  5    94          3 logout_pending bit (1) unal,			/* logout after all pending requests are done */
+  5    95          3 master_hold bit (1) unal,			/* master_hold at command level */
+  5    96          3 slave_hold bit (1) unal,			/* slave hold at command level */
+  5    97          3 step bit (1) unal,				/* run in step mode */
+  5    98          3 quit_during_request bit (1) unal,		/* a quit occured, don't wait for wakeup */
+  5    99          3 runout_requests bit (1) unal,		/* hold after all pending requests are done */
+  5   100          3 re_init_in_progress bit (1) unal,		/* driver processing a re_init signal */
+  5   101          3 quit_signaled bit (1) unal,			/* set to "1"b by quit handler for anyone who is curious */
+  5   102          3 auto_logout_pending bit (1) unal,		/* inactivity limit exceeded, logout after next wakeup */
+  5   103          3 logout_on_hangup bit (1) unal,		/* logout instead of reinit if set */
+  5   104          3 pad bit (21) unal,				/* unused space */
+  5   105        2 slave,					/* slave control device data (ctl term or remote reader) */
+  5   106          3 slave_input char (32),			/* slave input stream name */
+  5   107          3 slave_output char (32),			/* slave output stream name */
+  5   108          3 slave_pad fixed bin,			/* allocation breakage */
+  5   109          3 slave_in ptr,				/* slave input iocbp */
+  5   110          3 slave_out ptr,				/* slave output iocbp */
+  5   111          3 slave_ev_chan fixed bin (71),		/* event channel the slave device blocks on */
+  5   112          3 active bit (1) unal,			/* on if there is a slave */
+  5   113          3 accept_input bit (1) unal,			/* on if commands may come from the slave */
+  5   114          3 allow_quits bit (1) unal,			/* on if we allow slave to send quits */
+  5   115          3 print_errors bit (1) unal,			/* on if errors will be sent to the slave */
+  5   116          3 log_msg bit (1) unal,			/* on if log messages are to be sent to the slave */
+  5   117          3 priv1 bit (1) unal,			/* driver_module defined slave privileges */
+  5   118          3 priv2 bit (1) unal,
+  5   119          3 priv3 bit (1) unal,
+  5   120          3 echo_cmd bit (1) unal,			/* on if each slave cmd should be written back */
+  5   121          3 slave_bit_pad bit (27) unal,			/* unused space */
+  5   122        2 ctl_term,					/* control terminal data */
+  5   123          3 ctl_attach_name char (32),			/* dial id, tty chan, or mrd_ device */
+  5   124          3 ctl_attach_type fixed bin,			/* attach name meaning: 1=line, 2=dial, 3=mrd_source */
+  5   125          3 ctl_pad fixed bin,				/* allocation breakage */
+  5   126          3 ctl_dial_chan fixed bin (71),		/* ipc event channel for dial comm */
+  5   127          3 ctl_input char (32),			/* ctl input stream name */
+  5   128          3 ctl_output char (32),			/* ctl output stream name */
+  5   129          3 ctl_io char (32),				/* ctl i/o stream name */
+  5   130          3 ctl_dev_dim char (32),			/* ctl_io attached with this dim */
+  5   131          3 ctl_ev_chan fixed bin (71),			/* IPC event chan ctl term blocks on */
+  5   132          3 ctl_device char (32),			/* ctl terminal device name */
+  5   133          3 form_type char (16),			/* format type if printing forms */
+  5   134          3 attached bit (1) unal,			/* ctl term attached to process */
+  5   135          3 forms bit (1) unal,			/* on if printing forms */
+  5   136          3 pad bit (34) unal,
+  5   137        2 admin_ec_name char (32),			/* name of the ec to use with the "x" command */
+  5   138        2 expansion_space (100) fixed bin;		/* reserved space...use at your own risk */
+  5   139 
+  5   140 /* END INCLUDE FILE ... iodd_static.incl.pl1 */
+      606 
+      607 
+  6     1 /* BEGIN INCLUDE FILE . . . mseg_message_info.incl.pl1 BIM 1984-10-10 */
+  6     2 /* format: style3,idind30 */
+  6     3 
+  6     4 /* structure returned when message is read from a message segment */
+  6     5 
+  6     6 
+  6     7 dcl	mseg_message_info_ptr	pointer;
+  6     8 
+  6     9 dcl	1 mseg_message_info		based (mseg_message_info_ptr) aligned,
+  6    10 	  2 version		char (8) aligned,
+  6    11 	  2 message_code		fixed bin,
+  6    12 	  2 control_flags		unaligned,
+  6    13 	    3 own			bit (1),
+  6    14 	    3 delete		bit (1),
+  6    15 	    3 pad			bit (34),
+  6    16 	  2 ms_ptr		ptr,		/* pointer to message */
+  6    17 	  2 ms_len		fixed bin (24),	/* length of message  in bits */
+  6    18 	  2 ms_id			bit (72),		/* unique ID of message */
+  6    19 						/* input in some cases */
+  6    20 	  2 ms_access_class		bit (72),		/* message access class */
+  6    21 	  2 sender_id		char (32) unaligned,/* process-group ID of sender */
+  6    22 	  2 sender_process_id	bit (36) aligned,	/* if nonzero, process that sent */
+  6    23 	  2 sender_level		fixed bin,	/* validation level of sender */
+  6    24 	  2 sender_authorization	bit (72),		/* access authorization of message sender */
+  6    25 	  2 sender_max_authorization	bit (72),		/* max authorization of sending process */
+  6    26 	  2 sender_audit		bit (36) aligned;   /* audit flags */
+  6    27 
+  6    28 declare	MSEG_MESSAGE_INFO_V1	char (8) aligned init ("msegmi01") int static options (constant);
+  6    29 
+  6    30 declare	(
+  6    31 	MSEG_READ_FIRST		init (1),
+  6    32 	MSEG_READ_LAST		init (2),
+  6    33 	MSEG_READ_SPECIFIED		init (3),
+  6    34 	MSEG_READ_BEFORE_SPECIFIED	init (4),
+  6    35 	MSEG_READ_AFTER_SPECIFIED	init (5))
+  6    36 	fixed bin int static options (constant);
+  6    37 
+  6    38 declare  (MSEG_READ_OWN		init ("1"b),
+  6    39 	MSEG_READ_DELETE		init ("01"b)
+  6    40 	)			bit (36) aligned internal static options (constant);
+  6    41 
+  6    42 /* END INCLUDE FILE . . . mseg_message_info.incl.pl1 */
+      608 
+      609 
+  7     1 /* BEGIN INCLUDE FILE...request_descriptor.incl.pl1 */
+  7     2 
+  7     3 /* Descriptor associated with an I/O daemon request */
+  7     4 /* Coded August 1973 by Robert S. Coren */
+  7     5 /* Modified by J. C. Whitmore, 5/78, to extend driver_data to 7 words */
+  7     6 /* Modified by C. Marker, 2/23/85, changed to use mseg_message_info */
+  7     7 
+  7     8 dcl  1 request_descriptor based aligned,
+  7     9 	2 mseg_message_info_copy like mseg_message_info,
+  7    10 	2 seq_id fixed bin(35),	/* sequential number assigned by coordinator */
+  7    11 	2 q fixed bin,		/* priority queue in which request was submitted */
+  7    12 	2 contd_seq_id fixed bin(35),	/* if nonzero, this is previous seq_id of continued request */
+  7    13 	2 prev_seq_id fixed bin(35),	/* if nonzero, this is previous seq_id of restarted request */
+  7    14 	2 dev_class_index fixed bin,	/* index of device_class entry */
+  7    15 	2 spare_fb fixed bin (17) unal, /* save half a word for later */
+  7    16 	2 charge_q fixed bin (17) unal, /* priority to use for charging */
+  7    17 	2 time_done fixed bin(71),	/* clock time when request was completed */
+  7    18 	2 prev_done fixed bin(18),	/* descriptor threaded ahead of this one in saved list */
+  7    19 	2 next_done fixed bin(18),	/*      "        "     behind    "        "       "      */
+  7    20 	2 driver_data bit(252),	/* driver maintained data */
+  7    21 	2 flags,
+  7    22 	   (3 continued,		/* unfinished by one driver and given to another */
+  7    23 	    3 finished,
+  7    24 	    3 restarted,
+  7    25 	    3 cancelled,
+  7    26 	    3 dont_delete,
+  7    27 	    3 saved,		/* not to be freed */
+  7    28 	    3 keep_in_queue,	/* keep request in queue */
+  7    29 	    3 series_restart,	/* this request is part of restarted series */
+  7    30 	    3 priority_request) bit (1) unal, /* this request was given extra priority */
+  7    31 	    3 pad bit(27) unal,
+  7    32 	2 next_pending fixed bin(18);	/* thread to next pending descriptor */
+  7    33 
+  7    34 /* END INCLUDE FILE...request_descriptor.incl.pl1 */
+      610 
+      611 
+      612      end iodd_listen_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    10/28/88  1229.8  iodd_listen_.pl1                  >special_ldd>install>MR12.2-1199>iodd_listen_.pl1
+598          1    08/29/75  1310.5  driver_ptr_list.incl.pl1          >ldd>include>driver_ptr_list.incl.pl1
+600          2    10/28/88  1226.9  driver_status.incl.pl1            >special_ldd>install>MR12.2-1199>driver_status.incl.pl1
+602          3    09/28/78  1359.8  iod_event_message.incl.pl1        >ldd>include>iod_event_message.incl.pl1
+604          4    10/28/88  1227.4  iod_tables_hdr.incl.pl1           >special_ldd>install>MR12.2-1199>iod_tables_hdr.incl.pl1
+606          5    10/28/88  1227.2  iodd_static.incl.pl1              >special_ldd>install>MR12.2-1199>iodd_static.incl.pl1
+608          6    01/10/85  2002.8  mseg_message_info.incl.pl1        >ldd>include>mseg_message_info.incl.pl1
+610          7    03/15/85  0953.1  request_descriptor.incl.pl1       >ldd>include>request_descriptor.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+accept_input            342(01)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 set ref
+                                                                                  188*
+active                  342            based           bit(1)                   level 3 packed packed unaligned dcl 5-17 set ref 183
+                                                                                  187* 300 358
+addr                                                   builtin function         dcl 154 ref 278 278 328 328 450 450 494 541 542 543
+aligned                   4     000203 automatic       bit(1)                   level 2 packed packed unaligned dcl 119 set ref 342
+allow_quits             342(02)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 set ref
+                                                                                  190* 249 311
+assigned_devices        265            based           fixed bin(17,0)          level 2 dcl 5-17 ref 204 386 388
+attached                 47            based           bit(1)                   level 3 in structure "driver_status" packed packed
+                                                                                  unaligned dcl 2-25 in procedure "iodd_listen_" ref
+                                                                                  206
+attached                436            based           bit(1)                   level 3 in structure "iodd_static" packed packed
+                                                                                  unaligned dcl 5-17 in procedure "iodd_listen_" ref
+                                                                                  324
+auto_logout_interval    263            based           fixed bin(17,0)          level 2 dcl 5-17 ref 444 444
+auto_logout_pending     310(13)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 set ref
+                                                                                  199* 230* 295* 465 481* 590*
+both                            000021 constant        fixed bin(17,0)          initial dcl 136 set ref 242* 244* 332* 437*
+busy                     47(01)        based           bit(1)                   level 3 packed packed unaligned dcl 2-25 set ref
+                                                                                  219* 408* 482* 496 521*
+chan_list_ptr            20            based           pointer                  level 2 in structure "iodd_static" dcl 5-17
+                                                                                  in procedure "iodd_listen_" ref 174
+chan_list_ptr                   000326 automatic       pointer                  dcl 159 in procedure "iodd_listen_" set ref 174* 175
+                                                                                  370 371 450*
+channel                   2            based           fixed bin(71,0)          array level 2 dcl 161 set ref 175 371*
+cleanup                         000320 stack reference condition                dcl 148 ref 225
+clock_                          000012 constant        entry                    external dcl 54 ref 282 413
+code                            000107 automatic       fixed bin(35,0)          dcl 80 in procedure "iodd_listen_" set ref 177* 178
+                                                                                  180* 182 183* 249* 278* 309* 316 318 318 328* 329
+                                                                                  332* 371* 450* 451 452* 453* 545* 547 548 551 551
+code                                   based           fixed bin(17,0)          level 2 in structure "ev_msg" packed packed
+                                                                                  unaligned dcl 3-8 in procedure "iodd_listen_" set
+                                                                                  ref 541*
+continue_to_signal_             000014 constant        entry                    external dcl 55 ref 576
+convert_ipc_code_               000016 constant        entry                    external dcl 56 ref 452 549
+coord_chan               40            based           fixed bin(71,0)          level 2 dcl 2-25 set ref 545*
+coord_proc_id            24            based           bit(36)                  level 2 dcl 5-17 set ref 397 404 465 545*
+ctl                             000156 automatic       structure                level 1 dcl 88 set ref 255* 278*
+ctl_term                344            based           structure                level 2 dcl 5-17
+current_devices         266            based           fixed bin(17,0)          level 2 dcl 5-17 set ref 201* 212* 212 273 384
+daemon_again                    000216 stack reference condition                dcl 148 ref 238
+daemon_again_slave              000224 stack reference condition                dcl 148 ref 240
+daemon_cancel                   000240 stack reference condition                dcl 148 ref 242
+daemon_idle                     000312 stack reference condition                dcl 148 ref 246 470
+daemon_kill                     000232 stack reference condition                dcl 148 ref 244
+daemon_logout                   000276 stack reference condition                dcl 148 ref 434
+daemon_save                     000254 stack reference condition                dcl 148 ref 236
+daemon_slave_logout             000304 stack reference condition                dcl 148 ref 465
+daemon_unclaimed                000246 stack reference condition                dcl 148 ref 454
+desc_ptr                        000104 automatic       pointer                  dcl 78 set ref 494* 496 502
+descriptor              146            based           structure                level 2 dcl 2-25 set ref 494
+dev_index                51            based           fixed bin(17,0)          level 2 dcl 2-25 ref 543
+device_id                20            based           char(32)                 level 2 dcl 2-25 ref 392 464
+dr_ptr                          000102 automatic       pointer                  dcl 77 set ref 205* 206 207 208 211 214 217 219
+driver_index                    000171 automatic       fixed bin(17,0)          dcl 109 set ref 256* 387* 387 388 388* 390
+driver_list_ptr          16            based           pointer                  level 2 dcl 5-17 ref 173
+driver_proc_id           25            based           bit(36)                  level 2 dcl 5-17 ref 208 217 500
+driver_ptr              304            based           pointer                  level 2 dcl 5-17 set ref 282 390* 392 397 397 402
+                                                                                  404 408 409 414 423 426 462* 464 465 482 494 496
+                                                                                  497 497 500 511 521 543 545
+driver_ptr_list                        based           structure                level 1 unaligned dcl 1-9
+driver_request          214            based           entry variable           level 2 dcl 5-17 ref 484
+driver_status                          based           structure                level 1 dcl 2-25
+ec                              000344 automatic       fixed bin(35,0)          dcl 535 set ref 548* 549* 550*
+error                           000027 constant        fixed bin(17,0)          initial dcl 139 set ref 183* 453* 550*
+ev_chan_list                           based           structure                level 1 dcl 161
+ev_msg                                 based           structure                level 1 dcl 3-8
+event_info                      000174 automatic       structure                level 1 dcl 112 set ref 450 450
+event_message                   000332 automatic       fixed bin(71,0)          dcl 3-6 set ref 540* 541 542 543 545*
+finished                 53(01)        based           bit(1)                   level 3 packed packed unaligned dcl 7-8 set ref 496
+                                                                                  502*
+flags                    53            based           structure                level 2 in structure "request_descriptor" dcl 7-8
+                                                                                  in procedure "iodd_listen_"
+flags                   310            based           structure                level 2 in structure "iodd_static" dcl 5-17
+                                                                                  in procedure "iodd_listen_"
+form_data                       000203 automatic       structure                level 1 dcl 119 set ref 328 328
+forms                   436(01)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 set ref 324
+                                                                                  330* 348*
+free_devices                    000170 automatic       fixed bin(17,0)          dcl 108 set ref 383* 386 396* 396 407* 407 425*
+hcs_$wakeup                     000020 constant        entry                    external dcl 57 ref 545
+i                               000106 automatic       fixed bin(17,0)          dcl 79 set ref 204* 205* 370* 371*
+idle_msg_sent                   000153 automatic       bit(1)                   packed unaligned dcl 84 set ref 202* 297* 476* 570
+                                                                                  574*
+iodd_command_processor_         000026 constant        entry                    external dcl 60 ref 309
+iodd_get_cmd_                   000024 constant        entry                    external dcl 59 ref 278
+iodd_msg_                       000022 constant        entry                    external dcl 58 ref 183 238 240 242 244 332 343 352
+                                                                                  358 437 453 550 570
+iodd_quit_handler_              000030 constant        entry                    external dcl 61 ref 231
+iodd_stat_p                     000054 external static pointer                  dcl 168 ref 172
+iodd_static                            based           structure                level 1 dcl 5-17
+iox_$control                    000034 constant        entry                    external dcl 63 ref 249 300 311 320 328 337 339
+iox_$look_iocb                  000032 constant        entry                    external dcl 62 ref 177 180
+ipc_$block                      000036 constant        entry                    external dcl 64 ref 450
+ipc_$drain_chn                  000040 constant        entry                    external dcl 65 ref 371
+last_cmd                        000161 automatic       fixed bin(17,0)          dcl 102 set ref 266* 306* 352 414
+last_wake_time           44            based           fixed bin(71,0)          level 2 dcl 2-25 set ref 282* 414 423*
+line                            000110 automatic       char(132)                packed unaligned dcl 81 set ref 278 278 309 309
+list_ptr                        000330 automatic       pointer                  dcl 1-7 set ref 173* 205 390 462
+listen_cmd_level                       constant        fixed bin(17,0)          initial dcl 131 ref 273
+logout_pending          310(05)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 set ref
+                                                                                  198* 434 439*
+major_device            154            based           char(32)                 level 2 dcl 5-17 set ref 352* 358* 570*
+master                          000025 constant        fixed bin(17,0)          initial dcl 133 set ref 183* 238* 252 299 352* 453*
+                                                                                  550*
+master_cmd                      000162 automatic       bit(1)                   packed unaligned dcl 103 set ref 264* 303* 352 364*
+master_hold             310(06)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 ref 260 507
+master_in                70            based           pointer                  level 2 dcl 5-17 set ref 252 337*
+minor_dev_index           0(18)        based           fixed bin(17,0)          level 2 packed packed unaligned dcl 3-8 set ref 543*
+mseg_message_info                      based           structure                level 1 dcl 6-9
+must_tell_coord                 000152 automatic       bit(1)                   packed unaligned dcl 83 set ref 254* 280 287* 515*
+                                                                                  519*
+nchars                          000151 automatic       fixed bin(17,0)          dcl 82 set ref 278* 309 309
+new_request                            constant        fixed bin(17,0)          initial dcl 140 set ref 283 421* 511 515
+no_coord                        000000 stack reference condition                dcl 148 ref 551
+none                                   constant        fixed bin(17,0)          initial dcl 132 ref 266 281 290 414
+normal                          000025 constant        fixed bin(17,0)          initial dcl 137 set ref 238* 240* 242* 244* 332*
+                                                                                  343* 352* 358* 437* 570*
+now                             000172 automatic       fixed bin(71,0)          dcl 110 set ref 413* 414 423
+null                                                   builtin function         dcl 154 ref 249 249 300 300 311 311 320 320 337 337
+                                                                                  339 339 525
+null_cmd_level                         constant        fixed bin(17,0)          initial dcl 130 ref 276
+number                                 based           fixed bin(17,0)          level 2 dcl 161 ref 370
+output_device           267            based           char(32)                 level 2 dcl 5-17 set ref 392* 464*
+print_errors            342(03)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 set ref
+                                                                                  189*
+prompt_master             0(01) 000156 automatic       bit(1)                   level 2 packed packed unaligned dcl 88 set ref 262*
+                                                                                  335*
+prompt_slave              0(02) 000156 automatic       bit(1)                   level 2 packed packed unaligned dcl 88 set ref 263*
+                                                                                  336*
+quit                            000210 stack reference condition                dcl 148 ref 227
+quit_during_request     310(09)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 set ref
+                                                                                  194* 523*
+quit_signaled           310(12)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 set ref
+                                                                                  523*
+re_init                         000270 stack reference condition                dcl 148 ref 456 553
+re_init_in_progress     310(11)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 set ref
+                                                                                  197*
+ready                    47(02)        based           bit(1)                   level 3 packed packed unaligned dcl 2-25 set ref
+                                                                                  207* 211 397 409* 426* 497 511
+recursion_flag          310(03)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 set ref
+                                                                                  196* 523*
+request_descriptor                     based           structure                level 1 dcl 7-8
+request_done                           constant        fixed bin(17,0)          initial dcl 142 ref 285 505 507 509 513
+request_in_progress     310(02)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 set ref
+                                                                                  195* 523*
+request_pending          46            based           bit(36)                  level 2 dcl 2-25 set ref 208* 214* 217* 397 402 404
+                                                                                  465 497* 500*
+requests_til_cmd        264            based           fixed bin(17,0)          level 2 dcl 5-17 set ref 193* 486* 486 491
+resume                          000262 stack reference condition                dcl 148 ref 234
+runout_requests         310(10)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 set ref
+                                                                                  200* 395 432 433*
+segptr                  306            based           pointer                  level 2 dcl 5-17 set ref 525*
+seq_id                    1            based           fixed bin(35,0)          level 2 dcl 3-8 set ref 542*
+slave                   312            based           structure                level 2 in structure "iodd_static" dcl 5-17
+                                                                                  in procedure "iodd_listen_"
+slave                           000027 constant        fixed bin(17,0)          initial dcl 135 in procedure "iodd_listen_" set ref
+                                                                                  240* 315 343* 352 358* 570*
+slave_cmd                       000163 automatic       bit(1)                   packed unaligned dcl 104 set ref 265* 305* 358 365*
+slave_hold              310(07)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 set ref 260
+                                                                                  438* 491* 509
+slave_in                334            based           pointer                  level 3 dcl 5-17 set ref 177* 249* 300* 311* 315
+                                                                                  339*
+slave_input             312            based           char(32)                 level 3 dcl 5-17 set ref 177*
+slave_out               336            based           pointer                  level 3 dcl 5-17 set ref 180* 328*
+slave_output            322            based           char(32)                 level 3 dcl 5-17 set ref 180*
+source                          000160 automatic       fixed bin(17,0)          dcl 101 set ref 278* 281 290 299 306 309* 320
+stat_p                          000010 internal static pointer                  dcl 5-15 set ref 172* 173 174 177 177 180 180 183
+                                                                                  187 188 189 190 193 194 195 196 197 198 199 200
+                                                                                  201 204 208 212 212 217 230 249 249 252 260 260
+                                                                                  260 273 282 295 300 300 311 311 315 324 324 328
+                                                                                  330 337 339 348 352 358 358 384 386 388 390 392
+                                                                                  392 395 397 397 397 402 404 404 408 409 414 414
+                                                                                  423 426 432 433 434 438 439 444 444 448 454 462
+                                                                                  464 464 465 465 465 481 482 484 486 486 491 491
+                                                                                  494 496 497 497 500 500 505 507 509 511 521 523
+                                                                                  523 523 523 525 543 545 545 556 570 590
+stat_seg                  2            based           structure                array level 2 unaligned dcl 1-9
+stat_segp                 2            based           pointer                  array level 3 dcl 1-9 ref 205 390 462
+state                           000157 automatic       fixed bin(17,0)          dcl 94 set ref 273* 276* 309*
+status_flags             47            based           structure                level 2 dcl 2-25
+step                    310(08)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 ref 260 505
+string                                                 builtin function         dcl 154 set ref 255*
+substr                                                 builtin function         dcl 154 ref 309 309
+terminal                        000164 automatic       pointer                  array dcl 106 set ref 252* 315* 320*
+test_entry              310(01)        based           bit(1)                   level 3 packed packed unaligned dcl 5-17 ref 454 556
+text_offset                            based           structure                level 1 packed packed unaligned dcl 4-45
+timer_channel                   000154 automatic       fixed bin(71,0)          dcl 86 set ref 175* 367* 448*
+timer_manager_$alarm_call       000046 constant        entry                    external dcl 68 ref 444
+timer_manager_$alarm_wakeup     000042 constant        entry                    external dcl 66 ref 448
+timer_manager_$reset_alarm_call 000050 constant        entry                    external dcl 69 ref 225 229 293 479
+timer_manager_$reset_alarm_wakeup
+                                000044 constant        entry                    external dcl 67 ref 367
+timer_manager_$sleep            000052 constant        entry                    external dcl 70 ref 556
+wait_for_input                  000156 automatic       bit(1)                   level 2 packed packed unaligned dcl 88 set ref 260*
+                                                                                  270* 307*
+wait_list_index           6     000174 automatic       fixed bin(17,0)          level 2 dcl 112 set ref 459 462
+wakeup_code                     000100 automatic       fixed bin(17,0)          dcl 75 in procedure "iodd_listen_" set ref 283* 285*
+                                                                                  286* 505* 507* 509* 511* 513* 515 518*
+wakeup_code                            parameter       fixed bin(17,0)          dcl 536 in procedure "wake_coord" ref 532 541
+wakeup_count                    000101 automatic       fixed bin(17,0)          dcl 76 set ref 384* 418 428* 428
+wakeup_time             300            based           fixed bin(71,0)          level 2 dcl 5-17 set ref 414 448*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+IODT_VERSION_5                         internal static char(8)                  initial packed unaligned dcl 4-49
+MSEG_MESSAGE_INFO_V1                   internal static char(8)                  initial dcl 6-28
+MSEG_READ_AFTER_SPECIFIED              internal static fixed bin(17,0)          initial dcl 6-30
+MSEG_READ_BEFORE_SPECIFIED             internal static fixed bin(17,0)          initial dcl 6-30
+MSEG_READ_DELETE                       internal static bit(36)                  initial dcl 6-38
+MSEG_READ_FIRST                        internal static fixed bin(17,0)          initial dcl 6-30
+MSEG_READ_LAST                         internal static fixed bin(17,0)          initial dcl 6-30
+MSEG_READ_OWN                          internal static bit(36)                  initial dcl 6-38
+MSEG_READ_SPECIFIED                    internal static fixed bin(17,0)          initial dcl 6-30
+ack_msg                                based           structure                level 1 dcl 3-18
+driver_status_ptr                      automatic       pointer                  dcl 2-24
+iod_tables_hdr                         based           structure                level 1 dcl 4-23
+ithp                                   automatic       pointer                  dcl 4-22
+mseg_message_info_ptr                  automatic       pointer                  dcl 6-7
+text_strings                           based           structure                level 1 dcl 4-39
+text_strings_ptr                       automatic       pointer                  dcl 4-38
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+block_for_all_events            002431 constant        label                    dcl 444 ref 414 418
+check_for_cmd                   001212 constant        label                    dcl 260 ref 440 471 526
+find_work                       001610 constant        label                    dcl 324 ref 290
+idle_proc                       003134 constant        entry                    internal dcl 567 ref 246
+iodd_listen_                    000275 constant        entry                    external dcl 48
+process_request                 002630 constant        label                    dcl 476 ref 397 404
+read                            001247 constant        label                    dcl 273 ref 268 316 459
+resume_operation                002662 constant        label                    dcl 491 ref 234
+slave_err                       000364 constant        label                    dcl 183 ref 178
+trigger_auto_logout             003216 constant        entry                    internal dcl 587 ref 225 225 229 229 293 293 444 444
+                                                                                  479 479
+wait                            001245 constant        label                    dcl 270 ref 318 322 340 345
+wake_coord                      002774 constant        entry                    internal dcl 532 ref 286 421 518
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      3606        3664    3251        3616
+Length      4322    3251        56         421     334           2
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+iodd_listen_                        367 external procedure  is an external procedure.  
+on unit on line 225                  72 on unit               
+on unit on line 227                  72 on unit               
+on unit on line 234                  64 on unit               
+on unit on line 236                  64 on unit               
+on unit on line 238                  96 on unit               
+on unit on line 240                  96 on unit               
+on unit on line 242                 100 on unit               
+on unit on line 244                 100 on unit               
+on unit on line 246                 108 on unit               
+wake_coord                              internal procedure  shares stack frame of external procedure iodd_listen_.  
+idle_proc                               internal procedure  shares stack frame of on unit on line 246.  
+trigger_auto_logout                  64 internal procedure  is assigned to an entry variable.  
+
+STORAGE FOR INTERNAL STATIC VARIABLES.
+
+   LOC IDENTIFIER                  BLOCK NAME
+000010 stat_p                      iodd_listen_
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+iodd_listen_             000100 wakeup_code                 iodd_listen_
+                         000101 wakeup_count                iodd_listen_
+                         000102 dr_ptr                      iodd_listen_
+                         000104 desc_ptr                    iodd_listen_
+                         000106 i                           iodd_listen_
+                         000107 code                        iodd_listen_
+                         000110 line                        iodd_listen_
+                         000151 nchars                      iodd_listen_
+                         000152 must_tell_coord             iodd_listen_
+                         000153 idle_msg_sent               iodd_listen_
+                         000154 timer_channel               iodd_listen_
+                         000156 ctl                         iodd_listen_
+                         000157 state                       iodd_listen_
+                         000160 source                      iodd_listen_
+                         000161 last_cmd                    iodd_listen_
+                         000162 master_cmd                  iodd_listen_
+                         000163 slave_cmd                   iodd_listen_
+                         000164 terminal                    iodd_listen_
+                         000170 free_devices                iodd_listen_
+                         000171 driver_index                iodd_listen_
+                         000172 now                         iodd_listen_
+                         000174 event_info                  iodd_listen_
+                         000203 form_data                   iodd_listen_
+                         000326 chan_list_ptr               iodd_listen_
+                         000330 list_ptr                    iodd_listen_
+                         000332 event_message               iodd_listen_
+                         000344 ec                          wake_coord
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+alloc_char_temp     call_ent_var        call_ext_out_desc   call_ext_out        return_mac          move_label_var
+make_label_var      tra_ext_1           mpfx2               signal_op           enable_op           shorten_stack
+ext_entry           int_entry
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+clock_                        continue_to_signal_           convert_ipc_code_             hcs_$wakeup
+iodd_command_processor_       iodd_get_cmd_                 iodd_msg_                     iodd_quit_handler_
+iox_$control                  iox_$look_iocb                ipc_$block                    ipc_$drain_chn
+timer_manager_$alarm_call     timer_manager_$alarm_wakeup   timer_manager_$reset_alarm_call
+timer_manager_$reset_alarm_wakeup                           timer_manager_$sleep
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+iodd_stat_p
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     48 000274       172 000302       173 000305       174 000310       175 000313       177 000315       178 000336
+    180 000340       182 000362       183 000364       187 000427       188 000433       189 000435       190 000437
+    193 000441       194 000444       195 000446       196 000450       197 000452       198 000454       199 000456
+    200 000460       201 000462       202 000463       204 000464       205 000473       206 000477       207 000502
+    208 000504       210 000510       211 000511       212 000514       214 000517       216 000520       217 000521
+    219 000525       220 000527       225 000531       227 000561       229 000575       230 000610       231 000614
+    232 000620       234 000621       236 000640       238 000655       240 000725       242 000775       244 001051
+    246 001125       249 001143       252 001202       254 001207       255 001210       256 001211       260 001212
+    262 001234       263 001236       264 001240       265 001241       266 001242       268 001244       270 001245
+    273 001247       276 001256       278 001260       280 001322       281 001324       282 001326       283 001337
+    284 001341       285 001342       286 001344       287 001346       290 001347       293 001351       295 001363
+    297 001367       299 001370       300 001373       303 001430       304 001432       305 001433       306 001435
+    307 001437       309 001441       311 001474       315 001535       316 001542       318 001545       320 001551
+    322 001607       324 001610       328 001620       329 001651       330 001653       332 001657       335 001715
+    336 001717       337 001721       339 001756       340 002013       342 002014       343 002017       345 002053
+    347 002054       348 002055       352 002057       356 002130       358 002131       364 002202       365 002203
+    367 002204       370 002213       371 002223       373 002235       383 002237       384 002240       386 002244
+    387 002251       388 002252       390 002257       392 002263       395 002266       396 002271       397 002272
+    401 002300       402 002301       404 002303       407 002305       408 002306       409 002310       411 002312
+    413 002313       414 002321       418 002334       421 002336       423 002340       425 002345       426 002346
+    428 002350       430 002352       432 002353       433 002356       434 002360       436 002366       437 002367
+    438 002422       439 002426       440 002430       444 002431       448 002457       450 002475       451 002512
+    452 002514       453 002523       454 002562       456 002573       459 002576       462 002601       464 002607
+    465 002612       470 002624       471 002627       476 002630       479 002631       481 002643       482 002647
+    484 002652       486 002656       491 002662       494 002670       496 002673       497 002701       500 002706
+    502 002710       505 002712       507 002720       509 002726       511 002734       513 002742       515 002744
+    518 002751       519 002753       521 002754       523 002761       525 002771       526 002773       532 002774
+    540 002776       541 003000       542 003003       543 003004       545 003011       547 003025       548 003027
+    549 003030       550 003037       551 003076       553 003107       556 003112       559 003133       567 003134
+    570 003135       574 003201       576 003204       578 003214       587 003215       590 003223       594 003226
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

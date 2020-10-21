@@ -1,0 +1,1010 @@
+	COMPILATION LISTING OF SEGMENT bj_storage_recycle
+	Compiled by: Multics PL/I Compiler, Release 28e, of February 14, 1985
+	Compiled at: Honeywell Multics Op. - System M
+	Compiled on: 04/04/85  0938.7 mst Thu
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        4*   *                                                         *
+        5*   *********************************************************** */
+        6 
+        7 /* DESCRIPTION:
+        8*
+        9*     This procedure is called when the end of the journal is reached.
+       10*     The journal is circular; it has a head and a tail. The head moves
+       11*     forward as the journal is written into; the tail stays where it is
+       12*     and is located by bj_pste.cl.origin_ci. When the head tries to step over
+       13*     the tail, it is time to recycle some of the control intervals starting
+       14*     from the tail and going towards the head. The tail is moved forward 
+       15*     towards the head, as far as possible, that is, up to the closest CI (to
+       16*     the tail) which still has some useful information, i.e. some information
+       17*     about a transaction still in progress.
+       18*
+       19*     If it can recycle at least 1 CI, it returns a zero code to the caller.
+       20*     If it cannot recycle any CI at all, it returns a "bj_journal_full"
+       21*     error code.
+       22*
+       23*     It does not attempt to rollback the "slow" transactions that may be
+       24*     responsible for filling up the journal. One may try to do it in a
+       25*     later version.
+       26*
+       27*     This procedure assumes that the bj_pste for this journal is already
+       28*     locked by the caller. 
+       29**/
+       30 
+       31 /* HISTORY:
+       32*Written by Andre Bensoussan,  08/06/82.
+       33*Modified:
+       34*11/18/82 by Andre Bensoussan:  to handle the special case where the caller
+       35*	  is trying to write its first logical record in the journal and
+       36*	  happens to be the only txn using the journal.
+       37*12/15/82 by Andre Bensoussan:  to update the header of the journal each time
+       38*	  the origin changes. This is necessary for finding the last CI
+       39*	  after a crash.
+       40*02/24/83 by Lee A. Newcomb:  to log error if n_txns found in pste does not
+       41*	  agree with the total found b walking the txt for the BJ used.
+       42*04/07/83 by A. Bensoussan:  to improve the message logged when number of txns 
+       43*	  in txt and pste do not agree; and also to no longer adjust the
+       44*	  number in the pste with the number found in the txt.
+       45*05/04/83 by M. Pandolf:  to add meters.
+       46*05/16/83 by A. Bensoussan:  to actually flush the new origin.
+       47*01/30/84 by M. Pandolf:  to dump txt and pst at n_txn discrepancy.
+       48*03/15/84 by M. Pandolf:  to perform more checking when determining whether
+       49*	  or not a txte has a valid transaction when calculating n_txn.  A
+       50*	  transaction is considered finished when its append state is
+       51*	  "comm" or "abor" and the record has been written; this ought to
+       52*	  close up the window where the n_txn discrepancy was.
+       53*11/02/84 by Maggie Sharpe:  to correct format and dcls; to convert a begin
+       54*            block to an internal procedure; to use "call ERROR_RETURN (code)"
+       55*            method of error_handling; to set and reset validation level
+       56*	  before calling file_manager_$? and after returning.
+       57*11/22/84 by Lee A. Newcomb:  Changed to use dm_misc_util_$get_aim_dir.
+       58*12/10/84 by R. Michael Tague:  Changed incl name to dm_daemon_sv_codes.
+       59*01/15/85 by Lee A. Newcomb:  Fixed to use dm_log_sv_codes.incl.pl1 instead of
+       60*            the obsolete dm_daemon_sv_codes.
+       61*03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+       62**/
+       63 /* format: style4,indattr,^inddcls,ifthenstmt,ifthen,^indcomtxt,idind35 */
+       64 
+       65 bj_storage_recycle: proc (p_bj_ppte_ptr, p_code);
+       66 
+       67 /* START OF DECLARATIONS */
+       68 
+       69 /* Parameters */
+       70 dcl  (
+       71      p_bj_ppte_ptr			ptr,		/* Input */
+       72      p_code			fixed bin (35)	/* Output */
+       73      )				parameter;
+       74 
+       75 /* Automatic */
+       76 dcl  (
+       77      n_ci_recycled			fixed bin (24) uns,
+       78      new_origin_ci			fixed bin (24) uns,
+       79      ci_no			fixed bin (24) uns,
+       80      distance			fixed bin (24) uns,
+       81      bj_txt_idx			fixed bin,
+       82      code				fixed bin (35),
+       83      n_txn			fixed bin,
+       84      bj_uid			bit (36) aligned,
+       85      pf_oid			bit (36) aligned,
+       86      txn_id			bit (36) aligned,
+       87      saved_level			fixed bin,
+       88      current_ring			fixed bin (3),
+       89      1 my_bj_pste			like bj_pste aligned
+       90      )				automatic;
+       91 
+       92 /* Based */
+       93 
+       94 dcl  1 rec_id_overlay		based aligned,
+       95        2 ci_no			fixed bin (24) uns unaligned,
+       96        2 slot			fixed bin (12) uns unaligned;
+       97 
+       98 /* Builtin */
+       99 
+      100 dcl  (addr, hbound, lbound, null,
+      101      size, unspec)			builtin;
+      102 
+      103 /* Condition */
+      104 
+      105 dcl  cleanup			condition;
+      106 
+      107 /* Entries */
+      108 
+      109 dcl  bj_storage_util$distance		entry (ptr, fixed bin (24) uns) returns (fixed bin (24) uns);
+      110 dcl  bj_ci_zero$put_header		entry (bit (36) aligned, ptr, fixed bin);
+      111 dcl  cu_$level_get			entry (fixed bin);
+      112 dcl  cu_$level_set			entry (fixed bin);
+      113 dcl  dm_misc_util_$log		entry options (variable);
+      114 dcl  file_manager_$flush_consecutive_ci
+      115 				entry (bit (36) aligned, fixed bin (24), fixed bin (24), fixed bin (35));
+      116 dcl  get_ring_			entry () returns (fixed bin (3));
+      117 
+      118 
+      119 /* External */
+      120 dcl  (
+      121      dm_data_$bj_txt_ptr		ptr,
+      122      dm_error_$bj_journal_full	fixed bin (35)
+      123      )				external;
+      124 
+      125 	call cu_$level_get (saved_level);
+      126 	current_ring = get_ring_ ();
+      127 
+      128 	on cleanup begin;
+      129 	     call cu_$level_set (saved_level);
+      130 	end;
+      131 
+      132 	bj_ppte_ptr = p_bj_ppte_ptr;
+      133 	bj_pste_ptr = bj_ppte.bj_pste_ptr;
+      134 	bj_txt_ptr = dm_data_$bj_txt_ptr;
+      135 	bj_uid = bj_pste.bj_uid;
+      136 	pf_oid = bj_ppte.pf_oid;
+      137 
+      138 	code = 0;
+      139 
+      140 
+      141 	new_origin_ci = bj_pste.cl.origin_ci;
+      142 	n_ci_recycled = bj_pste.cl.number_ci;		/* Max number of ci's that can be recycled */
+      143 						/* is also the max distance from origin to a ci */
+      144 	n_txn = 0;
+      145 
+      146 /*
+      147*   this next loop is to find the transaction that has the oldest record
+      148*   in the before journal, so that we know how many ci's to recycle.  the
+      149*   elaborate if-then statement contains all the logic necessary to see
+      150*   if a transaction ought to be considered in our search
+      151**/
+      152 
+      153 	do bj_txt_idx = lbound (bj_txt.entry, 1) to hbound (bj_txt.entry, 1);
+      154 
+      155 	     bj_txte_ptr = addr (bj_txt.entry (bj_txt_idx));
+      156 
+      157 	     txn_id = bj_txte.tid;
+      158 
+      159 	     if bj_txte.bj_uid = bj_uid then		/* is this txn using our BJ? */
+      160 		if txn_id ^= "0"b then		/* and is it active? */
+      161 		     if bj_txte.first_bj_rec_id ^= "0"b then /* and has a record been written? */
+      162 			if bj_txte.last_completed_operation ^= COMMITTED then
+      163 						/* and has it not been committed */
+      164 			     if bj_txte.last_completed_operation ^= ABORTED then
+      165 						/* nor aborted? */
+      166 				if (bj_txte.pending_bj_rec_id = "0"b) /* and if an operation is pending */
+      167 				     | ((bj_txte.current_operation ^= COMMITTED) /* is neither for a commit */
+      168 				     & (bj_txte.current_operation ^= ABORTED)) then /* nor for an abort? */
+      169 				     if bj_txte.tid = txn_id then /* and hasn't changed from under us? */
+      170 					do;	/* THEN THIS IS A LIVE ONE! */
+      171 					n_txn = n_txn + 1;
+      172 					ci_no = addr (bj_txte.first_bj_rec_id) -> rec_id_overlay.ci_no;
+      173 					distance = bj_storage_util$distance (bj_pste_ptr, ci_no);
+      174 
+      175 					if distance < n_ci_recycled then
+      176 					     do;
+      177 					     new_origin_ci = ci_no;
+      178 					     n_ci_recycled = distance;
+      179 					end;
+      180 				     end;
+      181 	end;
+      182 
+      183 
+      184 	if n_txn ^= bj_pste.n_txn then		/* bj_pste and bj_txte don't agree */
+      185 	     call DUMP ();
+      186 
+      187 
+      188 	if n_txn = 0 then				/* See NOTE 1 */
+      189 	     do;
+      190 	     new_origin_ci = bj_pste.last_ci_on_disk;
+      191 	     n_ci_recycled = bj_storage_util$distance (bj_pste_ptr, new_origin_ci);
+      192 	end;
+      193 
+      194 	if n_ci_recycled <= 0 then do;
+      195 	     bj_pste.meters.n_journal_full = bj_pste.meters.n_journal_full + 1; /* METER */
+      196 	     call ERROR_RETURN (dm_error_$bj_journal_full);
+      197 	end;
+      198 
+      199 	bj_pste.meters.n_successful_recycles = bj_pste.meters.n_successful_recycles + 1; /* METER */
+      200 	bj_pste.meters.n_ci_recycled = bj_pste.meters.n_ci_recycled + n_ci_recycled;
+      201 
+      202 
+      203 /* Journal should be flushed at least up to the ci which will become the new 
+      204*   origin. This is to honor the convention that the origin should always be 
+      205*   flushed. With this convention, the cursors last_ci_buffered, last_ci_put,
+      206*   last_ci_flushed and last_ci_on_disk ALWAYS point to a CI in the circular 
+      207*   list and NEVER have null values.
+      208*   The bj_pste should not be unlocked during the I/O. 
+      209**/
+      210 
+      211 
+      212 	if n_ci_recycled > bj_storage_util$distance (bj_pste_ptr, bj_pste.last_ci_on_disk)
+      213 	     then call FLUSH_NEW_ORIGIN ();
+      214 
+      215 
+      216 
+      217 /* The header of the journal must be updated each time the origin of the
+      218*   circular list changes. This is to be able to find the end of the journal
+      219*   after a system crash. If we change the origin in the pste and then update
+      220*   the header, we have a window in between; if the process crashes in the
+      221*   window, the next process will not know that the header has to be updated.
+      222*   So, we take a copy of the pste, we change the origin in the copy, and we
+      223*   use the copy to update the header; then we change the origin in the pste.
+      224*   If the process crashes in the window, the header will be updated again
+      225*   when recycle is done again. */
+      226 
+      227 
+      228 	unspec (my_bj_pste) = unspec (bj_pste);
+      229 
+      230 	my_bj_pste.cl.origin_ci = new_origin_ci;
+      231 
+      232 	call bj_ci_zero$put_header (pf_oid, addr (my_bj_pste), size (bj_pste));
+      233 
+      234 	call cu_$level_set ((current_ring));
+      235 	call file_manager_$flush_consecutive_ci (pf_oid, 0, 1, code);
+      236 	call cu_$level_set (saved_level);
+      237 
+      238 	if code ^= 0 then call ERROR_RETURN (code);
+      239 
+      240 
+      241 /* Now change the origin in the bj_pste */
+      242 
+      243 	bj_pste.cl.origin_ci = new_origin_ci;
+      244 
+      245 	p_code = 0;
+      246 MAIN_RETURN:
+      247 	return;
+      248 
+      249 ERROR_RETURN:
+      250      proc (error_code);
+      251 
+      252 dcl  error_code			fixed bin (35);
+      253 
+      254 	p_code = error_code;
+      255 	goto MAIN_RETURN;
+      256 
+      257      end ERROR_RETURN;
+      258 
+      259 /* NOTE 1 - This means that no transaction using the journal was found by
+      260*	inspecting the bj_txt table. However, bj_storage_recycle was called
+      261*	on behalf of a txn trying to put its first logical record in the
+      262*	journal. Since the logical record is not stored yet, or at least
+      263*	not stored completely yet, in the journal, it does not appear yet
+      264*	in the bj_txte as the first rec_id stored by this txn.
+      265*
+      266*	In the special situation, if no portion of the logical record was
+      267*	stored yet, the entire journal is available; if one or several
+      268*	portions of the logical record have already be written and more
+      269*	space is needed for the rest, the entire journal is available except
+      270*	for the CI's containing the portion(s) of the logical record already
+      271*	stored. In both cases, it is safe to move the origin forward, up to
+      272*	the last_ci_on_disk. This is what the program does.
+      273*
+      274*	Setting the origin to the last_ci_on_disk does, in general, make
+      275*	space available except in the following case, which is a very special
+      276*	case and very unlikely to happen: The logical record that this txn
+      277*	is attempting to write is larger than the entire journal; in this
+      278*	case the last_ci_on_disk is equal to the origin_ci. The program does
+      279*	the right thing even in this strange case: When it calculates the 
+      280*	number of recycled CI's, it does it by evaluating the distance
+      281*	between the new origin and the old origin. In this special case, the
+      282*	new origin and the old are the same and the distance is zero. The
+      283*	program returns n_ci_recycled = 0, which indicates that the journal 
+      284*	is full. */
+      285 
+      286 FLUSH_NEW_ORIGIN: proc;
+      287 
+      288 
+      289 	call cu_$level_set ((current_ring));
+      290 	call file_manager_$flush_consecutive_ci (pf_oid, (new_origin_ci), 1, code);
+      291 	call cu_$level_set (saved_level);
+      292 
+      293 	if code ^= 0 then call ERROR_RETURN (code);
+      294 
+      295 	if n_ci_recycled > bj_storage_util$distance (bj_pste_ptr, bj_pste.last_ci_flushed) then
+      296 	     bj_pste.last_ci_flushed = new_origin_ci;
+      297 
+      298 	bj_pste.last_ci_on_disk = new_origin_ci;
+      299 
+      300 
+      301 
+      302 /* Note - The stamp and various counters of before images held are 
+      303*	not updated. In order to update them with the correct values, one 
+      304*	would have to keep stamp and before image info about all ci's that
+      305*	are not on disk yet; or one should read the CI before flushing it,
+      306*	and get the necessary info from the ci itself, which would be too 
+      307*	bad, considering that the ci is most likely already written out by
+      308*	page control. The "error" introduced by not doing the proper updating
+      309*	is always on the "safe" side; the flush mechanism is self adjusting,
+      310*	and the stamp and counters will soon become correct again. */
+      311 
+      312 
+      313 
+      314 	return;
+      315      end FLUSH_NEW_ORIGIN;
+      316 
+      317 DUMP: proc ();
+      318 
+      319 /*
+      320*   this routine is not to see the light of day in production.  it is an
+      321*   attempt to determine why the n_txn calculation has gone awry.
+      322**/
+      323 
+      324 dcl  dm_misc_util_$get_aim_dir	entry (char (*));
+      325 dcl  unique_chars_			entry (bit (*)) returns (char (15));
+      326 dcl  hcs_$make_seg			entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35));
+      327 dcl  term_$seg_ptr			entry (ptr, fixed bin (35));
+      328 dcl  aim_dir			char (168);
+      329 dcl  ecode			fixed bin (35);
+      330 dcl  entryname_prefix		char (15);
+      331 dcl  txt_cptr			ptr;
+      332 dcl  pste_cptr			ptr;
+      333 dcl  tables_available		bit (1) aligned;
+      334 dcl  RW				fixed bin (5) internal static options (constant) init (01010b);
+      335 
+      336 	call dm_misc_util_$get_aim_dir (aim_dir);
+      337 
+      338 	entryname_prefix = unique_chars_ (""b);
+      339 
+      340 	call hcs_$make_seg (aim_dir, entryname_prefix || ".bj_pste", "",
+      341 	     RW, pste_cptr, ecode);
+      342 	if pste_cptr ^= null () then
+      343 	     do;
+      344 	     call hcs_$make_seg (aim_dir, entryname_prefix || ".bj_txt", "",
+      345 		RW, txt_cptr, ecode);
+      346 	     if txt_cptr ^= null () then
+      347 		do;
+      348 		pste_cptr -> bj_pste = bj_pste_ptr -> bj_pste;
+      349 		txt_cptr -> bj_txt = bj_txt_ptr -> bj_txt;
+      350 		call term_$seg_ptr (pste_cptr, ecode);
+      351 		call term_$seg_ptr (txt_cptr, ecode);
+      352 		tables_available = "1"b;
+      353 	     end;
+      354 	     else do;
+      355 		call term_$seg_ptr (txt_cptr, ecode);
+      356 		tables_available = "0"b;
+      357 	     end;
+      358 	end;
+      359 	else tables_available = "0"b;
+      360 
+      361 	call dm_misc_util_$log (INFORM_SV, 0, "bj_storage_recycle",
+      362 	     "For bj_uid = ^o, n_txn in txt is ^d, but bj_pste.n_txn = ^d. Tables ^[copied into ^a.*^;not available^s^].",
+      363 	     bj_uid, n_txn, bj_pste.n_txn, tables_available, entryname_prefix);
+      364 
+      365 
+      366      end DUMP;
+      367  	/* BEGIN dm_bj_static.incl.pl1 */
+  1     2 /*
+  1     3*Modified: 
+  1     4*10/04/82 by Lee A. Newcomb:  To change from internal static to external
+  1     5*	  static.
+  1     6**/
+  1     7 
+  1     8 dcl dm_system_data_$bj_max_n_journals		fixed bin ext static;
+  1     9 dcl dm_system_data_$bj_max_n_processes		fixed bin ext static;
+  1    10 dcl dm_system_data_$max_n_transactions     fixed bin ext static;
+  1    11 
+  1    12 	/* END dm_bj_static.incl.pl1 */
+  1    13 
+      367 
+      368  /*  BEGIN INCLUDE FILE:	dm_bj_ppt.incl.pl1	*/
+  2     2 /*
+  2     3*Layout of the per-process before journal table and entries.
+  2     4*
+  2     5*Written by Andre Bensoussan June/July 1982
+  2     6*Modified:
+  2     7*09/29/82 by Lee A. Newcomb:  To make two default oid cells, pad ppte's
+  2     8*	  to account for all used space, and use dm_system_data_ for
+  2     9*	  determining dimension of bj_ppt.e.
+  2    10**/
+  2    11 /* format: style4,indattr,idind33,^indcomtxt */
+  2    12 
+  2    13 dcl  BJ_PPT_VERSION_1	        fixed bin int static options (constant) init (1);
+  2    14 dcl  BJ_PPTE_VERSION_1	        fixed bin int static options (constant) init (1);
+  2    15 
+  2    16 dcl  bj_ppt_ptr		        ptr;
+  2    17 
+  2    18 dcl  1 bj_ppt		        based (bj_ppt_ptr) aligned,
+  2    19        2 version		        fixed bin,
+  2    20        2 max_n_entries	        fixed bin,		/* should be = dm_system_data_$bj_max_n_journals */
+  2    21        2 n_entries_used	        fixed bin,		/* # of BJs open in this process */
+  2    22        2 highest_ix_used	        fixed bin,		/* max. # of BJs ever opened in this process */
+  2    23        2 default_bj,				/* for selecting a txn def. BJ by write_before_mark protocol */
+  2    24          3 user_set_oid	        bit (36),		/* explicit user setting via $set_default_bj */
+  2    25          3 last_opened_oid	        bit (36),		/* implicit if no user setting, set by open and close */
+  2    26 						/* if both zero, use system default BJ */
+  2    27        2 process_id		        bit (36),		/* so we don't have to keep calling for it. */
+  2    28        2 process_ix		        fixed bin,		/* index into bj_check_in_table */
+  2    29        2 mod_list_area	        (100) fixed bin (35), /* for keeping track of ppt mods, not curr. used */
+  2    30 
+  2    31        2 e		        dim (dm_system_data_$bj_max_n_journals refer (bj_ppt.max_n_entries))
+  2    32 			        like bj_ppte;	/* an entry for each BJ open in this process */
+  2    33 						/* always make sure bj_ppt.e is on a even word boundary */
+  2    34 
+  2    35 /* now specify the format of each per-process BJ table entry */
+  2    36 
+  2    37 dcl  bj_ppte_ptr		        ptr;
+  2    38 
+  2    39 dcl  1 bj_ppte		        based (bj_ppte_ptr) aligned,
+  2    40        2 version		        fixed bin,		/* better be the same for all entries in a bj_ppt */
+  2    41        2 bj_uid		        bit (36),		/* UID of the BJ page file */
+  2    42        2 pf_oid		        bit (36),		/* OID of the BJ page file */
+  2    43        2 n_opening		        fixed bin,		/* how many openings this process has done for this BJ */
+  2    44        2 bj_pste_ptr	        ptr,		/* "link" to per-system BJ table entry */
+  2    45        2 open_time		        fixed bin (71);	/* used to fill in bj_ppt.default_bj.last_opened_oid */
+  2    46 						/* if the last opened BJ is closed */
+  2    47 
+  2    48 /* END INCLUDE FILE:	bj_ppt.incl.pl1	*/
+      368 
+      369  /* BEGIN INCLUDE FILE:	dm_bj_pste.incl.pl1	*/
+  3     2 
+  3     3 /* DESCRIPTION
+  3     4*
+  3     5*	Layout of the per-system before journal table
+  3     6*     entries.  This structure is used to contain information
+  3     7*     about a before journal active in a running DMS.  It is
+  3     8*     currently also used as the header of a before journal
+  3     9*     (see dm_bj_header.incl.pl1).  Version changes to this
+  3    10*     structure require either automatic conversion to be set
+  3    11*     up, or users to be told to re-create their journals.
+  3    12*
+  3    13*	Currently, a bj_pste must be 64 words long;  any
+  3    14*     future changes must at least make sure a bj_pste is an
+  3    15*     even # of words for the alignment of some of its
+  3    16*     elements.
+  3    17**/
+  3    18 
+  3    19 /*  HISTORY:
+  3    20*
+  3    21*Written by Andre Bensoussan, 06/15/82.
+  3    22*Modified:
+  3    23*08/16/82 by Andre Bensoussan: to add stamp_for_last_ci_put.
+  3    24*09/29/82 by Lee A. Newcomb: to fix BJ_PSTE_VERSION_1 and fix some
+  3    25*	  alignments.
+  3    26*11/01/82 by Andre Bensoussan: to add "stamp_for_last_ci_on_disk",
+  3    27*	  "n_bi_still_unsafe", and "n_bi_being_saved".
+  3    28*02/08/83 by M. Pandolf: to add append_state structure.
+  3    29*03/19/83 by L. A. Newcomb: to fix up some alignments and spelling problems.
+  3    30*04/27/83 by M. Pandolf: to add meter structure at end.
+  3    31*02/11/85 by Lee A. Newcomb:  Fixed version constant name to agree with its
+  3    32*            value of 2; fixed references to page files or PF's; fixed format
+  3    33*            of description and history sections.
+  3    34*03/07/85 by Lee A. Newcomb:  Changed a pad word to be txn_storage_limit and
+  3    35*            expanded on the description for future generations (no
+  3    36*            version was made).
+  3    37*03/27/85 by Lee A. Newcomb:  Changed one of the unused meters to
+  3    38*            n_txn_storage_limit_hits (again without a version change).
+  3    39**/
+  3    40 /* format: style2,ll79,ind3,^indprocbody,ifthendo,ifthen,^indnoniterdo,^inddcls,dclind5,idind35,linecom */
+  3    41 
+  3    42 dcl  BJ_PSTE_VERSION_2		fixed bin internal static
+  3    43 				options (constant) init (2);
+  3    44 
+  3    45 dcl  bj_pste_ptr			ptr;
+  3    46 
+  3    47 /* MUST HAVE EVEN NUMBER OR WORDS */
+  3    48 dcl  1 bj_pste			based (bj_pste_ptr) aligned,
+  3    49        2 version			fixed bin,
+  3    50        2 bj_ix			fixed bin,	/* Index of this entry in bj_pst table */
+  3    51        2 lock			aligned,
+  3    52          3 pid			bit (36),		/* process ID of lock owner */
+  3    53          3 event			bit (36),
+  3    54        2 bj_uid			bit (36),		/* UID of BJ file */
+  3    55        2 ci_size			fixed bin,	/* In number of bytes */
+  3    56        2 max_size			fixed bin,	/* In number of ci's */
+  3    57        2 active			bit (1) aligned,	/* 0 means journal not being used */
+  3    58        2 time_header_updated		fixed bin (71),
+  3    59        2 earliest_meaningful_time	fixed bin (71),	/* time stamp on first valid control interval */
+  3    60        2 update_frequency		fixed bin,	/* Not used yet, probably will be how many CIs */
+  3    61        2 last_rec_id		bit (36),		/* rec id of the last logical record in journal */
+  3    62        2 n_processes		fixed bin,	/* Number of processes using this BJ */
+  3    63        2 n_txn			fixed bin,	/* Number of txn in progress using this BJ */
+  3    64        2 last_ci_info		aligned,
+  3    65          3 last_ci_buffered		fixed bin (24) uns, /* Last ci encached in the buffer */
+  3    66          3 last_ci_put		fixed bin (24) uns, /* Last ci put in the BJ */
+  3    67          3 last_ci_flushed		fixed bin (24) uns, /* Last ci for which flush initiated */
+  3    68          3 last_ci_on_disk		fixed bin (24) uns, /* Last ci of that portion of the BJ known to be ... */
+  3    69 						/* .. completely on disk */
+  3    70          3 stamp_for_last_ci_put	fixed bin (71),	/* Time stamp associated with the last ci put in the BJ */
+  3    71          3 stamp_for_last_ci_on_disk	fixed bin (71),	/* Time stamp associated with the last ci on disk in the BJ */
+  3    72        2 n_bi_still_unsafe		fixed bin,	/* number of bi's still not on disk */
+  3    73        2 n_bi_being_saved		fixed bin,	/* number of bi's for which flush initiated */
+  3    74        2 buffer_offset		fixed bin (18) uns, /* Now allocated in the bj_pst segment */
+  3    75        2 txn_storage_limit		fixed bin (35),	/* # of bytes a single txn may write */
+  3    76        2 cl			aligned,		/* Circular List */
+  3    77          3 origin_ci		fixed bin (24) uns,
+  3    78          3 lowest_ci		fixed bin (24) uns,
+  3    79          3 highest_ci		fixed bin (24) uns,
+  3    80          3 number_ci		fixed bin (24) uns,
+  3    81        2 append_state		aligned,
+  3    82          3 current_operation		char (4),		/* equal to "appe" when append in progress */
+  3    83          3 pending_n_txn		fixed bin,	/* n_txn value when append done */
+  3    84          3 pending_last_rec_id	bit (36),		/* last_rec_id value after append done */
+  3    85          3 pending_last_element_id	bit (36),		/* last element id after append done */
+  3    86          3 txte_rec_id_relp		bit (18),		/* rel ptr into seg containing TXT for txte.pending_bj_rec_id */
+  3    87        2 pad_to_even_word1		bit (36) aligned,
+  3    88        2 meters			aligned,		/* dim (10) fixed bin (71), */
+  3    89          3 n_bi_written		fixed bin (71),	/* meter (1) */
+  3    90          3 n_bi_bytes_written		fixed bin (71),	/* meter (2) */
+  3    91          3 n_journal_full		fixed bin (71),	/* meter (3) */
+  3    92          3 n_successful_recycles	fixed bin (71),	/* meter (4) */
+  3    93          3 n_ci_recycled		fixed bin (71),	/* meter (5) */
+  3    94          3 n_txn_started		fixed bin (71),	/* meter (6) */
+  3    95          3 n_non_null_txn		fixed bin (71),	/* meter (7) */
+  3    96          3 n_txn_storage_limit_hits	fixed bin (71),	/* meter (8) */
+  3    97          3 meter			(9:10) fixed bin (71),
+  3    98 						/* meter (9) - meter (10) */
+  3    99        2 pad_to_64_words		(6) bit (36);	/* 64 is even (see below) */
+  3   100 
+  3   101 
+  3   102 /*  END INCLUDE FILE:	dm_bj_pste.incl.pl1	*/
+      369 
+      370  /* BEGIN INCLUDE FILE:	dm_bj_txt.incl.pl1	*/
+  4     2 /* 
+  4     3*dm_bj_txt - before journal per-system transaction table.
+  4     4*
+  4     5*Designed by A. Bensoussan
+  4     6*Written  by M. Pandolf 06/02/82
+  4     7*Modified:
+  4     8*10/01/82 by Lee A. Newcomb:  To use dm_system_data_ for dimension attributes
+  4     9*	  and specify alignment on level one.
+  4    10*08feb83  by M. Pandolf:      To restructure the TXT and TXTE.
+  4    11*30mar83  by M. Pandolf:      To add last_completed_operation and ok_to_write.
+  4    12**/
+  4    13 /* format: style4,indattr,idind33,^indcomtxt */
+  4    14 
+  4    15 dcl  BJ_TXT_VERSION_1	        fixed bin int static options (constant) init (1);
+  4    16 
+  4    17 dcl  bj_txt_ptr		        ptr;		/* pointer to transaction table */
+  4    18 dcl  bj_txte_ptr		        ptr;		/* pointer to transaction table element */
+  4    19 
+  4    20 dcl  1 bj_txt		        aligned based (bj_txt_ptr), /* transaction table */
+  4    21        2 version		        fixed bin,		/* should be BJ_TXT_VERSION_1 */
+  4    22        2 max_n_entries	        fixed bin,
+  4    23        2 n_entries_used	        fixed bin,		/* assumed contiguous */
+  4    24        2 pad_header_to_32_words       bit (36) dim (29),	/* to mod32 align bj_txt.entry */
+  4    25        2 entry		        dim (dm_system_data_$max_n_transactions refer (bj_txt.max_n_entries))
+  4    26 			        like bj_txte;
+  4    27 
+  4    28 dcl  1 bj_txte		        based (bj_txte_ptr) aligned, /* single entry, must be mod32 word aligned */
+  4    29        2 tid		        bit (36),		/* transaction id if this or last txn */
+  4    30        2 bj_uid		        bit (36),		/* UID of before journal chosen at begin mark */
+  4    31        2 entry_state aligned,
+  4    32          3 last_completed_operation   char (4),		/* to prevent multiple abort and commit */
+  4    33          3 ok_to_write                bit (1),		/* basically validates using this entry */
+  4    34        2 owner_info aligned,				/* info about creation of txte */
+  4    35          3 process_id	        bit (36),		/* of process that wrote begin mark */
+  4    36        2 operator_info aligned,			/* of process that is currently using this txte */
+  4    37          3 process_id	        bit (36),		/* of process that shall write subsequent marks */
+  4    38          3 ppte_ptr		        ptr,		/* pointer to PPTE for this transaction */
+  4    39          3 bj_oid		        bit (36),		/* before journal opening ID for operator */
+  4    40        2 records_info aligned,			/* grouped to be saved and restored as one unit */
+  4    41          3 curr_checkpoint_rec_id     bit (36),		/* ident of checkpoint record if doing a rollback, */
+  4    42 						/* else, this value must be zero. */
+  4    43          3 first_bj_rec_id	        bit (36),		/* ident of first mark for this transaction */
+  4    44          3 last_bj_rec_id	        bit (36),		/* ident of current mark for this transaction */
+  4    45          3 n_rec_written	        fixed bin (35),	/* count of marks written for this transaction */
+  4    46          3 n_bytes_written	        fixed bin (35),	/* count of total bytes written to journal */
+  4    47          3 last_fm_postcommit_handler_rec_id
+  4    48 			        bit (36),		/* ident of last special handler in list */
+  4    49        2 append_state aligned,			/* the first two members define the state of this */
+  4    50          3 current_operation	        char (4),		/* transaction and its interaction with bj_storage: */
+  4    51          3 pending_bj_rec_id	        bit (36),		/* operation  rec_id  state */
+  4    52 						/*   *null*    XXX    quiesed */
+  4    53 						/*   ^null     "0"b   write pending */
+  4    54 						/*   ^null     ^"0"b  write completed, needs flushing */
+  4    55 						/* */
+  4    56          3 pending_n_rec_written      fixed bin (35),	/* copy to n_rec_written before flush */
+  4    57          3 pending_n_bytes_written    fixed bin (35),	/* copy to n_bytes_written before flush */
+  4    58        2 pad_entry_to_32_words        bit (36) dim (13);	/* make any part of table 32 words long */
+  4    59 
+  4    60 /* END INCLUDE FILE:	dm_bj_txt_ptr	*/
+      370 
+      371  /* BEGIN INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+  5     2 
+  5     3 /* format: ^indcom */
+  5     4 
+  5     5 /* DESCRIPTION:
+  5     6*   These are the severity codes used by the dms daemon when calling its logger.
+  5     7*   The severity is ranked thusly:
+  5     8*
+  5     9*   severity log write situation
+  5    10*   -------- --- ----- ---------
+  5    11*          0 no  yes   standard output, query, etc.
+  5    12*          1 yes yes   fatal error, terminate dms daemon.
+  5    13*          2 yes yes   nonfatal error.
+  5    14*          3 yes yes   informative message.
+  5    15*          4 yes no    log information only.
+  5    16**/
+  5    17 
+  5    18 /* HISTORY:
+  5    19*
+  5    20*Written by M. Pandolf, 10/06/82.
+  5    21*Modified:
+  5    22*12/10/84 by R. Michael Tague: Rename and reformat description/history.
+  5    23*01/13/85 by Lee A. Newcomb:  Renamed to dm_log_sv_codes from
+  5    24*            dm_daemon_sv_codes as the severity codes for the DM log are not
+  5    25*            restrained to the DM Daemon's use.
+  5    26*01/24/85 by Lee A. Newcomb:  Fixed to say dm_log_sv_codes.incl.pl1 in the
+  5    27*            BEGIN and END INCLUDE comments, instead of dm_daemon_sv_codes.==.
+  5    28**/
+  5    29 
+  5    30 /* format: style5 */
+  5    31 
+  5    32      dcl	   (PRINT_SV, QUERY_SV)    fixed bin internal static
+  5    33 			       options (constant) init (0);
+  5    34      dcl	   (CRASH_SV, FATAL_SV)    fixed bin internal static
+  5    35 			       options (constant) init (1);
+  5    36      dcl	   ERROR_SV	       fixed bin internal static
+  5    37 			       options (constant) init (2);
+  5    38      dcl	   INFORM_SV	       fixed bin internal static
+  5    39 			       options (constant) init (3);
+  5    40      dcl	   LOG_SV		       fixed bin internal static
+  5    41 			       options (constant) init (4);
+  5    42 
+  5    43 /* END INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+      371 
+      372  /* format: style4,indattr,idind33,^indcomtxt */
+  6     2 
+  6     3 /* BEGIN INCLUDE FILE:	dm_bj_records.incl.pl1	*/
+  6     4 /*
+  6     5*Before journal records - images and marks
+  6     6*
+  6     7*Designed by Andre Bensoussan 02/03/82
+  6     8*Written by Mike Pandolf 07/07/82
+  6     9*Modified:
+  6    10*10/01/82 by Lee A. Newcomb:  To add n_txn to all records so rollback after
+  6    11*	  crash knows how many transactions were active at crash time.
+  6    12*15feb83  by M. Pandolf: To add fm_handler_rec for both rollback and postcommit
+  6    13*	  handler used exclusively by file_manager_, add BEGIN_COMMIT mark,
+  6    14*	  and add PREFORM_BEGIN mark (for housekeeping, never written).
+  6    15*05apr83 by M. Pandolf to add BEGIN_MARK for bj_txte.last_completed_operation
+  6    16**/
+  6    17 
+  6    18 
+  6    19 dcl  bj_rec_hdr_ptr		        ptr;		/* pointer to various bj records */
+  6    20 
+  6    21 dcl  1 bj_rec_hdr		        aligned based (bj_rec_hdr_ptr),
+  6    22        2 type		        char (4),		/* see types below */
+  6    23        2 tid		        bit (36),		/* transaction id for this record */
+  6    24        2 process_id		        bit (36),		/* of process initiating this transaction */
+  6    25        2 prev_rec_id	        bit (36),		/* of record in this transaction */
+  6    26        2 prev_rec_byte_size	        fixed bin (24),	/* of record in this transaction */
+  6    27        2 tx_rec_no		        fixed bin (35),	/* number of this record in transaction list */
+  6    28        2 n_txn		        fixed bin;		/* number of active txn's in the BJ containing this txn */
+  6    29 						/* with at least one record written in the BJ.  This is */
+  6    30 						/* used for rollback after crash */
+  6    31 						/* N.B. commits and abort marks do not count themselves */
+  6    32 
+  6    33 /* before journal records for the various record types */
+  6    34 
+  6    35 dcl  1 bj_committed_rec	        aligned like bj_rec_hdr based (bj_rec_hdr_ptr);
+  6    36 
+  6    37 dcl  1 bj_begin_commit_rec	        aligned like bj_rec_hdr based (bj_rec_hdr_ptr);
+  6    38 
+  6    39 dcl  1 bj_aborted_rec	        aligned like bj_rec_hdr based (bj_rec_hdr_ptr);
+  6    40 
+  6    41 dcl  1 bj_rolled_back_rec	        aligned based (bj_rec_hdr_ptr),
+  6    42        2 header		        like bj_rec_hdr,
+  6    43        2 checkpoint_no	        fixed bin (35),
+  6    44        2 last_rolled_back_rec_id      bit (36);
+  6    45 
+  6    46 dcl  1 bj_rollback_handler_rec        aligned based (bj_rec_hdr_ptr),
+  6    47        2 header		        like bj_rec_hdr,
+  6    48        2 name_len		        fixed bin (24),
+  6    49        2 info_len		        fixed bin (24),
+  6    50        2 proc_name		        char (bj_rollback_name_len refer (bj_rollback_handler_rec.name_len)),
+  6    51        2 info_bits		        bit (bj_rollback_info_len refer (bj_rollback_handler_rec.info_len));
+  6    52 
+  6    53 /* dm_bj_records.incl.pl1 CONTINUED NEXT PAGE */
+  6    54 
+  6    55 /* dm_bj_records.incl.pl1 CONTINUATION FROM PREVIOUS PAGE */
+  6    56 
+  6    57 dcl  1 bj_before_image	        aligned based (bj_rec_hdr_ptr),
+  6    58        2 header		        like bj_rec_hdr,
+  6    59        2 fm_uid		        bit (36),
+  6    60        2 fm_oid		        bit (36),
+  6    61        2 ci_no		        fixed bin (35),
+  6    62        2 n_parts		        fixed bin (17),
+  6    63        2 image_len		        fixed bin (24),
+  6    64        2 part		        dim (bj_before_image_n_parts refer (bj_before_image.n_parts)),
+  6    65          3 byte_offset	        fixed bin (24),
+  6    66          3 byte_length	        fixed bin (24),
+  6    67        2 image		        char (bj_before_image_len refer (bj_before_image.image_len));
+  6    68 
+  6    69 dcl  1 bj_fm_handler_rec	        aligned based (bj_rec_hdr_ptr),
+  6    70        2 header		        like bj_rec_hdr,
+  6    71        2 fm_uid		        bit (36),
+  6    72        2 fm_oid		        bit (36),
+  6    73        2 prev_fm_handler_rec_id       bit (36),
+  6    74        2 info_len		        fixed bin,
+  6    75        2 info_bytes		        char (bj_fm_handler_info_len refer (bj_fm_handler_rec.info_len));
+  6    76 
+  6    77 /* extent definers */
+  6    78 
+  6    79 dcl  bj_rollback_name_len	        fixed bin (24);
+  6    80 dcl  bj_rollback_info_len	        fixed bin (24);
+  6    81 dcl  bj_before_image_n_parts	        fixed bin;
+  6    82 dcl  bj_before_image_len	        fixed bin (24);
+  6    83 dcl  bj_fm_handler_info_len	        fixed bin (24);
+  6    84 
+  6    85 /* record type identifiers */
+  6    86 
+  6    87 dcl  1 BJ_RECORD_TYPE	        int static options (constant) aligned,
+  6    88      ( 2 BEGIN_COMMIT	        init ("bcom"),
+  6    89        2 PERFORM_COMMIT	        init ("pcom"),
+  6    90        2 COMMITTED		        init ("comm"),
+  6    91        2 ABORTED		        init ("abor"),
+  6    92        2 ROLLED_BACK	        init ("roll"),
+  6    93        2 HANDLER		        init ("hand"),
+  6    94        2 FM_ROLLBACK_HANDLER	        init ("fmrb"),
+  6    95        2 FM_POSTCOMMIT_HANDLER        init ("fmpc"),
+  6    96        2 BEGIN_MARK		        init ("begi"),
+  6    97        2 BEFORE_IMAGE	        init ("befo")) char (4);
+  6    98 
+  6    99 /* END INCLUDE FILE:	dm_bj_records.incl.pl1	*/
+      372 
+      373 
+      374 
+      375      end bj_storage_recycle;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/04/85  0826.1  bj_storage_recycle.pl1            >spec>on>7192.pbf-04/04/85>bj_storage_recycle.pl1
+367          1    01/07/85  0857.8  dm_bj_static.incl.pl1             >ldd>include>dm_bj_static.incl.pl1
+368          2    01/07/85  0857.6  dm_bj_ppt.incl.pl1                >ldd>include>dm_bj_ppt.incl.pl1
+369          3    04/04/85  0819.1  dm_bj_pste.incl.pl1               >spec>on>7192.pbf-04/04/85>dm_bj_pste.incl.pl1
+370          4    01/07/85  0858.0  dm_bj_txt.incl.pl1                >ldd>include>dm_bj_txt.incl.pl1
+371          5    03/06/85  1031.1  dm_log_sv_codes.incl.pl1          >ldd>include>dm_log_sv_codes.incl.pl1
+372          6    01/07/85  0857.7  dm_bj_records.incl.pl1            >ldd>include>dm_bj_records.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+ABORTED                   3     000000 constant        char(4)                  initial level 2 dcl 6-87 ref 159 159
+BJ_RECORD_TYPE                  000000 constant        structure                level 1 dcl 6-87
+COMMITTED                 2     000000 constant        char(4)                  initial level 2 dcl 6-87 ref 159 159
+INFORM_SV                       000013 constant        fixed bin(17,0)          initial dcl 5-38 set ref 361*
+RW                              000012 constant        fixed bin(5,0)           initial dcl 334 set ref 340* 344*
+addr                                                   builtin function         dcl 100 ref 155 172 232 232
+aim_dir                         000256 automatic       char(168)                unaligned dcl 328 set ref 336* 340* 344*
+append_state             21            based           structure                level 2 dcl 4-28
+bj_ci_zero$put_header           000012 constant        entry                    external dcl 110 ref 232
+bj_ppte                                based           structure                level 1 dcl 2-39
+bj_ppte_ptr                     000222 automatic       pointer                  dcl 2-37 set ref 132* 133 136
+bj_pste                                based           structure                level 1 dcl 3-48 set ref 228 232 232 348* 348
+bj_pste_ptr               4            based           pointer                  level 2 in structure "bj_ppte" dcl 2-39 in procedure
+                                                                                  "bj_storage_recycle" ref 133
+bj_pste_ptr                     000224 automatic       pointer                  dcl 3-45 in procedure "bj_storage_recycle" set ref
+                                                                                  133* 135 141 142 173* 184 190 191* 195 195 199 199
+                                                                                  200 200 212* 212 228 232 232 243 295* 295 295 298
+                                                                                  348 361
+bj_rec_hdr                             based           structure                level 1 dcl 6-21
+bj_storage_util$distance        000010 constant        entry                    external dcl 109 ref 173 191 212 295
+bj_txt                                 based           structure                level 1 dcl 4-20 set ref 349* 349
+bj_txt_idx                      000104 automatic       fixed bin(17,0)          dcl 76 set ref 153* 155*
+bj_txt_ptr                      000226 automatic       pointer                  dcl 4-17 set ref 134* 153 153 155 349
+bj_txte                                based           structure                level 1 dcl 4-28
+bj_txte_ptr                     000230 automatic       pointer                  dcl 4-18 set ref 155* 157 159 159 159 159 159 159
+                                                                                  159 159 172
+bj_uid                          000107 automatic       bit(36)                  dcl 76 in procedure "bj_storage_recycle" set ref
+                                                                                  135* 159 361*
+bj_uid                    1            based           bit(36)                  level 2 in structure "bj_txte" dcl 4-28 in procedure
+                                                                                  "bj_storage_recycle" ref 159
+bj_uid                    4            based           bit(36)                  level 2 in structure "bj_pste" dcl 3-48 in procedure
+                                                                                  "bj_storage_recycle" set ref 135
+ci_no                           000102 automatic       fixed bin(24,0)          unsigned dcl 76 in procedure "bj_storage_recycle"
+                                                                                  set ref 172* 173* 177
+ci_no                                  based           fixed bin(24,0)          level 2 in structure "rec_id_overlay" packed
+                                                                                  unsigned unaligned dcl 94 in procedure
+                                                                                  "bj_storage_recycle" ref 172
+cl                       34     000114 automatic       structure                level 2 in structure "my_bj_pste" dcl 76
+                                                                                  in procedure "bj_storage_recycle"
+cl                       34            based           structure                level 2 in structure "bj_pste" dcl 3-48 in procedure
+                                                                                  "bj_storage_recycle"
+cleanup                         000214 stack reference condition                dcl 105 ref 128
+code                            000105 automatic       fixed bin(35,0)          dcl 76 set ref 138* 235* 238 238* 290* 293 293*
+cu_$level_get                   000014 constant        entry                    external dcl 111 ref 125
+cu_$level_set                   000016 constant        entry                    external dcl 112 ref 129 234 236 289 291
+current_operation        21            based           char(4)                  level 3 dcl 4-28 ref 159 159
+current_ring                    000113 automatic       fixed bin(3,0)           dcl 76 set ref 126* 234 289
+distance                        000103 automatic       fixed bin(24,0)          unsigned dcl 76 set ref 173* 175 178
+dm_data_$bj_txt_ptr             000026 external static pointer                  dcl 120 ref 134
+dm_error_$bj_journal_full       000030 external static fixed bin(35,0)          dcl 120 set ref 196*
+dm_misc_util_$get_aim_dir       000032 constant        entry                    external dcl 324 ref 336
+dm_misc_util_$log               000020 constant        entry                    external dcl 113 ref 361
+ecode                           000330 automatic       fixed bin(35,0)          dcl 329 set ref 340* 344* 350* 351* 355*
+entry                    40            based           structure                array level 2 dcl 4-20 set ref 153 153 155
+entry_state               2            based           structure                level 2 dcl 4-28
+entryname_prefix                000331 automatic       char(15)                 unaligned dcl 330 set ref 338* 340 344 361*
+error_code                             parameter       fixed bin(35,0)          dcl 252 ref 249 254
+file_manager_$flush_consecutive_ci
+                                000022 constant        entry                    external dcl 114 ref 235 290
+first_bj_rec_id          14            based           bit(36)                  level 3 dcl 4-28 set ref 159 172
+get_ring_                       000024 constant        entry                    external dcl 116 ref 126
+hbound                                                 builtin function         dcl 100 ref 153
+hcs_$make_seg                   000036 constant        entry                    external dcl 326 ref 340 344
+last_ci_flushed          22            based           fixed bin(24,0)          level 3 unsigned dcl 3-48 set ref 295* 295*
+last_ci_info             20            based           structure                level 2 dcl 3-48
+last_ci_on_disk          23            based           fixed bin(24,0)          level 3 unsigned dcl 3-48 set ref 190 212* 298*
+last_completed_operation
+                          2            based           char(4)                  level 3 dcl 4-28 ref 159 159
+lbound                                                 builtin function         dcl 100 ref 153
+max_n_entries             1            based           fixed bin(17,0)          level 2 dcl 4-20 set ref 153 349
+meters                   46            based           structure                level 2 dcl 3-48
+my_bj_pste                      000114 automatic       structure                level 1 dcl 76 set ref 228* 232 232
+n_ci_recycled            56            based           fixed bin(71,0)          level 3 in structure "bj_pste" dcl 3-48 in procedure
+                                                                                  "bj_storage_recycle" set ref 200* 200
+n_ci_recycled                   000100 automatic       fixed bin(24,0)          unsigned dcl 76 in procedure "bj_storage_recycle"
+                                                                                  set ref 142* 175 178* 191* 194 200 212 295
+n_journal_full           52            based           fixed bin(71,0)          level 3 dcl 3-48 set ref 195* 195
+n_successful_recycles
+                         54            based           fixed bin(71,0)          level 3 dcl 3-48 set ref 199* 199
+n_txn                    17            based           fixed bin(17,0)          level 2 in structure "bj_pste" dcl 3-48 in procedure
+                                                                                  "bj_storage_recycle" set ref 184 361*
+n_txn                           000106 automatic       fixed bin(17,0)          dcl 76 in procedure "bj_storage_recycle" set ref
+                                                                                  144* 171* 171 184 188 361*
+new_origin_ci                   000101 automatic       fixed bin(24,0)          unsigned dcl 76 set ref 141* 177* 190* 191* 230 243
+                                                                                  290 295 298
+null                                                   builtin function         dcl 100 ref 342 346
+number_ci                37            based           fixed bin(24,0)          level 3 unsigned dcl 3-48 set ref 142
+origin_ci                34     000114 automatic       fixed bin(24,0)          level 3 in structure "my_bj_pste" unsigned dcl 76
+                                                                                  in procedure "bj_storage_recycle" set ref 230*
+origin_ci                34            based           fixed bin(24,0)          level 3 in structure "bj_pste" unsigned dcl 3-48
+                                                                                  in procedure "bj_storage_recycle" set ref 141 243*
+p_bj_ppte_ptr                          parameter       pointer                  dcl 70 ref 65 132
+p_code                                 parameter       fixed bin(35,0)          dcl 70 set ref 65 245* 254*
+pending_bj_rec_id        22            based           bit(36)                  level 3 dcl 4-28 ref 159
+pf_oid                          000110 automatic       bit(36)                  dcl 76 in procedure "bj_storage_recycle" set ref
+                                                                                  136* 232* 235* 290*
+pf_oid                    2            based           bit(36)                  level 2 in structure "bj_ppte" dcl 2-39 in procedure
+                                                                                  "bj_storage_recycle" ref 136
+pste_cptr                       000340 automatic       pointer                  dcl 332 set ref 340* 342 348 350*
+rec_id_overlay                         based           structure                level 1 dcl 94
+records_info             13            based           structure                level 2 dcl 4-28
+saved_level                     000112 automatic       fixed bin(17,0)          dcl 76 set ref 125* 129* 236* 291*
+size                                                   builtin function         dcl 100 ref 232 232
+tables_available                000342 automatic       bit(1)                   dcl 333 set ref 352* 356* 359* 361*
+term_$seg_ptr                   000040 constant        entry                    external dcl 327 ref 350 351 355
+tid                                    based           bit(36)                  level 2 dcl 4-28 ref 157 159
+txn_id                          000111 automatic       bit(36)                  dcl 76 set ref 157* 159 159
+txt_cptr                        000336 automatic       pointer                  dcl 331 set ref 344* 346 349 351* 355*
+unique_chars_                   000034 constant        entry                    external dcl 325 ref 338
+unspec                                                 builtin function         dcl 100 set ref 228* 228
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+BJ_PPTE_VERSION_1                      internal static fixed bin(17,0)          initial dcl 2-14
+BJ_PPT_VERSION_1                       internal static fixed bin(17,0)          initial dcl 2-13
+BJ_PSTE_VERSION_2                      internal static fixed bin(17,0)          initial dcl 3-42
+BJ_TXT_VERSION_1                       internal static fixed bin(17,0)          initial dcl 4-15
+CRASH_SV                               internal static fixed bin(17,0)          initial dcl 5-34
+ERROR_SV                               internal static fixed bin(17,0)          initial dcl 5-36
+FATAL_SV                               internal static fixed bin(17,0)          initial dcl 5-34
+LOG_SV                                 internal static fixed bin(17,0)          initial dcl 5-40
+PRINT_SV                               internal static fixed bin(17,0)          initial dcl 5-32
+QUERY_SV                               internal static fixed bin(17,0)          initial dcl 5-32
+bj_aborted_rec                         based           structure                level 1 dcl 6-39
+bj_before_image                        based           structure                level 1 dcl 6-57
+bj_before_image_len                    automatic       fixed bin(24,0)          dcl 6-82
+bj_before_image_n_parts                automatic       fixed bin(17,0)          dcl 6-81
+bj_begin_commit_rec                    based           structure                level 1 dcl 6-37
+bj_committed_rec                       based           structure                level 1 dcl 6-35
+bj_fm_handler_info_len                 automatic       fixed bin(24,0)          dcl 6-83
+bj_fm_handler_rec                      based           structure                level 1 dcl 6-69
+bj_ppt                                 based           structure                level 1 dcl 2-18
+bj_ppt_ptr                             automatic       pointer                  dcl 2-16
+bj_rec_hdr_ptr                         automatic       pointer                  dcl 6-19
+bj_rollback_handler_rec                based           structure                level 1 dcl 6-46
+bj_rollback_info_len                   automatic       fixed bin(24,0)          dcl 6-80
+bj_rollback_name_len                   automatic       fixed bin(24,0)          dcl 6-79
+bj_rolled_back_rec                     based           structure                level 1 dcl 6-41
+dm_system_data_$bj_max_n_journals      external static fixed bin(17,0)          dcl 1-8
+dm_system_data_$bj_max_n_processes     external static fixed bin(17,0)          dcl 1-9
+dm_system_data_$max_n_transactions     external static fixed bin(17,0)          dcl 1-10
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+DUMP                            000570 constant        entry                    internal dcl 317 ref 184
+ERROR_RETURN                    000466 constant        entry                    internal dcl 249 ref 196 238 293
+FLUSH_NEW_ORIGIN                000474 constant        entry                    internal dcl 286 ref 212
+MAIN_RETURN                     000465 constant        label                    dcl 246 ref 255
+bj_storage_recycle              000110 constant        entry                    external dcl 65
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      1312        1354    1104        1322
+Length      1676    1104        42         306     206           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+bj_storage_recycle                  380 external procedure  is an external procedure.  
+on unit on line 128                  68 on unit               
+ERROR_RETURN                            internal procedure  shares stack frame of external procedure bj_storage_recycle.  
+FLUSH_NEW_ORIGIN                        internal procedure  shares stack frame of external procedure bj_storage_recycle.  
+DUMP                                    internal procedure  shares stack frame of external procedure bj_storage_recycle.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+bj_storage_recycle       000100 n_ci_recycled               bj_storage_recycle
+                         000101 new_origin_ci               bj_storage_recycle
+                         000102 ci_no                       bj_storage_recycle
+                         000103 distance                    bj_storage_recycle
+                         000104 bj_txt_idx                  bj_storage_recycle
+                         000105 code                        bj_storage_recycle
+                         000106 n_txn                       bj_storage_recycle
+                         000107 bj_uid                      bj_storage_recycle
+                         000110 pf_oid                      bj_storage_recycle
+                         000111 txn_id                      bj_storage_recycle
+                         000112 saved_level                 bj_storage_recycle
+                         000113 current_ring                bj_storage_recycle
+                         000114 my_bj_pste                  bj_storage_recycle
+                         000222 bj_ppte_ptr                 bj_storage_recycle
+                         000224 bj_pste_ptr                 bj_storage_recycle
+                         000226 bj_txt_ptr                  bj_storage_recycle
+                         000230 bj_txte_ptr                 bj_storage_recycle
+                         000256 aim_dir                     DUMP
+                         000330 ecode                       DUMP
+                         000331 entryname_prefix            DUMP
+                         000336 txt_cptr                    DUMP
+                         000340 pste_cptr                   DUMP
+                         000342 tables_available            DUMP
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+call_ext_out_desc   call_ext_out        return              enable              ext_entry           int_entry
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+bj_ci_zero$put_header         bj_storage_util$distance      cu_$level_get                 cu_$level_set
+dm_misc_util_$get_aim_dir     dm_misc_util_$log             file_manager_$flush_consecutive_ci
+get_ring_                     hcs_$make_seg                 term_$seg_ptr                 unique_chars_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+dm_data_$bj_txt_ptr           dm_error_$bj_journal_full
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     65 000104       125 000115       126 000123       128 000132       129 000146       130 000155       132 000156
+    133 000162       134 000164       135 000170       136 000172       138 000174       141 000175       142 000177
+    144 000201       153 000202       155 000213       157 000217       159 000221       171 000247       172 000250
+    173 000253       175 000266       177 000271       178 000273       181 000275       184 000277       188 000304
+    190 000306       191 000311       194 000324       195 000326       196 000332       199 000341       200 000345
+    212 000350       228 000367       230 000373       232 000375       234 000414       235 000425       236 000445
+    238 000454       243 000460       245 000463       246 000465       249 000466       254 000470       255 000473
+    286 000474       289 000475       290 000506       291 000527       293 000536       295 000542       298 000564
+    314 000567       317 000570       336 000571       338 000602       340 000617       342 000662       344 000666
+    346 000731       348 000735       349 000742       350 000753       351 000764       352 000775       353 000777
+    355 001000       356 001011       358 001012       359 001013       361 001014       366 001076
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

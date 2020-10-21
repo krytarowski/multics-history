@@ -1,0 +1,1746 @@
+	COMPILATION LISTING OF SEGMENT fm_delete_close_
+	Compiled by: Multics PL/I Compiler, Release 33e, of October 6, 1992
+	Compiled at: CGI                             
+	Compiled on: 2000-04-17_1933.77_Mon_mdt
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        4*   *                                                         *
+        5*   *********************************************************** */
+        6 
+        7 /* DESCRIPTION: 
+        8*
+        9*          This module deletes and closes files.  There are three entries
+       10*     delete_close, close and post_transaction.  The post_transaction
+       11*     entry is used to complete the close a file which was started during
+       12*     a transaction.
+       13**/
+       14 
+       15 /* HISTORY: 
+       16*Written by Matthew Pierret, 07/12/84.
+       17*           (Taken from fm_open_.pl1, written by Jeff Ives.)
+       18*           (Originally designed in January 1982 by Andre Bensoussan.)
+       19*Modified:
+       20*08/27/84 by Matthew Pierret:  Changed to set p_code to 0.
+       21*10/25/84 by Matthew Pierret:  Changed to answer audit comments, as follows:
+       22*            Moved setting of p_code up to the beginning of delete_close and
+       23*            close entries. Used dm_log_sv_codes.incl.pl1. Removed post_commit
+       24*            entry (it is being replaced by fm_do_$postcommit_do). Changed
+       25*            REALLY_CLOSE to use explicit qualifier references to
+       26*            file_access_info. Changed to use dm_error_$no_current_transaction.
+       27*            Changed to check for valid saved_validation_level before reseting
+       28*            it in FINISH. Moved dm_fm_file_oid to main procedure. Removed
+       29*            check for limit of openings (changes to fm_create_open_ make it
+       30*            unnecessary). Added documentation to explain the closing cases.
+       31*            Added error message when file_oid.uid_tail and
+       32*            file_access_info.uid don't match.
+       33*12/17/84 by Matthew Pierret:  Changed for new state variables in 
+       34*            file_access_info, substituting entry_state for thread and adding
+       35*            file_state. Made this routine set file_state to 
+       36*            FILE_LOGICALLY_DELETED if the file is logically deleted.
+       37*            Other routines will check file_state instead of relying on
+       38*            seg_0_num to be set to ""b for a logically deleted file, which is
+       39*            no longer true.
+       40*01/04/85 by Matthew C. Pierret:  In REALLY_CLOSE, consolidated the two test
+       41*            for seg_0_num not equal to zero into one test, as the then clause
+       42*            of the first test set seg_0_num to zero, causing the second to
+       43*            always fail. Also changed FINISH to understand to try to delete
+       44*            the system-pathname-table entry.
+       45*02/12/85 by Matthew C. Pierret:  Changed to set to zero the seg_0_num and
+       46*            seg_nums in the file_access_info just before deleting a file with
+       47*            no rollback protection.  This fixes a bug in which shuch a file
+       48*            could be deleted but, if directed, file_manager_ would attempt to
+       49*            reference through one of the segment numbers.
+       50*03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+       51*03/08/85 by S. Cox: Added TRANSACTION_BJ_FULL_HANDLER. 
+       52*03/21/85 by S. Cox: TRANSACTION_BJ_FULL_HANDLER: Add revert of txn_bj_full_
+       53*04/25/85 by Matthew C. Pierret:  Changed post_transaction and REALLY_CLOSE to
+       54*            accept a file_state of FILE_DOES_NOT_EXIST as a trigger for
+       55*            really-really-closing.  Changed close to accept a file_state of
+       56*            FILE_LOGICALLY_DELETED as a trigger for really-closing or
+       57*            scheduling for a post-transaction close.  This means that deleting
+       58*            a file closes the file.
+       59*           Changed REALLY_CLOSE to call fm_sys_pn_tbl_util_$redelete_force
+       60*            instead of $delete if the file_state is FILE_DOES_NOT_EXIST.
+       61**/
+       62 
+       63 /* format: style2,ind3 */
+       64 
+       65 fm_delete_close_$delete_close:
+       66    proc (p_file_oid, p_code);
+       67 
+       68 /* START OF DECLARATIONS */
+       69 
+       70 /* Parameters */
+       71 
+       72       dcl	    p_code	       fixed bin (35) parm;
+       73       dcl	    p_file_oid	       bit (36) aligned parm;
+       74 
+       75 /* Automatic */
+       76 
+       77       dcl	    code		       fixed bin (35) init (0);
+       78       dcl	    current_validation_level
+       79 			       fixed bin init (0);
+       80       dcl	    dir_path	       char (168);
+       81       dcl	    delete_name	       char (32);
+       82       dcl	    entry_name	       char (32);
+       83       dcl	    my_file_oid	       bit (36) aligned init (""b);
+       84       dcl	    my_fsuid	       bit (36) aligned init (""b);
+       85       dcl	    file_access_table_idx  fixed bin init (0);
+       86       dcl	    sys_idx	       fixed bin init (0);
+       87       dcl	    sys_pn_tbl_index       fixed bin init (0);
+       88       dcl	    post_actions_thread_idx
+       89 			       fixed bin init (0);
+       90 
+       91       dcl	    saved_validation_level fixed bin init (-1);	/* for FINISH */
+       92       dcl	    global_file_uid	       bit (36) aligned init (""b);
+       93 						/* for FINISH */
+       94       dcl	    global_sys_pn_tbl_idx  fixed bin init (-1);	/* for FINISH */
+       95       dcl	    global_msf_fcb_ptr     ptr init (null ());	/* for FINISH */
+       96 
+       97       dcl	    seg_ptr	       ptr init (null ());
+       98       dcl	    seg_0_ptr	       ptr init (null ());
+       99 
+      100       dcl	    1 my_file_access_info  aligned like file_access_info;
+      101       dcl	    1 my_signal_structure  aligned like condition_info_header;
+      102 
+      103 /* Conditions */
+      104 
+      105       dcl	    cleanup	       condition;
+      106       dcl	    fm_sub_error_	       condition;
+      107       dcl	    transaction_bj_full_   condition;
+      108 
+      109 /* Constants */
+      110 
+      111       dcl	    (
+      112 	    MYNAME	       init ("fm_delete_close_") char (32) varying,
+      113 	    BYTES_PER_WORD	       init (4) fixed bin,
+      114 	    MAX_CHARS_FOR_DELETE_NAME
+      115 			       init (16) fixed bin,
+      116 	    NO_CI_IS_HELD	       init (0) fixed bin (27),
+      117 	    NO_ERROR_MESSAGE       init ("") char (1),
+      118 	    NO_OID	       init (""b) bit (36) aligned,
+      119 	    NO_TRANSACTION_IN_PROGRESS
+      120 			       init (""b) bit (36) aligned
+      121 	    )		       internal static options (constant);
+      122 
+      123 /* Based */
+      124 
+      125 /* Builtin */
+      126 
+      127       dcl	    (addr, baseptr, char, decimal, lbound, length, min, null, rtrim, size, substr, unspec)
+      128 			       builtin;
+      129 
+      130 /* External */
+      131 
+      132       dcl	    dm_data_$current_txn_id
+      133 			       bit (36) aligned ext;
+      134       dcl	    dm_error_$bad_file_oid fixed bin (35) ext;
+      135       dcl	    dm_error_$bj_journal_full
+      136 			       fixed bin (35) ext;
+      137       dcl	    dm_error_$file_doesnt_exist
+      138 			       fixed bin (35) ext;
+      139       dcl	    dm_error_$no_current_transaction
+      140 			       fixed bin (35) ext;
+      141       dcl	    error_table_$insufficient_access
+      142 			       fixed bin (35);
+      143       dcl	    error_table_$no_w_permission
+      144 			       fixed bin (35) ext;
+      145 
+      146 /* Entry */
+      147 
+      148       dcl	    before_journal_manager_$write_fm_postcommit_handler
+      149 			       entry (bit (36) aligned, bit (36) aligned, ptr, fixed bin (21), fixed bin (35));
+      150       dcl	    before_journal_manager_$write_fm_rollback_handler
+      151 			       entry (bit (36) aligned, bit (36) aligned, ptr, fixed bin (17), fixed bin (27),
+      152 			       fixed bin (71), fixed bin (35));
+      153       dcl	    cu_$level_get	       entry (fixed bin);
+      154       dcl	    cu_$level_set	       entry (fixed bin);
+      155       dcl	    expand_pathname_       entry (char (*), char (*), char (*), fixed bin (35));
+      156       dcl	    fm_error_util_$get_code
+      157 			       entry () returns (fixed bin (35));
+      158       dcl	    fm_put_$clear_flush_list
+      159 			       entry (fixed bin (35));
+      160       dcl	    fm_sys_pn_tbl_util_$delete
+      161 			       entry (bit (36) aligned, fixed bin (17));
+      162       dcl	    fm_sys_pn_tbl_util_$redelete_force
+      163 			       entry (bit (36) aligned, fixed bin (17));
+      164       dcl	    fm_sys_pn_tbl_util_$rename
+      165 			       entry (bit (36) aligned, fixed bin (17), char (32));
+      166       dcl	    get_ring_	       entry () returns (fixed bin (3));
+      167       dcl	    hcs_$chname_file       entry (char (*), char (*), char (*), char (*), fixed bin (35));
+      168       dcl	    hcs_$del_dir_tree      entry (char (*), char (*), fixed bin (35));
+      169       dcl	    hcs_$delentry_file     entry (char (*), char (*), fixed bin (35));
+      170       dcl	    hcs_$fs_get_path_name  entry (ptr, char (*), fixed bin, char (*), fixed bin (35));
+      171       dcl	    hcs_$get_user_effmode  entry (char (*), char (*), char (*), fixed bin, fixed bin (5), fixed bin (35));
+      172       dcl	    hcs_$set_safety_sw     entry (char (*), char (*), bit (1), fixed bin (35));
+      173       dcl	    ioa_$rsnnl	       entry () options (variable);
+      174       dcl	    lock_manager_$lock     entry (bit (36) aligned, fixed bin (27), fixed bin, fixed bin (71), fixed bin,
+      175 			       fixed bin (35));
+      176       dcl	    msf_manager_$close     entry (ptr);
+      177       dcl	    pathname_	       entry (char (*), char (*)) returns (char (168));
+      178       dcl	    signal_	       entry () options (variable);
+      179       dcl	    transaction_manager_$abort_txn
+      180 			       entry (bit (36) aligned, fixed bin (35));
+      181       dcl	    unique_bits_	       entry () returns (bit (70));
+      182       dcl	    unique_chars_	       entry (bit (*)) returns (char (15));
+      183 
+      184 /* END OF DECLARATIONS */
+      185 
+      186 /* DESCRIPTION of fm_delete_close_$delete_close:
+      187*     
+      188*     delete_close deletes a file, then closes it.  The file must be open,
+      189*     as implied by the fact that an opening id is taken as input.  In the 
+      190*     near future, this entry should be changed to only logically delete
+      191*     files, and set up a post-commit handler to do the actual delete.
+      192*     This is part of the implementation of protected file deletion.
+      193*
+      194*delete_close: entry (p_file_oid, p_code);
+      195*
+      196**/
+      197 
+      198       p_code = 0;
+      199       my_file_oid = p_file_oid;
+      200 
+      201       call cu_$level_get (saved_validation_level);
+      202       on cleanup call FINISH ();
+      203       current_validation_level = get_ring_ ();
+      204       call cu_$level_set (current_validation_level);
+      205 
+      206       call GET_ACCESS_INFO (my_file_oid, addr (my_file_access_info), file_access_table_idx);
+      207 
+      208       if my_file_access_info.seg_0_num = ""b
+      209       then call ERROR_RETURN (dm_error_$file_doesnt_exist, NO_ERROR_MESSAGE);
+      210 
+      211       call GET_PATH (my_file_access_info.seg_0_num, dir_path, entry_name);
+      212 
+      213       sys_pn_tbl_index = my_file_access_info.pn_tbl_idx;
+      214 
+      215       call VERIFY_ACCESS_TO_DELETE_FILE (dir_path, entry_name, my_file_access_info.ring_brackets.write,
+      216 	 saved_validation_level);
+      217 
+      218       if my_file_access_info.integrity_switches.transaction
+      219       then call VERIFY_TRANSACTION_STATE ();
+      220 
+      221       if my_file_access_info.integrity_switches.lock
+      222       then call LOCK_FILE (my_file_access_info.uid);
+      223 
+      224       delete_name =
+      225 	 unique_chars_ (unique_bits_ ()) || "."
+      226 	 || substr (entry_name, 1, min (length (entry_name), MAX_CHARS_FOR_DELETE_NAME));
+      227 
+      228       if my_file_access_info.integrity_switches.bj
+      229       then
+      230          do;
+      231 	  on transaction_bj_full_ goto TRANSACTION_BJ_FULL_HANDLER;
+      232 	  call WRITE_ROLLBACK_HANDLER_FOR_DELETE (my_file_access_info.uid, my_file_oid, sys_pn_tbl_index, dir_path,
+      233 	       entry_name, delete_name);
+      234          end;
+      235 
+      236       if my_file_access_info.integrity_switches.transaction
+      237       then call FLUSH_MODIFIED_PAGES ();
+      238 
+      239       if my_file_access_info.integrity_switches.bj
+      240       then
+      241          do;
+      242 	  call WRITE_POSTCOMMIT_HANDLER_FOR_DELETE (my_file_access_info.uid, my_file_oid, sys_pn_tbl_index, dir_path,
+      243 	       delete_name);
+      244 	  my_file_access_info.state.file_state = FILE_LOGICALLY_DELETED;
+      245 	  file_access_table.e (file_access_table_idx) = my_file_access_info;
+      246 	  call LOGICAL_DELETE (my_file_access_info.uid, sys_pn_tbl_index, dir_path, entry_name, delete_name);
+      247          end;
+      248       else
+      249          do;
+      250 	  my_file_access_info.seg_0_num = ""b;
+      251 	  my_file_access_info.seg_nums (*) = 0;
+      252 	  file_access_table.e (file_access_table_idx) = my_file_access_info;
+      253 	  call REALLY_DELETE (dir_path, entry_name);
+      254          end;
+      255 
+      256       go to JOIN_CLOSE;
+      257 
+      258 /* DESCRIPTION of fm_delete_close_$close:
+      259*     
+      260*     close logically closes a file.  It decrements the count of openings
+      261*     for this process for this file, and if the count reaches 0, the file
+      262*     is put on a list of files to be actually closed at the end of the
+      263*     transaction.  This post-transaction action is not to be confused with a 
+      264*     post-commit action, which only happens if a transaction commits.
+      265**/
+      266 
+      267 close:
+      268    entry (p_file_oid, p_code);
+      269 
+      270       p_code = 0;
+      271       my_file_oid = p_file_oid;
+      272 
+      273       call cu_$level_get (saved_validation_level);
+      274       on cleanup call FINISH ();
+      275       current_validation_level = get_ring_ ();
+      276       call cu_$level_set (current_validation_level);
+      277 
+      278       call GET_ACCESS_INFO (my_file_oid, addr (my_file_access_info), file_access_table_idx);
+      279 
+      280 JOIN_CLOSE:
+      281       p_file_oid = ""b;
+      282 
+      283 /* There are three cases which determine the behavior of the
+      284*   closing, as follows:
+      285*   
+      286*   1) This process has the file open more times than it has
+      287*   closed the file. This is the case if the opens component of
+      288*   my_file_access_info is greater than 0 after it has been
+      289*   decremented for this closing.  In this case, the file cannot
+      290*   be really closed, so just record the new opens count.
+      291*   
+      292*   2) The opens have reached 0, but a transaction is in progress
+      293*   and this file is a file whose opening is recorded in the
+      294*   sys_pn_tbl (for use if the before_journal_manager_ must open
+      295*   the file by its uid).  In this case the actual closing should
+      296*   be delayed until after the transaction has completed.  Put
+      297*   the file_access_table entry on the thread of entries which
+      298*   require post-transaction activity.
+      299*   
+      300*   3) The opens count is done to 0 and either there is not
+      301*   current transaction or the file is not in the sys_pn_tbl.  In
+      302*   this case there is no reason to delay the closing, so really
+      303*   close the file.
+      304**/
+      305 
+      306       my_file_access_info.opens = my_file_access_info.opens - 1;
+      307 
+      308       if my_file_access_info.opens > 0 & my_file_access_info.state.file_state ^= FILE_LOGICALLY_DELETED
+      309       then file_access_table.e (file_access_table_idx) = my_file_access_info;
+      310       else if my_file_access_info.pn_tbl_idx > 0 & dm_data_$current_txn_id ^= ""b
+      311       then
+      312          do;
+      313 	  do post_actions_thread_idx = file_access_table.h.post_transaction_actions
+      314 	       repeat (file_access_table.e (post_actions_thread_idx).state.entry_state)
+      315 	       while (post_actions_thread_idx > 0 & post_actions_thread_idx ^= file_access_table_idx);
+      316 	  end;
+      317 
+      318 	  if file_access_table_idx ^= post_actions_thread_idx
+      319 						/* If it is not already on the list,		*/
+      320 	  then
+      321 	     do;					/* then add it.				*/
+      322 	        my_file_access_info.state.entry_state = file_access_table.h.post_transaction_actions;
+      323 	        file_access_table.e (file_access_table_idx) = my_file_access_info;
+      324 	        file_access_table.h.post_transaction_actions = file_access_table_idx;
+      325 	     end;
+      326          end;
+      327       else
+      328          do;
+      329 	  if my_file_access_info.integrity_switches.transaction & my_file_access_info.seg_0_num ^= ""b
+      330 	       & dm_data_$current_txn_id ^= ""b
+      331 	  then
+      332 	     do;
+      333 	        call fm_put_$clear_flush_list (code);
+      334 	        if code ^= 0
+      335 	        then call ERROR_RETURN (code, NO_ERROR_MESSAGE);
+      336 	     end;
+      337 
+      338 	  call REALLY_CLOSE (addr (my_file_access_info), file_access_table_idx);
+      339          end;
+      340 
+      341       call cu_$level_set (saved_validation_level);
+      342 
+      343 MAIN_RETURN:					/* Only point from which control returns to the caller */
+      344       return;
+
+      345 
+      346 TRANSACTION_BJ_FULL_HANDLER:
+      347 /**** Cannot call bj_report_err_ to do this since BJ cannot be called recursively. */
+      348 /**** See also fm_(create_open_ put), which need to handle this condition. */
+      349       revert transaction_bj_full_;
+      350       my_signal_structure.length = size (my_signal_structure);
+      351       my_signal_structure.version = 1;
+      352       string (my_signal_structure.action_flags) = "0"b;
+      353       call ioa_$rsnnl ("Deleting DM file UID ^w OID ^w ^a>^a", my_signal_structure.info_string, (0),
+      354 	 my_file_access_info.uid, my_file_oid, dir_path, entry_name);
+      355       my_signal_structure.status_code = dm_error_$bj_journal_full;
+      356 
+      357       call transaction_manager_$abort_txn (dm_data_$current_txn_id, code);
+      358       call signal_ ("transaction_bj_full_", null (), addr (my_signal_structure));
+      359       call ERROR_RETURN (dm_error_$bj_journal_full, "");	/* should never get here */
+      360 
+      361 ERROR_RETURN:
+      362    proc (er_p_code, er_p_message);
+      363 
+      364       dcl	    er_p_code	       fixed bin (35);
+      365       dcl	    er_p_message	       char (*);
+      366 
+      367       dcl	    dm_misc_util_$log      entry () options (variable);
+      368 
+      369       if er_p_message ^= ""
+      370       then call dm_misc_util_$log (LOG_SV, er_p_code, MYNAME, "^a", er_p_message);
+      371 
+      372       p_code = er_p_code;
+      373       call FINISH ();
+      374       go to MAIN_RETURN;
+      375 
+      376    end ERROR_RETURN;
+      377 
+      378 
+      379 FINISH:
+      380    proc ();
+      381 
+      382       if global_msf_fcb_ptr ^= null
+      383       then call msf_manager_$close (global_msf_fcb_ptr);
+      384       if global_sys_pn_tbl_idx ^= -1
+      385       then
+      386          do;
+      387 	  on fm_sub_error_
+      388 	     begin;
+      389 	        go to FINISH_IGNORE_THIS_ERROR;
+      390 	     end;
+      391 	  call fm_sys_pn_tbl_util_$delete (global_file_uid, global_sys_pn_tbl_idx);
+      392 FINISH_IGNORE_THIS_ERROR:
+      393 	  revert fm_sub_error_;
+      394          end;
+      395       if saved_validation_level ^= -1
+      396       then call cu_$level_set (saved_validation_level);
+      397 
+      398    end FINISH;
+      399 
+      400 /*                DESCRIPTION OF fm_delete_close_$post_transaction :
+      401*     
+      402*          This entry is used to execute actions which cannot be done until
+      403*     after the point at which a transaction is completed, whether committed or
+      404*     aborted.  It is by contract run after file_manager_$undo or 
+      405*     file_manager_$postcommit_do.  Currently it closes all files which were
+      406*     closed during the transaction.  The files are left open until this point
+      407*     in case the transaction is aborted - then the before journal manager will
+      408*     need to have the files open to efficiently roll back modifications.
+      409**/
+      410 
+      411 post_transaction:
+      412    entry ();
+      413 
+      414       call cu_$level_get (saved_validation_level);
+      415       current_validation_level = get_ring_ ();
+      416       on cleanup call cu_$level_set (saved_validation_level);
+      417       call cu_$level_set (current_validation_level);
+      418 
+      419       do file_access_table_idx = file_access_table.h.post_transaction_actions
+      420 	 repeat (my_file_access_info.state.entry_state) while (file_access_table_idx > 0);
+      421 
+      422          my_file_access_info = file_access_table.e (file_access_table_idx);
+      423 
+      424          if my_file_access_info.opens = 0 | my_file_access_info.state.file_state = FILE_DOES_NOT_EXIST
+      425          then call REALLY_CLOSE (addr (my_file_access_info), file_access_table_idx);
+      426       end;
+      427 
+      428       file_access_table.h.post_transaction_actions = -1;
+      429 
+      430       call cu_$level_set (saved_validation_level);
+      431 
+      432       return;
+      433 
+      434 FLUSH_MODIFIED_PAGES:
+      435    proc ();
+      436 
+      437       dcl	    fmp_code	       fixed bin (35);
+      438 
+      439       fmp_code = 0;
+      440       call fm_put_$clear_flush_list (fmp_code);
+      441       if fmp_code ^= 0
+      442       then call ERROR_RETURN (code, NO_ERROR_MESSAGE);
+      443       else return;
+      444 
+      445    end FLUSH_MODIFIED_PAGES;
+      446 
+      447 GET_PATH:
+      448    proc (gp_p_seg_0_num, gp_p_dir, gp_p_entry);
+      449 
+      450       dcl	    gp_p_seg_0_num	       bit (18) unal parm;
+      451       dcl	    gp_p_dir	       char (168) parm;
+      452       dcl	    gp_p_entry	       char (32) parm;
+      453 
+      454       dcl	    gp_seg_0_ptr	       ptr;
+      455       dcl	    gp_full_path	       char (168);
+      456       dcl	    gp_code	       fixed bin (35);
+      457 
+      458       gp_code = 0;
+      459       gp_seg_0_ptr = baseptr (gp_p_seg_0_num);
+      460       call hcs_$fs_get_path_name (gp_seg_0_ptr, gp_full_path, (0), gp_p_entry, gp_code);
+      461       if gp_code ^= 0
+      462       then call ERROR_RETURN (gp_code,
+      463 	      " Unable to get path name of file with whose first component has segment number "
+      464 	      || char (decimal (gp_p_seg_0_num)) || ".");
+      465       call expand_pathname_ (gp_full_path, gp_p_dir, gp_p_entry, gp_code);
+      466       if gp_code ^= 0
+      467       then call ERROR_RETURN (gp_code, gp_full_path);
+      468 
+      469       return;
+      470 
+      471    end GET_PATH;
+      472 
+      473 GET_ACCESS_INFO:
+      474    proc (gai_p_file_oid, gai_p_file_access_info_ptr, gai_p_file_access_table_idx);
+      475 
+      476       dcl	    gai_p_file_oid	       bit (36) aligned;
+      477       dcl	    gai_p_file_access_info_ptr
+      478 			       ptr;
+      479       dcl	    gai_p_file_access_table_idx
+      480 			       fixed bin;
+      481 
+      482       dcl	    1 gai_file_oid	       aligned like file_oid;
+      483 
+      484       unspec (gai_file_oid) = gai_p_file_oid;
+      485       gai_p_file_access_table_idx = gai_file_oid.file_access_table_idx;
+      486 
+      487       if gai_p_file_access_table_idx < lbound (file_access_table.e, 1)
+      488 	 | gai_p_file_access_table_idx > file_access_table.h.last_entry
+      489       then call ERROR_RETURN (dm_error_$bad_file_oid, NO_ERROR_MESSAGE);
+      490 
+      491       gai_p_file_access_info_ptr -> file_access_info = file_access_table.e (gai_p_file_access_table_idx);
+      492 
+      493       if gai_p_file_access_info_ptr -> file_access_info.opens = 0
+      494       then call ERROR_RETURN (dm_error_$bad_file_oid, NO_ERROR_MESSAGE);
+      495 
+      496       if gai_file_oid.uid_tail ^= substr (gai_p_file_access_info_ptr -> file_access_info.uid, 19, 18)
+      497       then call ERROR_RETURN (dm_error_$bad_file_oid,
+      498 	      "Opening id contains uid tail " || char (gai_file_oid.uid_tail) || "; file access info contains uid "
+      499 	      || char (gai_p_file_access_info_ptr -> file_access_info.uid));
+      500 
+      501       return;
+      502 
+      503    end GET_ACCESS_INFO;
+      504 
+      505 LOCK_FILE:
+      506    proc (lf_p_file_uid);
+      507 
+      508       dcl	    lf_p_file_uid	       bit (36) aligned parm;
+      509       dcl	    lf_code	       fixed bin (35);
+      510 
+      511       lf_code = 0;
+      512       call lock_manager_$lock (lf_p_file_uid, LOCK_ENTIRE_FILE, LOCK_MODE_X, 1e9, (0), lf_code);
+      513       if lf_code ^= 0
+      514       then call ERROR_RETURN (lf_code, NO_ERROR_MESSAGE);
+      515 
+      516       return;
+      517 
+      518    end LOCK_FILE;
+      519 
+      520 LOGICAL_DELETE:
+      521    proc (ld_p_file_uid, ld_p_sys_pn_tbl_index, ld_p_dir, ld_p_entry_name, ld_p_delete_name);
+      522 
+      523 /* DESCRIPTION of LOGICAL_DELETE:
+      524*
+      525*   This routine logically deletes a file, as follows:
+      526*
+      527*   1) Add the special "delete-name" to the file.
+      528*   2) Change the name of the file in the sys_pn_tbl to the delete-name.
+      529*   3) Remove the real name from the file.
+      530*
+      531*   This method ensures that the entry in sys_pn_tbl will always have
+      532*   a name which corresponds to an actual file. 
+      533**/
+      534 
+      535       dcl	    ld_p_file_uid	       bit (36) aligned parm;
+      536       dcl	    ld_p_sys_pn_tbl_index  fixed bin parm;
+      537       dcl	    ld_p_dir	       char (168) parm;
+      538       dcl	    ld_p_entry_name	       char (32) parm;
+      539       dcl	    ld_p_delete_name       char (32) parm;
+      540 
+      541       dcl	    ld_code	       fixed bin (35);
+      542 
+      543       ld_code = 0;
+      544       call hcs_$chname_file (ld_p_dir, ld_p_entry_name, "", ld_p_delete_name, ld_code);
+      545       if ld_code ^= 0
+      546       then call ERROR_RETURN (ld_code, " Logically deleting " || pathname_ (rtrim (ld_p_dir), ld_p_entry_name));
+      547       call fm_sys_pn_tbl_util_$rename (ld_p_file_uid, ld_p_sys_pn_tbl_index, ld_p_delete_name);
+      548       call hcs_$chname_file (ld_p_dir, ld_p_entry_name, ld_p_entry_name, "", ld_code);
+      549       if ld_code ^= 0
+      550       then call ERROR_RETURN (ld_code, " Logically deleting " || pathname_ (rtrim (ld_p_dir), ld_p_entry_name));
+      551 
+      552       return;
+      553 
+      554    end LOGICAL_DELETE;
+      555 
+      556 REALLY_CLOSE:
+      557    proc (rc_p_file_access_info_ptr, rc_p_file_access_table_idx);
+      558 
+      559 
+      560       dcl	    rc_p_file_access_info_ptr
+      561 			       ptr;
+      562       dcl	    rc_p_file_access_table_idx
+      563 			       fixed bin;
+      564 
+      565       unspec (file_access_table.e (rc_p_file_access_table_idx)) = ""b;
+      566 
+      567       if rc_p_file_access_table_idx = file_access_table.h.last_entry
+      568       then
+      569          do;
+      570 	  do file_access_table.h.last_entry = file_access_table.h.last_entry by -1
+      571 	       to lbound (file_access_table.e, 1)
+      572 	       while (file_access_table.e (file_access_table.h.last_entry).state.entry_state
+      573 	       = FILE_ACCESS_INFO_NOT_IN_USE);
+      574 	  end;
+      575          end;
+      576 
+      577       if rc_p_file_access_info_ptr -> file_access_info.seg_0_num ^= ""b
+      578       then
+      579          do;
+      580 	  global_msf_fcb_ptr = rc_p_file_access_info_ptr -> file_access_info.msf_ptr;
+      581 	  rc_p_file_access_info_ptr -> file_access_info.msf_ptr = null ();
+      582 	  rc_p_file_access_info_ptr -> file_access_info.seg_0_num = ""b;
+      583 	  unspec (rc_p_file_access_info_ptr -> file_access_info.seg_nums) = ""b;
+      584 
+      585 	  if rc_p_file_access_info_ptr -> file_access_info.pn_tbl_idx > 0
+      586 	       | rc_p_file_access_info_ptr -> file_access_info.state.file_state = FILE_DOES_NOT_EXIST
+      587 	  then
+      588 	     do;
+      589 	        global_file_uid = rc_p_file_access_info_ptr -> file_access_info.uid;
+      590 	        global_sys_pn_tbl_idx = rc_p_file_access_info_ptr -> file_access_info.pn_tbl_idx;
+      591 	        rc_p_file_access_info_ptr -> file_access_info.pn_tbl_idx = -1;
+      592 
+      593 	        if rc_p_file_access_info_ptr -> file_access_info.state.file_state = FILE_DOES_NOT_EXIST
+      594 	        then call fm_sys_pn_tbl_util_$redelete_force (global_file_uid, global_sys_pn_tbl_idx);
+      595 	        else call fm_sys_pn_tbl_util_$delete (global_file_uid, global_sys_pn_tbl_idx);
+      596 	        global_sys_pn_tbl_idx = -1;		/* mark as done */
+      597 	     end;
+      598 
+      599 	  if global_msf_fcb_ptr ^= null
+      600 	  then
+      601 	     do;
+      602 	        call msf_manager_$close (global_msf_fcb_ptr);
+      603 	        global_msf_fcb_ptr = null ();		/* mark as done */
+      604 	     end;
+      605          end;
+      606 
+      607       return;
+      608 
+      609    end REALLY_CLOSE;
+      610 
+      611 REALLY_DELETE:
+      612    proc (rd_p_dir_path, rd_p_entry_name);
+      613 
+      614 /* DESCRIPTION fo REALLY_DELETE:
+      615*   Physically deletes a file from the Multics file system.  This
+      616*   entails first setting the safety switch to off, as files are
+      617*   created with the safety switch on, then deleting the contents of
+      618*   the file subtree (i.e., the components of the file), and finally
+      619*   deleting the file directory itself.  
+      620*
+      621*   This routine is only called for files which do not have rollback
+      622*   protection.
+      623*   
+      624*   Variables declared in this subroutine are prefixed with rd_ to
+      625*   indicate that they are local to the subroutine.  Parameters ar
+      626*e   further prefixed with a p_, making the full prefix for parameters
+      627*   rd_p_.
+      628**/
+      629 
+      630       dcl	    rd_p_dir_path	       char (168);
+      631       dcl	    rd_p_entry_name	       char (32);
+      632 
+      633       call hcs_$set_safety_sw (rd_p_dir_path, rd_p_entry_name, "0"b, code);
+      634       if code ^= 0
+      635       then call ERROR_RETURN (code,
+      636 	      " Unable to set the safety switch to off for " || pathname_ (rtrim (rd_p_dir_path), rd_p_entry_name)
+      637 	      || ".");
+      638 
+      639       call hcs_$del_dir_tree (rd_p_dir_path, rd_p_entry_name, code);
+      640       if code ^= 0
+      641       then call ERROR_RETURN (code, pathname_ (rtrim (rd_p_dir_path), rd_p_entry_name));
+      642 
+      643       call hcs_$delentry_file (rd_p_dir_path, rd_p_entry_name, code);
+      644       if code ^= 0
+      645       then call ERROR_RETURN (code, pathname_ (rtrim (rd_p_dir_path), rd_p_entry_name));
+      646 
+      647       return;
+      648 
+      649    end REALLY_DELETE;
+      650 
+      651 VERIFY_ACCESS_TO_DELETE_FILE:
+      652    proc (va_p_dir, va_p_entry, va_p_write_bracket, va_p_validation_level);
+      653 
+      654       dcl	    va_p_dir	       char (168) parm;
+      655       dcl	    va_p_entry	       char (32) parm;
+      656       dcl	    va_p_write_bracket     fixed bin (3) uns unal parm;
+      657       dcl	    va_p_validation_level  fixed bin parm;
+      658 
+      659       dcl	    va_code	       fixed bin (35);
+      660       dcl	    va_containing_dir_dir  char (168);
+      661       dcl	    va_containing_dir_entry
+      662 			       char (32);
+      663       dcl	    va_modes	       fixed bin (5);
+      664 
+      665       if va_p_write_bracket < va_p_validation_level
+      666       then call ERROR_RETURN (error_table_$no_w_permission, " Deleting " || pathname_ (rtrim (va_p_dir), va_p_entry));
+      667       va_code = 0;
+      668       call expand_pathname_ (va_p_dir, va_containing_dir_dir, va_containing_dir_entry, va_code);
+      669       if va_code ^= 0
+      670       then call ERROR_RETURN (va_code, va_p_dir);
+      671       call hcs_$get_user_effmode (va_containing_dir_dir, va_containing_dir_entry, "", va_p_validation_level, va_modes,
+      672 	 va_code);
+      673       if va_code ^= 0
+      674       then call ERROR_RETURN (va_code, va_p_dir);
+      675       if va_modes ^= SM_ACCESS_BIN & va_modes ^= SMA_ACCESS_BIN
+      676       then call ERROR_RETURN (error_table_$insufficient_access, "Deleting " || pathname_ (rtrim (va_p_dir), va_p_entry));
+      677 
+      678       return;
+      679 
+      680    end VERIFY_ACCESS_TO_DELETE_FILE;
+      681 
+      682 
+      683 VERIFY_TRANSACTION_STATE:
+      684    proc ();
+      685 
+      686       if dm_data_$current_txn_id = NO_TRANSACTION_IN_PROGRESS
+      687       then call ERROR_RETURN (dm_error_$no_current_transaction, NO_ERROR_MESSAGE);
+      688 
+      689       return;
+      690 
+      691    end VERIFY_TRANSACTION_STATE;
+      692 
+      693 WRITE_POSTCOMMIT_HANDLER_FOR_DELETE:
+      694    proc (wp_p_file_uid, wp_p_file_oid, wp_p_sys_pn_tbl_index, wp_p_dir, wp_p_delete_name);
+      695 
+      696       dcl	    wp_p_file_uid	       bit (36) aligned parm;
+      697       dcl	    wp_p_file_oid	       bit (36) aligned parm;
+      698       dcl	    wp_p_sys_pn_tbl_index  fixed bin parm;
+      699       dcl	    wp_p_dir	       char (168) parm;
+      700       dcl	    wp_p_delete_name       char (32) parm;
+      701 
+      702       dcl	    1 wp_delete_postcommit_info
+      703 			       aligned like delete_postcommit_info;
+      704       dcl	    wp_code	       fixed bin (35);
+      705 
+      706       wp_delete_postcommit_info.header.version = POSTCOMMIT_INFO_VERSION_1;
+      707       wp_delete_postcommit_info.header.operation = DELETE_POSTCOMMIT_OPERATION;
+      708       wp_delete_postcommit_info.sys_pn_tbl_index = wp_p_sys_pn_tbl_index;
+      709       wp_delete_postcommit_info.dir_path = wp_p_dir;
+      710       wp_delete_postcommit_info.file_name = wp_p_delete_name;
+      711       wp_code = 0;
+      712       call before_journal_manager_$write_fm_postcommit_handler (wp_p_file_uid, wp_p_file_oid,
+      713 	 addr (wp_delete_postcommit_info), size (wp_delete_postcommit_info) * BYTES_PER_WORD, wp_code);
+      714       if wp_code ^= 0
+      715       then call ERROR_RETURN (wp_code,
+      716 	      " Writing postcommit handler for " || pathname_ (rtrim (wp_p_dir), wp_p_delete_name));
+      717 
+      718       return;
+      719    end WRITE_POSTCOMMIT_HANDLER_FOR_DELETE;
+      720 
+      721 WRITE_ROLLBACK_HANDLER_FOR_DELETE:
+      722    proc (wr_p_file_uid, wr_p_file_oid, wr_p_sys_pn_tbl_index, wr_p_dir, wr_p_entry_name, wr_p_delete_name);
+      723 
+      724       dcl	    wr_p_file_uid	       bit (36) aligned parm;
+      725       dcl	    wr_p_file_oid	       bit (36) aligned parm;
+      726       dcl	    wr_p_sys_pn_tbl_index  fixed bin parm;
+      727       dcl	    wr_p_dir	       char (168) parm;
+      728       dcl	    wr_p_entry_name	       char (32) parm;
+      729       dcl	    wr_p_delete_name       char (32) parm;
+      730 
+      731       dcl	    wr_code	       fixed bin (35);
+      732       dcl	    wr_time_stamp	       fixed bin (71);	/* dummy variable */
+      733       dcl	    1 wr_delete_rollback_info
+      734 			       aligned like delete_rollback_info;
+      735 
+      736       wr_code = 0;
+      737       wr_delete_rollback_info.header.version = ROLLBACK_INFO_VERSION_1;
+      738       wr_delete_rollback_info.header.operation = DELETE_ROLLBACK_OPERATION;
+      739       wr_delete_rollback_info.sys_pn_tbl_index = wr_p_sys_pn_tbl_index;
+      740       wr_delete_rollback_info.dir_path = wr_p_dir;
+      741       wr_delete_rollback_info.predelete_name = wr_p_entry_name;
+      742       wr_delete_rollback_info.postdelete_name = wr_p_delete_name;
+      743 
+      744       call before_journal_manager_$write_fm_rollback_handler (wr_p_file_uid, wr_p_file_oid,
+      745 	 addr (wr_delete_rollback_info), size (delete_rollback_info) * BYTES_PER_WORD, NO_CI_IS_HELD, wr_time_stamp,
+      746 	 wr_code);
+      747       if wr_code ^= 0
+      748       then call ERROR_RETURN (wr_code,
+      749 	      " Writing delete rollback handler for " || pathname_ (rtrim (wr_p_dir), wr_p_entry_name));
+      750 
+      751       return;
+      752 
+      753    end WRITE_ROLLBACK_HANDLER_FOR_DELETE;
+      754 
+  1     1 /*  BEGIN INCLUDE FILE: dm_fm_file_oid.incl.pl1 */
+  1     2 
+  1     3 /* DESCRIPTION:
+  1     4*        This include file contains the file_oid (file opening identifier)
+  1     5*   structure.  File opening ids are passed across the file_manager_
+  1     6*   interface as bit(36)aligned strings.  The file_oid structure defines
+  1     7*   the contents of the string.  Two components make up a file opening id:
+  1     8*   the index of the file opening in the file_access_table structure, which
+  1     9*   contains per-process information on each file which is open, and the
+  1    10*   last 18 bits of the file's unique id, used for verification of the entry
+  1    11*   in the file_access_table.
+  1    12**/
+  1    13 
+  1    14 /*
+  1    15*HISTORY:
+  1    16*Written by Matthew Pierret, 07/16/84.
+  1    17*Modified:
+  1    18*11/02/84 by Matthew Pierret:  Made file_oid based.
+  1    19**/
+  1    20 
+  1    21 /* format: style2,ind3 */
+  1    22 
+  1    23      dcl	   1 file_oid	      aligned based,
+  1    24 	     2 file_access_table_idx
+  1    25 			      fixed bin (17) unal,	/* index into file_access_table */
+  1    26 	     2 uid_tail	      bit (18) unal;	/* Last 18 bits of file unique id */
+  1    27 
+  1    28 
+  1    29 /* END INCLUDE FILE:  dm_fm_file_oid.incl.pl1 */
+      755 
+      756 
+  2     1 /* BEGIN INCLUDE FILE:	dm_fm_file_access_info.incl.pl1 */
+  2     2 
+  2     3 /* DESCRIPTION:
+  2     4*        The file_access_info structure contains per-process information
+  2     5*   about a DM file.  Each file_access_info structure is one entry in
+  2     6*   the file_access_table.e array.  The entry can be in one of three states:
+  2     7*   not-in-use (file_access_info.entry_state is 0), in-use (entry_state is
+  2     8*   -1) or still in-use, but to be discarded at the end of the transaction
+  2     9*   (any number > 0).  An entry needs to be discarded when the file is 
+  2    10*   completely closed by the user.  This last state is useful because it is 
+  2    11*   better not to discard the entry when it is completely closed until the
+  2    12*   end of the current transaction, so that if the transaction is aborted, the 
+  2    13*   file need not be re-opened to apply the before images.  A list of entries
+  2    14*   to be discarded is maintained using the entry_state variable.
+  2    15*        The file can be in one of three states: exists (file_state = 1), 
+  2    16*   does not exist (file_state = 0), and logically_deleted (file_state = 3).
+  2    17**/
+  2    18 
+  2    19 /* HISTORY:
+  2    20*Written by Jeffrey D. Ives, 10/11/82.
+  2    21*  (Original design by Andre Bensoussan, 01/28/82.)
+  2    22*Modified:
+  2    23*10/05/83 Jeffrey D. Ives: Added fields for lock advice and expanded seg_nums.
+  2    24*07/12/84 by Matthew Pierret: Re-named proc_ad to file_access_info.
+  2    25*12/17/84 by Matthew Pierret: Changed post_transaction_actions sub-structure
+  2    26*            to state, with entry_state (replacing thread) and the new
+  2    27*            file_state.  Added a DESCRIPTION section. Added constants for
+  2    28*            possible file_state values.
+  2    29**/
+  2    30 
+  2    31 /* format: style2,^inddcls,dclind5 */
+  2    32 
+  2    33 dcl  1 file_access_info     aligned based (file_access_info_ptr),
+  2    34        2 state	        aligned,
+  2    35          3 entry_state      fixed bin (17) unal,
+  2    36          3 file_state       fixed bin (17) unal,
+  2    37        2 uid	        bit (36),
+  2    38        2 blocking_factor    fixed bin (17) unal,
+  2    39        2 ring_brackets      unal,
+  2    40          3 write	        fixed bin (3) unsigned unal,
+  2    41          3 read	        fixed bin (3) unsigned unal,
+  2    42          3 mbz_rb	        fixed bin (3) unsigned unal,
+  2    43        2 integrity_switches unal,
+  2    44          3 record_time_modified
+  2    45 		        bit (1) unal,		/* record time modified in ci_header and trailer	*/
+  2    46          3 transaction      bit (1) unal,		/* permit access only during a transaction	*/
+  2    47          3 lock	        bit (1) unal,		/* lock control intervals before accessing them	*/
+  2    48          3 bj	        bit (1) unal,		/* put undo records in the before journal	*/
+  2    49          3 aj	        bit (1) unal,		/* put redo records in the after journal	*/
+  2    50          3 mbz_is	        bit (4) unal,
+  2    51        2 last_transaction_id
+  2    52 		        bit (36),
+  2    53        2 msf_ptr	        ptr unal,
+  2    54        2 pn_tbl_idx	        fixed bin (17) unal,
+  2    55        2 lock_advice        fixed bin (17) unal,
+  2    56        2 opens	        fixed bin (17) unal,
+  2    57        2 seg_0_num	        bit (18) unal,
+  2    58        2 seg_nums	        (27) fixed bin (12) uns unal;
+  2    59 
+  2    60 
+  2    61 dcl  file_access_info_ptr   ptr init (null ());
+  2    62 
+  2    63 dcl  (
+  2    64      FILE_ACCESS_INFO_IN_USE
+  2    65 		        init (-1),
+  2    66      FILE_ACCESS_INFO_NOT_IN_USE
+  2    67 		        init (0),
+  2    68      FILE_DOES_NOT_EXIST init (0),
+  2    69      FILE_EXISTS	        init (1),
+  2    70      FILE_LOGICALLY_DELETED init (3)
+  2    71      )		        fixed bin internal static options (constant);
+  2    72 
+  2    73 
+  2    74 /* END INCLUDE FILE:	dm_fm_file_access_info.incl.pl1  */
+      757 
+      758 
+  3     1 /* BEGIN INCLUDE FILE:	dm_fm_file_access_tbl.incl.pl1  */
+  3     2 
+  3     3 /* DESCRIPTION:
+  3     4*
+  3     5*        This include file contains the file_access_table structure.  This
+  3     6*   is a per-process table which contains one entry for each file which the
+  3     7*   process has open.  The table is set up during per-process initialization 
+  3     8*   and is pointed to by fm_data_$file_access_table_ptr.  The bounds limit
+  3     9*   on the array of entries is abritrary and can be changed.
+  3    10**/
+  3    11 
+  3    12 /* HISTORY:
+  3    13*Written by Jeffrey D. Ives, 10/11/82. 
+  3    14*  (01/28/82 Andre Bensoussan, Design.)
+  3    15*Modified:
+  3    16*07/11/84 by Matthew Pierret:  Changed name of structure from proc_ad_tbl to
+  3    17*            file_access_table.
+  3    18*11/07/84 by Matthew Pierret:  Removed the un-used post_commit_actions element.
+  3    19*            Removed the now-obsolete oid structure.  It has been replaced by
+  3    20*            file_oid in dm_fm_file_oid.incl.pl1.
+  3    21**/
+  3    22 
+  3    23 /* format: style2,ind3 */
+  3    24 
+  3    25 
+  3    26      dcl	   fm_data_$file_access_table_ptr
+  3    27 			      ptr ext;
+  3    28 
+  3    29      dcl	   1 file_access_table    aligned based (fm_data_$file_access_table_ptr),
+  3    30 	     2 h,
+  3    31 	       3 version	      char (8) aligned,
+  3    32 	       3 last_entry	      fixed bin,
+  3    33 	       3 post_transaction_actions
+  3    34 			      fixed bin,
+  3    35 	       3 mbz_1	      (6) fixed bin (71),
+  3    36 	     2 e		      (1024) like file_access_info;
+  3    37 
+  3    38 
+  3    39      dcl	   FILE_ACCESS_TABLE_VERSION_1
+  3    40 			      init ("FileAT 1") char (8) aligned static options (constant);
+  3    41 
+  3    42 /*  END INCLUDE FILE:    dm_fm_file_access_tbl.incl.pl1  */
+      759 
+      760 
+  4     1 /* BEGIN INCLUDE FILE  dm_fm_postcommit_info.incl.pl1 */
+  4     2 
+  4     3 /* DESCRIPTION:
+  4     4*
+  4     5*   This include file contains the structures which define the postcommit
+  4     6*   handlers for the creation and deletion of files.  They are used by
+  4     7*   file_manager_$postcommit_do.
+  4     8*
+  4     9*   All structure elements are unaligned because we don't trust
+  4    10*   before_journal_manager_ to align the buffer in which it places
+  4    11*   the structure.
+  4    12**/
+  4    13 
+  4    14 /* HISTORY:
+  4    15*Written by Matthew Pierret, 10/16/84.
+  4    16*Modified:
+  4    17*03/07/85 by R. Michael Tague:  Added increment_postcommit_info.
+  4    18**/
+  4    19 
+  4    20 /****^  HISTORY COMMENTS:
+  4    21*  1) change(87-01-15,Hergert), approve(87-04-01,MCR7632),
+  4    22*     audit(87-01-30,Dupuis), install(87-04-02,MR12.1-1020):
+  4    23*     For TR phx20754. Added element_id so that we can save the id of the
+  4    24*     key_count_array and use it at post commit time, if necessary.
+  4    25*                                                   END HISTORY COMMENTS */
+  4    26 
+  4    27 
+  4    28 /* format: style2,ind3 */
+  4    29 
+  4    30      dcl	   1 postcommit_info_header
+  4    31 			      based (postcommit_info_ptr),
+  4    32 	     2 version	      char (8) unal,
+  4    33 	     2 operation	      char (8) unal;
+  4    34 
+  4    35      dcl	   1 delete_postcommit_info
+  4    36 			      based (postcommit_info_ptr),
+  4    37 	     2 header	      like postcommit_info_header,
+  4    38 	     2 sys_pn_tbl_index   fixed bin unal,
+  4    39 	     2 dir_path	      char (168) unal,
+  4    40 	     2 file_name	      char (32) unal;
+  4    41 
+  4    42      dcl	   1 increment_postcommit_info
+  4    43 			      based (postcommit_info_ptr),
+  4    44 	     2 header	      like postcommit_info_header,
+  4    45 	     2 increments_ptr     ptr,
+  4    46 	     2 element_id         bit (36),
+  4    47 	     2 number_of_words    fixed bin (35),
+  4    48 	     2 ci_number	      fixed bin (27),
+  4    49 	     2 offset_in_bytes    fixed bin (35);
+  4    50 
+  4    51      dcl	   postcommit_info_ptr    ptr init (null ());
+  4    52      dcl	   (
+  4    53 	   POSTCOMMIT_INFO_VERSION_1
+  4    54 			      init ("PCInfo 1"),
+  4    55 	   DELETE_POSTCOMMIT_OPERATION
+  4    56 			      init ("deletion"),
+  4    57 	   CREATE_POSTCOMMIT_OPERATION
+  4    58 			      init ("creation"),
+  4    59 	   INCREMENT_POSTCOMMIT_OPERATION
+  4    60 			      init ("incremen")
+  4    61 	   )		      char (8) internal static options (constant);
+  4    62 
+  4    63 
+  4    64 /* END INCLUDE FILE  dm_fm_postcommit_info.incl.pl1 */
+      761 
+      762 
+  5     1 /* BEGIN INCLUDE FILE  dm_fm_rollback_info.incl.pl1 */
+  5     2 
+  5     3 /* DESCRIPTION:
+  5     4*
+  5     5*   This include file contains the structures which define the rollback
+  5     6*   handlers for the creation and deletion of files.  They are used by
+  5     7*   file_manager_$undo.
+  5     8*
+  5     9*   All structure elements are unaligned because we don't trust
+  5    10*   before_journal_manager_ to align the buffer in which it places
+  5    11*   the structure.
+  5    12**/
+  5    13 
+  5    14 /* HISTORY:
+  5    15*Written by Matthew Pierret, 10/16/84.
+  5    16*Modified:
+  5    17**/
+  5    18 
+  5    19 /* format: style2,ind3 */
+  5    20 
+  5    21      dcl	   1 rollback_info_header based (rollback_info_ptr),
+  5    22 	     2 version	      char (8) unal,
+  5    23 	     2 operation	      char (8) unal;
+  5    24 
+  5    25      dcl	   1 delete_rollback_info based (rollback_info_ptr),
+  5    26 	     2 header	      like rollback_info_header,
+  5    27 	     2 sys_pn_tbl_index   fixed bin unal,
+  5    28 	     2 dir_path	      char (168) unal,
+  5    29 	     2 predelete_name     char (32) unal,
+  5    30 	     2 postdelete_name    char (32) unal;
+  5    31 
+  5    32      dcl	   1 create_rollback_info based (rollback_info_ptr),
+  5    33 	     2 header	      like rollback_info_header,
+  5    34 	     2 sys_pn_tbl_index   fixed bin unal,
+  5    35 	     2 dir_path	      char (168) unal,
+  5    36 	     2 file_name	      char (32) unal;
+  5    37 
+  5    38      dcl	   rollback_info_ptr      ptr init (null ());
+  5    39      dcl	   (
+  5    40 	   ROLLBACK_INFO_VERSION_1
+  5    41 			      init ("RBInfo 1"),
+  5    42 	   DELETE_ROLLBACK_OPERATION
+  5    43 			      init ("deletion"),
+  5    44 	   CREATE_ROLLBACK_OPERATION
+  5    45 			      init ("creation")
+  5    46 	   )		      char (8) internal static options (constant);
+  5    47 
+  5    48 
+  5    49 /* END INCLUDE FILE  dm_fm_rollback_info.incl.pl1 */
+      763 
+      764 
+  6     1 /*  START OF:	dm_lock_modes.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+  6     2 
+  6     3 /* DESCRIPTION:
+  6     4*
+  6     5*     Hierarchical lock modes for Data Management control interval locking.  In
+  6     6*addition to conventional read and write locks, intention locks are provided
+  6     7*for finer locking granularity.
+  6     8**/
+  6     9 
+  6    10 /* HISTORY:
+  6    11*Written by Jeffrey D. Ives, 04/30/82.
+  6    12*Modified:
+  6    13*12/05/84 by Stanford S. Cox: Added Description.
+  6    14**/
+  6    15 /* format: style3,idind25 */
+  6    16 
+  6    17      dcl	   LOCK_MODE_S	      fixed bin static options (constant) init (2);
+  6    18      dcl	   LOCK_MODE_X	      fixed bin static options (constant) init (3);
+  6    19      dcl	   LOCK_MODE_IS	      fixed bin static options (constant) init (4);
+  6    20      dcl	   LOCK_MODE_IX	      fixed bin static options (constant) init (5);
+  6    21      dcl	   LOCK_MODE_SIX	      fixed bin static options (constant) init (6);
+  6    22 
+  6    23      dcl	   LOCK_ENTIRE_FILE	      fixed bin (27) static options (constant) init (-1);
+  6    24 
+  6    25      dcl	   LOCK_MODE_NAMES (2:6)  char (3) int static options (constant)
+  6    26 			      init ("  S", "  X", " IS", " IX", "SIX");
+  6    27 
+  6    28 /*
+  6    29*     S       Share                           Let others read it but not modify it.
+  6    30*     X	   Exclusive		     Let nobody else read or modify it.
+  6    31*     IS	   Intention Share		     I am only using S locks, because I am only reading CIs.
+  6    32*     IX	   Intention Exclusive	     I am using S and X locks, because I am reading and modifying CIs.
+  6    33*     SIX	   Share with Intention Exclusive  I am reading control intervals, but only locking the ones I modify.
+  6    34**/
+  6    35 
+  6    36 /*  END OF:	dm_lock_modes.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+      765 
+      766 
+  7     1 /* BEGIN INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+  7     2 
+  7     3 /* format: ^indcom */
+  7     4 
+  7     5 /* DESCRIPTION:
+  7     6*   These are the severity codes used by the dms daemon when calling its logger.
+  7     7*   The severity is ranked thusly:
+  7     8*
+  7     9*   severity log write situation
+  7    10*   -------- --- ----- ---------
+  7    11*          0 no  yes   standard output, query, etc.
+  7    12*          1 yes yes   fatal error, terminate dms daemon.
+  7    13*          2 yes yes   nonfatal error.
+  7    14*          3 yes yes   informative message.
+  7    15*          4 yes no    log information only.
+  7    16**/
+  7    17 
+  7    18 /* HISTORY:
+  7    19*
+  7    20*Written by M. Pandolf, 10/06/82.
+  7    21*Modified:
+  7    22*12/10/84 by R. Michael Tague: Rename and reformat description/history.
+  7    23*01/13/85 by Lee A. Newcomb:  Renamed to dm_log_sv_codes from
+  7    24*            dm_daemon_sv_codes as the severity codes for the DM log are not
+  7    25*            restrained to the DM Daemon's use.
+  7    26*01/24/85 by Lee A. Newcomb:  Fixed to say dm_log_sv_codes.incl.pl1 in the
+  7    27*            BEGIN and END INCLUDE comments, instead of dm_daemon_sv_codes.==.
+  7    28**/
+  7    29 
+  7    30 /* format: style5 */
+  7    31 
+  7    32      dcl	   (PRINT_SV, QUERY_SV)    fixed bin internal static
+  7    33 			       options (constant) init (0);
+  7    34      dcl	   (CRASH_SV, FATAL_SV)    fixed bin internal static
+  7    35 			       options (constant) init (1);
+  7    36      dcl	   ERROR_SV	       fixed bin internal static
+  7    37 			       options (constant) init (2);
+  7    38      dcl	   INFORM_SV	       fixed bin internal static
+  7    39 			       options (constant) init (3);
+  7    40      dcl	   LOG_SV		       fixed bin internal static
+  7    41 			       options (constant) init (4);
+  7    42 
+  7    43 /* END INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+      767 
+      768 
+  8     1 /* BEGIN INCLUDE FILE ... access_mode_values.incl.pl1
+  8     2*
+  8     3*   Values for the "access mode" argument so often used in hardcore
+  8     4*   James R. Davis 26 Jan 81  MCR 4844
+  8     5*   Added constants for SM access 4/28/82 Jay Pattin
+  8     6*   Added text strings 03/19/85 Chris Jones
+  8     7**/
+  8     8 
+  8     9 
+  8    10 /* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+  8    11 dcl	(
+  8    12 	N_ACCESS		   init ("000"b),
+  8    13 	R_ACCESS		   init ("100"b),
+  8    14 	E_ACCESS		   init ("010"b),
+  8    15 	W_ACCESS		   init ("001"b),
+  8    16 	RE_ACCESS		   init ("110"b),
+  8    17 	REW_ACCESS	   init ("111"b),
+  8    18 	RW_ACCESS		   init ("101"b),
+  8    19 	S_ACCESS		   init ("100"b),
+  8    20 	M_ACCESS		   init ("010"b),
+  8    21 	A_ACCESS		   init ("001"b),
+  8    22 	SA_ACCESS		   init ("101"b),
+  8    23 	SM_ACCESS		   init ("110"b),
+  8    24 	SMA_ACCESS	   init ("111"b)
+  8    25 	)		   bit (3) internal static options (constant);
+  8    26 
+  8    27 /* The following arrays are meant to be accessed by doing either 1) bin (bit_value) or
+  8    28*   2) divide (bin_value, 2) to come up with an index into the array. */
+  8    29 
+  8    30 dcl	SEG_ACCESS_MODE_NAMES  (0:7) init ("null", "W", "E", "EW", "R", "RW", "RE", "REW") char (4) internal
+  8    31 			   static options (constant);
+  8    32 
+  8    33 dcl	DIR_ACCESS_MODE_NAMES  (0:7) init ("null", "A", "M", "MA", "S", "SA", "SM", "SMA") char (4) internal
+  8    34 			   static options (constant);
+  8    35 
+  8    36 dcl	(
+  8    37 	N_ACCESS_BIN	   init (00000b),
+  8    38 	R_ACCESS_BIN	   init (01000b),
+  8    39 	E_ACCESS_BIN	   init (00100b),
+  8    40 	W_ACCESS_BIN	   init (00010b),
+  8    41 	RW_ACCESS_BIN	   init (01010b),
+  8    42 	RE_ACCESS_BIN	   init (01100b),
+  8    43 	REW_ACCESS_BIN	   init (01110b),
+  8    44 	S_ACCESS_BIN	   init (01000b),
+  8    45 	M_ACCESS_BIN	   init (00010b),
+  8    46 	A_ACCESS_BIN	   init (00001b),
+  8    47 	SA_ACCESS_BIN	   init (01001b),
+  8    48 	SM_ACCESS_BIN	   init (01010b),
+  8    49 	SMA_ACCESS_BIN	   init (01011b)
+  8    50 	)		   fixed bin (5) internal static options (constant);
+  8    51 
+  8    52 /* END INCLUDE FILE ... access_mode_values.incl.pl1 */
+      769 
+      770 
+  9     1 /* BEGIN INCLUDE FILE condition_info_header.incl.pl1 BIM 1981 */
+  9     2 /* format: style2 */
+  9     3 
+  9     4      declare condition_info_header_ptr
+  9     5 			      pointer;
+  9     6      declare 1 condition_info_header
+  9     7 			      aligned based (condition_info_header_ptr),
+  9     8 	     2 length	      fixed bin,		/* length in words of this structure */
+  9     9 	     2 version	      fixed bin,		/* version number of this structure */
+  9    10 	     2 action_flags	      aligned,		/* tell handler how to proceed */
+  9    11 	       3 cant_restart     bit (1) unaligned,	/* caller doesn't ever want to be returned to */
+  9    12 	       3 default_restart  bit (1) unaligned,	/* caller can be returned to with no further action */
+  9    13 	       3 quiet_restart    bit (1) unaligned,	/* return, and print no message */
+  9    14 	       3 support_signal   bit (1) unaligned,	/* treat this signal as if the signalling procedure had the support bit set */
+  9    15 						/* if the signalling procedure had the support bit set, do the same for its caller */
+  9    16 	       3 pad	      bit (32) unaligned,
+  9    17 	     2 info_string	      char (256) varying,	/* may contain printable message */
+  9    18 	     2 status_code	      fixed bin (35);	/* if^=0, code interpretable by com_err_ */
+  9    19 
+  9    20 /* END INCLUDE FILE condition_info_header.incl.pl1 */
+      771 
+      772 
+      773    end fm_delete_close_$delete_close;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/17/00  1933.7  fm_delete_close_.pl1              >udd>sm>ds>w>ml>fm_delete_close_.pl1
+755          1    01/07/85  1000.9  dm_fm_file_oid.incl.pl1           >ldd>incl>dm_fm_file_oid.incl.pl1
+757          2    03/06/85  1131.2  dm_fm_file_access_info.incl.pl1   >ldd>incl>dm_fm_file_access_info.incl.pl1
+759          3    01/07/85  1001.1  dm_fm_file_access_tbl.incl.pl1    >ldd>incl>dm_fm_file_access_tbl.incl.pl1
+761          4    04/09/87  0950.7  dm_fm_postcommit_info.incl.pl1    >ldd>incl>dm_fm_postcommit_info.incl.pl1
+763          5    01/07/85  1000.4  dm_fm_rollback_info.incl.pl1      >ldd>incl>dm_fm_rollback_info.incl.pl1
+765          6    01/07/85  1001.4  dm_lock_modes.incl.pl1            >ldd>incl>dm_lock_modes.incl.pl1
+767          7    03/06/85  1131.1  dm_log_sv_codes.incl.pl1          >ldd>incl>dm_log_sv_codes.incl.pl1
+769          8    04/11/85  1552.6  access_mode_values.incl.pl1       >ldd>incl>access_mode_values.incl.pl1
+771          9    03/24/82  1447.2  condition_info_header.incl.pl1    >ldd>incl>condition_info_header.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+BYTES_PER_WORD                         constant        fixed bin(17,0)          initial dcl 111 ref 712 744
+DELETE_POSTCOMMIT_OPERATION     000004 constant        char(8)                  initial packed unaligned dcl 4-52 ref 707
+DELETE_ROLLBACK_OPERATION       000000 constant        char(8)                  initial packed unaligned dcl 5-39 ref 738
+FILE_ACCESS_INFO_NOT_IN_USE            constant        fixed bin(17,0)          initial dcl 2-63 ref 570
+FILE_DOES_NOT_EXIST                    constant        fixed bin(17,0)          initial dcl 2-63 ref 424 585 593
+FILE_LOGICALLY_DELETED                 constant        fixed bin(17,0)          initial dcl 2-63 ref 244 308
+LOCK_ENTIRE_FILE                000043 constant        fixed bin(27,0)          initial dcl 6-23 set ref 512*
+LOCK_MODE_X                     000056 constant        fixed bin(17,0)          initial dcl 6-18 set ref 512*
+LOG_SV                          000033 constant        fixed bin(17,0)          initial dcl 7-40 set ref 369*
+MAX_CHARS_FOR_DELETE_NAME              constant        fixed bin(17,0)          initial dcl 111 ref 224
+MYNAME                          000010 constant        varying char(32)         initial dcl 111 set ref 369*
+NO_CI_IS_HELD                   000055 constant        fixed bin(27,0)          initial dcl 111 set ref 744*
+NO_ERROR_MESSAGE                000032 constant        char(1)                  initial packed unaligned dcl 111 set ref 208* 334*
+                                                                                  441* 487* 493* 513* 686*
+NO_TRANSACTION_IN_PROGRESS             constant        bit(36)                  initial dcl 111 ref 686
+POSTCOMMIT_INFO_VERSION_1       000006 constant        char(8)                  initial packed unaligned dcl 4-52 ref 706
+ROLLBACK_INFO_VERSION_1         000002 constant        char(8)                  initial packed unaligned dcl 5-39 ref 737
+SMA_ACCESS_BIN                         constant        fixed bin(5,0)           initial dcl 8-36 ref 675
+SM_ACCESS_BIN                          constant        fixed bin(5,0)           initial dcl 8-36 ref 675
+action_flags              2     000234 automatic       structure                level 2 dcl 101 set ref 352*
+addr                                                   builtin function         dcl 127 ref 206 206 278 278 338 338 358 358 424 424
+                                                                                  712 712 744 744
+baseptr                                                builtin function         dcl 127 ref 459
+before_journal_manager_$write_fm_postcommit_handler
+                                000024 constant        entry                    external dcl 148 ref 712
+before_journal_manager_$write_fm_rollback_handler
+                                000026 constant        entry                    external dcl 150 ref 744
+bj                        2(30) 000214 automatic       bit(1)                   level 3 packed packed unaligned dcl 100 set ref 228
+                                                                                  239
+char                                                   builtin function         dcl 127 ref 461 496 496
+cleanup                         000342 stack reference condition                dcl 105 ref 202 274 416
+code                            000100 automatic       fixed bin(35,0)          initial dcl 77 set ref 77* 333* 334 334* 357* 441*
+                                                                                  633* 634 634* 639* 640 640* 643* 644 644*
+condition_info_header                  based           structure                level 1 dcl 9-6
+cu_$level_get                   000030 constant        entry                    external dcl 153 ref 201 273 414
+cu_$level_set                   000032 constant        entry                    external dcl 154 ref 204 276 341 395 416 417 430
+current_validation_level        000101 automatic       fixed bin(17,0)          initial dcl 78 set ref 78* 203* 204* 275* 276* 415*
+                                                                                  417*
+decimal                                                builtin function         dcl 127 ref 461
+delete_name                     000154 automatic       char(32)                 packed unaligned dcl 81 set ref 224* 232* 242* 246*
+delete_postcommit_info                 based           structure                level 1 packed packed unaligned dcl 4-35
+delete_rollback_info                   based           structure                level 1 packed packed unaligned dcl 5-25 ref 744
+dir_path                  4(18) 000750 automatic       char(168)                level 2 in structure "wr_delete_rollback_info"
+                                                                                  packed packed unaligned dcl 733 in procedure
+                                                                                  "WRITE_ROLLBACK_HANDLER_FOR_DELETE" set ref 740*
+dir_path                  4(18) 000646 automatic       char(168)                level 2 in structure "wp_delete_postcommit_info"
+                                                                                  packed packed unaligned dcl 702 in procedure
+                                                                                  "WRITE_POSTCOMMIT_HANDLER_FOR_DELETE" set ref 709*
+dir_path                        000102 automatic       char(168)                packed unaligned dcl 80 in procedure
+                                                                                  "fm_delete_close_$delete_close" set ref 211* 215*
+                                                                                  232* 242* 246* 253* 353*
+dm_data_$current_txn_id         000010 external static bit(36)                  dcl 132 set ref 310 329 357* 686
+dm_error_$bad_file_oid          000012 external static fixed bin(35,0)          dcl 134 set ref 487* 493* 496*
+dm_error_$bj_journal_full       000014 external static fixed bin(35,0)          dcl 135 set ref 355 359*
+dm_error_$file_doesnt_exist     000016 external static fixed bin(35,0)          dcl 137 set ref 208*
+dm_error_$no_current_transaction
+                                000020 external static fixed bin(35,0)          dcl 139 set ref 686*
+dm_misc_util_$log               000106 constant        entry                    external dcl 367 ref 369
+e                        20            based           structure                array level 2 dcl 3-29 set ref 245* 252* 308* 323*
+                                                                                  422 487 491 565* 570
+entry_name                      000164 automatic       char(32)                 packed unaligned dcl 82 set ref 211* 215* 224 224
+                                                                                  232* 246* 253* 353*
+entry_state                     000214 automatic       fixed bin(17,0)          level 3 in structure "my_file_access_info" packed
+                                                                                  packed unaligned dcl 100 in procedure
+                                                                                  "fm_delete_close_$delete_close" set ref 322* 426
+entry_state              20            based           fixed bin(17,0)          array level 4 in structure "file_access_table"
+                                                                                  packed packed unaligned dcl 3-29 in procedure
+                                                                                  "fm_delete_close_$delete_close" set ref 316 570
+er_p_code                              parameter       fixed bin(35,0)          dcl 364 set ref 361 369* 372
+er_p_message                           parameter       char                     packed unaligned dcl 365 set ref 361 369 369*
+error_table_$insufficient_access
+                                000356 automatic       fixed bin(35,0)          dcl 141 set ref 675*
+error_table_$no_w_permission    000022 external static fixed bin(35,0)          dcl 143 set ref 665*
+expand_pathname_                000034 constant        entry                    external dcl 155 ref 465 668
+file_access_info                       based           structure                level 1 dcl 2-33 set ref 491*
+file_access_info_ptr            000360 automatic       pointer                  initial dcl 2-61 set ref 2-61*
+file_access_table                      based           structure                level 1 dcl 3-29
+file_access_table_idx           000176 automatic       fixed bin(17,0)          initial dcl 85 in procedure
+                                                                                  "fm_delete_close_$delete_close" set ref 85* 206*
+                                                                                  245 252 278* 308 313 318 323 324 338* 419* 419*
+                                                                                  422 424*
+file_access_table_idx           000500 automatic       fixed bin(17,0)          level 2 in structure "gai_file_oid" packed packed
+                                                                                  unaligned dcl 482 in procedure "GET_ACCESS_INFO"
+                                                                                  set ref 485
+file_name                56(18) 000646 automatic       char(32)                 level 2 packed packed unaligned dcl 702 set ref 710*
+file_oid                               based           structure                level 1 dcl 1-23
+file_state                0(18) 000214 automatic       fixed bin(17,0)          level 3 in structure "my_file_access_info" packed
+                                                                                  packed unaligned dcl 100 in procedure
+                                                                                  "fm_delete_close_$delete_close" set ref 244* 308
+                                                                                  424
+file_state                0(18)        based           fixed bin(17,0)          level 3 in structure "file_access_info" packed
+                                                                                  packed unaligned dcl 2-33 in procedure
+                                                                                  "fm_delete_close_$delete_close" set ref 585 593
+fm_data_$file_access_table_ptr  000104 external static pointer                  dcl 3-26 ref 245 252 308 313 316 322 323 324 419 422
+                                                                                  428 487 487 491 565 567 570 570 570 570 570
+fm_put_$clear_flush_list        000036 constant        entry                    external dcl 158 ref 333 440
+fm_sub_error_                   000000 stack reference condition                dcl 106 ref 387 392
+fm_sys_pn_tbl_util_$delete      000040 constant        entry                    external dcl 160 ref 391 595
+fm_sys_pn_tbl_util_$redelete_force
+                                000042 constant        entry                    external dcl 162 ref 593
+fm_sys_pn_tbl_util_$rename      000044 constant        entry                    external dcl 164 ref 547
+fmp_code                        000404 automatic       fixed bin(35,0)          dcl 437 set ref 439* 440* 441
+gai_file_oid                    000500 automatic       structure                level 1 dcl 482 set ref 484*
+gai_p_file_access_info_ptr             parameter       pointer                  dcl 477 ref 473 491 493 496 496
+gai_p_file_access_table_idx            parameter       fixed bin(17,0)          dcl 479 set ref 473 485* 487 487 491
+gai_p_file_oid                         parameter       bit(36)                  dcl 476 ref 473 484
+get_ring_                       000046 constant        entry                    external dcl 166 ref 203 275 415
+global_file_uid                 000203 automatic       bit(36)                  initial dcl 92 set ref 92* 391* 589* 593* 595*
+global_msf_fcb_ptr              000206 automatic       pointer                  initial dcl 95 set ref 95* 382 382* 580* 599 602*
+                                                                                  603*
+global_sys_pn_tbl_idx           000204 automatic       fixed bin(17,0)          initial dcl 94 set ref 94* 384 391* 590* 593* 595*
+                                                                                  596*
+gp_code                         000470 automatic       fixed bin(35,0)          dcl 456 set ref 458* 460* 461 461* 465* 466 466*
+gp_full_path                    000416 automatic       char(168)                packed unaligned dcl 455 set ref 460* 465* 466*
+gp_p_dir                               parameter       char(168)                packed unaligned dcl 451 set ref 447 465*
+gp_p_entry                             parameter       char(32)                 packed unaligned dcl 452 set ref 447 460* 465*
+gp_p_seg_0_num                         parameter       bit(18)                  packed unaligned dcl 450 ref 447 459 461
+gp_seg_0_ptr                    000414 automatic       pointer                  dcl 454 set ref 459* 460*
+h                                      based           structure                level 2 dcl 3-29
+hcs_$chname_file                000050 constant        entry                    external dcl 167 ref 544 548
+hcs_$del_dir_tree               000052 constant        entry                    external dcl 168 ref 639
+hcs_$delentry_file              000054 constant        entry                    external dcl 169 ref 643
+hcs_$fs_get_path_name           000056 constant        entry                    external dcl 170 ref 460
+hcs_$get_user_effmode           000060 constant        entry                    external dcl 171 ref 671
+hcs_$set_safety_sw              000062 constant        entry                    external dcl 172 ref 633
+header                          000750 automatic       structure                level 2 in structure "wr_delete_rollback_info"
+                                                                                  dcl 733 in procedure
+                                                                                  "WRITE_ROLLBACK_HANDLER_FOR_DELETE"
+header                          000646 automatic       structure                level 2 in structure "wp_delete_postcommit_info"
+                                                                                  dcl 702 in procedure
+                                                                                  "WRITE_POSTCOMMIT_HANDLER_FOR_DELETE"
+info_string               3     000234 automatic       varying char(256)        level 2 dcl 101 set ref 353*
+integrity_switches        2(27) 000214 automatic       structure                level 2 packed packed unaligned dcl 100
+ioa_$rsnnl                      000064 constant        entry                    external dcl 173 ref 353
+last_entry                2            based           fixed bin(17,0)          level 3 dcl 3-29 set ref 487 567 570* 570 570*
+lbound                                                 builtin function         dcl 127 ref 487 570
+ld_code                         000520 automatic       fixed bin(35,0)          dcl 541 set ref 543* 544* 545 545* 548* 549 549*
+ld_p_delete_name                       parameter       char(32)                 packed unaligned dcl 539 set ref 520 544* 547*
+ld_p_dir                               parameter       char(168)                packed unaligned dcl 537 set ref 520 544* 545 545
+                                                                                  548* 549 549
+ld_p_entry_name                        parameter       char(32)                 packed unaligned dcl 538 set ref 520 544* 545* 548*
+                                                                                  548* 549*
+ld_p_file_uid                          parameter       bit(36)                  dcl 535 set ref 520 547*
+ld_p_sys_pn_tbl_index                  parameter       fixed bin(17,0)          dcl 536 set ref 520 547*
+length                          000234 automatic       fixed bin(17,0)          level 2 in structure "my_signal_structure" dcl 101
+                                                                                  in procedure "fm_delete_close_$delete_close" set
+                                                                                  ref 350*
+length                                                 builtin function         dcl 127 in procedure "fm_delete_close_$delete_close"
+                                                                                  ref 224
+lf_code                         000510 automatic       fixed bin(35,0)          dcl 509 set ref 511* 512* 513 513*
+lf_p_file_uid                          parameter       bit(36)                  dcl 508 set ref 505 512*
+lock                      2(29) 000214 automatic       bit(1)                   level 3 packed packed unaligned dcl 100 set ref 221
+lock_manager_$lock              000066 constant        entry                    external dcl 174 ref 512
+min                                                    builtin function         dcl 127 ref 224
+msf_manager_$close              000070 constant        entry                    external dcl 176 ref 382 602
+msf_ptr                   4            based           pointer                  level 2 packed packed unaligned dcl 2-33 set ref 580
+                                                                                  581*
+my_file_access_info             000214 automatic       structure                level 1 dcl 100 set ref 206 206 245 252 278 278 308
+                                                                                  323 338 338 422* 424 424
+my_file_oid                     000174 automatic       bit(36)                  initial dcl 83 set ref 83* 199* 206* 232* 242* 271*
+                                                                                  278* 353*
+my_fsuid                        000175 automatic       bit(36)                  initial dcl 84 set ref 84*
+my_signal_structure             000234 automatic       structure                level 1 dcl 101 set ref 350 358 358
+null                                                   builtin function         dcl 127 ref 95 97 98 358 358 2-61 4-51 5-38 382 581
+                                                                                  599 603
+opens                     6            based           fixed bin(17,0)          level 2 in structure "file_access_info" packed
+                                                                                  packed unaligned dcl 2-33 in procedure
+                                                                                  "fm_delete_close_$delete_close" set ref 493
+opens                     6     000214 automatic       fixed bin(17,0)          level 2 in structure "my_file_access_info" packed
+                                                                                  packed unaligned dcl 100 in procedure
+                                                                                  "fm_delete_close_$delete_close" set ref 306* 306
+                                                                                  308 424
+operation                 2     000750 automatic       char(8)                  level 3 in structure "wr_delete_rollback_info"
+                                                                                  packed packed unaligned dcl 733 in procedure
+                                                                                  "WRITE_ROLLBACK_HANDLER_FOR_DELETE" set ref 738*
+operation                 2     000646 automatic       char(8)                  level 3 in structure "wp_delete_postcommit_info"
+                                                                                  packed packed unaligned dcl 702 in procedure
+                                                                                  "WRITE_POSTCOMMIT_HANDLER_FOR_DELETE" set ref 707*
+p_code                                 parameter       fixed bin(35,0)          dcl 72 set ref 65 198* 267 270* 372*
+p_file_oid                             parameter       bit(36)                  dcl 73 set ref 65 199 267 271 280*
+pathname_                       000072 constant        entry                    external dcl 177 ref 545 549 634 640 640 644 644 665
+                                                                                  675 714 747
+pn_tbl_idx                5            based           fixed bin(17,0)          level 2 in structure "file_access_info" packed
+                                                                                  packed unaligned dcl 2-33 in procedure
+                                                                                  "fm_delete_close_$delete_close" set ref 585 590
+                                                                                  591*
+pn_tbl_idx                5     000214 automatic       fixed bin(17,0)          level 2 in structure "my_file_access_info" packed
+                                                                                  packed unaligned dcl 100 in procedure
+                                                                                  "fm_delete_close_$delete_close" set ref 213 310
+post_actions_thread_idx         000201 automatic       fixed bin(17,0)          initial dcl 88 set ref 88* 313* 313 313* 316 318
+post_transaction_actions
+                          3            based           fixed bin(17,0)          level 3 dcl 3-29 set ref 313 322 324* 419 428*
+postcommit_info_header                 based           structure                level 1 packed packed unaligned dcl 4-30
+postcommit_info_ptr             000362 automatic       pointer                  initial dcl 4-51 set ref 4-51*
+postdelete_name          66(18) 000750 automatic       char(32)                 level 2 packed packed unaligned dcl 733 set ref 742*
+predelete_name           56(18) 000750 automatic       char(32)                 level 2 packed packed unaligned dcl 733 set ref 741*
+rc_p_file_access_info_ptr              parameter       pointer                  dcl 560 ref 556 577 580 581 582 583 585 585 589 590
+                                                                                  591 593
+rc_p_file_access_table_idx             parameter       fixed bin(17,0)          dcl 562 ref 556 565 567
+rd_p_dir_path                          parameter       char(168)                packed unaligned dcl 630 set ref 611 633* 634 634
+                                                                                  639* 640 640 640 640 643* 644 644 644 644
+rd_p_entry_name                        parameter       char(32)                 packed unaligned dcl 631 set ref 611 633* 634* 639*
+                                                                                  640* 640* 643* 644* 644*
+ring_brackets             2(18) 000214 automatic       structure                level 2 packed packed unaligned dcl 100
+rollback_info_header                   based           structure                level 1 packed packed unaligned dcl 5-21
+rollback_info_ptr               000364 automatic       pointer                  initial dcl 5-38 set ref 5-38* 744
+rtrim                                                  builtin function         dcl 127 ref 545 545 549 549 634 634 640 640 640 640
+                                                                                  644 644 644 644 665 665 675 675 714 714 747 747
+saved_validation_level          000202 automatic       fixed bin(17,0)          initial dcl 91 set ref 91* 201* 215* 273* 341* 395
+                                                                                  395* 414* 416* 430*
+seg_0_num                 6(18) 000214 automatic       bit(18)                  level 2 in structure "my_file_access_info" packed
+                                                                                  packed unaligned dcl 100 in procedure
+                                                                                  "fm_delete_close_$delete_close" set ref 208 211*
+                                                                                  250* 329
+seg_0_num                 6(18)        based           bit(18)                  level 2 in structure "file_access_info" packed
+                                                                                  packed unaligned dcl 2-33 in procedure
+                                                                                  "fm_delete_close_$delete_close" set ref 577 582*
+seg_0_ptr                       000212 automatic       pointer                  initial dcl 98 set ref 98*
+seg_nums                  7            based           fixed bin(12,0)          array level 2 in structure "file_access_info" packed
+                                                                                  packed unsigned unaligned dcl 2-33 in procedure
+                                                                                  "fm_delete_close_$delete_close" set ref 583*
+seg_nums                  7     000214 automatic       fixed bin(12,0)          array level 2 in structure "my_file_access_info"
+                                                                                  packed packed unsigned unaligned dcl 100
+                                                                                  in procedure "fm_delete_close_$delete_close" set
+                                                                                  ref 251*
+seg_ptr                         000210 automatic       pointer                  initial dcl 97 set ref 97*
+signal_                         000074 constant        entry                    external dcl 178 ref 358
+size                                                   builtin function         dcl 127 ref 350 712 744
+state                    20            based           structure                array level 3 in structure "file_access_table"
+                                                                                  dcl 3-29 in procedure
+                                                                                  "fm_delete_close_$delete_close"
+state                           000214 automatic       structure                level 2 in structure "my_file_access_info" dcl 100
+                                                                                  in procedure "fm_delete_close_$delete_close"
+state                                  based           structure                level 2 in structure "file_access_info" dcl 2-33
+                                                                                  in procedure "fm_delete_close_$delete_close"
+status_code             104     000234 automatic       fixed bin(35,0)          level 2 dcl 101 set ref 355*
+substr                                                 builtin function         dcl 127 ref 224 496
+sys_idx                         000177 automatic       fixed bin(17,0)          initial dcl 86 set ref 86*
+sys_pn_tbl_index          4     000646 automatic       fixed bin(17,0)          level 2 in structure "wp_delete_postcommit_info"
+                                                                                  packed packed unaligned dcl 702 in procedure
+                                                                                  "WRITE_POSTCOMMIT_HANDLER_FOR_DELETE" set ref 708*
+sys_pn_tbl_index                000200 automatic       fixed bin(17,0)          initial dcl 87 in procedure
+                                                                                  "fm_delete_close_$delete_close" set ref 87* 213*
+                                                                                  232* 242* 246*
+sys_pn_tbl_index          4     000750 automatic       fixed bin(17,0)          level 2 in structure "wr_delete_rollback_info"
+                                                                                  packed packed unaligned dcl 733 in procedure
+                                                                                  "WRITE_ROLLBACK_HANDLER_FOR_DELETE" set ref 739*
+transaction               2(28) 000214 automatic       bit(1)                   level 3 packed packed unaligned dcl 100 set ref 218
+                                                                                  236 329
+transaction_bj_full_            000350 stack reference condition                dcl 107 ref 231 346
+transaction_manager_$abort_txn  000076 constant        entry                    external dcl 179 ref 357
+uid                       1            based           bit(36)                  level 2 in structure "file_access_info" dcl 2-33
+                                                                                  in procedure "fm_delete_close_$delete_close" set
+                                                                                  ref 496 496 589
+uid                       1     000214 automatic       bit(36)                  level 2 in structure "my_file_access_info" dcl 100
+                                                                                  in procedure "fm_delete_close_$delete_close" set
+                                                                                  ref 221* 232* 242* 246* 353*
+uid_tail                  0(18) 000500 automatic       bit(18)                  level 2 packed packed unaligned dcl 482 set ref 496
+                                                                                  496
+unique_bits_                    000100 constant        entry                    external dcl 181 ref 224 224
+unique_chars_                   000102 constant        entry                    external dcl 182 ref 224
+unspec                                                 builtin function         dcl 127 set ref 484* 565* 583*
+va_code                         000546 automatic       fixed bin(35,0)          dcl 659 set ref 667* 668* 669 669* 671* 673 673*
+va_containing_dir_dir           000547 automatic       char(168)                packed unaligned dcl 660 set ref 668* 671*
+va_containing_dir_entry         000621 automatic       char(32)                 packed unaligned dcl 661 set ref 668* 671*
+va_modes                        000631 automatic       fixed bin(5,0)           dcl 663 set ref 671* 675 675
+va_p_dir                               parameter       char(168)                packed unaligned dcl 654 set ref 651 665 665 668*
+                                                                                  669* 673* 675 675
+va_p_entry                             parameter       char(32)                 packed unaligned dcl 655 set ref 651 665* 675*
+va_p_validation_level                  parameter       fixed bin(17,0)          dcl 657 set ref 651 665 671*
+va_p_write_bracket                     parameter       fixed bin(3,0)           packed unsigned unaligned dcl 656 ref 651 665
+version                   1     000234 automatic       fixed bin(17,0)          level 2 in structure "my_signal_structure" dcl 101
+                                                                                  in procedure "fm_delete_close_$delete_close" set
+                                                                                  ref 351*
+version                         000750 automatic       char(8)                  level 3 in structure "wr_delete_rollback_info"
+                                                                                  packed packed unaligned dcl 733 in procedure
+                                                                                  "WRITE_ROLLBACK_HANDLER_FOR_DELETE" set ref 737*
+version                         000646 automatic       char(8)                  level 3 in structure "wp_delete_postcommit_info"
+                                                                                  packed packed unaligned dcl 702 in procedure
+                                                                                  "WRITE_POSTCOMMIT_HANDLER_FOR_DELETE" set ref 706*
+wp_code                         000735 automatic       fixed bin(35,0)          dcl 704 set ref 711* 712* 714 714*
+wp_delete_postcommit_info       000646 automatic       structure                level 1 dcl 702 set ref 712 712 712
+wp_p_delete_name                       parameter       char(32)                 packed unaligned dcl 700 set ref 693 710 714*
+wp_p_dir                               parameter       char(168)                packed unaligned dcl 699 ref 693 709 714 714
+wp_p_file_oid                          parameter       bit(36)                  dcl 697 set ref 693 712*
+wp_p_file_uid                          parameter       bit(36)                  dcl 696 set ref 693 712*
+wp_p_sys_pn_tbl_index                  parameter       fixed bin(17,0)          dcl 698 ref 693 708
+wr_code                         000744 automatic       fixed bin(35,0)          dcl 731 set ref 736* 744* 747 747*
+wr_delete_rollback_info         000750 automatic       structure                level 1 dcl 733 set ref 744 744
+wr_p_delete_name                       parameter       char(32)                 packed unaligned dcl 729 ref 721 742
+wr_p_dir                               parameter       char(168)                packed unaligned dcl 727 ref 721 740 747 747
+wr_p_entry_name                        parameter       char(32)                 packed unaligned dcl 728 set ref 721 741 747*
+wr_p_file_oid                          parameter       bit(36)                  dcl 725 set ref 721 744*
+wr_p_file_uid                          parameter       bit(36)                  dcl 724 set ref 721 744*
+wr_p_sys_pn_tbl_index                  parameter       fixed bin(17,0)          dcl 726 ref 721 739
+wr_time_stamp                   000746 automatic       fixed bin(71,0)          dcl 732 set ref 744*
+write                     2(18) 000214 automatic       fixed bin(3,0)           level 3 packed packed unsigned unaligned dcl 100 set
+                                                                                  ref 215*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+A_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 8-11
+A_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 8-36
+CRASH_SV                               internal static fixed bin(17,0)          initial dcl 7-34
+CREATE_POSTCOMMIT_OPERATION            internal static char(8)                  initial packed unaligned dcl 4-52
+CREATE_ROLLBACK_OPERATION              internal static char(8)                  initial packed unaligned dcl 5-39
+DIR_ACCESS_MODE_NAMES                  internal static char(4)                  initial array packed unaligned dcl 8-33
+ERROR_SV                               internal static fixed bin(17,0)          initial dcl 7-36
+E_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 8-11
+E_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 8-36
+FATAL_SV                               internal static fixed bin(17,0)          initial dcl 7-34
+FILE_ACCESS_INFO_IN_USE                internal static fixed bin(17,0)          initial dcl 2-63
+FILE_ACCESS_TABLE_VERSION_1            internal static char(8)                  initial dcl 3-39
+FILE_EXISTS                            internal static fixed bin(17,0)          initial dcl 2-63
+INCREMENT_POSTCOMMIT_OPERATION         internal static char(8)                  initial packed unaligned dcl 4-52
+INFORM_SV                              internal static fixed bin(17,0)          initial dcl 7-38
+LOCK_MODE_IS                           internal static fixed bin(17,0)          initial dcl 6-19
+LOCK_MODE_IX                           internal static fixed bin(17,0)          initial dcl 6-20
+LOCK_MODE_NAMES                        internal static char(3)                  initial array packed unaligned dcl 6-25
+LOCK_MODE_S                            internal static fixed bin(17,0)          initial dcl 6-17
+LOCK_MODE_SIX                          internal static fixed bin(17,0)          initial dcl 6-21
+M_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 8-11
+M_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 8-36
+NO_OID                                 internal static bit(36)                  initial dcl 111
+N_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 8-11
+N_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 8-36
+PRINT_SV                               internal static fixed bin(17,0)          initial dcl 7-32
+QUERY_SV                               internal static fixed bin(17,0)          initial dcl 7-32
+REW_ACCESS                             internal static bit(3)                   initial packed unaligned dcl 8-11
+REW_ACCESS_BIN                         internal static fixed bin(5,0)           initial dcl 8-36
+RE_ACCESS                              internal static bit(3)                   initial packed unaligned dcl 8-11
+RE_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 8-36
+RW_ACCESS                              internal static bit(3)                   initial packed unaligned dcl 8-11
+RW_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 8-36
+R_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 8-11
+R_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 8-36
+SA_ACCESS                              internal static bit(3)                   initial packed unaligned dcl 8-11
+SA_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 8-36
+SEG_ACCESS_MODE_NAMES                  internal static char(4)                  initial array packed unaligned dcl 8-30
+SMA_ACCESS                             internal static bit(3)                   initial packed unaligned dcl 8-11
+SM_ACCESS                              internal static bit(3)                   initial packed unaligned dcl 8-11
+S_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 8-11
+S_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 8-36
+W_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 8-11
+W_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 8-36
+condition_info_header_ptr              automatic       pointer                  dcl 9-4
+create_rollback_info                   based           structure                level 1 packed packed unaligned dcl 5-32
+fm_error_util_$get_code         000000 constant        entry                    external dcl 156
+increment_postcommit_info              based           structure                level 1 unaligned dcl 4-42
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+ERROR_RETURN                    001312 constant        entry                    internal dcl 361 ref 208 334 359 441 461 466 487 493
+                                                                                  496 513 545 549 634 640 644 665 669 673 675 686
+                                                                                  714 747
+FINISH                          001377 constant        entry                    internal dcl 379 ref 202 274 373
+FINISH_IGNORE_THIS_ERROR        001454 constant        label                    dcl 392 ref 389
+FLUSH_MODIFIED_PAGES            001471 constant        entry                    internal dcl 434 ref 236
+GET_ACCESS_INFO                 001654 constant        entry                    internal dcl 473 ref 206 278
+GET_PATH                        001512 constant        entry                    internal dcl 447 ref 211
+JOIN_CLOSE                      000665 constant        label                    dcl 280 ref 256
+LOCK_FILE                       002036 constant        entry                    internal dcl 505 ref 221
+LOGICAL_DELETE                  002073 constant        entry                    internal dcl 520 ref 246
+MAIN_RETURN                     001024 constant        label                    dcl 343 ref 374
+REALLY_CLOSE                    002333 constant        entry                    internal dcl 556 ref 338 424
+REALLY_DELETE                   002503 constant        entry                    internal dcl 611 ref 253
+TRANSACTION_BJ_FULL_HANDLER     001025 constant        label                    dcl 346 set ref 231
+VERIFY_ACCESS_TO_DELETE_FILE    003013 constant        entry                    internal dcl 651 ref 215
+VERIFY_TRANSACTION_STATE        003321 constant        entry                    internal dcl 683 ref 218
+WRITE_POSTCOMMIT_HANDLER_FOR_DELETE
+                                003342 constant        entry                    internal dcl 693 ref 242
+WRITE_ROLLBACK_HANDLER_FOR_DELETE
+                                003471 constant        entry                    internal dcl 721 ref 232
+close                           000576 constant        entry                    external dcl 267
+fm_delete_close_$delete_close   000264 constant        entry                    external dcl 65
+post_transaction                001160 constant        entry                    external dcl 411
+
+NAME DECLARED BY CONTEXT OR IMPLICATION.
+string                                                 builtin function         ref 352
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      4674        5004    4131        4704
+Length      5476    4131       110         456     542           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+fm_delete_close_$delete_close      1772 external procedure  is an external procedure.  
+on unit on line 202                  64 on unit               
+on unit on line 231                  64 on unit               
+on unit on line 274                  64 on unit               
+ERROR_RETURN                            internal procedure  shares stack frame of external procedure fm_delete_close_$delete_close  
+FINISH                               80 internal procedure  enables or reverts conditions.  
+on unit on line 387                  64 on unit               
+on unit on line 416                  68 on unit               
+FLUSH_MODIFIED_PAGES                    internal procedure  shares stack frame of external procedure fm_delete_close_$delete_close  
+GET_PATH                                internal procedure  shares stack frame of external procedure fm_delete_close_$delete_close  
+GET_ACCESS_INFO                         internal procedure  shares stack frame of external procedure fm_delete_close_$delete_close  
+LOCK_FILE                               internal procedure  shares stack frame of external procedure fm_delete_close_$delete_close  
+LOGICAL_DELETE                          internal procedure  shares stack frame of external procedure fm_delete_close_$delete_close  
+REALLY_CLOSE                            internal procedure  shares stack frame of external procedure fm_delete_close_$delete_close  
+REALLY_DELETE                           internal procedure  shares stack frame of external procedure fm_delete_close_$delete_close  
+VERIFY_ACCESS_TO_DELETE_FILE            internal procedure  shares stack frame of external procedure fm_delete_close_$delete_close  
+VERIFY_TRANSACTION_STATE                internal procedure  shares stack frame of external procedure fm_delete_close_$delete_close  
+WRITE_POSTCOMMIT_HANDLER_FOR_DELETE
+                                        internal procedure  shares stack frame of external procedure fm_delete_close_$delete_close  
+WRITE_ROLLBACK_HANDLER_FOR_DELETE
+                                        internal procedure  shares stack frame of external procedure fm_delete_close_$delete_close  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+fm_delete_close_$delete_close
+                         000100 code                        fm_delete_close_$delete_close
+                         000101 current_validation_level    fm_delete_close_$delete_close
+                         000102 dir_path                    fm_delete_close_$delete_close
+                         000154 delete_name                 fm_delete_close_$delete_close
+                         000164 entry_name                  fm_delete_close_$delete_close
+                         000174 my_file_oid                 fm_delete_close_$delete_close
+                         000175 my_fsuid                    fm_delete_close_$delete_close
+                         000176 file_access_table_idx       fm_delete_close_$delete_close
+                         000177 sys_idx                     fm_delete_close_$delete_close
+                         000200 sys_pn_tbl_index            fm_delete_close_$delete_close
+                         000201 post_actions_thread_idx     fm_delete_close_$delete_close
+                         000202 saved_validation_level      fm_delete_close_$delete_close
+                         000203 global_file_uid             fm_delete_close_$delete_close
+                         000204 global_sys_pn_tbl_idx       fm_delete_close_$delete_close
+                         000206 global_msf_fcb_ptr          fm_delete_close_$delete_close
+                         000210 seg_ptr                     fm_delete_close_$delete_close
+                         000212 seg_0_ptr                   fm_delete_close_$delete_close
+                         000214 my_file_access_info         fm_delete_close_$delete_close
+                         000234 my_signal_structure         fm_delete_close_$delete_close
+                         000356 error_table_$insufficient_access
+                                                            fm_delete_close_$delete_close
+                         000360 file_access_info_ptr        fm_delete_close_$delete_close
+                         000362 postcommit_info_ptr         fm_delete_close_$delete_close
+                         000364 rollback_info_ptr           fm_delete_close_$delete_close
+                         000404 fmp_code                    FLUSH_MODIFIED_PAGES
+                         000414 gp_seg_0_ptr                GET_PATH
+                         000416 gp_full_path                GET_PATH
+                         000470 gp_code                     GET_PATH
+                         000500 gai_file_oid                GET_ACCESS_INFO
+                         000510 lf_code                     LOCK_FILE
+                         000520 ld_code                     LOGICAL_DELETE
+                         000546 va_code                     VERIFY_ACCESS_TO_DELETE_FILE
+                         000547 va_containing_dir_dir       VERIFY_ACCESS_TO_DELETE_FILE
+                         000621 va_containing_dir_entry     VERIFY_ACCESS_TO_DELETE_FILE
+                         000631 va_modes                    VERIFY_ACCESS_TO_DELETE_FILE
+                         000646 wp_delete_postcommit_info   WRITE_POSTCOMMIT_HANDLER_FOR_DELETE
+                         000735 wp_code                     WRITE_POSTCOMMIT_HANDLER_FOR_DELETE
+                         000744 wr_code                     WRITE_ROLLBACK_HANDLER_FOR_DELETE
+                         000746 wr_time_stamp               WRITE_ROLLBACK_HANDLER_FOR_DELETE
+                         000750 wr_delete_rollback_info     WRITE_ROLLBACK_HANDLER_FOR_DELETE
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+r_ne_as             alloc_char_temp     cat_realloc_chars   call_ext_out_desc   call_ext_out        call_int_this
+call_int_other      return_mac          tra_ext_1           enable_op           shorten_stack       ext_entry
+int_entry           any_to_any_truncate_
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+before_journal_manager_$write_fm_postcommit_handler         before_journal_manager_$write_fm_rollback_handler
+cu_$level_get                 cu_$level_set                 dm_misc_util_$log             expand_pathname_
+fm_put_$clear_flush_list      fm_sys_pn_tbl_util_$delete    fm_sys_pn_tbl_util_$redelete_force
+fm_sys_pn_tbl_util_$rename    get_ring_                     hcs_$chname_file              hcs_$del_dir_tree
+hcs_$delentry_file            hcs_$fs_get_path_name         hcs_$get_user_effmode         hcs_$set_safety_sw
+ioa_$rsnnl                    lock_manager_$lock            msf_manager_$close            pathname_
+signal_                       transaction_manager_$abort_txn                              unique_bits_
+unique_chars_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+dm_data_$current_txn_id       dm_error_$bad_file_oid        dm_error_$bj_journal_full     dm_error_$file_doesnt_exist
+dm_error_$no_current_transaction                            error_table_$no_w_permission
+fm_data_$file_access_table_ptr
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     77 000233        78 000234        83 000235        84 000236        85 000237        86 000240        87 000241
+     88 000242        91 000243        92 000245        94 000246        95 000247        97 000251        98 000252
+ 2   61 000253    4   51 000254    5   38 000255        65 000260       198 000272       199 000274       201 000276
+    202 000305       203 000327       204 000340       206 000347       208 000353       211 000373       213 000375
+    215 000400       218 000402       221 000406       224 000413       228 000470       231 000474       232 000513
+    236 000515       239 000521       242 000524       244 000526       245 000530       246 000540       247 000542
+    250 000543       251 000545       252 000561       253 000571       256 000573       267 000574       270 000604
+    271 000606       273 000610       274 000617       275 000641       276 000652       278 000661       280 000665
+    306 000667       308 000674       310 000715       313 000725       316 000736       318 000745       322 000747
+    323 000755       324 000763       326 000765       329 000766       333 000776       334 001004       338 001011
+    341 001015       343 001024       346 001025       350 001026       351 001030       352 001032       353 001033
+    355 001077       357 001102       358 001112       359 001141       411 001156       414 001166       415 001175
+    416 001206       417 001232       419 001241       422 001250       424 001257       426 001272       428 001276
+    430 001303       432 001311       361 001312       369 001323       372 001365       373 001371       374 001375
+    379 001376       382 001404       384 001417       387 001423       389 001437       391 001442       392 001454
+    395 001455       398 001470       434 001471       439 001472       440 001473       441 001502       443 001510
+    445 001511       447 001512       458 001514       459 001515       460 001525       461 001560       465 001620
+    466 001646       469 001653       473 001654       484 001656       485 001660       487 001663       491 001707
+    493 001722       496 001741       501 002034       505 002036       511 002040       512 002041       513 002065
+    516 002072       520 002073       543 002075       544 002076       545 002127       547 002205       548 002222
+    549 002253       552 002331       556 002333       565 002335       567 002345       570 002352       574 002372
+    577 002375       580 002403       581 002405       582 002411       583 002413       585 002416       589 002426
+    590 002430       591 002432       593 002434       595 002452       596 002463       599 002465       602 002471
+    603 002500       607 002502       611 002503       633 002505       634 002535       639 002623       640 002646
+    643 002716       644 002741       647 003011       651 003013       665 003015       667 003113       668 003115
+    669 003142       671 003161       673 003217       675 003236       678 003317       683 003321       686 003322
+    689 003341       693 003342       706 003344       707 003346       708 003350       709 003353       710 003357
+    711 003363       712 003364       714 003411       718 003467       721 003471       736 003473       737 003474
+    738 003476       739 003500       740 003503       741 003507       742 003513       744 003517       747 003550
+    751 003626
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

@@ -1,0 +1,2181 @@
+	COMPILATION LISTING OF SEGMENT dmsd_overseer_
+	Compiled by: Multics PL/I Compiler, Release 29, of July 28, 1986
+	Compiled at: Honeywell Bull, Phx. Az., Sys-M 
+	Compiled on: 08/04/87  1646.0 mst Tue
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        4*   *                                                         *
+        5*   *********************************************************** */
+        6 
+        7 /* DESCRIPTION:
+        8*This is the main procedure for the Data Management Daemon.  The Daemon runs
+        9*as a caretaker process for a Data Management system.  The Daemon creates an
+       10*IPC channel to receive requests from user's processes to perform various
+       11*functions on behalf of the users.  The Daemon handles abandoned transactions
+       12*and system recovery.  The Daemon initializes and controls the Data Management
+       13*system and schedules DM system shutdowns.  The Daemon requests the Answering
+       14*Service to send it notifications of process terminations over the Daemon's
+       15*request channel and the Daemon maintains an idle timer that also sends a
+       16*wakeup over the Daemon's request channel to periodically adjust the
+       17*transaction table.
+       18*
+       19*This program has two entry points.
+       20*1. dmsd_overseer_ is the main entry point and is called by
+       21*   initialize_process_ when the daemon is to function in its normal capacity
+       22*   as a process overseer.  This entry never returns, QUITS are not allowed,
+       23*   Multics command level can not be reached, and the Daemon sits in a
+       24*   limited subsystem that only allows the commands new_proc and shutdown.
+       25*
+       26*2. dmsd_overseer_$test is the command entry point used when a user wants
+       27*   to set up a test DM system with the user's current process as its Daemon.
+       28*   The limited subsystem listener of this entry points allows (..) escapes
+       29*   to Multics command level and the quit command.  QUITS are allowed and the
+       30*   command cleans up after itself when exited or released.
+       31*
+       32*Since there are several steps that must be taken to set up a process
+       33*as a Daemon, and since the process may be interrupted at any point when the
+       34*Daemon is invoked as a command, the Daemon uses a system_state structure of
+       35*flags to record just how far the process has gone so that the FINISH routine
+       36*can know just what needs to be undane at clean up time.
+       37**/
+       38 
+       39 /* HISTORY:
+       40*Written by R. Michael Tague, 11/23/84.
+       41*Modified:
+       42*12/06/84 by R. Michael Tague: Changed dmsd_util_$* to dm_daemon_util_$* and
+       43*            call to dm_daemon_util_$unset_shutdown_timers.
+       44*12/09/84 by Lindsey Spratt: Changed to call dm_daemon_util_$log correctly.
+       45*            This subr requires that its first argument be a severity.
+       46*12/12/84 by R. Michael Tague: Fixed up in response to auditing comments.
+       47*12/13/84 by R. Michael Tague: Added SCHEDULE_SHUTDOWN ().
+       48*12/13/84 by R. Michael Tague: Changed name of dm_system_init_info.incl.pl1.
+       49*01/08/85 by Steve Herbst: Eliminated log initialization, values to be set
+       50*	  via dm_system_data_template_; fixed ring bracket in "Initializing
+       51*	  Data Management" message.
+       52*03/06/85 by Lee A. Newcomb:  Fixed the testing entry to reset the system
+       53*            directory to what it was when dmsd_overseer_ was invoked, not the
+       54*            constant >site>dm.  Removed unused variables and includes.
+       55*03/07/85 by Lee A. Newcomb:  Fixed so previous_system_dir is automatic, not
+       56*            internal static as I mistakenly made it in previous change.
+       57*03/07/85 by R. Michael Tague:  Fixed the ERROR_RETURN procedure to correctly
+       58*	  call com_err_ and sub_err_.
+       59*03/19/85 by R. Michael Tague:  Changed ssu name for process overseer to 
+       60*	  DM_Daemon_overseer instead of Daemon_no_prompt.
+       61*03/28/85 by Steve Herbst: Changed in response to audit, fixed calling
+       62*	  sequence of dm_daemon_util_$log.
+       63*04/02/85 by Lee A. Newcomb:  Fixed to set dm_daemon_util_$logout as the cl
+       64*            intermediary, the old practice of new_proc'ing led to new_proc
+       65*            looping.
+       66*04/09/85 by Lee A. Newcomb:  To use convert_access_class_ and not the obsolete
+       67*            convert_authorization_.
+       68**/
+       69 /* format: style5,^indcomtxt */
+       70 
+       71 dmsd_overseer_:
+       72         proc (p_pit_pointer, p_call_listener_upon_return,
+       73 	  p_listener_command_line);
+       74 
+       75 /* START OF DECLARATIONS */
+       76 /* Parameter */
+       77 
+       78         dcl     p_pit_pointer		ptr;
+       79         dcl     p_call_listener_upon_return
+       80 				bit (1) aligned;
+       81         dcl     p_listener_command_line char (*) varying;
+       82 
+       83 /* Automatic */
+       84 
+       85         dcl     myname		char (32);
+       86         dcl     previous_dm_system_dir	char (168) init ("");
+       87 					      /* must be set via a subr call */
+       88         dcl     request_channel	fixed bin (71) init (0);
+       89         dcl     saved_ips_mask	bit (36) aligned;
+       90         dcl     saved_system_shutdown_handler
+       91 				ptr;
+       92         dcl     ssu_system_ptr	ptr init (null ());
+       93         dcl     system_dir_pathname	char (168);
+       94         dcl     1 system_state	unaligned,
+       95 	        2 testing_error_return
+       96 				bit (1) init ("0"b),
+       97 	        2 system_dir_set	bit (1) init ("0"b),
+       98 	        2 shutdown_handler_set
+       99 				bit (1) init ("0"b),
+      100 	        2 dm_initialized	bit (1) init ("0"b);
+      101 
+      102 /* Based */
+      103 /* Builtin */
+      104 
+      105         dcl     (addr, codeptr, fixed, min, null, size, unspec)
+      106 				builtin;
+      107 
+      108 /* Condition */
+      109 
+      110         dcl     (cleanup, error, finish)
+      111 				condition;
+      112 
+      113 /* Constant */
+      114 
+      115         dcl     BITS_PER_WORD		init (36) fixed bin internal
+      116 				static options (constant);
+      117         dcl     DM_DAEMON_VERSION_1	init ("1") char (1) internal
+      118 				static options (constant);
+      119         dcl     NOT_TESTING		init ("0"b) bit (1) internal
+      120 				static options (constant);
+      121         dcl     TESTING		init ("1"b) bit (1) internal
+      122 				static options (constant);
+      123         dcl     (NO_PAD, NO_NL)	init ("0"b) bit (1) aligned
+      124 				internal static options (constant);
+      125 
+      126 
+      127 /* Entry */
+      128 
+      129         dcl     com_err_		entry () options (variable);
+      130         dcl     continue_to_signal_	entry (fixed bin (35));
+      131         dcl     convert_access_class_$to_string
+      132 				entry (bit (72) aligned, char (*),
+      133 				fixed bin (35));
+      134         dcl     create_ips_mask_	entry (ptr, fixed bin, bit (36) aligned)
+      135 				;
+      136         dcl     cu_$arg_list_ptr	entry (ptr);
+      137         dcl     cu_$arg_ptr		entry (fixed bin, ptr, fixed bin (21),
+      138 				fixed bin (35));
+      139         dcl     cu_$generate_call	entry (entry, ptr);
+      140         dcl     cu_$set_cl_intermediary entry (entry);
+      141         dcl     dmsd_ssu_request_tables_$daemon_requests
+      142 				entry;
+      143         dcl     dmsd_ssu_request_tables_$test_daemon_requests
+      144 				entry;
+      145         dcl     dm_daemon_util_$log	entry () options (variable);
+      146         dcl     dm_daemon_util_$logout	entry ();
+      147         dcl     dm_daemon_util_$new_proc
+      148 				entry ();
+      149         dcl     dm_daemon_util_$request entry;
+      150         dcl     dm_daemon_util_$unset_shutdown_timers
+      151 				entry ();
+      152         dcl     dm_daemon_util_$get_daemon_info
+      153 				entry (ptr);
+      154         dcl     dm_daemon_util_$initialize_system
+      155 				entry (ptr);
+      156         dcl     dm_daemon_util_$schedule_shutdown
+      157 				entry ();
+      158         dcl     dm_misc_util_$get_system_dir
+      159 				entry (char (*));
+      160         dcl     dm_misc_util_$is_process_using_dm
+      161 				entry () returns (bit (1) aligned);
+      162         dcl     dm_misc_util_$set_system_dir
+      163 				entry (char (*));
+      164         dcl     get_ring_		entry () returns (fixed bin (3));
+      165         dcl     get_system_free_area_	entry () returns (ptr);
+      166         dcl     get_authorization_	entry () returns (bit (72) aligned);
+      167         dcl     hcs_$fs_get_path_name	entry (ptr, char (*), fixed bin,
+      168 				char (*), fixed bin (35));
+      169         dcl     hcs_$get_ring_brackets	entry (char (*), char (*),
+      170 				(3) fixed bin (3), fixed bin (35));
+      171         dcl     hcs_$make_ptr		entry (ptr, char (*), char (*), ptr,
+      172 				fixed bin (35));
+      173         dcl     hcs_$reset_ips_mask	entry (bit (36) aligned,
+      174 				bit (36) aligned);
+      175         dcl     hcs_$set_ips_mask	entry (bit (36) aligned,
+      176 				bit (36) aligned);
+      177         dcl     hcs_$wakeup		entry (bit (36) aligned, fixed bin (71),
+      178 				fixed bin (71), fixed bin (35));
+      179 
+      180         dcl     ioa_		entry options (variable);
+      181         dcl     ioa_$rsnnl		entry options (variable);
+      182         dcl     ioa_$general_rs	entry (ptr, fixed bin, fixed bin,
+      183 				char (*), fixed bin (21),
+      184 				bit (1) aligned, bit (1) aligned);
+      185         dcl     ipc_$create_ev_chn	entry (fixed bin (71), fixed bin (35));
+      186         dcl     ipc_$decl_ev_call_chn	entry (fixed bin (71), entry, ptr,
+      187 				fixed bin, fixed bin (35));
+      188         dcl     ipc_$delete_ev_chn	entry (fixed bin (71), fixed bin (35));
+      189         dcl     message_segment_$add_file
+      190 				entry (char (*), char (*), ptr,
+      191 				fixed bin (18), bit (72) aligned,
+      192 				fixed bin (35));
+      193         dcl     sct_manager_$get	entry (fixed bin, ptr, fixed bin (35));
+      194         dcl     sct_manager_$set	entry (fixed bin, ptr, fixed bin (35));
+      195 
+      196         dcl     ssu_$cpescape_disabled	entry;
+      197         dcl     ssu_$create_invocation	entry (char (*), char (*), ptr, ptr,
+      198 				char (*), ptr, fixed bin (35));
+      199         dcl     ssu_$destroy_invocation entry (ptr);
+      200         dcl     ssu_$listen		entry (ptr, ptr, fixed bin (35));
+      201         dcl     ssu_$set_prompt_mode	entry (ptr, bit (*));
+      202         dcl     ssu_$set_procedure	entry (ptr, char (*), entry,
+      203 				fixed bin (35));
+      204         dcl     sub_err_		entry () options (variable);
+      205         dcl     system_info_$request_chn
+      206 				entry (bit (36) aligned, fixed bin (71),
+      207 				char (*), char (*));
+      208         dcl     timer_manager_$alarm_wakeup
+      209 				entry (fixed bin (71), bit (2),
+      210 				fixed bin (71));
+      211         dcl     timer_manager_$reset_alarm_wakeup
+      212 				entry (fixed bin (71));
+      213         dcl     transaction_manager_$user_shutdown
+      214 				entry (ptr, ptr, fixed bin (35));
+      215 
+      216 /* External */
+      217         dcl     dm_request_action_$adjust_process_id
+      218 				fixed bin (17) ext;
+      219         dcl     error_table_$noarg	fixed bin (35) ext;
+      220         dcl     error_table_$smallarg	fixed bin (35) ext;
+      221         dcl     ssu_et_$subsystem_aborted
+      222 				fixed bin (35) ext;
+      223 
+      224 /* Static */
+      225 
+      226 /* END OF DECLARATIONS */
+      227 
+      228 /* ************************************************************************
+      229*   * dmsd_overseer_ - This entry is called by initialize_process_ to act  *
+      230*   * as the process overseer for the Data Management Daemon.  A process   *
+      231*   * overseer is called with three parameters.  The local names and the   *
+      232*   * the functions of these paramenters follow:			    *
+      233*   * p_pit_pointer (input) - A pointer to the pit which is not used by    *
+      234*   *    this overseer.					    *
+      235*   * p_call_listener_upon_return (output) - A flag which if set to "1"b   *
+      236*   *    will cause initialize_process_ to call the listener_ should the   *
+      237*   *    overseer return.  If set to "0"b, a fatal process error will      *
+      238*   *    occur if the overseer returns.  Here this flag is set to "0"b,    *
+      239*   *    this overseer should never return.			    *
+      240*   * p_listener_command_line (output) - The command line that	    *
+      241*   *    initialize_process should pass to the listener if the overseer    *
+      242*   *    returns and p_call_listener_upon_return is set.		    *
+      243*   ************************************************************************ */
+      244 
+      245         call SET_CL_INTERMEDIARY;
+      246         myname = "dmsd_overseer_";
+      247         call SET_ERROR_RETURN (NOT_TESTING);
+      248 
+      249         call SET_UP_DAEMON ();
+      250         on finish call FINISH_CONDITION_HANDLER;
+      251 
+      252         call COMMAND_LISTEN ();
+      253         call ERROR_RETURN ();
+      254 
+      255 /* *************************************************************************
+      256*   * dmsd_overseer_$test - This entry is a command entry for setting up    *
+      257*   * a Data Management Daemon in a user's process.  This command is used   *
+      258*   * for DM system and DM Daemon testing.  This command expects one	     *
+      259*   * argument which is the pathname of a directory that will become the    *
+      260*   * Data Management System directory.  The user should not be using DM    *
+      261*   * when this command is called.  If the user is using a DM system, he or *
+      262*   * she should use the dm_user_shutdown command first.		     *
+      263*   *     After establishing a DM system, this command enters a limited     *
+      264*   * subsystem enviornment.  This limited subsystem allows (..)  escapes   *
+      265*   * to Multics command level and the quit command.  Type: list_requests   *
+      266*   * while in the subsystem for a list of commands.		     *
+      267*   ************************************************************************ */
+      268 
+      269 test:
+      270         entry () options (variable);
+      271         myname = "dmsd_overseer_$test";
+      272         call SET_ERROR_RETURN (TESTING);
+      273         call GET_ARGUMENT_PATHNAME (system_dir_pathname);
+      274         call SET_SYSTEM_DIRECTORY (system_dir_pathname);
+      275         on cleanup call FINISH ();
+      276 
+      277         call SET_UP_DAEMON ();
+      278 
+      279         call TEST_COMMAND_LISTEN ();
+      280         call RETURN ();
+      281 
+      282 MAIN_RETURN:
+      283         return;
+      284 
+      285 /* *************************************************************************
+      286*   * COMMAND_LISTEN - This is the ssu_ command listener for the normal     *
+      287*   * Daemon process overseer.  Except for a few standard subsystem	     *
+      288*   * commands, the only commands allowed are new_proc and shutdown.  	     *
+      289*   * Command processor escapes are not allowed and QUIT signals remain     *
+      290*   * masked.						     *
+      291*   ************************************************************************* */
+      292 
+      293 COMMAND_LISTEN:
+      294         proc ();
+      295         dcl     cl_code		fixed bin (35);
+      296         dcl     cl_version_str	char (10);
+      297 
+      298         call ioa_$rsnnl ("^i", cl_version_str, (0), DM_DAEMON_VERSION_1);
+      299         call ssu_$create_invocation ("DM_Daemon_overseer", cl_version_str,
+      300 	  null (), codeptr (dmsd_ssu_request_tables_$daemon_requests), "",
+      301 	  ssu_system_ptr, cl_code);
+      302         if cl_code ^= 0 then
+      303 	      call ERROR_RETURN (cl_code,
+      304 		"^/Cannot create a command listener subsystem.");
+      305         else
+      306 	      do;
+      307 	      call ssu_$set_prompt_mode (ssu_system_ptr, DONT_PROMPT);
+      308 	      call ssu_$set_procedure (ssu_system_ptr, "cpescape",
+      309 		ssu_$cpescape_disabled, cl_code);
+      310 	      if cl_code ^= 0 then
+      311 		    call ERROR_RETURN (cl_code,
+      312 		        "^/Unable to disable (..) command processor escapes."
+      313 		        );
+      314 	      else
+      315 		    do;
+      316 		    call ssu_$listen (ssu_system_ptr, null (), cl_code);
+      317 		    call ERROR_RETURN (cl_code,
+      318 		        "^/Program Error.  Subsystem listener returned.");
+      319 		    end;
+      320 	      end;
+      321         end COMMAND_LISTEN;
+      322 
+      323 /* *************************************************************************
+      324*   * DESTROY_REQUEST_CHANNEL - This procedure is called to destroy the     *
+      325*   * Daemon request channel if one exits.  This only happens during FINISH *
+      326*   * for the $test command entry.				     *
+      327*   ************************************************************************* */
+      328 
+      329 DESTROY_REQUEST_CHANNEL:
+      330         proc ();
+      331         dcl     drc_code		fixed bin (35);
+      332         if request_channel ^= 0 then
+      333 	      call ipc_$delete_ev_chn (request_channel, drc_code);
+      334         end DESTROY_REQUEST_CHANNEL;
+      335 
+      336 /* *************************************************************************
+      337*   * DESTROY_SSU_INVOCATION - This procedure is called during FINISH for   *
+      338*   * the $test command entry to destroy the subsystem command invocation   *
+      339*   * if one exists.						     *
+      340*   ************************************************************************* */
+      341 
+      342 DESTROY_SSU_INVOCATION:
+      343         proc ();
+      344 
+      345         if ssu_system_ptr ^= null () then
+      346 	      call ssu_$destroy_invocation (ssu_system_ptr);
+      347         end DESTROY_SSU_INVOCATION;
+      348 
+      349 /* *************************************************************************
+      350*   * ERROR_RETURN -	This return is called only when when an error has	     *
+      351*   * occured and the Daemon cannot continue.  The procedure operates	     *
+      352*   * differently depending on the value of			     *
+      353*   * system_state.testing_error_return.  If the value is NOT_TESTING, the  *
+      354*   * normal value, then the error is reported via the DM log and sub_err_  *
+      355*   * and then the Daemon calls dm_daemon_util_$logout to logout the	     *
+      356*   * Daemon's process.  If the value is TESTING, then the error is	     *
+      357*   * reported via the DM log and com_err_ since the testing entry point is *
+      358*   * a command and then the Daemon executes FINISH and returns to the      *
+      359*   * user's command level.  The value of system_state.testing_error_return *
+      360*   * is set with a call to SET_ERROR_RETURN.			     *
+      361*   ************************************************************************* */
+      362 
+      363 ERROR_RETURN:
+      364         proc () options (variable);
+      365 
+      366         dcl     er_arg_list_ptr	ptr;
+      367         dcl     er_based_error_code	fixed bin (35) based;
+      368         dcl     1 er_err_msg_struc,
+      369 	        2 length		fixed bin (21),
+      370 	        2 string		char (1024);
+      371         dcl     er_err_msg		varying char (1024)
+      372 				based (addr (er_err_msg_struc));
+      373 
+      374         call cu_$arg_list_ptr (er_arg_list_ptr);
+      375         if er_arg_list_ptr -> arg_list.arg_count > 0 then
+      376 	      do;
+      377 	      if er_arg_list_ptr -> arg_list.arg_count > 1 then
+      378 		    call ioa_$general_rs (er_arg_list_ptr, 2, 3,
+      379 		        er_err_msg_struc.string, er_err_msg_struc.length,
+      380 		        NO_PAD, NO_NL);
+      381 	      else
+      382 		    er_err_msg = "";
+      383 	      call LOG_MESSAGE (ERROR_SV,
+      384 		er_arg_list_ptr -> arg_list.arg_ptrs (1)
+      385 		-> er_based_error_code, myname, er_err_msg);
+      386 	      end;
+      387         if system_state.testing_error_return then
+      388 	      do;
+      389 	      call com_err_ (er_arg_list_ptr -> arg_list.arg_ptrs (1)
+      390 		-> er_based_error_code, myname, er_err_msg);
+      391 	      call FINISH;
+      392 	      end;
+      393         else
+      394 	      do;
+      395 	      call sub_err_ (er_arg_list_ptr -> arg_list.arg_ptrs (1)
+      396 		-> er_based_error_code, myname, ACTION_CANT_RESTART, null,
+      397 		0, er_err_msg);
+      398 	      call dm_daemon_util_$logout;
+      399 	      end;
+      400         goto MAIN_RETURN;
+      401         end ERROR_RETURN;
+      402 
+      403 LOG_MESSAGE:
+      404         proc options (variable);
+      405         dcl     lm_arg_list_ptr	ptr init (null);
+      406         call cu_$arg_list_ptr (lm_arg_list_ptr);
+      407         call cu_$generate_call (dm_daemon_util_$log, lm_arg_list_ptr);
+      408         end LOG_MESSAGE;
+      409 
+      410 /* *************************************************************************
+      411*   * FINISH - This procedure is called to finish up when the $test command *
+      412*   * exited normally of during an error return.  FINISH is also called as  *
+      413*   * a cleanup handler for the $test command.  FINISH is never called	     *
+      414*   * if we have entered through the normal Daemon overseer entry.	     *
+      415*   * Interrupts are	masked to prevent a QUIT during cleanup.  Anything     *
+      416*   * that was set up during  the execution of the command should be	     *
+      417*   * cleaned up after this by FINISH.  The values of flags in	     *
+      418*   * system_state controls just what needs to be cleaned up.	     *
+      419*   ************************************************************************* */
+      420 
+      421 FINISH:
+      422         proc ();
+      423         dcl     f_code		fixed bin (35);
+      424 
+      425         call MASK_INTERRUPTS ();
+      426         on error
+      427 	      begin;
+      428 	      call UNMASK_INTERRUPTS ();
+      429 	      call continue_to_signal_ (f_code);
+      430 	      if f_code ^= 0 then
+      431 		    call dm_daemon_util_$log (ERROR_SV, f_code, myname,
+      432 		        "continue_to_signal_ error in FINISH on unit.");
+      433 	      end;
+      434         call dm_daemon_util_$unset_shutdown_timers ();
+      435         call DESTROY_SSU_INVOCATION ();
+      436         call UNSET_IDLE_TIMER ();
+      437         call RESET_SYSTEM_SHUTDOWN_HANDLER ();
+      438         call SHUTDOWN_DM_SYSTEM ();
+      439         call DESTROY_REQUEST_CHANNEL ();
+      440         call RESET_SYSTEM_DIRECTORY ();
+      441         call UNMASK_INTERRUPTS ();
+      442         end FINISH;
+      443 
+      444 /* *************************************************************************
+      445*   * FINISH_CONDITION_HANDLER - This procedure is called from the main     *
+      446*   * Daemon as overseer entry point when a finish condition is signaled.   *
+      447*   * We simply log the fact that the Daemon is logging out and continue    *
+      448*   * the signal.						     *
+      449*   ************************************************************************* */
+      450 
+      451 FINISH_CONDITION_HANDLER:
+      452         proc ();
+      453         dcl     fch_code		fixed bin (35);
+      454 
+      455         call ioa_ ("Data Management System Daemon logout.");
+      456         call dm_daemon_util_$log (INFORM_SV,
+      457 	  "Data Management System Daemon logout.");
+      458         call continue_to_signal_ (fch_code);
+      459         if fch_code ^= 0 then
+      460 	      call ERROR_RETURN (fch_code,
+      461 		"^/Unable to continue to signal finish condition.");
+      462         end FINISH_CONDITION_HANDLER;
+      463 
+      464 /* *************************************************************************
+      465*   * GET_ARGUMENT_PATHNAME - Called by the $test entry to get the system   *
+      466*   * directory pathname argument that must be supplied to the command.     *
+      467*   ************************************************************************* */
+      468 
+      469 GET_ARGUMENT_PATHNAME:
+      470         proc (gap_pathname);
+      471         dcl     gap_pathname		char (168);
+      472         dcl     gap_arg_ptr		ptr;
+      473         dcl     gap_arg_length	fixed bin (21);
+      474         dcl     gap_argument		char (gap_arg_length)
+      475 				based (gap_arg_ptr);
+      476         dcl     gap_code		fixed bin (35);
+      477 
+      478         call cu_$arg_ptr (1, gap_arg_ptr, gap_arg_length, gap_code);
+      479         if gap_code ^= 0 then
+      480 	      call ERROR_RETURN (error_table_$noarg, "^/Syntax: ^a pathname",
+      481 		myname);
+      482         else
+      483 	      gap_pathname = gap_argument;
+      484         end GET_ARGUMENT_PATHNAME;
+      485 
+      486 /* *************************************************************************
+      487*   * IDLE_TIME_IN_SECONDS - This function returns the the value of the DM  *
+      488*   * system parameter that specifies the amount of time between idle	     *
+      489*   * timeouts for the Daemon.  The time is converted from minutes to	     *
+      490*   * seconds and returned.					     *
+      491*   ************************************************************************* */
+      492 
+      493 IDLE_TIME_IN_SECONDS:
+      494         proc () returns (fixed bin);
+      495         dcl     1 itis_daemon_info	aligned like dm_daemon_info;
+      496 
+      497         itis_daemon_info.version = DM_DAEMON_INFO_VERSION_1;
+      498         call dm_daemon_util_$get_daemon_info (addr (itis_daemon_info));
+      499         return (60 * itis_daemon_info.wakeup_increment);
+      500         end IDLE_TIME_IN_SECONDS;
+      501 
+      502 /* *************************************************************************
+      503*   * INITIALIZE_DM_SYSTEM - This procedure is called to initialize the DM  *
+      504*   * system.  After this call, the Data Management system is live.	     *
+      505*   * system_state.dm_initialized is set in this procedure.                 *
+      506*   ************************************************************************* */
+      507 
+      508 INITIALIZE_DM_SYSTEM:
+      509         proc ();
+      510         dcl     1 ids_init_info	aligned like dm_system_init_info;
+      511 
+      512         ids_init_info.version = DM_SYSTEM_INIT_INFO_VERSION_1;
+      513         ids_init_info.event_channel = request_channel;
+      514         system_state.dm_initialized = "1"b;
+      515         call dm_daemon_util_$initialize_system (addr (ids_init_info));
+      516         end INITIALIZE_DM_SYSTEM;
+      517 
+      518 /* *************************************************************************
+      519*   * LOG_DM_INITIALIZED - This procedure logs the fact that the DM system  *
+      520*   * has been initialized on the output channel and the DM system log.     *
+      521*   ************************************************************************* */
+      522 
+      523 LOG_DM_INITIALIZED:
+      524         proc ();
+      525 
+      526         call ioa_ ("Data Management System initialized.");
+      527         call dm_daemon_util_$log (INFORM_SV,
+      528 	  "Data Management System initialized.");
+      529         end LOG_DM_INITIALIZED;
+      530 
+      531 /* *************************************************************************
+      532*   * LOG_DM_INITIALIZING - This procedure logs on the Daemon console log   *
+      533*   * that the Data Management system is about to be created.  We also      *
+      534*   * display what ring is the DM ring and the AIM classification.  We get  *
+      535*   * the ring number by getting a pointer to dm_daemon_gate_, converting   *
+      536*   * this pointer to a pathname, and then getting the write ring bracket   *
+      537*   * of dm_dameon_gate_.  The AIM classification string is displayed up to *
+      538*   * the first 100 characters.  Ellipsis is used to denote a longer	     *
+      539*   * classification string.					     *
+      540*   ************************************************************************* */
+      541 
+      542 LOG_DM_INITIALIZING:
+      543         proc ();
+      544 
+      545         dcl     ldi_classification_string
+      546 				char (100);
+      547         dcl     ldi_code		fixed bin (35);
+      548         dcl     ldi_daemon_gate_dir	char (168);
+      549         dcl     ldi_daemon_gate_ptr	ptr;
+      550         dcl     ldi_daemon_gate_seg	char (32);
+      551         dcl     ldi_ring_brackets	(3) fixed bin (3);
+      552 
+      553         call hcs_$make_ptr (codeptr (dmsd_overseer_), "dm_daemon_gate_", "",
+      554 	  ldi_daemon_gate_ptr, ldi_code);
+      555         if ldi_code ^= 0 then
+      556 	      call ERROR_RETURN (ldi_code,
+      557 		"^/Cannot get a pointer to dm_daemon_gate_.");
+      558         call hcs_$fs_get_path_name (ldi_daemon_gate_ptr, ldi_daemon_gate_dir,
+      559 	  (0), ldi_daemon_gate_seg, ldi_code);
+      560         if ldi_code ^= 0 then
+      561 	      call ERROR_RETURN (ldi_code,
+      562 		"^/Cannot get the pathname for dm_daemon_gate_.");
+      563         call hcs_$get_ring_brackets (ldi_daemon_gate_dir, ldi_daemon_gate_seg,
+      564 	  ldi_ring_brackets, ldi_code);
+      565         if ldi_code ^= 0 then
+      566 	      call ERROR_RETURN (ldi_code,
+      567 		"^/Cannot get the ring brackets of dm_daemon_gate_.");
+      568         call convert_access_class_$to_string (get_authorization_ (),
+      569 	  ldi_classification_string, ldi_code);
+      570         if ldi_code = error_table_$smallarg then
+      571 	      call ioa_ (
+      572 		"Initializing Data Management in ring ^i at^/^a . . .",
+      573 		min (ldi_ring_brackets (2), get_ring_ ()),
+      574 		ldi_classification_string);
+      575         else if ldi_code = 0 then
+      576 	      call ioa_ (
+      577 		"Initializing Data Management in ring ^i^[^; at ^a^].",
+      578 		min (ldi_ring_brackets (2), get_ring_ ()),
+      579 		(ldi_classification_string = ""), ldi_classification_string)
+      580 		;
+      581         else
+      582 	      call ERROR_RETURN (ldi_code,
+      583 		"^/Unable to get AIM classificaton.");
+      584         end LOG_DM_INITIALIZING;
+      585 
+      586 /* *************************************************************************
+      587*   * MAKE_REQUEST_CHANNEL_RECEIVER - This procedure creates an event call  *
+      588*   * channel so that DM users may make requests of the Daemon.  This	     *
+      589*   * channel is also used to receive idle timout wakeups and notifications *
+      590*   * of process terminations, both in the form of requests.		     *
+      591*   ************************************************************************* */
+      592 
+      593 MAKE_REQUEST_CHANNEL_RECEIVER:
+      594         proc ();
+      595         dcl     mrcr_code		fixed bin (35);
+      596 
+      597         call ipc_$create_ev_chn (request_channel, mrcr_code);
+      598         if mrcr_code ^= 0 then
+      599 	      call ERROR_RETURN (mrcr_code,
+      600 		"^/Cannot create request channel.");
+      601         else
+      602 	      do;
+      603 	      call ipc_$decl_ev_call_chn (request_channel,
+      604 		dm_daemon_util_$request, null (), 0, mrcr_code);
+      605 	      if mrcr_code ^= 0 then
+      606 		    call ERROR_RETURN (mrcr_code,
+      607 		        "^/Cannot create request call channel.");
+      608 	      end;
+      609         end MAKE_REQUEST_CHANNEL_RECEIVER;
+      610 
+      611 /* *************************************************************************
+      612*   * MASK_INTERRUPTS - This routines masks all IPS interrupts and saves    *
+      613*   * the previous IPS mask in saved_ips_mask.			     *
+      614*   ************************************************************************* */
+      615 
+      616 MASK_INTERRUPTS:
+      617         proc ();
+      618         dcl     mi_mask_names		(1) char (32);
+      619         dcl     mi_mask		bit (36) aligned;
+      620 
+      621         mi_mask_names (1) = "-all";
+      622         call create_ips_mask_ (addr (mi_mask_names), 1, mi_mask);
+      623         call hcs_$set_ips_mask (mi_mask, saved_ips_mask);
+      624         end MASK_INTERRUPTS;
+      625 
+      626 /* *************************************************************************
+      627*   * REGISTER_FOR_PROC_TERM_NOTIFY - This procedure sends a message to the *
+      628*   * Answering Service over its request channel requesting that this	     *
+      629*   * process be registered to receive notifications upon the termination   *
+      630*   * of any process.  This is used so that the Daemon can abort any	     *
+      631*   * transaction that that process may have held when the process was      *
+      632*   * terminated.  The notifications from the Answering Service are sent as *
+      633*   * requests on the DM Daemon's request channel.			     *
+      634*   ************************************************************************* */
+      635 
+      636 REGISTER_FOR_PROC_TERM_NOTIFY:
+      637         proc ();
+      638         dcl     mptr_code		fixed bin (35);
+      639         dcl     1 mptr_proc_term_info	aligned like asr_buzzard_info;
+      640         dcl     mptr_as_request_channel fixed bin (71);
+      641         dcl     mptr_as_request_dir	char (168);
+      642         dcl     1 mptr_as_request_message
+      643 				aligned
+      644 				like dm_adjust_process_id_word_1;
+      645         dcl     mptr_as_request_proc	bit (36) aligned;
+      646         dcl     mptr_as_request_seg	char (32);
+      647         dcl     mptr_as_request_uid	bit (72) aligned;
+      648 
+      649 
+      650         mptr_proc_term_info.header.version = as_request_version_1;
+      651         mptr_proc_term_info.header.type = ASR_PROC_TERM_NOTIFY;
+      652         mptr_proc_term_info.header.reply_channel = 0;
+      653         mptr_proc_term_info.version = asr_buzzard_info_version_1;
+      654         mptr_proc_term_info.info_channel = request_channel;
+      655         mptr_as_request_message.action_type =
+      656 	  dm_request_action_$adjust_process_id;
+      657         mptr_as_request_message.pad = 0;
+      658         mptr_proc_term_info.my_reference_id = unspec (mptr_as_request_message);
+      659         call system_info_$request_chn (mptr_as_request_proc,
+      660 	  mptr_as_request_channel, mptr_as_request_dir, mptr_as_request_seg);
+      661         call message_segment_$add_file (mptr_as_request_dir,
+      662 	  mptr_as_request_seg, addr (mptr_proc_term_info),
+      663 	  BITS_PER_WORD * size (mptr_proc_term_info), mptr_as_request_uid,
+      664 	  mptr_code);
+      665         if mptr_code ^= 0 then
+      666 	      call dm_daemon_util_$log (ERROR_SV, mptr_code, myname,
+      667 		"^/Cannot add to Answering Servce request message segment.^/Cannot receive process termination notifications."
+      668 		);
+      669         else
+      670 	      do;
+      671 	      call hcs_$wakeup (mptr_as_request_proc, mptr_as_request_channel,
+      672 		fixed (mptr_as_request_uid), mptr_code);
+      673 	      if mptr_code ^= 0 then
+      674 		    call dm_daemon_util_$log (ERROR_SV, mptr_code, myname,
+      675 		        "^/Cannot send IPC wakeup to Answering Service.^/Cannot receive process termination notifications."
+      676 		        );
+      677 	      end;
+      678         end REGISTER_FOR_PROC_TERM_NOTIFY;
+      679 
+      680 /* *************************************************************************
+      681*   * RESET_SYSTEM_DIRECTORY - This procedure sets the DM system directory  *
+      682*   * to its default value.  If system_state.system_dir_set is true and     *
+      683*   * system_state.dm_initialized is false.  The system directory can only  *
+      684*   * be set if the DM system has been shutdown.  This procedure is called  *
+      685*   * during FINISH for the $test command.  The system directory is not     *
+      686*   * reset to its original value since it was not possible to get the	     *
+      687*   * previous value of the system directoy without risking an error.	     *
+      688*   *							     *
+      689*   * system_state.system_dir_set is reset in this procedure.	     *
+      690*   ************************************************************************* */
+      691 
+      692 RESET_SYSTEM_DIRECTORY:
+      693         proc ();
+      694         if system_state.system_dir_set & ^system_state.dm_initialized then
+      695 	      do;
+      696 	      call dm_misc_util_$set_system_dir (previous_dm_system_dir);
+      697 	      system_state.system_dir_set = "0"b;
+      698 	      end;
+      699         end RESET_SYSTEM_DIRECTORY;
+      700 
+      701 /* *************************************************************************
+      702*   * RETURN - This is the normal return procedure for the $test command.   *
+      703*   * The Daemon as an overseer does not have a valid return, it should     *
+      704*   * never return.  A non-local goto MAIN_RETURN is performed to unwind    *
+      705*   * the stack.						     *
+      706*   ************************************************************************* */
+      707 
+      708 RETURN:
+      709         proc ();
+      710 
+      711         call FINISH ();
+      712         goto MAIN_RETURN;
+      713         end RETURN;
+      714 
+      715 /* *************************************************************************
+      716*   * SCHEDULE_SHUTDOWN - This routine is called after the DM system has    *
+      717*   * been initialized.  It causes a DM system shutdown to be scheduled.    *
+      718*   ************************************************************************* */
+      719 
+      720 SCHEDULE_SHUTDOWN:
+      721         proc ();
+      722 
+      723         call dm_daemon_util_$schedule_shutdown ();
+      724         end SCHEDULE_SHUTDOWN;
+      725 
+      726 /* *************************************************************************
+      727*   * SET_CL_INTERMEDIARY - This procedure sets the system cl_intermediary  *
+      728*   * which is the default error handler called after printing the error    *
+      729*   * information.  This entry is used from the Daemon an overseer entry    *
+      730*   * point.  It is the setting of this procedure that prevents the	     *
+      731*   * Daemon's process from ever reaching Multics command level.  We handle *
+      732*   * this error by causing the Daemon to new_proc.		     *
+      733*   ************************************************************************* */
+      734 
+      735 SET_CL_INTERMEDIARY:
+      736         proc ();
+      737 
+      738         call cu_$set_cl_intermediary (dm_daemon_util_$logout);
+      739         end SET_CL_INTERMEDIARY;
+      740 
+      741 /* *************************************************************************
+      742*   * SET_ERROR_RETURN - This procedure sets the			     *
+      743*   * system_state.testing_error_return flag which controls what	     *
+      744*   * ERROR_RETURN does if it should be called.  The constants TESTING and  *
+      745*   * NOT_TESTING should be used when making the call to this routine.	     *
+      746*   ************************************************************************* */
+      747 
+      748 SET_ERROR_RETURN:
+      749         proc (ser_testing);
+      750         dcl     ser_testing		bit (1);
+      751         system_state.testing_error_return = ser_testing;
+      752         end SET_ERROR_RETURN;
+      753 
+      754 /* *************************************************************************
+      755*   * SET_IDLE_TIMER - This procedure is called to set a timeout wakeup to  *
+      756*   * go off sit_time_interval_seconds in the future.  This time interval   *
+      757*   * is set by the caller to the DM system parameter idle time.  When the  *
+      758*   * timer goes off it will send an alarm wakeup over the Daemon's request *
+      759*   * channel.						     *
+      760*   ************************************************************************* */
+      761 
+      762 SET_IDLE_TIMER:
+      763         proc (sit_time_interval_seconds);
+      764         dcl     sit_time_interval_seconds
+      765 				fixed bin (71);
+      766         dcl     SIT_RELATIVE_SECONDS_REQUEST
+      767 				bit (2) init ("11"b);
+      768 
+      769         call timer_manager_$alarm_wakeup (sit_time_interval_seconds,
+      770 	  SIT_RELATIVE_SECONDS_REQUEST, request_channel);
+      771         end SET_IDLE_TIMER;
+      772 
+      773 /* *************************************************************************
+      774*   * SET_SYSTEM_DIRECTORY - The procedure is called to set the DM system   *
+      775*   * directory to a specified pathname. We check to see if the user is     *
+      776*   * currently using a Data Management system before trying to set the     *
+      777*   * system directory.  dm_misc_util_$set_system_dir will not set the	     *
+      778*   * system directory if the process is currenty using DM.  This is only   *
+      779*   * called from the $test command entry point.			     *
+      780*   *							     *
+      781*   * The system_state.system_dir_set flag is set in this procedure.	     *
+      782*   ************************************************************************* */
+      783 
+      784 SET_SYSTEM_DIRECTORY:
+      785         proc (ssd_pathname);
+      786         dcl     ssd_pathname		char (168);
+      787 
+      788         if dm_misc_util_$is_process_using_dm () then
+      789 	      call ERROR_RETURN (0,
+      790 		"^/User must execute dm_user_shutdown before trying to^/create another DM system."
+      791 		);
+      792         else
+      793 	      do;
+      794 	      call dm_misc_util_$get_system_dir (previous_dm_system_dir);
+      795 	      system_state.system_dir_set = "1"b;
+      796 	      call dm_misc_util_$set_system_dir (ssd_pathname);
+      797 	      end;
+      798         end SET_SYSTEM_DIRECTORY;
+      799 
+      800 /* *************************************************************************
+      801*   * SET_SYSTEM_SHUTDOWN_HANDLER - This procedure saves the current	     *
+      802*   * system_shutdown_scheduled_ IPS signal handler in the global variable  *
+      803*   * saved_system_shutdown_handler and then changes the current handler to *
+      804*   * be the handler appropriate for the DM daemon.  The DM Daemon handler  *
+      805*   * will reschedule DM shutdown whenever it receives a		     *
+      806*   * system_shutdown_scheduled_ IPS from the Answering Service.	     *
+      807*   * The system_state.shutdown_handler_set flag is set here.	     *
+      808*   ************************************************************************* */
+      809 
+      810 SET_SYSTEM_SHUTDOWN_HANDLER:
+      811         proc ();
+      812         dcl     sssh_code		fixed bin (35);
+      813 
+      814         call sct_manager_$get (system_shutdown_scheduled_sct_index,
+      815 	  saved_system_shutdown_handler, sssh_code);
+      816         if sssh_code ^= 0 then
+      817 	      call ERROR_RETURN (sssh_code,
+      818 		"^/Cannot get the current system_shutdown_scheduled_ handler."
+      819 		);
+      820         else
+      821 	      do;
+      822 	      system_state.shutdown_handler_set = "1"b;
+      823 	      call sct_manager_$set (system_shutdown_scheduled_sct_index,
+      824 		codeptr (dm_daemon_util_$schedule_shutdown), sssh_code);
+      825 	      if sssh_code ^= 0 then
+      826 		    call ERROR_RETURN (sssh_code,
+      827 		        "^/Cannot set the system_shutdown_scheduled_ handler."
+      828 		        );
+      829 	      end;
+      830         end SET_SYSTEM_SHUTDOWN_HANDLER;
+      831 
+      832 /* *************************************************************************
+      833*   * SET_UP_DAEMON - This procedure does all that is necessary to set up   *
+      834*   * as a Data Management system and Daemon.			     *
+      835*   ************************************************************************* */
+      836 
+      837 SET_UP_DAEMON:
+      838         proc ();
+      839 
+      840         call LOG_DM_INITIALIZING ();
+      841         call MAKE_REQUEST_CHANNEL_RECEIVER ();
+      842         call INITIALIZE_DM_SYSTEM ();
+      843         call SET_SYSTEM_SHUTDOWN_HANDLER ();
+      844         call SCHEDULE_SHUTDOWN ();
+      845         call REGISTER_FOR_PROC_TERM_NOTIFY ();
+      846         call SET_IDLE_TIMER (IDLE_TIME_IN_SECONDS ());
+      847         call LOG_DM_INITIALIZED ();
+      848         end SET_UP_DAEMON;
+      849 
+      850 /* *************************************************************************
+      851*   * SHUTDOWN_DM_SYSTEM - This procedure is called by FINISH to close down *
+      852*   * the DM system if there is one.  This only happens in the $test	     *
+      853*   * command entry.  This procedure must get and free an area because the  *
+      854*   * transaction_manager_$user_shutdown procedure needs an area pointer to *
+      855*   * allocate a structure in that we do not use.  If the		     *
+      856*   * system_state.dm_initialized flag is set, then shutdown is performed   *
+      857*   * and the flag is reset.					     *
+      858*   ************************************************************************* */
+      859 
+      860 SHUTDOWN_DM_SYSTEM:
+      861         proc ();
+      862         dcl     1 sds_shutdown_info	aligned like tm_shutdown_info
+      863 				based (tm_shutdown_info_ptr);
+      864         dcl     sds_code		fixed bin (35);
+      865 
+      866         if system_state.dm_initialized then
+      867 	      do;
+      868 	      call transaction_manager_$user_shutdown (
+      869 		get_system_free_area_ (), tm_shutdown_info_ptr, sds_code);
+      870 	      if sds_code ^= 0 then
+      871 		    call com_err_ (sds_code, myname,
+      872 		        "^/Cannot shutdown test DM system.");
+      873 	      else
+      874 		    do;
+      875 		    free sds_shutdown_info;
+      876 		    system_state.dm_initialized = "0"b;
+      877 		    end;
+      878 	      end;
+      879         end SHUTDOWN_DM_SYSTEM;
+      880 
+      881 /* *************************************************************************
+      882*   * TEST_COMMAND_LISTEN - This is the ssu_ listener for the Daemon when   *
+      883*   * invoked as a test command through the $test entry.  This command      *
+      884*   * listener differers from the Daemon as overseer command listener in    *
+      885*   * that it allow (..) escapes to Multics command level, and has a quit   *
+      886*   * command.  QUITS are allowed because they are allowed anytime during   *
+      887*   * the execution of the $test command entry.  The error code	     *
+      888*   * ssu_et_$subsystem_aborted is the normal error code return from	     *
+      889*   * ssu_$listen when a quit command has been typed.  The subsystem	     *
+      890*   * invocation has to be destroyed in the FINISH procedure.	     *
+      891*   ************************************************************************* */
+      892 
+      893 TEST_COMMAND_LISTEN:
+      894         proc ();
+      895         dcl     tcl_code		fixed bin (35);
+      896         dcl     tcl_version_str	char (10);
+      897 
+      898         call ioa_$rsnnl ("^i", tcl_version_str, (0), DM_DAEMON_VERSION_1);
+      899         call ssu_$create_invocation ("DM_Daemon", tcl_version_str, null (),
+      900 	  codeptr (dmsd_ssu_request_tables_$test_daemon_requests), "",
+      901 	  ssu_system_ptr, tcl_code);
+      902         if tcl_code ^= 0 then
+      903 	      call ERROR_RETURN (tcl_code,
+      904 		"^/Cannot create a command listener subsystem.");
+      905         else
+      906 	      do;
+      907 	      call ssu_$listen (ssu_system_ptr, null (), tcl_code);
+      908 	      if tcl_code ^= ssu_et_$subsystem_aborted then
+      909 		    call ERROR_RETURN (tcl_code,
+      910 		        "^/Subsystem listener returned with error.");
+      911 	      end;
+      912         end TEST_COMMAND_LISTEN;
+      913 
+      914 /* *************************************************************************
+      915*   * UNMASK_INTERRUPTS - This procedure restores the IPS mask to its saved *
+      916*   * value.						     *
+      917*   ************************************************************************* */
+      918 
+      919 UNMASK_INTERRUPTS:
+      920         proc ();
+      921 
+      922         call hcs_$reset_ips_mask (saved_ips_mask, (""b));
+      923         end UNMASK_INTERRUPTS;
+      924 
+      925 /* *************************************************************************
+      926*   * UNSET_IDLE_TIMER - Eliminates any idle timout that may be pending.    *
+      927*   ************************************************************************* */
+      928 
+      929 UNSET_IDLE_TIMER:
+      930         proc ();
+      931 
+      932         if request_channel ^= 0 then
+      933 	      call timer_manager_$reset_alarm_wakeup (request_channel);
+      934         end UNSET_IDLE_TIMER;
+      935 
+      936 /* *************************************************************************
+      937*   * RESET_SYSTEM_SHUTDOWN_HANDLER  If system_state.shutdown_handler_set   *
+      938*   * indicated that the system_shutdown_scheduled_ IPS handler was set,    *
+      939*   * this procedure resets it to its previous value and resets the	     *
+      940*   * system_state flag.					     *
+      941*   ************************************************************************* */
+      942 
+      943 RESET_SYSTEM_SHUTDOWN_HANDLER:
+      944         proc ();
+      945         dcl     ussh_code		fixed bin (35);
+      946 
+      947         if system_state.shutdown_handler_set then
+      948 	      do;
+      949 	      call sct_manager_$set (system_shutdown_scheduled_sct_index,
+      950 		saved_system_shutdown_handler, ussh_code);
+      951 	      if ussh_code ^= 0 then
+      952 		    call com_err_ (ussh_code, myname,
+      953 		        "^/Cannot reset the system_shutdown_shceduled_ IPS handler."
+      954 		        );
+      955 	      else
+      956 		    system_state.shutdown_handler_set = "0"b;
+      957 	      end;
+      958         end RESET_SYSTEM_SHUTDOWN_HANDLER;
+      959 
+  1     1 /* BEGIN INCLUDE FILE ... arg_list.incl.pl1
+  1     2*
+  1     3*   James R. Davis 10 May 79 */
+  1     4 
+  1     5 
+  1     6      
+  1     7 /****^  HISTORY COMMENTS:
+  1     8*  1) change(86-05-15,DGHowe), approve(86-05-15,MCR7375),
+  1     9*     audit(86-07-15,Schroth):
+  1    10*     added command_name_arglist declaration to allow the storage of the
+  1    11*     command name given to the command processor
+  1    12*                                                   END HISTORY COMMENTS */
+  1    13 
+  1    14      dcl	   1 arg_list	      aligned based,
+  1    15 	     2 header,
+  1    16 	       3 arg_count	      fixed bin (17) unsigned unal,
+  1    17 	       3 pad1	      bit (1) unal,
+  1    18 	       3 call_type	      fixed bin (18) unsigned unal,
+  1    19 	       3 desc_count	      fixed bin (17) unsigned unal,
+  1    20 	       3 pad2	      bit (19) unal,
+  1    21 	     2 arg_ptrs	      (arg_list_arg_count refer (arg_list.arg_count)) ptr,
+  1    22 	     2 desc_ptrs	      (arg_list_arg_count refer (arg_list.arg_count)) ptr;
+  1    23 
+  1    24 
+  1    25      dcl	   1 command_name_arglist	      aligned based,
+  1    26 	     2 header,
+  1    27 	       3 arg_count	      fixed bin (17) unsigned unal,
+  1    28 	       3 pad1	      bit (1) unal,
+  1    29 	       3 call_type	      fixed bin (18) unsigned unal,
+  1    30 	       3 desc_count	      fixed bin (17) unsigned unal,
+  1    31 	       3 mbz              bit(1) unal,
+  1    32                  3 has_command_name bit(1) unal,
+  1    33 	       3 pad2	      bit (17) unal,
+  1    34 	     2 arg_ptrs	      (arg_list_arg_count refer (command_name_arglist.arg_count)) ptr,
+  1    35 	     2 desc_ptrs	      (arg_list_arg_count refer (command_name_arglist.arg_count)) ptr,
+  1    36 	     2 name,
+  1    37                  3 command_name_ptr         pointer,
+  1    38                  3 command_name_length      fixed bin (21);
+  1    39 	
+  1    40 
+  1    41 
+  1    42      dcl	   1 arg_list_with_envptr aligned based,	/* used with non-quick int and entry-var calls */
+  1    43 	     2 header,
+  1    44 	       3 arg_count	      fixed bin (17) unsigned unal,
+  1    45 	       3 pad1	      bit (1) unal,
+  1    46 	       3 call_type	      fixed bin (18) unsigned unal,
+  1    47 	       3 desc_count	      fixed bin (17) unsigned unal,
+  1    48 	       3 pad2	      bit (19) unal,
+  1    49 	     2 arg_ptrs	      (arg_list_arg_count refer (arg_list_with_envptr.arg_count)) ptr,
+  1    50 	     2 envptr	      ptr,
+  1    51 	     2 desc_ptrs	      (arg_list_arg_count refer (arg_list_with_envptr.arg_count)) ptr;
+  1    52 
+  1    53 
+  1    54      dcl	   (
+  1    55 	   Quick_call_type	      init (0),
+  1    56 	   Interseg_call_type     init (4),
+  1    57 	   Envptr_supplied_call_type
+  1    58 			      init (8)
+  1    59 	   )		      fixed bin (18) unsigned unal int static options (constant);
+  1    60 
+  1    61 /* The user must declare arg_list_arg_count - if an adjustable automatic structure
+  1    62*   is being "liked" then arg_list_arg_count may be a parameter, in order to allocate
+  1    63*   an argument list of the proper size in the user's stack
+  1    64*
+  1    65**/
+  1    66 /* END INCLUDE FILE ... arg_list.incl.pl1 */
+      960 
+      961 
+  2     1 /* BEGIN INCLUDE FILE ... as_request_header.incl.pl1 */
+  2     2 
+  2     3 /* DESCRIPTION:
+  2     4*   Answering Service request information.
+  2     5**/
+  2     6 
+  2     7 
+  2     8 /****^  HISTORY COMMENTS:
+  2     9*  1) change(00-01-01,JRandom), approve(), audit(), install():
+  2    10*      Written by someone, at sometime.
+  2    11*  2) change(84-09-10,Tague), approve(), audit(), install():
+  2    12*      R. Michael Tague: Added ASR_BUMP_USER request.
+  2    13*  3) change(84-10-04,Margulies), approve(), audit(), install():
+  2    14*      BIM: ASR_ADMIN_COMMAND.
+  2    15*  4) change(85-01-23,Swenson), approve(), audit(), install():
+  2    16*      E. Swenson for ASR_NOTE_PNT_CHANGE.
+  2    17*  5) change(85-02-18,Margulies), approve(), audit(), install():
+  2    18*      BIM: ASR_DAEMON_COMMAND, ASR_COM_CHANNEL_INFO
+  2    19*  6) change(85-12-12,Lippard), approve(85-12-30,MCR7326),
+  2    20*     audit(86-10-27,GDixon), install(86-10-28,MR12.0-1200):
+  2    21*      Jim Lippard: Added ASR_ABS_COMMAND request.
+  2    22*                                                   END HISTORY COMMENTS */
+  2    23 
+  2    24 
+  2    25 /* format: style4 */
+  2    26 
+  2    27 dcl  as_request_version_1 fixed bin internal static initial (1) options (constant);
+  2    28 
+  2    29 dcl  (
+  2    30      ASR_FIRST_TYPE initial (1),
+  2    31      ASR_DIAL_SERVER initial (1),
+  2    32      ASR_DIAL_OUT initial (2),
+  2    33      ASR_FPE_CAUSES_LOGOUT initial (3),
+  2    34      ASR_FPE_CAUSES_NEW_PROC initial (4),
+  2    35      ASR_PROC_TERM_NOTIFY initial (5),
+  2    36      ASR_BUMP_USER initial (6),
+  2    37      ASR_ADMIN_COMMAND initial (7),
+  2    38      ASR_NOTE_PNT_CHANGE initial (8),
+  2    39      ASR_DAEMON_COMMAND initial (9),
+  2    40      ASR_COM_CHANNEL_INFO initial (10),
+  2    41      ASR_ABS_COMMAND initial (11),
+  2    42      ASR_LAST_TYPE initial (11)
+  2    43      ) fixed bin internal static options (constant);
+  2    44 
+  2    45 dcl  ASR_DEFER_IN_ADMIN_MODE (1:11) bit (1) int static options (constant)
+  2    46      init ((6) (1) "0"b, "1"b, (4) (1) "0"b);
+  2    47 
+  2    48 dcl  ASR_REQUEST_NAMES (1:11) int static options (constant)
+  2    49 	char (40) init (
+  2    50 	"Dial request",
+  2    51 	"Dial out request",
+  2    52 	"Logout on fatal process error",
+  2    53 	"New process on fatal process error",
+  2    54 	"Monitor process terminations",
+  2    55 	"Bump user",
+  2    56 	"Execute admin command",
+  2    57 	"Note PNT change",
+  2    58 	"Daemon command",
+  2    59 	"Communications channel info",
+  2    60 	"Absentee command");
+  2    61 
+  2    62 dcl  1 as_request_header based aligned,
+  2    63        2 version fixed bin,				/* version number */
+  2    64        2 type fixed bin,				/* what to do */
+  2    65        2 reply_channel fixed bin (71);			/* who to tell */
+  2    66 
+  2    67 
+  2    68 /* END INCLUDE FILE ... as_request_header.incl.pl1 */
+      962 
+      963 
+  3     1 /* BEGIN INCLUDE FILE ... as_requests.incl.pl1 */
+  3     2 /* DESCRIPTION:
+  3     3*   This include file is the repository of as_request_ structures which are
+  3     4*   not so complicated or arcane as to require their own include file.
+  3     5*   It requires as_request_header.incl.pl1
+  3     6**/
+  3     7 
+  3     8 /* HISTORY:
+  3     9*   Written by someone, at sometime.
+  3    10*   Modified:
+  3    11*   09/10/84 by R. Michael Tague:  Add the structure asr_bump_user_info
+  3    12*   and asr_reply_bump_user.
+  3    13*   01/23/85 by E. Swenson:  Add the asr_note_pnt_change_info structure.
+  3    14**/
+  3    15 
+  3    16 /* format: style4 */
+  3    17 
+  3    18      /*** return status from an as_request_ call. ***/
+  3    19 
+  3    20 dcl  asr_replyp ptr;
+  3    21 dcl  1 asr_reply aligned based (asr_replyp),		/* IPC status return for a.s. request */
+  3    22        2 code fixed bin (35),				/* standard error code */
+  3    23        2 data bit (36);				/* other data */
+  3    24 
+  3    25      /*** request to monitor process destructions, and the destruction notification ***/
+  3    26 
+  3    27 dcl  asr_buzzard_info_version_1 char (8) init ("buzzard1") int static options (constant);
+  3    28 dcl  asr_buzzard_infop ptr;
+  3    29 dcl  1 asr_buzzard_info aligned based (asr_buzzard_infop),	/* for watching dying processes */
+  3    30        2 header aligned like as_request_header,
+  3    31        2 version char (8),
+  3    32        2 info_channel fixed bin (71),			/* IPC channel to send processid wakeup messges */
+  3    33        2 my_reference_id bit (36);			/* becomes top 36 bits of death notice */
+  3    34 
+  3    35 dcl  1 asr_buzzard_notification aligned based (asr_replyp), /* message on process destruction */
+  3    36        2 your_reference_id bit (36),			/* from asr_buzzard_info.my_reference_id */
+  3    37        2 process_id bit (36);				/* process id of dead process */
+  3    38 
+  3    39 /* ***********************************************************************
+  3    40*   * asr_bump_user_info  -  Message segment info structure for the       *
+  3    41*   *                        ASR_BUMP_USER requests.                      *
+  3    42*   *      process-id  -  process_id of process to be bumped.             *
+  3    43*   *      message     -  message to be splat across user terminal when   *
+  3    44*   *                     the bump is begun, i.e., the grace time starts. *
+  3    45*   *		     No message is sent if message = "".             *
+  3    46*   *      grace_time_in_seconds				   *
+  3    47*   *                  -  Amount of time given to the user before the     *
+  3    48*   *                     user's process is actually terminated.          *
+  3    49*   *      reply_reference_id					   *
+  3    50*   *	            -  Reference id that will be returned in the       *
+  3    51*   *                     as_reply_bump_user structure.  A reply channel  *
+  3    52*   *                     must be specified in reply_channel in the       *
+  3    53*   *		     header of this structure.  The reply message    *
+  3    54*   *		     will have the sturcture of asr_reply_bump_user. *
+  3    55*   *********************************************************************** */
+  3    56 
+  3    57 dcl  asr_bump_user_info_version_1 char (8) init ("asrbump1") int static options (constant);
+  3    58 
+  3    59 dcl  asr_bump_user_info_ptr ptr;
+  3    60 dcl  1 asr_bump_user_info aligned based (asr_bump_user_info_ptr),
+  3    61        2 header aligned like as_request_header,
+  3    62        2 version char (8),
+  3    63        2 process_id bit (36),
+  3    64        2 message char (100) unaligned,
+  3    65        2 grace_time_in_seconds fixed bin,
+  3    66        2 reply_reference_id bit (36);
+  3    67 
+  3    68 /* ***********************************************************************
+  3    69*   * asr_reply_bump_user  -  Structure sent with the IPC reply upon      *
+  3    70*   *                         initiating the bump.  Note:  the actual     *
+  3    71*   *		         bump does not take place until after the    *
+  3    72*   *                         given of default grace time.                *
+  3    73*   *      code    -  Standard system status code.                        *
+  3    74*   *      reference_id					   *
+  3    75*   *              -  Reference id supplied in asr_bump_user_info when    *
+  3    76*   *                 bump user request was made.                         *
+  3    77*   *********************************************************************** */
+  3    78 
+  3    79 dcl  1 asr_reply_bump_user aligned based (asr_replyp),
+  3    80        2 code fixed bin (35),
+  3    81        2 reference_id bit (36);
+  3    82 
+  3    83 
+  3    84 dcl  asr_admin_command_info_ptr pointer;
+  3    85 dcl  1 asr_admin_command_info aligned based (asr_admin_command_info_ptr),
+  3    86        2 header aligned like as_request_header,
+  3    87        2 version char (8),
+  3    88        2 flags aligned,
+  3    89          3 send_start_wakeup bit (1) unaligned,		/* over reply channel */
+  3    90          3 send_completion_wakeup bit (1) unaligned,	/* over reply channel */
+  3    91          3 send_completion_message bit (1) unaligned,
+  3    92          3 send_completion_mail bit (1) unaligned,
+  3    93          3 dialog bit (1) unaligned,			/* NOT YET IMPLEMENTED */
+  3    94          3 pad bit (31) unaligned,
+  3    95        2 dialog_info aligned,				/* NOT YET IMPLEMENTED */
+  3    96          3 event_channel fixed bin (71),		/* NOTIFY ME ON READ/RIGHT */
+  3    97          3 output_message_segment_pathname char (200) unaligned, /* Writes go here */
+  3    98          3 input_message_segment_pathname char (200) unaligned, /* Reads come here */
+  3    99        2 mail_destination char (200) unaligned,
+  3   100        2 command_length fixed bin (21),
+  3   101        2 command char (asr_ac_length refer (asr_admin_command_info.command_length)) unaligned;
+  3   102 
+  3   103 /* See admin_dialog_info.incl.pl1 for related structures */
+  3   104 
+  3   105 dcl  asr_ac_length fixed bin (21);
+  3   106 dcl  ASR_AC_VERSION_1 char (8) init ("asrac001") int static options (constant);
+  3   107 
+  3   108 dcl  1 asr_reply_admin_command aligned based (asr_replyp),
+  3   109        2 code fixed bin (35),
+  3   110        2 flags aligned,
+  3   111          3 command_refused bit (1) unaligned,
+  3   112          3 command_started bit (1) unaligned,
+  3   113          3 command_completed bit (1) unaligned,		/* with or without errors */
+  3   114          3 command_aborted bit (1) unaligned,
+  3   115          3 command_had_errors bit (1) unaligned,		/* at least one error */
+  3   116          3 pad bit (31) unaligned;
+  3   117 
+  3   118 /**** The following structure is used by the Ring-1 PNT software to
+  3   119*      notify the answering service of a PNT change which might affect
+  3   120*      logged in processes. */
+  3   121 
+  3   122 dcl  asr_note_pnt_change_info_ptr ptr;
+  3   123 
+  3   124 dcl  1 asr_note_pnt_change_info structure aligned based (asr_note_pnt_change_info_ptr),
+  3   125        2 header aligned like as_request_header,
+  3   126        2 version char (8),
+  3   127        2 person_id char (32);
+  3   128 
+  3   129 dcl  ASR_NPC_INFO_VERSION_1 char (8) initial ("asrnpc01") internal static options (constant);
+  3   130 
+  3   131 /* END INCLUDE FILE ... as_requests.incl.pl1 */
+      964 
+      965 
+  4     1 /* BEGIN INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+  4     2 
+  4     3 /* format: ^indcom */
+  4     4 
+  4     5 /* DESCRIPTION:
+  4     6*   These are the severity codes used by the dms daemon when calling its logger.
+  4     7*   The severity is ranked thusly:
+  4     8*
+  4     9*   severity log write situation
+  4    10*   -------- --- ----- ---------
+  4    11*          0 no  yes   standard output, query, etc.
+  4    12*          1 yes yes   fatal error, terminate dms daemon.
+  4    13*          2 yes yes   nonfatal error.
+  4    14*          3 yes yes   informative message.
+  4    15*          4 yes no    log information only.
+  4    16**/
+  4    17 
+  4    18 /* HISTORY:
+  4    19*
+  4    20*Written by M. Pandolf, 10/06/82.
+  4    21*Modified:
+  4    22*12/10/84 by R. Michael Tague: Rename and reformat description/history.
+  4    23*01/13/85 by Lee A. Newcomb:  Renamed to dm_log_sv_codes from
+  4    24*            dm_daemon_sv_codes as the severity codes for the DM log are not
+  4    25*            restrained to the DM Daemon's use.
+  4    26*01/24/85 by Lee A. Newcomb:  Fixed to say dm_log_sv_codes.incl.pl1 in the
+  4    27*            BEGIN and END INCLUDE comments, instead of dm_daemon_sv_codes.==.
+  4    28**/
+  4    29 
+  4    30 /* format: style5 */
+  4    31 
+  4    32      dcl	   (PRINT_SV, QUERY_SV)    fixed bin internal static
+  4    33 			       options (constant) init (0);
+  4    34      dcl	   (CRASH_SV, FATAL_SV)    fixed bin internal static
+  4    35 			       options (constant) init (1);
+  4    36      dcl	   ERROR_SV	       fixed bin internal static
+  4    37 			       options (constant) init (2);
+  4    38      dcl	   INFORM_SV	       fixed bin internal static
+  4    39 			       options (constant) init (3);
+  4    40      dcl	   LOG_SV		       fixed bin internal static
+  4    41 			       options (constant) init (4);
+  4    42 
+  4    43 /* END INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+      966 
+      967 
+  5     1 /* BEGIN INCLUDE FILE  dm_request_message.incl.pl1 */
+  5     2 
+  5     3 /* DESCRIPTION
+  5     4*   This include file describes the format of messages sent to the
+  5     5*   data management daemon process.  All messages begin with a common
+  5     6*   header, and contain information specific to the request within
+  5     7*   the message.
+  5     8**/
+  5     9 
+  5    10 /* HISTORY
+  5    11*Written by M. Pandolf, 10/28/82.
+  5    12*Modified:
+  5    13*11/04/82 by M. Pandolf: to add dm_adjust_bjt_message.
+  5    14*01/25/83 by M. Pandolf: to add dm_adjust_tdt_entry_message and to replace
+  5    15*         dm_bury message with dm_adjust_process_id.
+  5    16*03/11/83 by to M. Pandolf: to add list_ref_names and terminate.
+  5    17*11/28/84 by R. Michael Tague: added dm_adjust_process_id_word_1 and 
+  5    18*         dm_alarm_message.
+  5    19*01/22/85 by R. Michael Tague: added dm_kill_txn and changed the entry
+  5    20*         new_process_notifications to new_process_notifies.
+  5    21**/
+  5    22 
+  5    23 /* format: style5,^indcomtxt */
+  5    24 dcl     dm_request_message_ptr  pointer;
+  5    25 
+  5    26 dcl     1 dm_request_message	  aligned based (dm_request_message_ptr),
+  5    27         ( 2 action_type	  fixed bin (17),
+  5    28 	2 action_specific_data
+  5    29 			  bit (54)
+  5    30 	)		  unaligned;
+  5    31 
+  5    32 dcl     1 dm_terminate_segno_message
+  5    33 			  aligned based (dm_request_message_ptr),
+  5    34         ( 2 action_type	  fixed bin (17),
+  5    35 	2 segment_number	  bit (18),
+  5    36 	2 pad		  fixed bin (35)
+  5    37 	)		  unaligned;
+  5    38 
+  5    39 dcl     1 dm_adjust_txn_message aligned based (dm_request_message_ptr),
+  5    40         ( 2 action_type	  fixed bin (17),
+  5    41 	2 transaction_index	  fixed bin (17),
+  5    42 	2 transaction_id	  bit (36)
+  5    43 	)		  unaligned;
+  5    44 
+  5    45 dcl     1 dm_adjust_tdt_entry_message
+  5    46 			  aligned based (dm_request_message_ptr),
+  5    47         ( 2 action_type	  fixed bin (17),
+  5    48 	2 transaction_index	  fixed bin (17),
+  5    49 	2 transaction_id	  bit (36)
+  5    50 	)		  unaligned;
+  5    51 
+  5    52 dcl     1 dm_adjust_process_id_message
+  5    53 			  aligned based (dm_request_message_ptr),
+  5    54         ( 2 action_type	  fixed bin (17),
+  5    55 	2 pad		  fixed bin (17),
+  5    56 	2 process_id	  bit (36)
+  5    57 	)		  unaligned;
+  5    58 
+  5    59 dcl     1 dm_adjust_process_id_word_1
+  5    60 			  aligned based (dm_request_message_ptr),
+  5    61 	2 action_type	  fixed bin (17) unaligned,
+  5    62 	2 pad		  fixed bin (17) unaligned;
+  5    63 
+  5    64 dcl     1 dm_kill_txn	  aligned based (dm_request_message_ptr),
+  5    65 	2 action_type	  fixed bin (17) unaligned,
+  5    66 	2 pad		  fixed bin (17) unaligned,
+  5    67 	2 transaction_id	  bit (36) unaligned;
+  5    68 
+  5    69 dcl     dm_alarm_message	  char (8) aligned based (dm_request_message_ptr);
+  5    70 
+  5    71 /* END INCLUDE FILE dm_request_message.incl.pl1 */
+      968 
+      969 
+  6     1 /* BEGIN INCLUDE FILE dm_system_init_info.incl.pl1 */
+  6     2 
+  6     3 /* HISTORY
+  6     4*
+  6     5*Written by M. Pandolf, 09/16/82.
+  6     6*Modified:
+  6     7*05/17/83 by L. A. Newcomb to make version char (8).
+  6     8*12/13/84 by R. Michael Tague: Changed name from dm_system_init_info.incl.pl1.
+  6     9**/
+  6    10 
+  6    11 /* format:  style4,indattr,ifthenstmt,ifthen,idind33,^indcomtxt */
+  6    12 
+  6    13 dcl  dm_system_init_info_ptr	        ptr;
+  6    14 
+  6    15 dcl  1 dm_system_init_info	        aligned based (dm_system_init_info_ptr),
+  6    16        2 version		        char (8),
+  6    17        2 event_channel	        fixed bin (71);
+  6    18 
+  6    19 dcl  DM_SYSTEM_INIT_INFO_VERSION_1     char (8) aligned init ("dmintst1")
+  6    20 			        internal static options (constant);
+  6    21 
+  6    22 /* END INCLUDE FILE dm_system_init_info.incl.pl1 */
+      970 
+      971 
+  7     1 /* BEGIN INCLUDE FILE dm_tm_shutdown_info.incl.pl1 */
+  7     2 
+  7     3 /* DESCRIPTION:
+  7     4*
+  7     5*	This contains the structure used to pass information from
+  7     6*     the DM ring to the user ring about a process' transactions that
+  7     7*     existed when the process terminated its usage of a Data
+  7     8*     Management System.
+  7     9**/
+  7    10 
+  7    11 /* HISTORY:
+  7    12*Written by Steve Herbst, 11/22/83.
+  7    13*Modified:
+  7    14*04/27/84 by L. A. Newcomb:  Renamed structure shutdown_info to
+  7    15*            tm_shutdown_info to prevent collision with system shutdown info
+  7    16*            structure.
+  7    17*05/16/84 by Steve Herbst:  Added ABANDONED constant.
+  7    18*09/20/84 by Lee A. Newcomb:  Added an abandoned entry to the OP_NAME array,
+  7    19*            aligned the version, and init'd tm_shutdown_info_ptr to null.
+  7    20**/
+  7    21 
+  7    22 /* format: style4,indattr,^indcomtxt,idind33 */
+  7    23 
+  7    24 dcl  1 tm_shutdown_info	        aligned based (tm_shutdown_info_ptr),
+  7    25        2 version		        char (8) aligned,	/* = "TMSHUT 1" */
+  7    26        2 count		        fixed bin,
+  7    27        2 transaction	        (tm_shutdown_alloc_count refer (tm_shutdown_info.count)),
+  7    28          3 txn_id		        bit (36) aligned,
+  7    29          3 op_completed	        fixed bin,
+  7    30          3 state		        fixed bin,
+  7    31          3 error_code	        fixed bin (35);
+  7    32 
+  7    33 dcl  tm_shutdown_info_ptr	        ptr init (null ());
+  7    34 dcl  tm_shutdown_alloc_count	        fixed bin;
+  7    35 
+  7    36 dcl  (						/* constants */
+  7    37      TM_SHUTDOWN_INFO_VERSION_1       char (8) aligned init ("TMSHUT 1"),
+  7    38      (ABORTED		        init (1),
+  7    39      FINISHED_ABORT		        init (2),
+  7    40      FINISHED_COMMIT	        init (3),
+  7    41      ABANDONED		        init (4)) fixed bin,
+  7    42      OP_NAME		        (4) char (32) init
+  7    43 			        ("Aborted", "Finished aborting", "Finished committing", "Abandoned")
+  7    44      )			        int static options (constant);
+  7    45 
+  7    46 /* END INCLUDE FILE - dm_tm_shutdown_info.incl.pl1 */
+      972 
+      973 
+  8     1 /* BEGIN INCLUDE FILE - dm_system_states.incl.pl1 */
+  8     2 
+  8     3 /* DESCRIPTION:
+  8     4*
+  8     5*	This include file contains the structure for getting all the
+  8     6*     information from dm_system_data_ about the caretaker Daemon of a DMS.
+  8     7*     The caller recieveing the info from the inner ring routine must set
+  8     8*     version to prevent its storage from being trashed.
+  8     9**/
+  8    10 
+  8    11 /* HISTORY:
+  8    12* Written by Lee A. Newcomb, 03/22/84.
+  8    13* Modified:
+  8    14**/
+  8    15 /* format:  style4,indattr,ifthenstmt,ifthen,idind33,^indcomtxt */
+  8    16 
+  8    17 dcl  dm_daemon_info_ptr	        ptr;
+  8    18 dcl  DM_DAEMON_INFO_VERSION_1	        char (8) init ("DMDMNIF1") options (constant) int static;
+  8    19 
+  8    20 dcl  1 dm_daemon_info	        aligned based (dm_daemon_info_ptr),
+  8    21        2 version		        char (8),
+  8    22        2 event_channel	        fixed bin (71),
+  8    23        2 process_id		        bit (36),
+  8    24        2 wakeup_increment	        fixed bin,
+  8    25        2 user_id		        char (32),
+  8    26        2 command_ms_name	        char (32);
+  8    27 
+  8    28 /* END INCLUDE FILE - dm_daemon_info.incl.pl1 */
+      974 
+      975 
+  9     1 /* BEGIN INCLUDE FILE ... ssu_prompt_modes.incl.pl1 */
+  9     2 /* Created:  15 February 1982 by G. Palter */
+  9     3 
+  9     4 /* Values for use in calls to ssu_$set_prompt_mode to control prompting by the subsystem listener */
+  9     5 
+  9     6 dcl  PROMPT bit (1) static options (constant) initial ("0"b);
+  9     7 dcl  DONT_PROMPT bit (1) static options (constant) initial ("1"b);
+  9     8 
+  9     9 dcl  PROMPT_AFTER_NULL_LINES bit (2) static options (constant) initial ("01"b);
+  9    10 dcl  DONT_PROMPT_AFTER_NULL_LINES bit (2) static options (constant) initial ("00"b);
+  9    11 
+  9    12 dcl  PROMPT_IF_TYPEAHEAD bit (3) static options (constant) initial ("000"b);
+  9    13 dcl  DONT_PROMPT_IF_TYPEAHEAD bit (3) static options (constant) initial ("001"b);
+  9    14 
+  9    15 /* For example:
+  9    16*      call ssu_$set_prompt_mode (sci_ptr, PROMPT | DONT_PROMPT_AFTER_NULL_LINES | DONT_PROMPT_IF_TYPEAHEAD); */
+  9    17 
+  9    18 /* END INCLUDE FILE ... ssu_prompt_modes.incl.pl1 */
+      976 
+      977 
+ 10     1 /* BEGIN INCLUDE FILE  static_handlers.incl.pl1  */
+ 10     2 
+ 10     3 /* format: style4,indattr,ifthenstmt,ifthen,idind33,^indcomtxt */
+ 10     4 
+ 10     5 /* HISTORY:
+ 10     6*Written by S. H. Webber, 06/20/75.
+ 10     7*Modified:
+ 10     8*12/15/83 by Benson Margulies:  added undefined_pointer_sct_index and
+ 10     9*	  pgt_sct_index.
+ 10    10*06/11/84 by Lee A. Newcomb:  added dm_shutdown_warning_sct_index and
+ 10    11*            dm_user_shutdown_sct_index for handling of Data Management
+ 10    12*            shutdown.
+ 10    13*08/22/84 by R. Michael Tague:  Removed dm_shutdown_warning_sct_index and
+ 10    14*            dm_user_shutdown_sct_index.  Added
+ 10    15*            system_shutdown_scheduled_sct_index and
+ 10    16*            dm_shutdown_scheduled_sct_index.
+ 10    17**/
+ 10    18 
+ 10    19 
+ 10    20 /****^  HISTORY COMMENTS:
+ 10    21*  1) change(85-11-13,Herbst), approve(87-07-21,MCR7697),
+ 10    22*     audit(87-07-21,GDixon), install(87-08-04,MR12.1-1056):
+ 10    23*     Add system_message_sct_index.
+ 10    24*                                                   END HISTORY COMMENTS */
+ 10    25 
+ 10    26 
+ 10    27 dcl  (
+ 10    28      shutdown_sct_index	        init (0),
+ 10    29      store_sct_index	        init (1),
+ 10    30      mme1_sct_index		        init (2),
+ 10    31      fault_tag_1_sct_index	        init (3),
+ 10    32      timer_runout_sct_index	        init (4),
+ 10    33      command_sct_index	        init (5),
+ 10    34      derail_sct_index	        init (6),
+ 10    35      lockup_sct_index	        init (7),
+ 10    36      connect_sct_index	        init (8),
+ 10    37      parity_sct_index	        init (9),
+ 10    38      illegal_procedure_sct_index      init (10),
+ 10    39      op_not_complete_sct_index        init (11),
+ 10    40      startup_sct_index	        init (12),
+ 10    41      ovrflo_sct_index	        init (13),
+ 10    42      zerodivide_sct_index	        init (14),
+ 10    43      execute_sct_index	        init (15),
+ 10    44      seg_fault_error_sct_index        init (16),
+ 10    45      page_fault_error_sct_index       init (17),
+ 10    46      directed_fault_2_sct_index       init (18),
+ 10    47      directed_fault_3_sct_index       init (19),
+ 10    48      accessviolation_sct_index        init (20),
+ 10    49      mme2_sct_index		        init (21),
+ 10    50      mme3_sct_index		        init (22),
+ 10    51      mme4_sct_index		        init (23),
+ 10    52      linkage_error_sct_index	        init (24),
+ 10    53      fault_tag_3_sct_index	        init (25),
+ 10    54      undefined_fault_sct_index        init (26),
+ 10    55      trouble_sct_index	        init (31),
+ 10    56      illegal_opcode_sct_index	        init (32),
+ 10    57      simfault_000000_sct_index        init (33),
+ 10    58      illegal_modifier_sct_index       init (34),
+ 10    59      illegal_ring_order_sct_index     init (35),
+ 10    60      not_in_execute_bracket_sct_index init (36),
+ 10    61      no_execute_permission_sct_index  init (37),
+ 10    62      not_in_read_bracket_sct_index    init (38),
+ 10    63      no_read_permission_sct_index     init (39),
+ 10    64      not_in_write_bracket_sct_index   init (40),
+ 10    65      no_write_permission_sct_index    init (41),
+ 10    66      not_a_gate_sct_index	        init (42),
+ 10    67      not_in_call_bracket_sct_index    init (43),
+ 10    68      outward_call_sct_index	        init (44),
+ 10    69      bad_outward_call_sct_index       init (45),
+ 10    70      inward_return_sct_index	        init (46),
+ 10    71      cross_ring_transfer_sct_index    init (47),
+ 10    72      ring_alarm_fault_sct_index       init (48),
+ 10    73      am_fault_sct_index	        init (49),
+ 10    74      out_of_bounds_sct_index	        init (50),
+ 10    75      fixedoverflow_sct_index	        init (51),
+ 10    76      overflow_sct_index	        init (52),
+ 10    77      underflow_sct_index	        init (53),
+ 10    78      stringsize_sct_index	        init (54),
+ 10    79      other_illegal_proc_sct_index     init (55),
+ 10    80      storage_sct_index	        init (56),
+ 10    81      packed_pointer_fault_sct_index   init (57),
+ 10    82      lot_fault_sct_index	        init (58),
+ 10    83      isot_fault_sct_index	        init (59),
+ 10    84      system_packed_pointer_sct_index  init (60),
+ 10    85      quit_sct_index		        init (61),
+ 10    86      alrm_sct_index		        init (62),
+ 10    87      cput_sct_index		        init (63),
+ 10    88      record_quota_overflow_sct_index  init (64),
+ 10    89      size_sct_index		        init (65),
+ 10    90      neti_sct_index		        init (66),
+ 10    91      other_command_sct_index	        init (67),
+ 10    92      susp_sct_index		        init (68),
+ 10    93      term_sct_index		        init (69),
+ 10    94      wkp_sct_index		        init (70),
+ 10    95      undefined_pointer_sct_index      init (71),
+ 10    96      pgt_sct_index		        init (72),
+ 10    97      system_shutdown_scheduled_sct_index
+ 10    98 	                            init (73),
+ 10    99      dm_shutdown_scheduled_sct_index  init (74),
+ 10   100      system_message_sct_index	        init (75)
+ 10   101      )			        fixed bin (17) int static options (constant);
+ 10   102 
+ 10   103 /* END INCLUDE FILE  static_handlers.incl.pl1 */
+      978 
+      979 
+ 11     1 /* BEGIN INCLUDE FILE sub_err_flags.incl.pl1 BIM 11/81 */
+ 11     2 /* format: style3 */
+ 11     3 
+ 11     4 /* These constants are to be used for the flags argument of sub_err_ */
+ 11     5 /* They are just "string (condition_info_header.action_flags)" */
+ 11     6 
+ 11     7 declare	(
+ 11     8 	ACTION_CAN_RESTART	init (""b),
+ 11     9 	ACTION_CANT_RESTART init ("1"b),
+ 11    10 	ACTION_DEFAULT_RESTART
+ 11    11 			init ("01"b),
+ 11    12 	ACTION_QUIET_RESTART
+ 11    13 			init ("001"b),
+ 11    14 	ACTION_SUPPORT_SIGNAL
+ 11    15 			init ("0001"b)
+ 11    16 	)		bit (36) aligned internal static options (constant);
+ 11    17 
+ 11    18 /* End include file */
+      980 
+      981 
+      982         end dmsd_overseer_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    08/04/87  1538.9  dmsd_overseer_.pl1                >special_ldd>install>MR12.1-1054>dmsd_overseer_.pl1
+960          1    08/05/86  0856.8  arg_list.incl.pl1                 >ldd>include>arg_list.incl.pl1
+962          2    10/30/86  2010.5  as_request_header.incl.pl1        >ldd>include>as_request_header.incl.pl1
+964          3    02/12/85  1429.5  as_requests.incl.pl1              >ldd>include>as_requests.incl.pl1
+966          4    03/06/85  1031.1  dm_log_sv_codes.incl.pl1          >ldd>include>dm_log_sv_codes.incl.pl1
+968          5    03/06/85  1031.2  dm_request_message.incl.pl1       >ldd>include>dm_request_message.incl.pl1
+970          6    01/07/85  0901.9  dm_system_init_info.incl.pl1      >ldd>include>dm_system_init_info.incl.pl1
+972          7    01/07/85  0900.0  dm_tm_shutdown_info.incl.pl1      >ldd>include>dm_tm_shutdown_info.incl.pl1
+974          8    01/07/85  0858.5  dm_daemon_info.incl.pl1           >ldd>include>dm_daemon_info.incl.pl1
+976          9    04/13/82  1620.2  ssu_prompt_modes.incl.pl1         >ldd>include>ssu_prompt_modes.incl.pl1
+978         10    08/04/87  1139.0  static_handlers.incl.pl1          >spec>install>1056>static_handlers.incl.pl1
+980         11    04/16/82  0958.1  sub_err_flags.incl.pl1            >ldd>include>sub_err_flags.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+ACTION_CANT_RESTART             000034 constant        bit(36)                  initial dcl 11-7 set ref 395*
+ASR_PROC_TERM_NOTIFY                   constant        fixed bin(17,0)          initial dcl 2-29 ref 651
+BITS_PER_WORD                          constant        fixed bin(17,0)          initial dcl 115 ref 661
+DM_DAEMON_INFO_VERSION_1        000002 constant        char(8)                  initial unaligned dcl 8-18 ref 497
+DM_DAEMON_VERSION_1             000010 constant        char(1)                  initial unaligned dcl 117 set ref 298* 898*
+DM_SYSTEM_INIT_INFO_VERSION_1   000004 constant        char(8)                  initial dcl 6-19 ref 512
+DONT_PROMPT                     000034 constant        bit(1)                   initial unaligned dcl 9-7 set ref 307*
+ERROR_SV                        000071 constant        fixed bin(17,0)          initial dcl 4-36 set ref 383* 430* 665* 673*
+INFORM_SV                       000070 constant        fixed bin(17,0)          initial dcl 4-38 set ref 456* 527*
+NOT_TESTING                            constant        bit(1)                   initial unaligned dcl 119 set ref 247*
+NO_NL                           000100 constant        bit(1)                   initial dcl 123 set ref 377*
+NO_PAD                          000100 constant        bit(1)                   initial dcl 123 set ref 377*
+SIT_RELATIVE_SECONDS_REQUEST    000674 automatic       bit(2)                   initial unaligned dcl 766 set ref 766* 769*
+TESTING                                constant        bit(1)                   initial unaligned dcl 121 set ref 272*
+action_type                     000622 automatic       fixed bin(17,0)          level 2 packed unaligned dcl 642 set ref 655*
+addr                                                   builtin function         dcl 105 ref 381 383 389 395 498 498 515 515 622 622
+                                                                                  661 661
+arg_count                              based           fixed bin(17,0)          level 3 packed unsigned unaligned dcl 1-14 ref 375
+                                                                                  377
+arg_list                               based           structure                level 1 dcl 1-14
+arg_ptrs                  2            based           pointer                  array level 2 dcl 1-14 ref 383 389 395
+as_request_header                      based           structure                level 1 dcl 2-62
+as_request_version_1                   constant        fixed bin(17,0)          initial dcl 2-27 ref 650
+asr_buzzard_info                       based           structure                level 1 dcl 3-29
+asr_buzzard_info_version_1      000006 constant        char(8)                  initial unaligned dcl 3-27 ref 653
+cl_code                         000272 automatic       fixed bin(35,0)          dcl 295 set ref 299* 302 302* 308* 310 310* 316*
+                                                                                  317*
+cl_version_str                  000273 automatic       char(10)                 unaligned dcl 296 set ref 298* 299*
+cleanup                         000246 stack reference condition                dcl 110 ref 275
+codeptr                                                builtin function         dcl 105 ref 299 299 553 553 823 823 899 899
+com_err_                        000010 constant        entry                    external dcl 129 ref 389 870 951
+continue_to_signal_             000012 constant        entry                    external dcl 130 ref 429 458
+convert_access_class_$to_string 000014 constant        entry                    external dcl 131 ref 568
+count                     2            based           fixed bin(17,0)          level 2 dcl 7-24 ref 875
+create_ips_mask_                000016 constant        entry                    external dcl 134 ref 622
+cu_$arg_list_ptr                000020 constant        entry                    external dcl 136 ref 374 406
+cu_$arg_ptr                     000022 constant        entry                    external dcl 137 ref 478
+cu_$generate_call               000024 constant        entry                    external dcl 139 ref 407
+cu_$set_cl_intermediary         000026 constant        entry                    external dcl 140 ref 738
+dm_adjust_process_id_word_1            based           structure                level 1 dcl 5-59
+dm_daemon_info                         based           structure                level 1 dcl 8-20
+dm_daemon_util_$get_daemon_info 000044 constant        entry                    external dcl 152 ref 498
+dm_daemon_util_$initialize_system
+                                000046 constant        entry                    external dcl 154 ref 515
+dm_daemon_util_$log             000034 constant        entry                    external dcl 145 ref 407 407 430 456 527 665 673
+dm_daemon_util_$logout          000036 constant        entry                    external dcl 146 ref 398 738 738
+dm_daemon_util_$request         000040 constant        entry                    external dcl 149 ref 603 603
+dm_daemon_util_$schedule_shutdown
+                                000050 constant        entry                    external dcl 156 ref 723 823 823
+dm_daemon_util_$unset_shutdown_timers
+                                000042 constant        entry                    external dcl 150 ref 434
+dm_initialized            0(03) 000244 automatic       bit(1)                   initial level 2 packed unaligned dcl 94 set ref 94*
+                                                                                  514* 694 866 876*
+dm_misc_util_$get_system_dir    000052 constant        entry                    external dcl 158 ref 794
+dm_misc_util_$is_process_using_dm
+                                000054 constant        entry                    external dcl 160 ref 788
+dm_misc_util_$set_system_dir    000056 constant        entry                    external dcl 162 ref 696 796
+dm_request_action_$adjust_process_id
+                                000152 external static fixed bin(17,0)          dcl 217 ref 655
+dm_system_init_info                    based           structure                level 1 dcl 6-15
+dmsd_ssu_request_tables_$daemon_requests
+                                000030 constant        entry                    external dcl 141 ref 299 299
+dmsd_ssu_request_tables_$test_daemon_requests
+                                000032 constant        entry                    external dcl 143 ref 899 899
+drc_code                        000106 automatic       fixed bin(35,0)          dcl 331 set ref 332*
+er_arg_list_ptr                 000100 automatic       pointer                  dcl 366 set ref 374* 375 377 377* 383 389 395
+er_based_error_code                    based           fixed bin(35,0)          dcl 367 set ref 383* 389* 395*
+er_err_msg                             based           varying char(1024)       dcl 371 set ref 381* 383* 389* 395*
+er_err_msg_struc                000102 automatic       structure                level 1 unaligned dcl 368 set ref 381 383 389 395
+error                           000000 stack reference condition                dcl 110 ref 426
+error_table_$noarg              000154 external static fixed bin(35,0)          dcl 219 set ref 479*
+error_table_$smallarg           000156 external static fixed bin(35,0)          dcl 220 ref 570
+event_channel             2     000352 automatic       fixed bin(71,0)          level 2 dcl 510 set ref 513*
+f_code                          000116 automatic       fixed bin(35,0)          dcl 423 set ref 429* 430 430*
+fch_code                        000106 automatic       fixed bin(35,0)          dcl 453 set ref 458* 459 459*
+finish                          000254 stack reference condition                dcl 110 ref 250
+fixed                                                  builtin function         dcl 105 ref 671 671
+gap_arg_length                  000306 automatic       fixed bin(21,0)          dcl 473 set ref 478* 482
+gap_arg_ptr                     000304 automatic       pointer                  dcl 472 set ref 478* 482
+gap_argument                           based           char                     unaligned dcl 474 ref 482
+gap_code                        000307 automatic       fixed bin(35,0)          dcl 476 set ref 478* 479
+gap_pathname                           parameter       char(168)                unaligned dcl 471 set ref 469 482*
+get_authorization_              000064 constant        entry                    external dcl 166 ref 568 568
+get_ring_                       000060 constant        entry                    external dcl 164 ref 570 570 575 575
+get_system_free_area_           000062 constant        entry                    external dcl 165 ref 868 868
+hcs_$fs_get_path_name           000066 constant        entry                    external dcl 167 ref 558
+hcs_$get_ring_brackets          000070 constant        entry                    external dcl 169 ref 563
+hcs_$make_ptr                   000072 constant        entry                    external dcl 171 ref 553
+hcs_$reset_ips_mask             000074 constant        entry                    external dcl 173 ref 922
+hcs_$set_ips_mask               000076 constant        entry                    external dcl 175 ref 623
+hcs_$wakeup                     000100 constant        entry                    external dcl 177 ref 671
+header                          000534 automatic       structure                level 2 in structure "mptr_proc_term_info" dcl 639
+                                                                                  in procedure "REGISTER_FOR_PROC_TERM_NOTIFY"
+header                                 based           structure                level 2 in structure "arg_list" dcl 1-14
+                                                                                  in procedure "dmsd_overseer_"
+ids_init_info                   000352 automatic       structure                level 1 dcl 510 set ref 515 515
+info_channel              6     000534 automatic       fixed bin(71,0)          level 2 dcl 639 set ref 654*
+ioa_                            000102 constant        entry                    external dcl 180 ref 455 526 570 575
+ioa_$general_rs                 000106 constant        entry                    external dcl 182 ref 377
+ioa_$rsnnl                      000104 constant        entry                    external dcl 181 ref 298 898
+ipc_$create_ev_chn              000110 constant        entry                    external dcl 185 ref 597
+ipc_$decl_ev_call_chn           000112 constant        entry                    external dcl 186 ref 603
+ipc_$delete_ev_chn              000114 constant        entry                    external dcl 188 ref 332
+itis_daemon_info                000316 automatic       structure                level 1 dcl 495 set ref 498 498
+ldi_classification_string       000372 automatic       char(100)                unaligned dcl 545 set ref 568* 570* 575 575*
+ldi_code                        000423 automatic       fixed bin(35,0)          dcl 547 set ref 553* 555 555* 558* 560 560* 563* 565
+                                                                                  565* 568* 570 575 581*
+ldi_daemon_gate_dir             000424 automatic       char(168)                unaligned dcl 548 set ref 558* 563*
+ldi_daemon_gate_ptr             000476 automatic       pointer                  dcl 549 set ref 553* 558*
+ldi_daemon_gate_seg             000500 automatic       char(32)                 unaligned dcl 550 set ref 558* 563*
+ldi_ring_brackets               000510 automatic       fixed bin(3,0)           array dcl 551 set ref 563* 570 570 575 575
+length                          000102 automatic       fixed bin(21,0)          level 2 dcl 368 set ref 377*
+lm_arg_list_ptr                 000100 automatic       pointer                  initial dcl 405 set ref 405* 406* 407*
+message_segment_$add_file       000116 constant        entry                    external dcl 189 ref 661
+mi_mask                         000144 automatic       bit(36)                  dcl 619 set ref 622* 623*
+mi_mask_names                   000134 automatic       char(32)                 array unaligned dcl 618 set ref 621* 622 622
+min                                                    builtin function         dcl 105 ref 570 570 575 575
+mptr_as_request_channel         000546 automatic       fixed bin(71,0)          dcl 640 set ref 659* 671*
+mptr_as_request_dir             000550 automatic       char(168)                unaligned dcl 641 set ref 659* 661*
+mptr_as_request_message         000622 automatic       structure                level 1 dcl 642 set ref 658
+mptr_as_request_proc            000623 automatic       bit(36)                  dcl 645 set ref 659* 671*
+mptr_as_request_seg             000624 automatic       char(32)                 unaligned dcl 646 set ref 659* 661*
+mptr_as_request_uid             000634 automatic       bit(72)                  dcl 647 set ref 661* 671 671
+mptr_code                       000532 automatic       fixed bin(35,0)          dcl 638 set ref 661* 665 665* 671* 673 673*
+mptr_proc_term_info             000534 automatic       structure                level 1 dcl 639 set ref 661 661 661
+mrcr_code                       000522 automatic       fixed bin(35,0)          dcl 595 set ref 597* 598 598* 603* 605 605*
+my_reference_id          10     000534 automatic       bit(36)                  level 2 dcl 639 set ref 658*
+myname                          000100 automatic       char(32)                 unaligned dcl 85 set ref 246* 271* 383* 389* 395*
+                                                                                  430* 479* 665* 673* 870* 951*
+null                                                   builtin function         dcl 105 ref 92 7-33 299 299 316 316 345 395 395 405
+                                                                                  603 603 899 899 907 907
+p_call_listener_upon_return            parameter       bit(1)                   dcl 79 ref 71
+p_listener_command_line                parameter       varying char             dcl 81 ref 71
+p_pit_pointer                          parameter       pointer                  dcl 78 ref 71
+pad                       0(18) 000622 automatic       fixed bin(17,0)          level 2 packed unaligned dcl 642 set ref 657*
+previous_dm_system_dir          000110 automatic       char(168)                initial unaligned dcl 86 set ref 86* 696* 794*
+reply_channel             2     000534 automatic       fixed bin(71,0)          level 3 dcl 639 set ref 652*
+request_channel                 000162 automatic       fixed bin(71,0)          initial dcl 88 set ref 88* 332 332* 513 597* 603*
+                                                                                  654 769* 932 932*
+saved_ips_mask                  000164 automatic       bit(36)                  dcl 89 set ref 623* 922*
+saved_system_shutdown_handler   000166 automatic       pointer                  dcl 90 set ref 814* 949*
+sct_manager_$get                000120 constant        entry                    external dcl 193 ref 814
+sct_manager_$set                000122 constant        entry                    external dcl 194 ref 823 949
+sds_code                        000162 automatic       fixed bin(35,0)          dcl 864 set ref 868* 870 870*
+sds_shutdown_info                      based           structure                level 1 dcl 862 ref 875
+ser_testing                            parameter       bit(1)                   unaligned dcl 750 ref 748 751
+shutdown_handler_set      0(02) 000244 automatic       bit(1)                   initial level 2 packed unaligned dcl 94 set ref 94*
+                                                                                  822* 947 955*
+sit_time_interval_seconds              parameter       fixed bin(71,0)          dcl 764 set ref 762 769*
+size                                                   builtin function         dcl 105 ref 661
+ssd_pathname                           parameter       char(168)                unaligned dcl 786 set ref 784 796*
+sssh_code                       000712 automatic       fixed bin(35,0)          dcl 812 set ref 814* 816 816* 823* 825 825*
+ssu_$cpescape_disabled          000124 constant        entry                    external dcl 196 ref 308 308
+ssu_$create_invocation          000126 constant        entry                    external dcl 197 ref 299 899
+ssu_$destroy_invocation         000130 constant        entry                    external dcl 199 ref 345
+ssu_$listen                     000132 constant        entry                    external dcl 200 ref 316 907
+ssu_$set_procedure              000136 constant        entry                    external dcl 202 ref 308
+ssu_$set_prompt_mode            000134 constant        entry                    external dcl 201 ref 307
+ssu_et_$subsystem_aborted       000160 external static fixed bin(35,0)          dcl 221 ref 908
+ssu_system_ptr                  000170 automatic       pointer                  initial dcl 92 set ref 92* 299* 307* 308* 316* 345
+                                                                                  345* 899* 907*
+string                    1     000102 automatic       char(1024)               level 2 packed unaligned dcl 368 set ref 377*
+sub_err_                        000140 constant        entry                    external dcl 204 ref 395
+system_dir_pathname             000172 automatic       char(168)                unaligned dcl 93 set ref 273* 274*
+system_dir_set            0(01) 000244 automatic       bit(1)                   initial level 2 packed unaligned dcl 94 set ref 94*
+                                                                                  694 697* 795*
+system_info_$request_chn        000142 constant        entry                    external dcl 205 ref 659
+system_shutdown_scheduled_sct_index
+                                000000 constant        fixed bin(17,0)          initial dcl 10-27 set ref 814* 823* 949*
+system_state                    000244 automatic       structure                level 1 packed unaligned dcl 94
+tcl_code                        000730 automatic       fixed bin(35,0)          dcl 895 set ref 899* 902 902* 907* 908 908*
+tcl_version_str                 000731 automatic       char(10)                 unaligned dcl 896 set ref 898* 899*
+testing_error_return            000244 automatic       bit(1)                   initial level 2 packed unaligned dcl 94 set ref 94*
+                                                                                  387 751*
+timer_manager_$alarm_wakeup     000144 constant        entry                    external dcl 208 ref 769
+timer_manager_$reset_alarm_wakeup
+                                000146 constant        entry                    external dcl 211 ref 932
+tm_shutdown_info                       based           structure                level 1 dcl 7-24
+tm_shutdown_info_ptr            000262 automatic       pointer                  initial dcl 7-33 set ref 7-33* 868* 875
+transaction_manager_$user_shutdown
+                                000150 constant        entry                    external dcl 213 ref 868
+type                      1     000534 automatic       fixed bin(17,0)          level 3 dcl 639 set ref 651*
+unspec                                                 builtin function         dcl 105 ref 658
+ussh_code                       000200 automatic       fixed bin(35,0)          dcl 945 set ref 949* 951 951*
+version                         000316 automatic       char(8)                  level 2 in structure "itis_daemon_info" dcl 495
+                                                                                  in procedure "IDLE_TIME_IN_SECONDS" set ref 497*
+version                         000534 automatic       fixed bin(17,0)          level 3 in structure "mptr_proc_term_info" dcl 639
+                                                                                  in procedure "REGISTER_FOR_PROC_TERM_NOTIFY" set
+                                                                                  ref 650*
+version                         000352 automatic       char(8)                  level 2 in structure "ids_init_info" dcl 510
+                                                                                  in procedure "INITIALIZE_DM_SYSTEM" set ref 512*
+version                   4     000534 automatic       char(8)                  level 2 in structure "mptr_proc_term_info" dcl 639
+                                                                                  in procedure "REGISTER_FOR_PROC_TERM_NOTIFY" set
+                                                                                  ref 653*
+wakeup_increment          5     000316 automatic       fixed bin(17,0)          level 2 dcl 495 set ref 499
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+ABANDONED                              internal static fixed bin(17,0)          initial dcl 7-36
+ABORTED                                internal static fixed bin(17,0)          initial dcl 7-36
+ACTION_CAN_RESTART                     internal static bit(36)                  initial dcl 11-7
+ACTION_DEFAULT_RESTART                 internal static bit(36)                  initial dcl 11-7
+ACTION_QUIET_RESTART                   internal static bit(36)                  initial dcl 11-7
+ACTION_SUPPORT_SIGNAL                  internal static bit(36)                  initial dcl 11-7
+ASR_ABS_COMMAND                        internal static fixed bin(17,0)          initial dcl 2-29
+ASR_AC_VERSION_1                       internal static char(8)                  initial unaligned dcl 3-106
+ASR_ADMIN_COMMAND                      internal static fixed bin(17,0)          initial dcl 2-29
+ASR_BUMP_USER                          internal static fixed bin(17,0)          initial dcl 2-29
+ASR_COM_CHANNEL_INFO                   internal static fixed bin(17,0)          initial dcl 2-29
+ASR_DAEMON_COMMAND                     internal static fixed bin(17,0)          initial dcl 2-29
+ASR_DEFER_IN_ADMIN_MODE                internal static bit(1)                   initial array unaligned dcl 2-45
+ASR_DIAL_OUT                           internal static fixed bin(17,0)          initial dcl 2-29
+ASR_DIAL_SERVER                        internal static fixed bin(17,0)          initial dcl 2-29
+ASR_FIRST_TYPE                         internal static fixed bin(17,0)          initial dcl 2-29
+ASR_FPE_CAUSES_LOGOUT                  internal static fixed bin(17,0)          initial dcl 2-29
+ASR_FPE_CAUSES_NEW_PROC                internal static fixed bin(17,0)          initial dcl 2-29
+ASR_LAST_TYPE                          internal static fixed bin(17,0)          initial dcl 2-29
+ASR_NOTE_PNT_CHANGE                    internal static fixed bin(17,0)          initial dcl 2-29
+ASR_NPC_INFO_VERSION_1                 internal static char(8)                  initial unaligned dcl 3-129
+ASR_REQUEST_NAMES                      internal static char(40)                 initial array unaligned dcl 2-48
+CRASH_SV                               internal static fixed bin(17,0)          initial dcl 4-34
+DONT_PROMPT_AFTER_NULL_LINES           internal static bit(2)                   initial unaligned dcl 9-10
+DONT_PROMPT_IF_TYPEAHEAD               internal static bit(3)                   initial unaligned dcl 9-13
+Envptr_supplied_call_type              internal static fixed bin(18,0)          initial unsigned unaligned dcl 1-54
+FATAL_SV                               internal static fixed bin(17,0)          initial dcl 4-34
+FINISHED_ABORT                         internal static fixed bin(17,0)          initial dcl 7-36
+FINISHED_COMMIT                        internal static fixed bin(17,0)          initial dcl 7-36
+Interseg_call_type                     internal static fixed bin(18,0)          initial unsigned unaligned dcl 1-54
+LOG_SV                                 internal static fixed bin(17,0)          initial dcl 4-40
+OP_NAME                                internal static char(32)                 initial array unaligned dcl 7-36
+PRINT_SV                               internal static fixed bin(17,0)          initial dcl 4-32
+PROMPT                                 internal static bit(1)                   initial unaligned dcl 9-6
+PROMPT_AFTER_NULL_LINES                internal static bit(2)                   initial unaligned dcl 9-9
+PROMPT_IF_TYPEAHEAD                    internal static bit(3)                   initial unaligned dcl 9-12
+QUERY_SV                               internal static fixed bin(17,0)          initial dcl 4-32
+Quick_call_type                        internal static fixed bin(18,0)          initial unsigned unaligned dcl 1-54
+TM_SHUTDOWN_INFO_VERSION_1             internal static char(8)                  initial dcl 7-36
+accessviolation_sct_index              internal static fixed bin(17,0)          initial dcl 10-27
+alrm_sct_index                         internal static fixed bin(17,0)          initial dcl 10-27
+am_fault_sct_index                     internal static fixed bin(17,0)          initial dcl 10-27
+arg_list_with_envptr                   based           structure                level 1 dcl 1-42
+asr_ac_length                          automatic       fixed bin(21,0)          dcl 3-105
+asr_admin_command_info                 based           structure                level 1 dcl 3-85
+asr_admin_command_info_ptr             automatic       pointer                  dcl 3-84
+asr_bump_user_info                     based           structure                level 1 dcl 3-60
+asr_bump_user_info_ptr                 automatic       pointer                  dcl 3-59
+asr_bump_user_info_version_1           internal static char(8)                  initial unaligned dcl 3-57
+asr_buzzard_infop                      automatic       pointer                  dcl 3-28
+asr_buzzard_notification               based           structure                level 1 dcl 3-35
+asr_note_pnt_change_info               based           structure                level 1 dcl 3-124
+asr_note_pnt_change_info_ptr           automatic       pointer                  dcl 3-122
+asr_reply                              based           structure                level 1 dcl 3-21
+asr_reply_admin_command                based           structure                level 1 dcl 3-108
+asr_reply_bump_user                    based           structure                level 1 dcl 3-79
+asr_replyp                             automatic       pointer                  dcl 3-20
+bad_outward_call_sct_index             internal static fixed bin(17,0)          initial dcl 10-27
+command_name_arglist                   based           structure                level 1 dcl 1-25
+command_sct_index                      internal static fixed bin(17,0)          initial dcl 10-27
+connect_sct_index                      internal static fixed bin(17,0)          initial dcl 10-27
+cput_sct_index                         internal static fixed bin(17,0)          initial dcl 10-27
+cross_ring_transfer_sct_index          internal static fixed bin(17,0)          initial dcl 10-27
+derail_sct_index                       internal static fixed bin(17,0)          initial dcl 10-27
+directed_fault_2_sct_index             internal static fixed bin(17,0)          initial dcl 10-27
+directed_fault_3_sct_index             internal static fixed bin(17,0)          initial dcl 10-27
+dm_adjust_process_id_message           based           structure                level 1 dcl 5-52
+dm_adjust_tdt_entry_message            based           structure                level 1 dcl 5-45
+dm_adjust_txn_message                  based           structure                level 1 dcl 5-39
+dm_alarm_message                       based           char(8)                  dcl 5-69
+dm_daemon_info_ptr                     automatic       pointer                  dcl 8-17
+dm_daemon_util_$new_proc        000000 constant        entry                    external dcl 147
+dm_kill_txn                            based           structure                level 1 dcl 5-64
+dm_request_message                     based           structure                level 1 dcl 5-26
+dm_request_message_ptr                 automatic       pointer                  dcl 5-24
+dm_shutdown_scheduled_sct_index        internal static fixed bin(17,0)          initial dcl 10-27
+dm_system_init_info_ptr                automatic       pointer                  dcl 6-13
+dm_terminate_segno_message             based           structure                level 1 dcl 5-32
+execute_sct_index                      internal static fixed bin(17,0)          initial dcl 10-27
+fault_tag_1_sct_index                  internal static fixed bin(17,0)          initial dcl 10-27
+fault_tag_3_sct_index                  internal static fixed bin(17,0)          initial dcl 10-27
+fixedoverflow_sct_index                internal static fixed bin(17,0)          initial dcl 10-27
+illegal_modifier_sct_index             internal static fixed bin(17,0)          initial dcl 10-27
+illegal_opcode_sct_index               internal static fixed bin(17,0)          initial dcl 10-27
+illegal_procedure_sct_index            internal static fixed bin(17,0)          initial dcl 10-27
+illegal_ring_order_sct_index           internal static fixed bin(17,0)          initial dcl 10-27
+inward_return_sct_index                internal static fixed bin(17,0)          initial dcl 10-27
+isot_fault_sct_index                   internal static fixed bin(17,0)          initial dcl 10-27
+linkage_error_sct_index                internal static fixed bin(17,0)          initial dcl 10-27
+lockup_sct_index                       internal static fixed bin(17,0)          initial dcl 10-27
+lot_fault_sct_index                    internal static fixed bin(17,0)          initial dcl 10-27
+mme1_sct_index                         internal static fixed bin(17,0)          initial dcl 10-27
+mme2_sct_index                         internal static fixed bin(17,0)          initial dcl 10-27
+mme3_sct_index                         internal static fixed bin(17,0)          initial dcl 10-27
+mme4_sct_index                         internal static fixed bin(17,0)          initial dcl 10-27
+neti_sct_index                         internal static fixed bin(17,0)          initial dcl 10-27
+no_execute_permission_sct_index        internal static fixed bin(17,0)          initial dcl 10-27
+no_read_permission_sct_index           internal static fixed bin(17,0)          initial dcl 10-27
+no_write_permission_sct_index          internal static fixed bin(17,0)          initial dcl 10-27
+not_a_gate_sct_index                   internal static fixed bin(17,0)          initial dcl 10-27
+not_in_call_bracket_sct_index          internal static fixed bin(17,0)          initial dcl 10-27
+not_in_execute_bracket_sct_index       internal static fixed bin(17,0)          initial dcl 10-27
+not_in_read_bracket_sct_index          internal static fixed bin(17,0)          initial dcl 10-27
+not_in_write_bracket_sct_index         internal static fixed bin(17,0)          initial dcl 10-27
+op_not_complete_sct_index              internal static fixed bin(17,0)          initial dcl 10-27
+other_command_sct_index                internal static fixed bin(17,0)          initial dcl 10-27
+other_illegal_proc_sct_index           internal static fixed bin(17,0)          initial dcl 10-27
+out_of_bounds_sct_index                internal static fixed bin(17,0)          initial dcl 10-27
+outward_call_sct_index                 internal static fixed bin(17,0)          initial dcl 10-27
+overflow_sct_index                     internal static fixed bin(17,0)          initial dcl 10-27
+ovrflo_sct_index                       internal static fixed bin(17,0)          initial dcl 10-27
+packed_pointer_fault_sct_index         internal static fixed bin(17,0)          initial dcl 10-27
+page_fault_error_sct_index             internal static fixed bin(17,0)          initial dcl 10-27
+parity_sct_index                       internal static fixed bin(17,0)          initial dcl 10-27
+pgt_sct_index                          internal static fixed bin(17,0)          initial dcl 10-27
+quit_sct_index                         internal static fixed bin(17,0)          initial dcl 10-27
+record_quota_overflow_sct_index        internal static fixed bin(17,0)          initial dcl 10-27
+ring_alarm_fault_sct_index             internal static fixed bin(17,0)          initial dcl 10-27
+seg_fault_error_sct_index              internal static fixed bin(17,0)          initial dcl 10-27
+shutdown_sct_index                     internal static fixed bin(17,0)          initial dcl 10-27
+simfault_000000_sct_index              internal static fixed bin(17,0)          initial dcl 10-27
+size_sct_index                         internal static fixed bin(17,0)          initial dcl 10-27
+startup_sct_index                      internal static fixed bin(17,0)          initial dcl 10-27
+storage_sct_index                      internal static fixed bin(17,0)          initial dcl 10-27
+store_sct_index                        internal static fixed bin(17,0)          initial dcl 10-27
+stringsize_sct_index                   internal static fixed bin(17,0)          initial dcl 10-27
+susp_sct_index                         internal static fixed bin(17,0)          initial dcl 10-27
+system_message_sct_index               internal static fixed bin(17,0)          initial dcl 10-27
+system_packed_pointer_sct_index        internal static fixed bin(17,0)          initial dcl 10-27
+term_sct_index                         internal static fixed bin(17,0)          initial dcl 10-27
+timer_runout_sct_index                 internal static fixed bin(17,0)          initial dcl 10-27
+tm_shutdown_alloc_count                automatic       fixed bin(17,0)          dcl 7-34
+trouble_sct_index                      internal static fixed bin(17,0)          initial dcl 10-27
+undefined_fault_sct_index              internal static fixed bin(17,0)          initial dcl 10-27
+undefined_pointer_sct_index            internal static fixed bin(17,0)          initial dcl 10-27
+underflow_sct_index                    internal static fixed bin(17,0)          initial dcl 10-27
+wkp_sct_index                          internal static fixed bin(17,0)          initial dcl 10-27
+zerodivide_sct_index                   internal static fixed bin(17,0)          initial dcl 10-27
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+COMMAND_LISTEN                  000773 constant        entry                    internal dcl 293 ref 252
+DESTROY_REQUEST_CHANNEL         001243 constant        entry                    internal dcl 329 ref 439
+DESTROY_SSU_INVOCATION          001261 constant        entry                    internal dcl 342 ref 435
+ERROR_RETURN                    001300 constant        entry                    internal dcl 363 ref 253 302 310 317 459 479 555 560
+                                                                                  565 581 598 605 788 816 825 902 908
+FINISH                          001556 constant        entry                    internal dcl 421 ref 275 391 711
+FINISH_CONDITION_HANDLER        001673 constant        entry                    internal dcl 451 ref 250
+GET_ARGUMENT_PATHNAME           001762 constant        entry                    internal dcl 469 ref 273
+IDLE_TIME_IN_SECONDS            002042 constant        entry                    internal dcl 493 ref 846 846
+INITIALIZE_DM_SYSTEM            002064 constant        entry                    internal dcl 508 ref 842
+LOG_DM_INITIALIZED              002105 constant        entry                    internal dcl 523 ref 847
+LOG_DM_INITIALIZING             002143 constant        entry                    internal dcl 542 ref 840
+LOG_MESSAGE                     001522 constant        entry                    internal dcl 403 ref 383
+MAIN_RETURN                     000772 constant        label                    dcl 282 ref 400 712
+MAKE_REQUEST_CHANNEL_RECEIVER   002535 constant        entry                    internal dcl 593 ref 841
+MASK_INTERRUPTS                 002641 constant        entry                    internal dcl 616 ref 425
+REGISTER_FOR_PROC_TERM_NOTIFY   002677 constant        entry                    internal dcl 636 ref 845
+RESET_SYSTEM_DIRECTORY          003115 constant        entry                    internal dcl 692 ref 440
+RESET_SYSTEM_SHUTDOWN_HANDLER   003741 constant        entry                    internal dcl 943 ref 437
+RETURN                          003142 constant        entry                    internal dcl 708 ref 280
+SCHEDULE_SHUTDOWN               003150 constant        entry                    internal dcl 720 ref 844
+SET_CL_INTERMEDIARY             003157 constant        entry                    internal dcl 735 ref 245
+SET_ERROR_RETURN                003174 constant        entry                    internal dcl 748 ref 247 272
+SET_IDLE_TIMER                  003203 constant        entry                    internal dcl 762 ref 846
+SET_SYSTEM_DIRECTORY            003223 constant        entry                    internal dcl 784 ref 274
+SET_SYSTEM_SHUTDOWN_HANDLER     003306 constant        entry                    internal dcl 810 ref 843
+SET_UP_DAEMON                   003405 constant        entry                    internal dcl 837 ref 249 277
+SHUTDOWN_DM_SYSTEM              003425 constant        entry                    internal dcl 860 ref 438
+TEST_COMMAND_LISTEN             003520 constant        entry                    internal dcl 893 ref 279
+UNMASK_INTERRUPTS               003704 constant        entry                    internal dcl 919 ref 428 441
+UNSET_IDLE_TIMER                003725 constant        entry                    internal dcl 929 ref 436
+dmsd_overseer_                  000656 constant        entry                    external dcl 71 ref 553 553
+test                            000726 constant        entry                    external dcl 269
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      5022        5204    4050        5032
+Length      5756    4050       162         535     752           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+dmsd_overseer_                      922 external procedure  is an external procedure.  
+on unit on line 250                 122 on unit               
+on unit on line 275                  64 on unit               
+COMMAND_LISTEN                          internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+DESTROY_REQUEST_CHANNEL                 internal procedure  shares stack frame of internal procedure FINISH.  
+DESTROY_SSU_INVOCATION                  internal procedure  shares stack frame of internal procedure FINISH.  
+ERROR_RETURN                        362 internal procedure  is declared options(variable).  
+LOG_MESSAGE                          76 internal procedure  is declared options(variable).  
+FINISH                              238 internal procedure  enables or reverts conditions.  
+on unit on line 426                  98 on unit               
+FINISH_CONDITION_HANDLER                internal procedure  shares stack frame of on unit on line 250.  
+GET_ARGUMENT_PATHNAME                   internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+IDLE_TIME_IN_SECONDS                    internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+INITIALIZE_DM_SYSTEM                    internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+LOG_DM_INITIALIZED                      internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+LOG_DM_INITIALIZING                     internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+MAKE_REQUEST_CHANNEL_RECEIVER           internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+MASK_INTERRUPTS                         internal procedure  shares stack frame of internal procedure FINISH.  
+REGISTER_FOR_PROC_TERM_NOTIFY           internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+RESET_SYSTEM_DIRECTORY                  internal procedure  shares stack frame of internal procedure FINISH.  
+RETURN                                  internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+SCHEDULE_SHUTDOWN                       internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+SET_CL_INTERMEDIARY                     internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+SET_ERROR_RETURN                        internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+SET_IDLE_TIMER                          internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+SET_SYSTEM_DIRECTORY                    internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+SET_SYSTEM_SHUTDOWN_HANDLER             internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+SET_UP_DAEMON                           internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+SHUTDOWN_DM_SYSTEM                      internal procedure  shares stack frame of internal procedure FINISH.  
+TEST_COMMAND_LISTEN                     internal procedure  shares stack frame of external procedure dmsd_overseer_.  
+UNMASK_INTERRUPTS                    72 internal procedure  is called by several nonquick procedures.  
+UNSET_IDLE_TIMER                        internal procedure  shares stack frame of internal procedure FINISH.  
+RESET_SYSTEM_SHUTDOWN_HANDLER           internal procedure  shares stack frame of internal procedure FINISH.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+ERROR_RETURN             000100 er_arg_list_ptr             ERROR_RETURN
+                         000102 er_err_msg_struc            ERROR_RETURN
+FINISH                   000106 drc_code                    DESTROY_REQUEST_CHANNEL
+                         000116 f_code                      FINISH
+                         000134 mi_mask_names               MASK_INTERRUPTS
+                         000144 mi_mask                     MASK_INTERRUPTS
+                         000162 sds_code                    SHUTDOWN_DM_SYSTEM
+                         000200 ussh_code                   RESET_SYSTEM_SHUTDOWN_HANDLER
+LOG_MESSAGE              000100 lm_arg_list_ptr             LOG_MESSAGE
+dmsd_overseer_           000100 myname                      dmsd_overseer_
+                         000110 previous_dm_system_dir      dmsd_overseer_
+                         000162 request_channel             dmsd_overseer_
+                         000164 saved_ips_mask              dmsd_overseer_
+                         000166 saved_system_shutdown_handler
+                                                            dmsd_overseer_
+                         000170 ssu_system_ptr              dmsd_overseer_
+                         000172 system_dir_pathname         dmsd_overseer_
+                         000244 system_state                dmsd_overseer_
+                         000262 tm_shutdown_info_ptr        dmsd_overseer_
+                         000272 cl_code                     COMMAND_LISTEN
+                         000273 cl_version_str              COMMAND_LISTEN
+                         000304 gap_arg_ptr                 GET_ARGUMENT_PATHNAME
+                         000306 gap_arg_length              GET_ARGUMENT_PATHNAME
+                         000307 gap_code                    GET_ARGUMENT_PATHNAME
+                         000316 itis_daemon_info            IDLE_TIME_IN_SECONDS
+                         000352 ids_init_info               INITIALIZE_DM_SYSTEM
+                         000372 ldi_classification_string   LOG_DM_INITIALIZING
+                         000423 ldi_code                    LOG_DM_INITIALIZING
+                         000424 ldi_daemon_gate_dir         LOG_DM_INITIALIZING
+                         000476 ldi_daemon_gate_ptr         LOG_DM_INITIALIZING
+                         000500 ldi_daemon_gate_seg         LOG_DM_INITIALIZING
+                         000510 ldi_ring_brackets           LOG_DM_INITIALIZING
+                         000522 mrcr_code                   MAKE_REQUEST_CHANNEL_RECEIVER
+                         000532 mptr_code                   REGISTER_FOR_PROC_TERM_NOTIFY
+                         000534 mptr_proc_term_info         REGISTER_FOR_PROC_TERM_NOTIFY
+                         000546 mptr_as_request_channel     REGISTER_FOR_PROC_TERM_NOTIFY
+                         000550 mptr_as_request_dir         REGISTER_FOR_PROC_TERM_NOTIFY
+                         000622 mptr_as_request_message     REGISTER_FOR_PROC_TERM_NOTIFY
+                         000623 mptr_as_request_proc        REGISTER_FOR_PROC_TERM_NOTIFY
+                         000624 mptr_as_request_seg         REGISTER_FOR_PROC_TERM_NOTIFY
+                         000634 mptr_as_request_uid         REGISTER_FOR_PROC_TERM_NOTIFY
+                         000674 SIT_RELATIVE_SECONDS_REQUEST
+                                                            SET_IDLE_TIMER
+                         000712 sssh_code                   SET_SYSTEM_SHUTDOWN_HANDLER
+                         000730 tcl_code                    TEST_COMMAND_LISTEN
+                         000731 tcl_version_str             TEST_COMMAND_LISTEN
+on unit on line 250      000106 fch_code                    FINISH_CONDITION_HANDLER
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+r_e_as              call_ext_out_desc   call_ext_out        call_int_this_desc  call_int_this       call_int_other_desc
+call_int_other      return_mac          tra_ext_1           enable_op           ext_entry           ext_entry_desc
+int_entry           op_freen_
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+com_err_                      continue_to_signal_           convert_access_class_$to_string
+create_ips_mask_              cu_$arg_list_ptr              cu_$arg_ptr                   cu_$generate_call
+cu_$set_cl_intermediary       dm_daemon_util_$get_daemon_info
+dm_daemon_util_$initialize_system                           dm_daemon_util_$log           dm_daemon_util_$logout
+dm_daemon_util_$request       dm_daemon_util_$schedule_shutdown
+dm_daemon_util_$unset_shutdown_timers                       dm_misc_util_$get_system_dir
+dm_misc_util_$is_process_using_dm                           dm_misc_util_$set_system_dir
+dmsd_ssu_request_tables_$daemon_requests                    dmsd_ssu_request_tables_$test_daemon_requests
+get_authorization_            get_ring_                     get_system_free_area_         hcs_$fs_get_path_name
+hcs_$get_ring_brackets        hcs_$make_ptr                 hcs_$reset_ips_mask           hcs_$set_ips_mask
+hcs_$wakeup                   ioa_                          ioa_$general_rs               ioa_$rsnnl
+ipc_$create_ev_chn            ipc_$decl_ev_call_chn         ipc_$delete_ev_chn            message_segment_$add_file
+sct_manager_$get              sct_manager_$set              ssu_$cpescape_disabled        ssu_$create_invocation
+ssu_$destroy_invocation       ssu_$listen                   ssu_$set_procedure            ssu_$set_prompt_mode
+sub_err_                      system_info_$request_chn      timer_manager_$alarm_wakeup
+timer_manager_$reset_alarm_wakeup                           transaction_manager_$user_shutdown
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+dm_request_action_$adjust_process_id                        error_table_$noarg            error_table_$smallarg
+ssu_et_$subsystem_aborted
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     86 000627        88 000632        92 000634        94 000636    7   33 000646        71 000652       245 000672
+    246 000673       247 000676       249 000700       250 000701       252 000717       253 000720       269 000724
+    271 000734       272 000737       273 000741       274 000743       275 000745       277 000767       279 000770
+    280 000771       282 000772       293 000773       298 000774       299 001024       302 001072       307 001114
+    308 001131       310 001164       316 001206       317 001223       321 001242       329 001243       332 001244
+    334 001260       342 001261       345 001262       347 001276       363 001277       374 001305       375 001313
+    377 001316       381 001364       383 001365       387 001414       389 001420       391 001442       392 001447
+    395 001450       398 001511       400 001516       403 001521       405 001527       406 001531       407 001537
+    408 001554       421 001555       425 001563       426 001564       428 001600       429 001605       430 001615
+    433 001651       434 001652       435 001657       436 001660       437 001661       438 001662       439 001663
+    440 001664       441 001665       442 001672       451 001673       455 001674       456 001710       458 001730
+    459 001737       462 001761       469 001762       478 001764       479 002003       482 002032       484 002041
+    493 002042       497 002044       498 002046       499 002057       508 002064       512 002065       513 002067
+    514 002071       515 002073       516 002104       523 002105       526 002106       527 002122       529 002142
+    542 002143       553 002144       555 002204       558 002225       560 002257       563 002300       565 002325
+    568 002346       570 002376       575 002442       581 002515       584 002534       593 002535       597 002536
+    598 002547       603 002571       605 002617       609 002640       616 002641       621 002642       622 002645
+    623 002664       624 002676       636 002677       650 002700       651 002702       652 002704       653 002706
+    654 002710       655 002712       657 002716       658 002720       659 002722       661 002746       665 003010
+    671 003043       673 003062       678 003114       692 003115       694 003116       696 003125       697 003136
+    699 003141       708 003142       711 003143       712 003147       720 003150       723 003151       724 003156
+    735 003157       738 003160       739 003173       748 003174       751 003176       752 003202       762 003203
+    766 003205       769 003207       771 003222       784 003223       788 003225       794 003260       795 003271
+    796 003273       798 003305       810 003306       814 003307       816 003322       822 003344       823 003346
+    825 003363       830 003404       837 003405       840 003406       841 003407       842 003410       843 003411
+    844 003412       845 003413       846 003414       847 003423       848 003424       860 003425       866 003426
+    868 003432       870 003455       875 003505       876 003514       879 003517       893 003520       898 003521
+    899 003551       902 003620       907 003642       908 003657       912 003702       919 003703       922 003711
+    923 003724       929 003725       932 003726       934 003740       943 003741       947 003742       949 003746
+    951 003761       955 004011       958 004014
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

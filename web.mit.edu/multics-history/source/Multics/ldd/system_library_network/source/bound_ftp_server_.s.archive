@@ -1,0 +1,4613 @@
+
+
+
+
+		    dev_file_transfer_.pl1          09/23/77  1031.6rew 09/22/77  1724.6      119286
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+dev_file_transfer_:
+          procedure (P_IB_ptr, argument);
+
+/*  A Pogran Program, 09/16/74
+
+    This program implements the Server Side of the
+    special Development Machine File Transfer software.
+
+    Modified by Ken Pogran, 10/02/74
+    Modified by Ken Pogran to incorporate auditing suggestions 3/12/75
+    Modified by D. M. Wells to change ftp_data declarations 12/76
+*/
+
+declare   argument  char (*),
+          P_IB_ptr  ptr;
+
+declare   1 ftp_data aligned like ftp_data_template defined (P_IB_ptr -> ftp_data_template);
+
+declare   byte_size           fixed bin (8),
+          bytes_read          fixed bin (24),
+          bytes_written       fixed bin (24) initial (0),
+          code                fixed bin (35),
+          dirname             char (168),
+          ename               char (32),
+          error_message       char (100) aligned initial (""),
+          error_message_length fixed bin (24),
+          later               fixed bin (71),
+          mode                char (4),
+          offset              fixed bin (24),
+          record_quota_overflow condition,
+          segment_ptr         pointer initial (null),
+          segptr              pointer,
+          short_message       char (8) aligned,
+          state               fixed bin (6),
+          status_bits         bit (72) aligned;
+
+declare   1 io_status aligned based (addr (status_bits)),
+            2 code  fixed bin (35),
+            2 stuff bit (36);
+
+declare   1 wait_list aligned automatic,
+             2 count fixed binary (17) initial (1),
+             2 channel fixed binary (71) initial (P_IB_ptr -> ftp_data_template.event_channel);
+
+declare   1 event_message aligned,
+            2 channel         fixed bin (71),
+            2 message         fixed bin (71),
+            2 more_stuff (4)  bit (36);
+
+declare   segment (offset) bit (36) aligned based;
+
+%include ftp_server_data;
+
+declare   clock_                        entry returns (fixed bin (71)),
+          convert_status_code_          entry (fixed bin (35), char (8) aligned, char (100) aligned),
+          cv_dec_                       entry (char (*)) returns (fixed bin (35)),
+          expand_pathname_              entry (char (*), char (*), char (*), fixed bin (35)),
+          ftp_initialization_$cleanup   entry (ptr, bit (1)),
+          ftp_initialization_$socket_init entry (ptr, fixed bin (35)),
+          hcs_$make_seg                 entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35)),
+          hcs_$set_bc_seg               entry (ptr, fixed bin (24), fixed bin (35)),
+          hcs_$terminate_noname         entry (ptr, fixed bin (35)),
+          ioa_                          entry options (variable),
+          ioa_$rsnnl                    entry options (variable),
+          ioa_$ioa_stream_nnl           entry options (variable),
+          ios_$attach                   entry (char (*), char (*), char (*), char (*), bit (72) aligned),
+          ios_$detach                   entry (char (*), char (*), char (*), bit (72) aligned),
+          ios_$order                    entry (char (*), char (*), ptr, bit (72) aligned),
+          ios_$write                    entry (char (*), ptr, fixed bin (24), fixed bin (24), fixed bin (24), bit (72) aligned),
+          ipc_$block                    entry (ptr, ptr, fixed bin (35)),
+          ncp_$initiate_connection                entry (bit (36), fixed bin (16), fixed bin (32), fixed bin (6), fixed bin (35)),
+          ncp_$close_connection         entry (bit (36), fixed bin (6), fixed bin (35)),
+          ncp_$get_socket_state         entry (bit (36), fixed bin (6), fixed bin (35)),
+          ncp_$read_data                entry (bit (36), ptr, fixed bin (24), fixed bin (24), fixed bin (6), fixed bin (35)),
+          ncp_$set_bytesize             entry (bit (36), fixed bin (8), fixed bin (35)),
+          timer_manager_$alarm_wakeup   entry (fixed bin (71), bit (2), fixed bin (71)),
+          timer_manager_$reset_alarm_wakeup entry (fixed bin (71));
+
+declare   (addr, null, substr, index, pointer, length) builtin;
+
+          call hcs_$make_seg ("", "dev_file_transfer_temp", "", 1010b, segptr, code);
+          if segptr = null
+          then      go to return_decoded_error;
+
+          mode = substr (argument, 6, 4);
+
+          if mode = "seg"
+          then      do;
+                    byte_size = 36;
+                    call expand_pathname_ (substr (argument, 24), dirname, ename, code);
+                    if code ^= 0
+                    then      go to return_decoded_error;
+                    call hcs_$make_seg (dirname, ename, "", 1010b, segment_ptr, code);
+                    if segment_ptr = null
+                    then      go to return_decoded_error;
+                    end;
+          else if mode = "prt"
+          then      do;
+                    byte_size = 9;
+                    call ios_$attach ("output_stream", "prtdim_", substr (argument, 11, 4), "", status_bits);
+                    if io_status.code ^= 0
+                    then      do;
+                              code = io_status.code;
+                              go to return_decoded_error;
+                              end;
+                    call ios_$order ("output_stream", "inside_page", null, status_bits);
+                    end;
+          else if mode = "tape"
+          then      do;
+                    byte_size = 36;
+                    call ios_$attach ("output_stream", "tape_", substr (argument, 11, length (argument) - 10),
+                              "w", status_bits);
+                    if io_status.code = 0
+                    then      call ioa_ ("+");
+                    else      do;
+                              code = io_status.code;
+                              go to return_decoded_error;
+                              end;
+                    end;
+          else      do;
+                    call ioa_ ("-Bad mode specification: ^a", mode);
+                    return;
+                    end;
+
+          call ftp_initialization_$socket_init (addr (ftp_data), code);
+          if code ^= 0
+          then      go to return_decoded_error;
+
+          call ncp_$set_bytesize (ftp_data.read_index, byte_size, code);
+          if code ^= 0
+          then      go to return_decoded_error;
+
+          call ncp_$initiate_connection (ftp_data.read_index, ftp_data.foreign_host, ftp_data.foreign_write_socket, state, code);
+          if code ^= 0
+          then      go to return_decoded_error;
+
+
+          later = clock_() + 15000000;
+          call timer_manager_$alarm_wakeup (later, "00"b, ftp_data.event_channel);
+check_state:
+          call ncp_$get_socket_state (ftp_data.read_index, state, code);
+          if code ^= 0
+          then      go to return_decoded_error;
+          if ^(state = 6 | state = 11)
+          then      if state = 5
+                    then      do;
+                              if clock_ () > later
+                              then      do;
+                                        error_message = "Data connection not accepted by Service System.";
+                                        go to terminate_and_return;
+                                        end;
+                              call ipc_$block (addr (wait_list), addr (event_message), code);
+                              if code ^= 0
+                              then      go to return_decoded_error;
+                              go to check_state;
+                              end;
+                    else      if state = 1
+                              then      do;
+                                        error_message = "Data connection refused by Service System.";
+                                        go to terminate_and_return;
+                                        end;
+                              else      do;
+                                        call ioa_$rsnnl ("Data connection in improper state ^d.", error_message,
+                                                  error_message_length, state);
+                                        call ncp_$close_connection (ftp_data.read_index, state, code);
+                                        go to terminate_and_return;
+                                        end;
+
+          call timer_manager_$reset_alarm_wakeup (ftp_data.event_channel);
+
+          if mode = "seg"
+          then      do offset = 0 repeat (offset + bytes_read) while (state = 6 | state = 11);
+                              call ncp_$read_data (ftp_data.read_index, pointer (segptr, offset), 100000,
+                                        bytes_read, state, code);
+                              if code = 0
+                              then      if bytes_read = 0
+                                        then      if state = 6
+                                                  then      do;
+                                                            call ipc_$block (addr (wait_list), addr (event_message), code);
+                                                            if code ^= 0
+                                                            then      go to return_decoded_error;
+                                                            end;
+                    end;
+          else      do;
+                    do while (state = 6 | state = 11);
+                              call ncp_$read_data (ftp_data.read_index, segptr, 100000, bytes_read, state, code);
+                              if code = 0
+                              then      if bytes_read = 0
+                                        then      if state = 6
+                                                  then      do;
+                                                            call ipc_$block (addr (wait_list), addr (event_message), code);
+                                                            if code ^= 0
+                                                            then      go to return_decoded_error;
+                                                            end;
+                                                  else;
+                                        else      do offset = 0 repeat (offset + bytes_written) while (offset < bytes_read);
+                                                  call ios_$write ("output_stream", segptr, offset,
+                                                            bytes_read - offset, bytes_written, status_bits);
+                                                  if io_status.code ^= 0
+                                                  then      do;
+                                                            code = io_status.code;
+                                                            go to return_decoded_error;
+                                                            end;
+                                                  end;
+                              end;
+                    if mode = "prt"
+                    then      call ioa_$ioa_stream_nnl ("output_stream", "^2|");
+                    call ios_$detach ("output_stream", "", "", status_bits);
+                    if io_status.code ^= 0
+                    then      do;
+                              code = io_status.code;
+                              go to return_decoded_error;
+                              end;
+                    end;
+
+          if state = 1
+          then      if mode = "seg"
+                    then      do;
+                              on condition (record_quota_overflow) begin;
+                                        call ioa_$rsnnl ("Record quota overflow in ^a; transfer of ^a is incomplete.",
+                                                  error_message, error_message_length, dirname, ename);
+                                        go to terminate_and_return;
+                                        end;
+                              segment_ptr -> segment = segptr -> segment;
+                              revert condition (record_quota_overflow);
+                              call hcs_$set_bc_seg (segment_ptr, cv_dec_ (substr (argument, 11, 12)), code);
+                              end;
+                    else;
+          else      call ioa_$rsnnl ("Data connection in improper state ^d at end of data transfer.",
+                              error_message, error_message_length, state);
+
+terminate_and_return:
+          call ftp_initialization_$cleanup (addr (ftp_data), "0"b);
+          if mode = "seg"
+          then      call hcs_$terminate_noname (segment_ptr, code);
+          if error_message = ""
+          then      call ioa_ ("+");
+          else      call ioa_ ("-^a", error_message);
+          return;
+
+return_decoded_error:
+          call convert_status_code_ (code, short_message, error_message);
+          go to terminate_and_return;
+
+          end dev_file_transfer_;
+  
+
+
+
+		    file_transfer_.pl1              10/03/77  1118.4rew 10/03/77  0930.1      366489
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+file_transfer_:
+file_transfer:
+          procedure (P_IB_ptr);
+
+/*  A Pogran Program 02/08/73
+
+    This module implements the actual file transfer functions of the Multics File Transfer Server.
+    The retrieve, store, append, and abort entries are intended to be called by the ftp_command_processor_.
+    However, the module is designed so that eventually there can be a file_transfer command which
+    does not require that the user be logged in over the Network, nor that he be in the FTP server environment.
+    This feature is not implemented at the present time.
+
+    Modified 02/28/73 by K. T. Pogran.
+    Added mail_transfer entry and modifications 04/12/73; K. T. Pogran.
+    Modified 11-15-73 by Kobziar to drop append access.
+    Modified 10/21/74 by K. T. Pogran to add File Access Protocol features, and reorganize.
+    Modified 10/25/74 by K. T. Pogran
+    Modified to add the list_transfer entry by Ken Pogran, 3/4/75
+    Modified 08/27/76 by D. M. Wells, to get
+          rid of 455 reply codes.  */
+
+
+declare   code                fixed bin (35) initial (0),
+          P_IB_ptr            ptr,
+          record_quota_overflow condition,
+          pathname            char (168),
+          date_time           char (24),
+          short_message       char (8) aligned,
+          error_message       char (100) aligned,
+          segment_created     bit (1) initial (""b),
+          state               fixed bin (6),
+          num_bits            fixed bin (24),
+          num_bytes           fixed bin (24),
+          mode_string         char (4) varying,
+          reference_offset    fixed bin (24),
+          pointer_expression  char (24) varying,
+          pointer_name        char (8),
+          reference_pointer   char (8),
+          reference_pointer_value fixed bin (24),
+          token_len           fixed bin (24),
+          reply_code          char (3);
+
+declare   1 ftp_data aligned like ftp_data_template defined (P_IB_ptr -> ftp_data_template);
+
+
+declare /* T__y_p_e_s       M__o_d_e_s      R__e_q_u_e_s_t_s    N_C_P_ O__r_d_e_r_s    */
+         ((ASCII,      Stream,    Retrieve)                 initial  (1),
+          (Image,      Text,      Store)                    initial  (2),
+          (Local_Byte, Block,     Append)                   initial  (3),
+                                  Mail                      initial  (4),
+                                  Open                      initial  (5),
+                                  Read                      initial  (6),
+                                  Write                     initial  (7),
+                                  Seek                      initial  (8),
+                                  Close                     initial  (9),
+                                  List                      initial (10)) fixed bin internal static options (constant);
+
+declare   Directory           bit (2) initial ("10"b);
+
+declare  (error_table_$moderr,
+          error_table_$badcall,
+          error_table_$segknown,
+          error_table_$net_invalid_state,
+          error_table_$badstar,
+          error_table_$net_socket_closed,
+          error_table_$incorrect_access,
+          error_table_$namedup,
+          error_table_$noentry,
+          error_table_$net_fhost_inactive,
+          error_table_$net_fhost_down,
+          error_table_$net_fimp_down)             external fixed bin (35);
+
+%include ftp_server_data;
+
+declare   request_name (9) char (4) internal static options (constant) initial
+          ("RETR", "STOR", "APPE", "MLFL", "OPEN", "READ", "WRIT", "SEEK", "CLOS");
+
+declare   1 branch aligned,
+           (2 type            bit (2),
+            2 nnames          bit (16),
+            2 nrp             bit (18),
+            2 dtm             bit (36),
+            2 dtu             bit (36),
+            2 mode            bit (5),
+            2 padding         bit (13),
+            2 records         bit (18),
+            2 dtd             bit (36),
+            2 dtem            bit (36),
+            2 acct            bit (36),
+            2 curlen          bit (12),
+            2 bitcnt          bit (24),
+            2 more            bit (72)) unaligned;
+
+declare   event_message (4) fixed bin (71);
+
+declare   upper_case char (26) internal static options (constant) initial ("ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+          lower_case char (26) internal static options (constant) initial ("abcdefghijklmnopqrstuvwxyz");
+
+
+declare   ioa_$ioa_switch                         entry options (variable),
+          com_err_                      entry options (variable),
+          expand_pathname_              entry (char (*), char (*), char (*), fixed bin (35)),
+          cv_dec_check_                 entry (char (*), fixed bin (35)) returns (fixed bin (35)),
+          clock_                        entry returns (fixed bin (71)),
+          date_time_                    entry (fixed bin (71), char (*)),
+          ftp_initialization_$socket_init entry (ptr, fixed bin (35)),
+          ftp_read_ascii_               entry (ptr, fixed bin (24), bit (36), fixed bin (71), fixed bin (24), fixed bin,
+                                                  fixed bin (35)),
+          ftp_read_ascii_$read_with_count entry (ptr, fixed bin (24), fixed bin (24), bit (36), fixed bin (71), fixed bin (24),
+                                                  fixed bin, fixed bin (35)),
+          ftp_write_ascii_              entry (ptr, fixed bin (24), fixed bin (24), bit (36), fixed bin (71), fixed bin,
+                                                  fixed bin (35)),
+          ftp_read_image_               entry (ptr, fixed bin (24), bit (36), fixed bin (71), fixed bin (24), fixed bin, fixed bin (8),
+                                                  fixed bin (35)),
+          ftp_read_image_$read_with_count entry (ptr, fixed bin (24), fixed bin (24), bit (36), fixed bin (71), fixed bin (24),
+                                                  fixed bin, fixed bin (8), fixed bin (35)),
+          ftp_write_image_              entry (ptr, fixed bin (24), fixed bin (24), bit (36), fixed bin (71), fixed bin, fixed bin (8),
+                                                  fixed bin (35)),
+          hcs_$status_long              entry (char (*), char (*), fixed bin, ptr, ptr, fixed bin (35)),
+          hcs_$delentry_seg             entry (ptr, fixed bin (35)),
+          hcs_$make_seg                 entry (char (*), char (*), char (*), fixed bin (5), ptr,
+                                                  fixed bin (35)),
+          hcs_$initiate                 entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2),
+                                                  ptr, fixed bin (35)),
+          hcs_$set_bc_seg               entry (ptr, fixed bin (24), fixed bin (35)),
+          hcs_$truncate_seg             entry (ptr, fixed bin, fixed bin (35)),
+          hcs_$terminate_noname         entry (ptr, fixed bin (35)),
+          ncp_$close_connection         entry (bit (36), fixed bin (6), fixed bin (35)),
+          ncp_$set_bytesize             entry (bit (36), fixed bin (8), fixed bin (35)),
+          check_fs_errcode_             entry (fixed bin (35), char (8) aligned, char (100) aligned),
+          ncp_$initiate_connection      entry (bit (36), fixed bin (16), fixed bin (32), fixed bin (6), fixed bin (35)),
+          ncp_$get_socket_state         entry (bit (36), fixed bin (6), fixed bin (35)),
+          ipc_$block                    entry (ptr, ptr, fixed bin (35));
+
+declare   (addr, binary, substr, search, divide, null, index, verify, translate) builtin;
+
+          call com_err_ (error_table_$badcall, "file_transfer",
+                    "Command not implemented yet; use FTP server environment.");
+          return;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+open:     entry (P_IB_ptr,argument);
+
+declare   argument char (*) varying;
+
+          ftp_data.request = Open;
+          token_len = index (argument, " ");
+          if token_len = 0
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "502  Mode or pathname for OPEN request missing.");
+                    return;
+                    end;
+
+          mode_string = substr (argument, 1, token_len - 1);
+          ftp_data.fap_modes = "00000"b;
+          if search (mode_string, "Rr") ^= 0
+          then      substr (ftp_data.fap_modes, 2, 1) = "1"b;
+          if search (mode_string, "Ww") ^= 0
+          then      substr (ftp_data.fap_modes, 4, 1) = "1"b;
+          if verify (mode_string, "RrWw") ^= 0
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "501  Bad syntax in mode string.  ""^a""", mode_string);
+                    return;
+                    end;
+
+          pathname = substr (argument, token_len + (verify (substr (argument, token_len + 1), " ")));
+          call check_ftp_parameters ();
+          call open_file (ftp_data.fap_modes);
+          call initialize_sockets ();
+          ftp_data.fap_read_bit, ftp_data.fap_write_bit = 0;
+          ftp_data.fap_file_is_open = "1"b;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200- ^a>^a open for ^a^/200  in ^a ^d-bit ^a.", ftp_data.dirname, ftp_data.ename, mode_string,
+                    mode_name (ftp_data.transfer_mode), ftp_data.byte_size,
+                    type_name (ftp_data.representation_type));
+
+          return;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+read:     entry (P_IB_ptr,argument);
+
+          ftp_data.request = Read;
+          call check_for_open_file ("01000"b, "read");
+          if ftp_data.fap_read_bit = ftp_data.fap_last_bit
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "458  Cannot read; read pointer is at end of file.");
+                    return;
+                    end;
+          num_bytes = cv_dec_check_ ((argument), code);
+          if code ^= 0
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "501  Argument ""^a"" to READ request is not a number.", argument);
+                    return;
+                    end;
+
+          if num_bytes <= 0
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "502  Request to read ^d bytes is invalid.", num_bytes);
+                    return;
+                    end;
+
+          num_bits = num_bytes * ftp_data.byte_size;
+          if ftp_data.fap_read_bit + num_bits > ftp_data.fap_last_bit
+          then      num_bits = ftp_data.fap_last_bit - ftp_data.fap_read_bit;
+
+          call open_data_socket (ftp_data.foreign_read_socket, ftp_data.local_write_socket, ftp_data.write_index);
+          ftp_data.abort_procedure = read_abort;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "250  Transfer started.");
+          call write_data (num_bits);
+
+          if ftp_data.fap_read_bit = ftp_data.fap_last_bit
+          then      do;
+                    call report_transfer_complete ();
+                    call close_data_socket (ftp_data.write_index);
+                    end;
+          else      if code = 0
+                    then      call ioa_$ioa_switch (ftp_data.iocb_ptr, "252  Transfer complete.");
+          ftp_data.abort_procedure = null_abort;
+
+          return;
+
+
+read_abort:
+          procedure;
+
+          call close_data_socket (ftp_data.write_index);
+          ftp_data.abort_procedure = null_abort;
+
+          end read_abort;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+write:    entry (P_IB_ptr,argument);
+
+          ftp_data.request = Write;
+          call check_for_open_file ("00010"b, "writ");
+          num_bytes = cv_dec_check_ ((argument), code);
+          if code ^= 0
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "501  Argument ""^a"" to WRIT request is not a number.", argument);
+                    return;
+                    end;
+
+          if num_bytes <= 0
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "502  Request to write ^d bytes is invalid.", num_bytes);
+                    return;
+                    end;
+
+          call open_data_socket (ftp_data.foreign_write_socket, ftp_data.local_read_socket, ftp_data.read_index);
+          ftp_data.abort_procedure = write_abort;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "250  Transfer begun.");
+          call read_data (num_bytes * ftp_data.byte_size);
+          ftp_data.abort_procedure = null_abort;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "252  Transfer complete.");
+
+          return;
+
+
+write_abort:
+          procedure;
+
+          call close_data_socket (ftp_data.read_index);
+          call update_write_pointer ();
+          ftp_data.abort_procedure = null_abort;
+
+          end write_abort;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+seek:     entry (P_IB_ptr,argument);
+
+          ftp_data.request = Seek;
+          token_len = index (argument, " ");
+          if token_len = 0
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "502  Incorrect number of parameters for SEEK request.");
+                    return;
+                    end;
+
+          pointer_name = translate (substr (argument, 1, token_len - 1), upper_case, lower_case);
+          pointer_expression = substr (argument, token_len + 1);
+          token_len = search (pointer_expression, "+-");
+          if token_len = 0
+          then      do;
+                    reference_pointer = translate (pointer_expression, upper_case, lower_case);
+                    reference_offset = 0;
+                    end;
+          else      do;
+                    reference_pointer = translate (substr (pointer_expression, 1, token_len - 1), upper_case, lower_case);
+                    reference_offset = cv_dec_check_ (substr (pointer_expression, token_len + 1), code);
+                    if code ^= 0
+                    then      do;
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "501  Invalid integer expression in SEEK parameter:  ""^a""",
+                                        substr (pointer_expression, token_len + 1));
+                              return;
+                              end;
+                    end;
+
+          if pointer_name = "READ" | reference_pointer = "READ"
+          then      call check_for_open_file ("01000"b, "read");
+          if pointer_name = "WRITE" | reference_pointer = "WRITE"
+          then      call check_for_open_file ("00010"b, "writ");
+
+          if reference_pointer = "FIRST"
+          then      reference_pointer_value = 0;
+          else if reference_pointer = "READ"
+          then      reference_pointer_value = ftp_data.fap_read_bit;
+          else if reference_pointer = "WRITE"
+          then      reference_pointer_value = ftp_data.fap_write_bit;
+          else if reference_pointer = "LAST"
+          then      reference_pointer_value = ftp_data.fap_last_bit;
+          else      do;
+                    pointer_name = reference_pointer;
+bad_pointer_name:   call ioa_$ioa_switch (ftp_data.iocb_ptr, "502  Invalid pointer name ""^a"" given to SEEK request.", pointer_name);
+                    return;
+                    end;
+
+          reference_pointer_value = reference_pointer_value + ftp_data.byte_size * reference_offset;
+          if reference_pointer_value < 0
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "503  Attempt to assign negative value to ^a pointer.", pointer_name);
+                    return;
+                    end;
+
+          if pointer_name = "READ"
+          then      if reference_pointer_value > ftp_data.fap_last_bit
+                    then      do;
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "503  Attempt to set READ pointer beyond end of file.");
+                              return;
+                              end;
+                    else      do;
+                              ftp_data.fap_read_bit = reference_pointer_value;
+                              if ftp_data.fap_read_bit = ftp_data.fap_last_bit
+                              then      call close_data_socket (ftp_data.write_index);
+                              end;
+          else if pointer_name = "WRITE"
+          then      ftp_data.fap_write_bit = reference_pointer_value;
+          else if pointer_name = "FIRST" | pointer_name = "LAST"
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "502  Illegal attempt to set ""^a"" pointer with SEEK request.", pointer_name);
+                    return;
+                    end;
+          else      go to bad_pointer_name;
+
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  ^a pointer set.", pointer_name);
+
+          return;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+close:    entry (P_IB_ptr);
+
+          ftp_data.request = Close;
+          call check_for_open_file ("00000"b, "clos");
+          call close_data_socket (ftp_data.read_index);
+          call close_data_socket (ftp_data.write_index);
+          call close_file ();
+          ftp_data.fap_file_is_open = "0"b;
+
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  ^a>^a closed.", ftp_data.dirname, ftp_data.ename);
+
+          return;
+
+retrieve: entry (P_IB_ptr,argument);
+
+          ftp_data.request = Retrieve;
+          pathname = argument;
+          call check_ftp_parameters ();
+          ftp_data.abort_procedure = retrieve_abort;
+          call open_file ("01000"b);
+          call initialize_sockets ();
+          call open_data_socket (ftp_data.foreign_read_socket, ftp_data.local_write_socket, ftp_data.write_index);
+          call report_start_of_transfer ("to");
+          call write_data (ftp_data.initial_bit_count);
+          call report_transfer_complete ();
+          call close_data_socket (ftp_data.write_index);
+          call close_file ();
+          ftp_data.abort_procedure = null_abort;
+
+          return;
+
+
+retrieve_abort:
+          procedure;
+
+          call close_data_socket (ftp_data.write_index);
+          call close_file ();
+          ftp_data.abort_procedure = null_abort;
+
+          end retrieve_abort;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+store:    entry (P_IB_ptr,argument);
+
+          ftp_data.request = Store;
+          pathname = argument;
+          call check_ftp_parameters ();
+          ftp_data.abort_procedure = store_abort;
+          call open_file ("00010"b);
+          ftp_data.fap_last_bit = 0;                                 /* remember to truncate the file when done       */
+          go to store_common;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+append:   entry (P_IB_ptr,argument);
+
+          ftp_data.request = Append;
+          pathname = argument;
+          call check_ftp_parameters ();
+          ftp_data.abort_procedure = store_abort;
+          call open_file ("00010"b);
+          ftp_data.fap_write_bit = ftp_data.fap_last_bit;
+
+store_common:
+          call initialize_sockets ();
+          call open_data_socket (ftp_data.foreign_write_socket, ftp_data.local_read_socket, ftp_data.read_index);
+          call report_start_of_transfer ("from");
+          on record_quota_overflow go to record_quota_overflow_handler;
+          call read_data (-1);
+          revert record_quota_overflow;
+          call report_transfer_complete ();
+          call close_file ();
+          ftp_data.abort_procedure = null_abort;
+
+          return;
+
+record_quota_overflow_handler:
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "453  Record quota overflow in ^a.  Cannot complete transfer of ^a.", ftp_data.dirname, ftp_data.ename);
+          call store_abort ();
+
+          return;
+
+
+store_abort:
+          procedure;
+
+          call close_data_socket (ftp_data.read_index);
+          call update_write_pointer ();
+          call close_file ();
+          ftp_data.abort_procedure = null_abort;
+
+          end store_abort;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+mail_transfer:
+          entry (P_IB_ptr, mail_seg_ptr, char_count, error_code);
+
+declare   mail_seg_ptr        pointer,
+          char_count          fixed bin,
+          error_code          fixed bin (35);
+
+          ftp_data.request = Mail;
+          ftp_data.segptra = mail_seg_ptr;
+          ftp_data.fap_write_bit, ftp_data.fap_last_bit, ftp_data.initial_bit_count = 0;
+          call check_ftp_parameters ();
+          call initialize_sockets ();
+          ftp_data.abort_procedure = mail_abort;
+          call open_data_socket (ftp_data.foreign_write_socket, ftp_data.local_read_socket, ftp_data.read_index);
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "250  Begin mail transfer.");
+          call read_data (-1);
+          ftp_data.abort_procedure = null_abort;
+          char_count = divide (ftp_data.fap_write_bit, 9, 17, 0);
+          error_code = code;
+
+          return;
+
+mail_abort:
+          procedure;
+
+          call close_data_socket (ftp_data.read_index);
+          ftp_data.abort_procedure = null_abort;
+
+          end mail_abort;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+list_transfer:
+          entry (P_IB_ptr, text_pointer, text_count);
+
+declare   text_pointer        pointer,
+          text_count          fixed bin;
+
+          ftp_data.request = List;
+          ftp_data.segptra = text_pointer;
+          ftp_data.fap_read_bit = 0;
+          call check_ftp_parameters ();
+          call initialize_sockets ();
+          ftp_data.abort_procedure = list_abort;
+          call open_data_socket (ftp_data.foreign_read_socket, ftp_data.local_write_socket, ftp_data.write_index);
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "250  Begin list transfer.");
+          call write_data (text_count * 9);
+          ftp_data.abort_procedure = null_abort;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "252  List transfer complete.");
+          call close_data_socket (ftp_data.write_index);
+
+          return;
+
+list_abort:
+          procedure;
+
+          call close_data_socket (ftp_data.write_index);
+          ftp_data.abort_procedure = null_abort;
+
+          end list_abort;
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+abort:    entry (P_IB_ptr);                    /* Called by ftp_command_processor_ to abort transfer. */
+          declare abort_procedure entry variable;
+
+          abort_procedure = ftp_data.abort_procedure;
+          if ftp_data.read_index ^= ""b               /* If no socket created, no useful aborting to do (Almost). */
+          then      call  abort_procedure ();               /* This is an entry variable -- it'll do the right thing. */
+
+          return;
+
+
+status:   entry (P_IB_ptr);
+
+          call date_time_ (clock_ (), date_time);
+          if ftp_data.request = Mail | ftp_data.request = List
+          then      do;
+                    if ftp_data.request = Mail
+                    then      short_message = "Mail";
+                    else      short_message = "List";
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "110  ^a transfer ^a ^a in ^a ^d-bit ^a in progress at ^a.", short_message, ftp_data.word,
+                              ftp_data.foreign_host_name, mode_name (ftp_data.transfer_mode), ftp_data.byte_size,
+                              type_name (ftp_data.representation_type), substr (date_time, 11, 6));
+                    end;
+          else      call ioa_$ioa_switch (ftp_data.iocb_ptr, "110- ^a of ^a>^a ^a ^a^/110  in ^a ^d-bit ^a in progress at ^a.",
+                    request_name (ftp_data.request), ftp_data.dirname, ftp_data.ename, ftp_data.word, ftp_data.foreign_host_name,
+                    mode_name (ftp_data.transfer_mode), ftp_data.byte_size, type_name (ftp_data.representation_type),
+                    substr (date_time, 11, 6));
+          return;
+
+check_ftp_parameters:
+          procedure ();
+
+          if ftp_data.fap_file_is_open
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "504  A file is already open for File Access Protocol transfer.");
+                    go to error_return;
+                    end;
+          if ftp_data.representation_type = ASCII
+          then      if ftp_data.byte_size = 8
+                    then      return;
+                    else      go to bad_bytesize;
+          else      if ftp_data.representation_type = Local_Byte
+                    then      if ftp_data.byte_size = 9
+                              then      go to check_mode;
+                              else      if ftp_data.byte_size ^= 36
+                                        then      go to bad_bytesize;
+check_mode:
+          if ftp_data.transfer_mode = Text
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "505  Text transfer mode is incompatible with ^a representation type.",
+                              type_name (ftp_data.representation_type));
+                    go to error_return;
+                    end;
+          else      return;
+
+bad_bytesize:
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "505  Current byte size ^d is incompatible with ^a representation type.",
+                    ftp_data.byte_size, type_name (ftp_data.representation_type));
+          go to error_return;
+
+          end check_ftp_parameters;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+open_file:
+          procedure (mode_bits);
+
+declare   mode_bits bit (5);
+
+          call expand_pathname_ (pathname, ftp_data.dirname, ftp_data.ename, code);
+          if code ^=0
+          then      go to bad_path;
+
+          if search (ftp_data.ename, "*=") ^= 0
+          then      do;
+                    code = error_table_$badstar;
+                    go to bad_path;
+                    end;
+
+          call hcs_$status_long (ftp_data.dirname, ftp_data.ename, 1, addr (branch), null, code);
+          if code ^= 0
+          then      if code = error_table_$noentry
+                    then      if substr (mode_bits, 4, 1)
+                              then      do;
+                                        ftp_data.initial_bit_count = 0;
+                                        call hcs_$make_seg (ftp_data.dirname, ftp_data.ename, "", 1110b, ftp_data.segptra, code);
+                                        if code = 0
+                                        then      segment_created = "1"b;
+                                        else      go to error_reply;
+                                        end;
+                              else go to error_reply;
+                    else      go to error_reply;
+          else      if branch.type = Directory
+                    then      do;
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "451  ^a>^a is a directory, not a segment.", ftp_data.dirname, ftp_data.ename);
+                              go to error_return;
+                              end;
+                    else      do;
+                              ftp_data.initial_bit_count = binary (branch.bitcnt, 24);
+                              if (branch.mode & mode_bits) ^= mode_bits
+                              then      do;
+                                        call ioa_$ioa_switch (ftp_data.iocb_ptr, "451 Incorrect access to ^a>^a.", ftp_data.dirname, ftp_data.ename);
+                                        go to error_return;
+                                        end;
+                              call hcs_$initiate (ftp_data.dirname, ftp_data.ename, "", 0, 0, ftp_data.segptra, code);
+                              if code ^= 0
+                              then      if code ^= error_table_$segknown
+                                        then      go to error_reply;
+                              end;
+          ftp_data.fap_last_bit = ftp_data.initial_bit_count;
+          ftp_data.fap_read_bit, ftp_data.fap_write_bit = 0;
+
+          end open_file;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+initialize_sockets:
+          procedure;
+
+          if ftp_data.read_index = ""b
+          then      do;
+                    call ftp_initialization_$socket_init (addr (ftp_data), code);
+                    if code ^= 0
+                    then      if code = 1         /* Special error code, error message already printed.  */
+                              then      go to error_return;
+                              else      go to net_error;
+                    end;
+
+          end initialize_sockets;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+check_for_open_file:
+          procedure (desired_mode, action);
+
+declare   desired_mode bit (5),
+          action char (*);
+
+          if ^ ftp_data.fap_file_is_open
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "504  No file is open.");
+                    go to error_return;
+                    end;
+          if (ftp_data.fap_modes & desired_mode) ^= desired_mode
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "503  File is not open for ^aing.", action);
+                    go to error_return;
+                    end;
+
+          end check_for_open_file;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+open_data_socket:
+          procedure (foreign_socket, local_socket, socket_index);
+
+declare   foreign_socket      fixed bin (32),
+          local_socket        fixed bin (32),
+          socket_index        bit (36);
+
+          call ncp_$get_socket_state (socket_index, state, code);
+          if code ^= 0
+          then      go to net_error;
+          if state = 6 | state = 11
+          then      return;
+
+          call wait_for_state_change (7);
+
+          if state ^= 1
+          then      go to bad_state;
+
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "255 SOCK ^d", local_socket);
+          call ncp_$set_bytesize (socket_index, ftp_data.byte_size, code);
+          if code ^= 0
+          then      go to net_error;
+
+          call ncp_$initiate_connection (socket_index, ftp_data.foreign_host, foreign_socket, state, code);
+          if code ^= 0
+          then      go to net_error;
+
+          call wait_for_state_change (5);
+          if state = 6 | state = 11
+          then      return;
+          if state = 1
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "454  Data connection refused by ^a.", ftp_data.foreign_host_name);
+                    code = error_table_$net_invalid_state;
+                    go to error_return;
+                    end;
+bad_state:
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "454  Unable to establish data connection to ^a (Multics NCP state ^d).",
+                    ftp_data.foreign_host_name, state);
+          call ncp_$close_connection (socket_index, state, code);
+          go to error_return;
+
+wait_for_state_change:
+                    procedure (starting_state);
+
+          declare   starting_state fixed bin;
+          declare   1 wait_list aligned automatic,
+                       2 count fixed binary (17) initial (1),
+                       2 channel fixed binary (71) initial (ftp_data.event_channel);
+
+
+                    do while (state = starting_state);
+                              call ipc_$block (addr (wait_list), addr (event_message), code);
+                              call ncp_$get_socket_state (socket_index, state, code);
+                              if code ^= 0
+                              then      go to net_error;
+                              end;
+
+                    end wait_for_state_change;
+
+          end open_data_socket;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+report_start_of_transfer:
+          procedure (which_way);
+
+declare   which_way char (*);
+
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "250- Beginning transfer of ^a>^a^/250  ^a ^a in ^a ^d-bit ^a.", ftp_data.dirname, ftp_data.ename, which_way,
+                    ftp_data.foreign_host_name, mode_name (ftp_data.transfer_mode),
+                    ftp_data.byte_size, type_name (ftp_data.representation_type));
+
+          end report_start_of_transfer;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+write_data:
+          procedure (bits_to_write);
+
+declare   bits_to_write fixed bin (24);
+
+          ftp_data.word = "to";
+          if ftp_data.representation_type = ASCII
+          then      call ftp_write_ascii_ (ftp_data.segptra, ftp_data.fap_read_bit, bits_to_write, ftp_data.write_index, ftp_data.event_channel,
+                              ftp_data.transfer_mode, code);
+          else      call ftp_write_image_ (ftp_data.segptra, ftp_data.fap_read_bit, bits_to_write, ftp_data.write_index, ftp_data.event_channel,
+                              ftp_data.transfer_mode, ftp_data.byte_size, code);
+          call check_ftp_io_error_code ();
+          ftp_data.fap_read_bit = ftp_data.fap_read_bit + bits_to_write;
+
+          end write_data;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+read_data:
+          procedure (bits_to_read);
+
+declare   bits_to_read fixed bin (24);
+
+          ftp_data.word = "from";
+          if bits_to_read = -1  /* Read all there is, then stop.  */
+          then      if ftp_data.representation_type = ASCII
+                    then      call ftp_read_ascii_ (ftp_data.segptra, ftp_data.fap_write_bit, ftp_data.read_index, ftp_data.event_channel,
+                                        ftp_data.bits_read, ftp_data.transfer_mode, code);
+                    else      call ftp_read_image_ (ftp_data.segptra, ftp_data.fap_write_bit, ftp_data.read_index, ftp_data.event_channel,
+                                        ftp_data.bits_read, ftp_data.transfer_mode, ftp_data.byte_size, code);
+          else      if ftp_data.representation_type = ASCII
+                    then      call ftp_read_ascii_$read_with_count (ftp_data.segptra, ftp_data.fap_write_bit, bits_to_read, ftp_data.read_index,
+                                        ftp_data.event_channel, ftp_data.bits_read, ftp_data.transfer_mode, code);
+                    else      call ftp_read_image_$read_with_count (ftp_data.segptra, ftp_data.fap_write_bit, bits_to_read, ftp_data.read_index,
+                                        ftp_data.event_channel, ftp_data.bits_read, ftp_data.transfer_mode, ftp_data.byte_size, code);
+          call check_ftp_io_error_code ();
+          call update_write_pointer ();
+
+          end read_data;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+update_write_pointer:
+          procedure ();
+
+          ftp_data.fap_write_bit = ftp_data.fap_write_bit + ftp_data.bits_read;
+          if ftp_data.fap_write_bit > ftp_data.fap_last_bit
+          then      ftp_data.fap_last_bit = ftp_data.fap_write_bit;
+
+          end update_write_pointer;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+check_ftp_io_error_code:
+          procedure;
+
+          if code ^= 0
+          then      if code = error_table_$net_invalid_state | code = error_table_$net_socket_closed
+                    then      call ioa_$ioa_switch (ftp_data.iocb_ptr, "452  Data socket closed prematurely by ^a; transfer incomplete.",
+                                        ftp_data.foreign_host_name);
+                    else      do;
+                              call check_fs_errcode_ (code, short_message, error_message);
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "452  ^a  Cannot complete transfer.", error_message);
+                              end;
+
+          end check_ftp_io_error_code;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+report_transfer_complete:
+          procedure;
+
+          if code = 0
+          then      call ioa_$ioa_switch (ftp_data.iocb_ptr, "252  Transfer complete.");
+
+          end report_transfer_complete;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+close_data_socket:
+          procedure (socket_index);
+
+declare   socket_index bit (36);
+
+          call ncp_$get_socket_state (socket_index, state, code);
+          if code = 0
+          then      if state ^= 1
+                    then      call ncp_$close_connection (socket_index, state, code);
+
+          end close_data_socket;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+close_file:
+          procedure ();
+
+          if ftp_data.fap_last_bit ^= ftp_data.initial_bit_count
+          then      do;
+                    call hcs_$set_bc_seg (ftp_data.segptra, ftp_data.fap_last_bit, code);
+                    if ftp_data.fap_last_bit < ftp_data.initial_bit_count
+                    then      call hcs_$truncate_seg (ftp_data.segptra, divide (ftp_data.fap_last_bit + 35, 36, 17, 0), code);
+                    end;
+          call hcs_$terminate_noname (ftp_data.segptra, code);
+
+          end close_file;
+
+
+/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+
+
+null_abort:
+          procedure;
+
+      /*  Nothing to it!  */
+
+          end null_abort;
+
+error_reply:
+          if code = error_table_$moderr | code = error_table_$incorrect_access
+          then      reply_code = "451";
+          else      if segment_created
+                    then      call hcs_$delentry_seg (ftp_data.segptra, code);
+          else if code = error_table_$namedup
+          then      reply_code = "456";
+          else if code = error_table_$noentry
+          then      reply_code = "450";
+          else      reply_code = "451";
+
+          call check_fs_errcode_ (code, short_message, error_message);
+
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "^a  ^a ^a>^a", reply_code, error_message, ftp_data.dirname, ftp_data.ename);
+error_return:
+          if ftp_data.request = Mail
+          then      if code = 0
+                    then      error_code = 1;
+                    else      error_code = code;
+          return;
+
+
+bad_path:
+          call check_fs_errcode_ (code, short_message, error_message);
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "550  ^a ^a", error_message, pathname);
+          go to error_return;
+
+
+
+net_error:
+          if code = error_table_$net_fhost_inactive | code = error_table_$net_fhost_down | code = error_table_$net_fimp_down
+          then      reply_code = "454";
+          else      reply_code = "452";
+
+          call check_fs_errcode_ (code, short_message, error_message);
+
+          if ftp_data.request = Mail
+          then      do;
+                    error_code = code;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "^a  ^a  Cannot initiate mail transfer from ^a.", reply_code, error_message,
+                              ftp_data.foreign_host_name);
+                    end;
+          else if ftp_data.request = List
+          then      call ioa_$ioa_switch (ftp_data.iocb_ptr, "^a  ^a  Cannot initiate list transfer to ^a.", reply_code, error_message,
+                              ftp_data.foreign_host_name);
+          else      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "^a- ^a  Cannot initiate transfer of
+^a  ^a>^a.", reply_code, error_message, reply_code, ftp_data.dirname, ftp_data.ename);
+                    call hcs_$terminate_noname (ftp_data.segptra, code);
+                    end;
+
+          end file_transfer_;
+   
+
+
+
+		    ftp_change_modes_.pl1           09/23/77  1031.6rew 09/22/77  1725.1       70929
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+ftp_change_modes_:
+          procedure (P_IB_ptr, which, argument);
+
+/*  A Pogran Program 02/06/73
+
+    This module implements the MODE, TYPE, STRU, FORM, BYTE, and SOCK
+    commands of the File Transfer Protocol.
+
+    Note that at this time, Structured Files and ANSI print format
+    are not supported by the Multics FTP-server.
+
+    Last modified by Ken Pogran 02/23/73  */
+
+declare   which     char (*),
+          P_IB_ptr  ptr,
+          argument  char (*) varying;
+
+declare   1 ftp_data aligned like ftp_data_template defined (P_IB_ptr -> ftp_data_template);
+declare   new_byte_size       fixed bin,
+          code                fixed bin (35),
+          comma_pos           fixed bin,
+          new_host            fixed bin (16),
+          new_socket          fixed bin (32),
+          new_type            fixed bin,
+          new_mode            fixed bin;
+
+%include ftp_server_data;
+
+declare   ioa_$ioa_switch                         entry options (variable),
+          convert_binary_integer_$decimal_string entry (fixed bin (35)) returns (char (12) varying),
+          cv_dec_check_                 entry (char (*), fixed bin (35)) returns (fixed bin (35)),
+          ftp_initialization_$socket_init entry (ptr, fixed bin (35)),
+          host_id_$symbol               entry (fixed bin (16), char (*), fixed bin (35));
+
+declare   (index, length, mod, substr) builtin;
+
+
+
+          if which = "FORM" then go to set_form;
+          else if which = "STRU" then go to set_structure;
+          else if which = "BYTE" then go to set_byte_size;
+          else if which = "SOCK" then go to set_socket;
+          else if which = "MODE" then go to set_mode;
+          else if which = "TYPE" then go to set_type;
+
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "400  ^a command not implemented at this time.", which);         /* Why was this routine called for  */
+          return;                                                               /* strange command?                 */
+
+set_form:
+          if argument = "U" | argument = "u"
+          then      call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  FORM U accepted.");
+          else      if argument = "P" | argument = "p"
+                    then      call ioa_$ioa_switch (ftp_data.iocb_ptr, "506  Print file format is not implemented at this time.");
+                    else      go to bad_parameter;
+          return;
+
+set_structure:
+          if argument = "F" | argument = "f"
+          then      call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 STRU F accepted.");
+          else      if argument = "R" | argument = "r"
+                    then      call ioa_$ioa_switch (ftp_data.iocb_ptr, "506  Record structured files are not implemented at this time.");
+
+                    else      go to bad_parameter;
+          return;
+
+set_byte_size:
+          new_byte_size = cv_dec_check_ ((argument), code);
+          if code ^= 0
+          then      call ioa_$ioa_switch (ftp_data.iocb_ptr, "503  Argument ""^a"" to BYTE command is not a decimal integer.", argument);
+          else      do;
+                    ftp_data.byte_size = new_byte_size;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  New byte size is ^d", new_byte_size);
+                    end;
+          return;
+
+set_socket:
+          if ftp_data.foreign_host = -1
+          then call ftp_initialization_$socket_init (addr (ftp_data), code);
+
+          comma_pos = index (argument, ",");
+          if comma_pos ^= 0
+          then      do;
+                    new_host = cv_dec_check_ (substr (argument, 1, comma_pos - 1), code);
+                    if code ^= 0
+                    then      do;
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "501  Bad host specification ""^a"".", substr (argument, 1, comma_pos - 1));
+                              return;
+                              end;
+                    new_socket = cv_dec_check_ (substr (argument, comma_pos + 1), code);
+                    if code ^= 0
+                    then      do;
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "501  Bad socket specification ""^a"".", substr (argument, comma_pos + 1));
+                              return;
+                              end;
+
+                    new_socket = new_socket - mod (new_socket, 2);
+                    ftp_data.foreign_host = new_host;
+                    ftp_data.foreign_read_socket = new_socket;
+                    ftp_data.foreign_write_socket = new_socket + 1;
+                    call host_id_$symbol (new_host, ftp_data.foreign_host_name, code);
+                    if code ^= 0
+                    then      ftp_data.foreign_host_name = "host " || convert_binary_integer_$decimal_string ((new_host));
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  New data socket is ^d at ^a.", new_socket, ftp_data.foreign_host_name);
+                    end;
+          else      do;
+                    new_socket = cv_dec_check_ ((argument), code);
+                    if code ^= 0
+                    then      do;
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "501  Bad socket specification ""^a"".", argument);
+                              return;
+                              end;
+                    new_socket = new_socket - mod (new_socket, 2);
+                    ftp_data.foreign_read_socket = new_socket;
+                    ftp_data.foreign_write_socket = new_socket + 1;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  New data socket is ^d.", new_socket);
+                    end;
+
+          return;
+
+set_type:
+          if length (argument) ^= 1
+          then      go to bad_parameter;
+
+          new_type = index ("AILE", argument);
+          if new_type = 0
+          then      do;
+                    new_type = index ("aile", argument);
+                    if new_type = 0
+                    then      do;
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "501  Unrecognized representation type ""^a"".", argument);
+                              return;
+                              end;
+                    end;
+          if new_type = 4
+          then      call ioa_$ioa_switch (ftp_data.iocb_ptr, "506  EBCDIC is not supported on Multics at this time.");
+          else      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  New representation type is ^a.", type_name (new_type));
+                    ftp_data.representation_type = new_type;
+                    end;
+          return;
+
+set_mode:
+          if length (argument) ^= 1
+          then      go to bad_parameter;
+
+          new_mode = index ("STB", argument);
+          if new_mode = 0
+          then      do;
+                    new_mode = index ("stb", argument);
+                    if new_mode = 0
+                    then      do;
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "501  Unrecognized transfer mode ""^a"".", argument);
+                              return;
+                              end;
+                    end;
+          ftp_data.transfer_mode = new_mode;
+
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  New transfer mode is ^a.", mode_name (new_mode));
+          return;
+
+bad_parameter:
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "501  Bad parameter ""^a"" to ^a command.", argument, which);
+
+          end ftp_change_modes_;
+   
+
+
+
+		    ftp_command_processor_.pl1      12/19/78  1640.9rew 12/19/78  1637.5      141426
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+ftp_command_processor_:
+          procedure (P_IB_ptr, command_line, quit_flag);
+
+/*  A Pogran Program 01/20/73
+
+    This module provides the command processor for the server File Transfer facility.
+    In addition to merely processing commands, it checks for invalid command sequences, etc.
+
+    Modified to handle special commands for development by Ken Pogran, 09/18/74
+    Modified for File Access Protocol commands by Ken Pogran, 10/25/74
+    Modified to implement NLST by Ken Pogran, 3/4/75 */
+
+
+/* modified July 1976 to handle two new commands to permit dprinting - XDPP: to send the
+dprint parameters, and XDPR: to actually request the printing.          N.Federman     */
+/*  Modified to implement XSEN, XMAS, and XSEM by C. Hornig, 8/21/78 */
+
+
+declare   command_line        char (*),
+          P_IB_ptr  ptr,
+          quit_flag bit (1);
+
+declare   1 ftp_data aligned like ftp_data_template defined (P_IB_ptr -> ftp_data_template);
+
+
+declare   command_length      fixed bin (24),
+          command             char (4),
+          i                   fixed bin,
+          argument            char (168) varying,
+          arg_length          fixed bin (24),
+          arg_begin           fixed bin (24),
+          arg_end             fixed bin (24);
+
+declare   command_names (40) char (4) internal static options (constant) initial
+         ("ABOR", "NOOP", "HELP", "REIN", "BYE",  "STAT",   /* These commands valid after SYNC */
+          "QUOT", "NQUO", "USER", "PASS", "ACCT", "CLOS",   /* These and preceeding commands do not need argument */
+          "BYTE", "SOCK", "TYPE", "STRU", "MODE", "FORM",
+          "REST", "LSTN", "ALLO", "RNFR", "RNTO", "DELE",
+          "OPEN", "SEEK",                                   /* Commands on these three lines may not be aborted. */
+          "MAIL", "MLFL", "NLST", "LIST", "RETR", "STOR",
+          "APPE", "READ", "WRIT", "XSEN", "XSEM", "XMAS",   /* Commands on these two lines can be ABORted. */
+          "XDPP", "XDPR" );                                     /* Commands to DPRINT a file */
+
+declare   upper_case          char (26) internal static options(constant) initial ("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+declare   lower_case          char (26) internal static options(constant) initial ("abcdefghijklmnopqrstuvwxyz");
+
+declare   ioa_$ioa_switch                         entry options (variable),
+          ftp_fs_commands_$XDPP         entry (ptr, char(*) varying),
+          ftp_fs_commands_$XDPR         entry (ptr, char(*) varying),
+          ftp_server_listen_$bye        entry (ptr, bit (1)),
+          ftp_fs_commands_$delete       entry (ptr, char (*) varying),
+          file_transfer_$status         entry (ptr),
+          file_transfer_$abort          entry (ptr),
+          file_transfer_$open           entry (ptr, char (*) varying),
+          file_transfer_$read           entry (ptr, char (*) varying),
+          file_transfer_$write          entry (ptr, char (*) varying),
+          file_transfer_$seek           entry (ptr, char (*) varying),
+          file_transfer_$close          entry (ptr),
+          ftp_change_modes_             entry (ptr, char (*), char (*) varying),
+          ftp_mail_                     entry (ptr, char (*), char (*) varying),
+          ftp_mail_$abort               entry (ptr),
+          ftp_server_status_$list       entry (ptr, char (*) varying),
+          ftp_server_status_$namelist   entry (ptr, char (*) varying),
+          ftp_server_status_            entry (ptr, char (*) varying),
+          ftp_fs_commands_$rename_from  entry (ptr, char (*) varying),
+          ftp_fs_commands_$rename_to    entry (ptr, char (*) varying),
+          file_transfer_$retrieve       entry (ptr, char (*) varying),
+          file_transfer_$store          entry (ptr, char (*) varying),
+          file_transfer_$append         entry (ptr, char (*) varying);
+
+declare   dev_file_transfer_            entry (ptr, char (*));
+
+declare   (substr, index, hbound, length, reverse, translate, verify) builtin;
+
+%include ftp_server_data;
+
+          command_length = index (command_line, " ") - 1;
+
+          if command_length = -1
+          then      do;
+                    command = command_line;
+                    command_length = length (command_line);
+                    end;
+          else      command = substr (command_line, 1, command_length);
+
+          command = translate (command, upper_case, lower_case);
+
+          if command_length >4
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "501  Command name longer than four characters:  ""^a""",
+                              translate (substr (command_line, 1, command_length), upper_case, lower_case));
+                    return;
+                    end;
+
+          if ftp_data.rename_in_progress
+          then      if command ^= "RNTO"
+                    then      do;
+                              ftp_data.rename_in_progress = "0"b;
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "505  RNFR must be followed by RNTO.");
+                              return;
+                              end;
+                    else      do;
+                              ftp_data.last_command = 23;
+                              call get_argument ();
+                              go to process_command (23);
+                              end;
+          else      if quit_flag
+                    then      do;
+                              do i = 1 to 6;
+                                        if command = command_names (i)
+                                        then      go to process_command (i);
+                                        end;
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "504  Only ABOR, NOOP, BYE, REIN, HELP, and STAT are valid after SYNC is received.");
+                              if ftp_data.last_command ^= 0
+                              then      call ioa_$ioa_switch (ftp_data.iocb_ptr, "050  Processing of ^a resumed.", command_names (ftp_data.last_command));
+                              return;
+                              end;
+                    else      do;
+                              do i = 1 to hbound(command_names,1);
+                                        if command = command_names (i)
+                                        then      go to have_command;
+                                        end;
+                              if command = "XDV1"
+                              then      go to development_command;
+                              if verify (command, " ABCDEFGHIJKLMNOPQRSTUVWXYZ") ^= 0
+                              then      call ioa_$ioa_switch (ftp_data.iocb_ptr, "501  Syntax error in command line: ""^a""", command_line);
+                              else      call ioa_$ioa_switch (ftp_data.iocb_ptr, "500  Unrecognized command: ""^a""", command);
+                              return;
+have_command:                 ftp_data.last_command = i;
+                              if i > 12
+                              then      call get_argument ();
+                              go to process_command (i);
+                              end;
+
+process_command (1):          /* ABOR */
+          if ^ quit_flag
+          then do;
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "202  ABOR ignored; no activity in progress at this time.");
+               return;
+               end;
+
+          if ftp_data.last_command > 26
+          then      do;
+                    if ftp_data.last_command = 27
+                    then      call ftp_mail_$abort (addr (ftp_data));
+                    else      call file_transfer_$abort (addr (ftp_data));
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "201  ^a aborted.", command_names (ftp_data.last_command));
+                    goto ftp_data.abort_return_label;
+                    end;
+
+          if ftp_data.last_command ^= 0
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "504  ^a cannot be aborted.", command_names (ftp_data.last_command));
+                    go to check_return;
+                    end;
+
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "202  ABOR ignored; no activity in progress at this time.");
+          return;
+
+process_command (2):          /* NOOP */
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  No operation.");
+          go to check_return;
+
+process_command (3):          /* HELP */
+process_command (7):          /* QUOT */
+process_command (8):          /* NQUO */
+process_command (19):         /* REST */
+process_command (20):         /* LSTN */
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "400  ^a command not implemented at this time.", command);
+          go to check_return;
+
+process_command (4):          /* REIN */
+          ftp_data.logout_hold = "1"b;
+
+process_command (5):          /* BYE */
+          if quit_flag
+          then      if ftp_data.last_command ^= 0
+                    then      do;
+                              ftp_data.bye_pending = "1"b;
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "232  ^a will be performed when ^a has completed.",
+                                        command, command_names (ftp_data.last_command));
+                              go to check_return;
+                              end;
+          call ftp_server_listen_$bye (addr (ftp_data), ftp_data.logout_hold);
+          ftp_data.logout_hold = "0"b;
+          go to check_return;           /* REIN is not permitted for Telnet user who invoked ftp_server */
+
+process_command (6):          /* STAT */
+          if quit_flag
+          then      if ftp_data.last_command > 27
+                    then      do;
+                              call file_transfer_$status (addr (ftp_data));
+                              go to check_return;
+                              end;
+          if verify (reverse (command_line), " ") < length (command_line) - command_length
+          then      call get_argument ();
+          else      argument = "";
+          call ftp_server_status_ (addr (ftp_data), argument);
+          go to check_return;
+
+process_command (9):          /* USER */
+process_command (10):         /* PASS */
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "504  ^a command not valid at this time.", command );
+          go to check_return;
+
+process_command (11):         /* ACCT */
+process_command (21):         /* ALLO */
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  ^a command is not required.", command);
+          go to check_return;
+
+process_command (12):         /* CLOS */
+          call file_transfer_$close (addr (ftp_data));
+          go to check_return;
+
+process_command (13):         /* BYTE */
+process_command (14):         /* SOCK */
+process_command (15):         /* TYPE */
+process_command (16):         /* STRU */
+process_command (17):         /* MODE */
+process_command (18):         /* FORM */
+          call ftp_change_modes_ (addr (ftp_data), command, argument);
+          go to check_return;
+
+process_command (22):         /* RNFR */
+          call ftp_fs_commands_$rename_from (addr (ftp_data), argument);
+          ftp_data.rename_in_progress = "1"b;
+          go to check_return;
+
+process_command (23):         /* RNTO */
+          if ^ ftp_data.rename_in_progress
+          then      do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "504  RNTO must be preceeded by RNFR.");
+                    end;
+          else      do;
+                    call ftp_fs_commands_$rename_to (addr (ftp_data), argument);
+                    ftp_data.rename_in_progress = "0"b;
+                    end;
+          go to check_return;
+
+process_command (24):         /* DELE */
+          call ftp_fs_commands_$delete (addr (ftp_data), argument);
+          go to check_return;
+
+process_command (25):         /* OPEN */
+          call file_transfer_$open (addr (ftp_data), argument);
+          go to check_return;
+
+process_command (26):         /* SEEK */
+          call file_transfer_$seek (addr (ftp_data), argument);
+          go to check_return;
+
+process_command (36):         /* XSEN */
+process_command (37):         /* XSEM */
+process_command (38):         /* XMAS */
+process_command (27):         /* MAIL */
+process_command (28):         /* MLFL */
+          call ftp_mail_ (addr (ftp_data), command, argument);
+          go to check_return;
+
+process_command (29):         /* NLST */
+          call ftp_server_status_$namelist (addr (ftp_data), argument);
+          go to check_return;
+
+process_command (30):         /* LIST */
+          call ftp_server_status_$list (addr (ftp_data), argument);
+          go to check_return;
+
+process_command (31):         /* RETR */
+          call file_transfer_$retrieve (addr (ftp_data), argument);
+          go to check_return;
+
+process_command (32):         /* STOR */
+          call file_transfer_$store (addr (ftp_data), argument);
+          go to check_return;
+
+process_command (33):         /* APPE */
+          call file_transfer_$append (addr (ftp_data), argument);
+          go to check_return;
+
+process_command (34):         /* READ */
+          call file_transfer_$read (addr (ftp_data), argument);
+          go to check_return;
+
+process_command (35):         /* WRIT */
+          call file_transfer_$write (addr (ftp_data), argument);
+          go to check_return;
+
+process_command(39) :   /* XDPP       */
+          call ftp_fs_commands_$XDPP (addr (ftp_data), argument);
+          go to check_return;
+
+process_command(40):       /* XDPR  */
+          call ftp_fs_commands_$XDPR (addr (ftp_data), argument);
+          go to check_return;
+
+
+
+check_return:
+          if quit_flag
+          then      if ftp_data.last_command ^= 0
+                    then      call ioa_$ioa_switch (ftp_data.iocb_ptr, "051  Processing of ^a resumed.", command_names (ftp_data.last_command));
+                    else;
+          else      do;
+                    ftp_data.last_command = 0;
+                    if ftp_data.bye_pending
+                    then      do;
+                              ftp_data.bye_pending = "0"b;
+                              call ftp_server_listen_$bye (addr (ftp_data), ftp_data.logout_hold);  /* REIN is not permitted for Telnet */
+                              ftp_data.logout_hold = "0"b;                                      /* user who invoked ftp_server          */
+                              end;
+                    end;
+          return;
+
+development_command:
+          call dev_file_transfer_ (addr (ftp_data), command_line);
+          go to check_return;
+
+get_argument:
+          procedure;
+
+          if length (command_line) = command_length
+          then      go to no_argument;
+          arg_begin = verify (substr (command_line, command_length + 2), " ") + command_length;
+          if arg_begin = command_length
+          then      go to no_argument;
+          arg_end = verify (reverse (command_line), " ");
+          arg_length = length (command_line) - arg_begin - arg_end + 1;
+          argument = substr (command_line, arg_begin + 1, arg_length);
+
+          end get_argument;
+
+no_argument:
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "502  Expected argument missing.");
+
+          end ftp_command_processor_;
+  
+
+
+
+		    ftp_fs_commands_.pl1            09/23/77  1031.6rew 09/22/77  1725.1      163008
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+delete:
+     procedure (P_IB_ptr, argument);
+
+declare  argument char (*) varying;
+
+/*  A Pogran Program 01/20/73
+
+   This module (ftp_fs_commands_) implements the File Transfer delete (DELE) and rename
+   (RNFR || RNTO) commands.  The delete command will unlink links (rather than chasing them
+   and deleting segments) and will not delete directories.  Delete acts like the Multics
+   deleteforce command (it is defined this way by the Protocol).
+
+   Last modified by Ken Pogran 02/13/73  */
+
+/* Modified July 1976 to implement the XDPP and XDPR commands which permit DPRINTing. XDPP is
+   invoked to send the DPRINT parameters while XDPR is used to actually request the printing.
+   N.Federman              */
+
+declare  delete_entry bit (1) initial ("0"b),
+         pathname char (168),
+          P_IB_ptr  ptr,
+         dirname char (168),
+         ename char (32),
+         new_name char (32),
+         reply_code char (3),
+         error_message char (100) aligned,
+         short_message char (8) aligned,
+         code fixed bin (35),
+          count fixed bin (17),
+         eql_name char (32);
+
+declare   1 ftp_data aligned like ftp_data_template defined (P_IB_ptr -> ftp_data_template);
+
+declare (error_table_$moderr,
+         error_table_$dirseg,
+         error_table_$incorrect_access,
+         error_table_$namedup,
+         error_table_$noentry,
+         error_table_$badstar) external static fixed bin (35);
+
+declare  expand_pathname_ entry (char (*), char (*), char (*), fixed bin (35)),
+         check_fs_errcode_ entry ( fixed bin (35), char (8) aligned, char (100) aligned),
+         ioa_$ioa_switch entry options (variable),
+         delete_$path entry ( char (*), char (*), bit (6), char (*), fixed bin (35)),
+          check_star_name_$entry entry (char (*), fixed bin (35)),
+         equal_ entry ( ptr, ptr, ptr, fixed bin (35)),
+         hcs_$chname_file entry ( char (*), char (*), char (*), char (*), fixed bin (35));
+
+declare (addr, hbound, index, length, substr, translate) builtin;
+
+/* added declarations */
+
+%include ftp_server_data;
+
+%include dprint_arg;
+
+
+dcl  parm_names (16) char (4) internal static options (constant) initial ("BLBL", "CARR", "COPY", "DELE", "DEST", "DTYP",
+     "FORM", "HEAD", "LLEN", "MARG", "OUTM", "PLEN", "QEUE", "RSET", "RTYP", "TLBL");
+dcl  parm char (4);
+dcl  i fixed bin;
+dcl  fixed_bin_arg fixed bin (35);
+dcl  code1 fixed bin;
+dcl  bitcnt fixed bin (24);
+dcl  longinfo char (100) aligned;
+dcl  type fixed bin (2);
+dcl  shortinfo char (8) aligned;
+dcl (del_acc, read_acc, stat_acc) bit (1) aligned ;
+dcl  ret_accname char (32) aligned;
+
+
+dcl  dprint_ entry ( char (*), char (*), ptr, fixed bin (35));
+dcl  dprint_$qfull entry (fixed bin (17), fixed bin (17), fixed bin (35), char (8));
+dcl  dprint_$access_check entry ( char (*), char (*), char (8) aligned, bit (1) aligned, bit (1) aligned, bit (1) aligned, char (*) aligned, fixed bin (35));
+dcl  cv_dec_check_ entry ( char (*), fixed bin) returns (fixed bin (35));
+dcl  convert_status_code_ entry ( fixed bin (35), char (8) aligned, char (100) aligned);
+dcl  hcs_$status_minf entry ( char (*), char (*), fixed bin (1), fixed bin (2), fixed bin (24), fixed bin (35));
+
+
+dcl (error_table_$lock_wait_time_exceeded, error_table_$notalloc) external fixed bin (35);
+
+
+dcl  upper_case char (26) internal static options (constant) initial ("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+dcl  lower_case char (26) internal static options (constant) initial ("abcdefghijklmnopqrstuvwxyz");
+
+          delete_entry = "1"b;
+
+          pathname = argument;
+          call expand_pathname_ (pathname, dirname, ename, code);
+          if code ^= 0
+          then go to bad_path;
+
+          call delete_$path (dirname, ename, "100110"b, "", code);
+          if code ^= 0
+          then goto interpret_error_code;
+
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "254  ^a>^a deleted.", dirname, ename);
+          return;
+
+rename_from:
+          entry (P_IB_ptr,  argument);
+
+          pathname = argument;
+          call expand_pathname_ (pathname, dirname, ename, code);
+          if code ^= 0
+          then go to bad_path;
+
+          ftp_data.old_dir = dirname;
+          ftp_data.old_name = ename;
+
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  Enter new name.");
+          return;
+
+rename_to:
+          entry (P_IB_ptr,  argument);
+
+          if length (argument) > 32
+          then do;
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "550  New entry name ""^a"" longer than 32 characters.", argument);
+               return;
+          end;
+
+          new_name = argument;
+
+          call check_star_name_$entry (new_name, code);
+          if code ^= 0
+          then do;
+               if code = 1 | code = 2
+               then code = error_table_$badstar;
+               go to bad_path;
+          end;
+
+          if index (new_name, "=") ^= 0
+          then do;
+               call equal_ (addr (ftp_data.old_name), addr (new_name), addr (eql_name), code);
+               if code ^= 0
+               then go to bad_path;
+               new_name = eql_name;
+          end;
+
+          call hcs_$chname_file (ftp_data.old_dir, ftp_data.old_name, ftp_data.old_name, new_name, code);
+          if code = 0
+          then do;
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "253  ^a renamed ^a in ^a.", ftp_data.old_name, new_name, ftp_data.old_dir);
+               return;
+          end;
+
+interpret_error_code:
+          if code = error_table_$moderr | code = error_table_$incorrect_access | code = error_table_$dirseg
+          then reply_code = "451";
+          else if code = error_table_$namedup
+          then reply_code = "456";
+          else if code = error_table_$noentry
+          then reply_code = "450";
+          else reply_code = "455";
+
+          call check_fs_errcode_ (code, short_message, error_message);
+
+          if delete_entry
+          then call ioa_$ioa_switch (ftp_data.iocb_ptr, "^a  ^a  ^a>^a", reply_code, error_message, dirname, ename);
+          else call ioa_$ioa_switch (ftp_data.iocb_ptr, "^a  ^a  Cannot rename ^a to ^a in ^a.", reply_code, error_message,
+               ftp_data.old_name, new_name, ftp_data.old_dir);
+
+          return;
+
+
+XDPP:     entry (P_IB_ptr,  argument);
+
+
+          if ftp_data.dptr = null () then call reset_proc;             /* make sure that data structrure is initialized */
+          dpap = ftp_data.dptr;
+          parm = substr (argument, 1, 4) ;                  /* pick up parameter name */
+          parm = translate (parm, upper_case, lower_case);
+          do i = 1 to hbound (parm_names, 1);
+               if parm = parm_names (i) then goto process_parm (i);
+          end;
+
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "500 XDPP unrecognized parameter ^a ", parm);
+          return;
+
+
+
+reset_proc: proc;
+                    if ftp_data.dptr = null ()
+                    then allocate dprint_arg set(ftp_data.dptr);
+                    dpap = ftp_data.dptr;
+               dprint_arg.version = 4;                      /* reset data structure containing the dprint parameters */
+               dprint_arg.copies = 1;
+               dprint_arg.delete = 0;
+               dprint_arg.queue = 3;
+               dprint_arg.pt_pch = 1;
+               dprint_arg.notify = 0;
+               dprint_arg.heading = "";
+               dprint_arg.output_module = 1;
+               dprint_arg.dest = "";
+               dprint_arg.carriage_control = "0"b;
+               dprint_arg.forms = "";
+               dprint_arg.lmargin = 0;
+               dprint_arg.line_lth = -1;
+               dprint_arg.class = "printer";
+               dprint_arg.page_lth = -1;
+               dprint_arg.top_label = "";
+               dprint_arg.bottom_label = "";
+               return;
+          end;
+
+
+process_parm (1):                                           /* bottom label */
+
+          dprint_arg.bottom_label = substr (argument, 6);
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPP bottom label set");
+          return;
+
+process_parm (2):                                           /* carriage control */
+
+          if (substr (argument, 6, 1) = "1") then dprint_arg.nep = "1"b;
+          if (substr (argument, 7, 1) = "1") then dprint_arg.single = "1"b;
+          if (substr (argument, 8, 1) = "1") then dprint_arg.non_edited = "1"b;
+          if (substr (argument, 9, 1) = "1") then dprint_arg.truncate = "1"b;
+          if (substr (argument, 10, 1) = "1") then dprint_arg.center_top_label = "1"b;
+          if (substr (argument, 11, 1) = "1") then dprint_arg.center_bottom_label = "1"b;
+          if (substr (argument, 12, 1) = "1") then dprint_arg.padding = "1"b;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPP  carriage control parameters set");
+          return;
+
+process_parm (3) :                                          /* copies */
+
+          fixed_bin_arg = cv_dec_check_ (substr (argument, 6), code1);
+          if code1 ^= 0 then do;
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "501 XDPP syntax error in copy parameter - invalid value ");
+               return;
+          end;
+          dprint_arg.copies = fixed_bin_arg;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPP  copies parameter set");
+          return;
+
+process_parm (4):                                           /* delete */
+
+          fixed_bin_arg = cv_dec_check_ (substr (argument, 6), code1);
+          if code1 ^= 0 then do;
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "501 XDPP syntax error in delete parameter - illegal value ");
+               return;
+          end;
+          dprint_arg.delete = fixed_bin_arg;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPP delete parameter set ");
+          return;
+
+process_parm (5):                                           /* destination */
+
+          dprint_arg.dest = substr (argument, 6);
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPP  destination parameter set");
+          return;
+
+process_parm (6):                                           /* dectype - pt_pch parameter */
+
+          fixed_bin_arg = cv_dec_check_ (substr (argument, 6), code1);
+          if code1 ^= 0 then do;
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "501 XDPP syntax error in device type parameter - illegal value ");
+               return;
+          end;
+          dprint_arg.pt_pch = fixed_bin_arg;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPP device type set");
+          return;
+
+
+process_parm (7):                                           /* form */
+
+          dprint_arg.forms = substr (argument, 6);
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPP forms parameter set");
+          return;
+
+process_parm (8):                                           /* heading */
+
+          dprint_arg.heading = substr (argument, 6);
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPP heading set");
+          return;
+
+process_parm (9):                                           /* line length */
+
+          fixed_bin_arg = cv_dec_check_ (substr (argument, 6), code1);
+          if code1 ^= 0 then do;
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "501 XDPP syntax error in line length parameter - illegal value ");
+               return;
+          end;
+          dprint_arg.line_lth = fixed_bin_arg;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPP line length set");
+          return;
+
+process_parm (10):                                          /* margin */
+
+          fixed_bin_arg = cv_dec_check_ (substr (argument, 6), code1);
+          if code1 ^= 0 then do;
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "501 XDPP syntax error in margin parameter - illegal value ");
+               return;
+          end;
+          dprint_arg.lmargin = fixed_bin_arg;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPP margin set");
+          return;
+
+process_parm (11):                                          /* output_module */
+
+          fixed_bin_arg = cv_dec_check_ (substr (argument, 6), code1);
+          if code1 ^= 0 then do;
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "501 XDPP syntax error in output module parameter - illegal value");
+               return;
+          end;
+          dprint_arg.output_module = fixed_bin_arg;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPP output module parameter set");
+          return;
+
+process_parm (12):                                          /* page_length */
+
+          fixed_bin_arg = cv_dec_check_ (substr (argument, 6), code1);
+          if code1 ^= 0 then do;
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "501 XDPP syntax error in page length parameter - illegal value ");
+               return;
+          end;
+          dprint_arg.page_lth = fixed_bin_arg;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPP page length set");
+          return;
+
+process_parm (13):                                          /* queue */
+
+          fixed_bin_arg = cv_dec_check_ (substr (argument, 6), code1);
+          if code1 ^= 0 then do;
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "501 XDPP syntax error in queue parameter - illegal value ");
+               return;
+          end;
+          dprint_arg.queue = fixed_bin_arg;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPP queue parameter set");
+          return;
+
+process_parm (14):                                          /* reset */
+
+          call reset_proc;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPP reset complete");
+          return;
+
+
+process_parm (15):                                          /* request type */
+
+          dprint_arg.class = substr (argument, 6);
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 request type set ");
+          return;
+
+process_parm (16):                                          /* top_label */
+
+          dprint_arg.top_label = substr (argument, 6);
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPP top label parameter set");
+          return;
+
+
+
+
+XDPR:     entry (P_IB_ptr,  argument);                                       /* where the argument is the pathname of the file to be printed */
+
+
+          if ftp_data.dptr = null () then call reset_proc;             /* make sure data structure is initialized */
+          dpap = ftp_data.dptr;
+          pathname = argument;
+          call expand_pathname_ (pathname, dirname, ename, code);
+          if code ^= 0 then do;
+               call convert_status_code_ (code, shortinfo, longinfo);
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "450 XDPR  ^a ", longinfo);
+               return;
+          end;
+          call hcs_$status_minf (dirname, ename, 1, type, bitcnt, code); /* see if file exists */
+          if code ^= 0 then do;
+               if code = error_table_$noentry then do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "450 XDPR file not found : ^a ^a ", dirname, ename);
+                    return;
+               end;
+               call convert_status_code_ (code, shortinfo, longinfo);
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "450 XDPR ^a ", longinfo);
+               return;
+          end;
+
+          call dprint_$access_check (dirname, ename, dprint_arg.class, del_acc, read_acc, stat_acc, ret_accname, code);
+                                                            /* check if we have access to the file */
+          if code ^= 0 then do;
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "451 XDPR unable to check access to file ");
+               return;
+          end;
+          if ^read_acc then do;
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "451 XDPR no read access to file ");
+               return;
+          end;
+          if ^stat_acc then do;
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "451 XDPR no status access to file ");
+               return;
+          end;
+
+/* ok, all is well so attempt the grand finale  */
+
+          call dprint_ (dirname, ename, dpap, code);
+
+          if code ^= 0 then do;
+               if code = error_table_$lock_wait_time_exceeded then do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "451 XDPR timeout while waiting on queue ");
+                    return;
+               end;
+               if code = error_table_$noentry then do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "503 XDPR request type probably doesn't exist ");
+                    return;
+               end;
+               if code = error_table_$notalloc then do;
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "451 XDPR request queue is full ");
+                    return;
+               end;
+               call convert_status_code_ (code, shortinfo, longinfo);
+               call ioa_$ioa_switch (ftp_data.iocb_ptr, "451 XDPR  ^a ", longinfo);
+               return;
+          end;
+
+
+          call dprint_$qfull (dpap -> dprint_arg.queue, count, code, (dpap -> dprint_arg.class));
+          count = max (0, count - 1);
+          if code ^= 0
+          then call ioa_$ioa_switch (ftp_data.iocb_ptr, "200 XDPR dprint request completed.");
+          else do;
+               if count = 1
+               then call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  There is 1 previous request.");
+               else call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  There are ^d previous requests.", count);
+               end;
+
+          return;
+
+
+
+
+
+bad_path:
+          call check_fs_errcode_ (code, short_message, error_message);
+
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "550  ^a ^a", error_message, pathname);
+
+     end delete;
+
+
+
+
+		    ftp_initialization_.pl1         09/23/77  1031.6rew 09/22/77  1725.3       61101
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+socket_init:
+          procedure (P_IB_ptr,error_code);
+
+declare   error_code          fixed bin (35);
+
+/*  A Pogran Program 02/20/73
+
+    This module performs the initialization of the local
+    data sockets and event channel for file transfer, and determines
+    the "default foreign socket" if necessary.  It also deactivates these sockets and deletes
+    the event channel when the user leaves the FTP server environment.
+    The "command_init" entry point is provided to re-initialize FTP parameters
+    when the FTP server environment is re-entered from command level.
+
+    Last modified by K. T. Pogran 3/4/75
+    Last modified by D. M. Wells to not deactivate sockets for normal user, to
+          use sockets S+2 and S+3, and to get rid of 455 reply codes.  */
+
+declare   code                fixed bin (35),
+          P_IB_ptr            ptr,
+          net_user_id         fixed bin (24),
+          local_pin           fixed bin (8),
+          foreign_read_socket bit (41);
+
+declare   1 ftp_data aligned like ftp_data_template defined (P_IB_ptr -> ftp_data_template);
+
+     declare
+          1 socket_info_struc (0 : 1) aligned automatic,
+             2 socket_state fixed binary (12),
+             2 local_socket fixed binary (32),
+             2 foreign_host fixed binary (16),
+             2 foreign_socket fixed binary (32);
+
+
+declare   hcs_$assign_channel           entry (fixed bin (71), fixed bin (35)),
+          ipc_$create_ev_chn            entry (fixed bin (71), fixed bin (35)),
+          ipc_$delete_ev_chn            entry (fixed bin (71), fixed bin (35)),
+          iox_$control                  entry (ptr, char (*), ptr, fixed bin (35)),
+          freen_                        entry (ptr),
+          ncp_$accept_passoff           entry (fixed bin (24), fixed bin, fixed bin (71), bit (36), fixed bin (35)),
+          ncp_$get_userid               entry (fixed bin (24), fixed bin (35)),
+          convert_binary_integer_$decimal_string
+                                        entry (fixed bin) returns (char (12) varying),
+          ioa_$ioa_switch                         entry options (variable),
+          host_id_$symbol               entry (fixed bin (16), char (*), fixed bin (35)),
+          ncp_$detach_socket            entry (bit (36), fixed bin (35));
+
+%include  ftp_server_data;
+
+declare   (addr, binary, divide, mod, null, substr) builtin;
+
+          call hcs_$assign_channel (ftp_data.event_channel, code);
+          if code ^= 0
+          then      do;                 /* Can't get fast channel.  */
+                    call ipc_$create_ev_chn (ftp_data.event_channel, code);
+                    if code ^= 0
+                    then      go to error_return;
+                    end;
+
+          call iox_$control (ftp_data.iocb_ptr, "get_socket_states", addr (socket_info_struc), code);
+          if code ^= 0
+          then      go to error_return;
+
+          net_user_id = divide (socket_info_struc (0).local_socket, 256, 24, 0);
+          local_pin = mod (socket_info_struc (0).local_socket, 256);
+
+          call ncp_$accept_passoff (net_user_id, local_pin + 2, ftp_data.event_channel, ftp_data.read_index, code);
+          if code ^= 0
+          then      go to error_return;
+
+          call ncp_$accept_passoff (net_user_id, local_pin + 3, ftp_data.event_channel, ftp_data.write_index, code);
+          if code ^= 0
+          then      go to error_return;
+
+          ftp_data.local_read_socket = socket_info_struc (0).local_socket + 2;
+          ftp_data.local_write_socket = socket_info_struc (0).local_socket + 3;
+
+          ftp_data.foreign_host = socket_info_struc (0).foreign_host;
+
+          ftp_data.foreign_read_socket = socket_info_struc (1).foreign_socket + 2;
+          ftp_data.foreign_write_socket = socket_info_struc (0).foreign_socket + 2;
+
+          call host_id_$symbol (ftp_data.foreign_host, ftp_data.foreign_host_name, code);
+          if code ^= 0
+          then do;
+               ftp_data.foreign_host_name = "host " || convert_binary_integer_$decimal_string ((ftp_data.foreign_host));
+               code = 0;           /*  We must do this or we'll return an error code to caller unwittingly! */
+               end;
+
+error_return:
+          error_code = code;
+
+          return;
+
+init_ftp_data:
+          entry (P_IB_ptr);
+
+          ftp_data.iocb_ptr = null ();
+          ftp_data.dptr = null ();
+          ftp_data.quit_flag = "0"b;
+          ftp_data.quit_condition = "quit";
+
+          ftp_data.event_channel = 0;
+          ftp_data.read_index = ""b;
+          ftp_data.write_index = ""b;
+          ftp_data.foreign_host = -1;
+          ftp_data.foreign_read_socket = -1;
+          ftp_data.foreign_write_socket = -1;
+          ftp_data.local_read_socket = -1;
+          ftp_data.local_write_socket = -1;
+          ftp_data.foreign_host_name = "";
+
+          ftp_data.byte_size = 8;
+          ftp_data.representation_type = 1;
+          ftp_data.transfer_mode = 1;
+
+          ftp_data.fap_file_is_open = "0"b;
+
+          ftp_data.segptra = null ();
+          ftp_data.segptrb = null ();
+          ftp_data.text_ptr = null ();
+
+          ftp_data.old_dir = "";
+          ftp_data.old_name = "";
+
+          ftp_data.bye_pending = "0"b;
+          ftp_data.logout_hold = "0"b;
+          ftp_data.last_command = 0;
+          ftp_data.rename_in_progress = "0"b;
+
+          return;
+
+
+cleanup:
+          entry (P_IB_ptr, server_process);
+
+declare   server_process      bit (1);
+
+/*    This entry is called by ftp_server_listen_$bye to deactivate data sockets
+      and delete the data socket event channel.  */
+
+          if server_process
+          then      return;             /* That's all we need to do; he's about to lose his process */
+
+          if ftp_data.read_index ^= ""b
+          then do;
+               call ncp_$detach_socket (ftp_data.read_index, (0));
+               call ncp_$detach_socket (ftp_data.write_index, (0));
+               end;
+
+          if ftp_data.event_channel ^= 0
+          then      do;
+                    call ipc_$delete_ev_chn (ftp_data.event_channel, code);
+                    ftp_data.event_channel = 0;
+                    end;
+
+          if ftp_data.dptr ^= null ()
+          then do;
+               call freen_ (ftp_data.dptr);
+               ftp_data.dptr = null ();
+               end;
+
+          end;
+   
+
+
+
+		    ftp_mail_.pl1                   07/17/81  1758.1rew 07/17/81  1540.2      100269
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+/* format: style4,delnl,insnl,tree,ifthenstmt,indnoniterend */
+ftp_mail_:
+     procedure (P_IB_ptr, Which, Argument);
+
+declare  Which char (*),
+         P_IB_ptr ptr,
+         Argument char (*) varying;
+
+declare  1 ftp_data aligned like ftp_data_template defined (P_IB_ptr -> ftp_data_template);
+
+/*  A Pogran Program 02/22/73
+
+   This module implements the network mail commands of the File Transfer Protocol.
+   It performs virtually the same actions as the standard system "mail"
+   command, but speaks to the user in FTP syntax.  Also, if it can be
+   determined, the full name of the network host the user is at is included
+   in the message header.
+
+   Rewritten July 1979 by C. Hornig.
+*/
+
+declare  1 tty_info aligned like terminal_info,
+         code fixed bin (35),
+         line char (128),
+         nelemt fixed bin (21),
+         i fixed bin (21),
+         host fixed bin (16),
+         host_name char (32),
+         anonymous bit (1) aligned,
+         tsegp ptr,
+         old_modes char (512),
+         long_rec bit (1) aligned,
+         type char (4) aligned;
+
+dcl  1 saved_mail aligned based (ftp_data.mail_info.segptrb),
+       2 type char (4),
+       2 mf aligned like mail_format;
+
+declare  (cleanup, record_quota_overflow) condition;
+
+declare  error_table_$long_record fixed bin (35) external;
+declare  error_table_$rqover fixed bin (35) external;
+
+declare  ioa_$ioa_switch entry options (variable),
+         canonicalize_ entry (ptr, fixed bin (21), ptr, fixed bin (21), fixed bin (35)),
+         convert_status_code_ entry (fixed bin (35), char (8) aligned, char (100) aligned),
+         iox_$get_line entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35)),
+         iox_$control entry (ptr, char (*), ptr, fixed bin (35)),
+         iox_$modes entry (ptr, char (*), char (*), fixed bin (35)),
+         file_transfer_$mail_transfer entry (ptr, ptr, fixed bin (21), fixed bin (35)),
+         host_id_$number entry (fixed bin (16), char (*), fixed bin (35)),
+         host_id_$symbol entry (fixed bin (16), char (*), fixed bin (35)),
+         net_log_ entry options (variable),
+         net_log_$net_error_log entry options (variable),
+         get_temp_segment_ entry (char (*), ptr, fixed (35)),
+         release_temp_segment_ entry (char (*), ptr, fixed (35)),
+         ftp_mail_mailer_ entry (varying char (*), pointer, fixed (35)),
+         ftp_mail_mailer_$validate entry (varying char (*), pointer, fixed (35));
+
+declare  (addr, hbound, index, length, null, substr) builtin;
+
+/* * * * * * * * * * * * * FTP_MAIL_ * * * * * * * * * */
+
+	anonymous = "0"b;
+	goto common;
+
+anonymous_mail:
+     entry (P_IB_ptr, Which, Argument);
+
+	anonymous = "1"b;
+
+common:
+	type = Which;
+	old_modes = "";
+	host_name = "Network";
+	tty_info.version = terminal_info_version;
+	call iox_$control (ftp_data.iocb_ptr, "terminal_info", addr (tty_info), code);
+	if (code = 0) & (tty_info.line_type = LINE_TELNET) then do;
+	     host_name = tty_info.id;
+	     call host_id_$number (host, tty_info.id, code);
+	     if code = 0 then do;
+		call host_id_$symbol (host, host_name, code);
+		if code ^= 0 then host_name = tty_info.id;
+		end;
+	     end;
+	if anonymous then call net_log_ (0, "ftp_mail_: From ^a: ^a ^a", host_name, Which, Argument);
+
+	tsegp = null ();
+
+	if /* case */ type = "XRSQ" then do;
+	     if /* case */ Argument = "?" then do;
+		ftp_data.mail_info.n_users = 0;
+		if (ftp_data.mail_info.i = 2) & (ftp_data.mail_info.segptrb ^= null ()) then do;
+		     call release_temp_segment_ ("ftp_mail_", ftp_data.mail_info.segptrb, code);
+		     ftp_data.mail_info.segptrb = null ();
+		     end;
+		call ioa_$ioa_switch (ftp_data.iocb_ptr, "215 T Please send the text first.");
+		end;
+	     else do;
+		call reset_xrsq;
+		ftp_data.mail_info.i = 0;
+		if /* case */ (Argument = "R") | (Argument = "r") then do;
+		     ftp_data.mail_info.i = 1;
+		     call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  OK, recipients first.");
+		     end;
+		else if (Argument = "T") | (Argument = "t") then do;
+		     ftp_data.mail_info.i = 2;
+		     call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  OK, text first.");
+		     end;
+		else if Argument = "" then call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  I hack XRSQ.");
+		else call error (501, 0, "XRSQ scheme not implemented");
+		end;
+	     return;
+	     end;
+
+	else if type = "XRCP" then do;
+	     if /* case */ ftp_data.mail_info.i = 2 then do;
+		if ftp_data.mail_info.segptrb = null () then call error (507, 0, "No mail to send yet");
+		mail_format_ptr = addr (saved_mail.mf);
+		call mail_it (saved_mail.type, Argument, code);
+		call reply (saved_mail.type, code);
+		end;
+
+	     else if ftp_data.mail_info.i = 1 then do;
+		call ftp_mail_mailer_$validate (Argument, null (), code);
+		if code ^= 0 then call error (450, code, "Validating address");
+		if ftp_data.mail_info.n_users >= hbound (ftp_data.mail_info.addressee, 1)
+		then call error (440, 0, "Too many names.");
+		ftp_data.mail_info.n_users = ftp_data.mail_info.n_users + 1;
+		ftp_data.mail_info.addressee (ftp_data.mail_info.n_users).user_name = Argument;
+		call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  Address accepted.");
+		end;
+
+	     else call error (501, 0, "Must use XRSQ first.");
+
+	     return;
+	     end;
+
+	on cleanup
+	     begin;
+		if anonymous then call net_log_ (0, "ftp_mail_: Mail attempt aborted.");
+		if tsegp ^= null () then call release_temp_segment_ ("ftp_mail_", tsegp, (0));
+	     end;
+	call get_temp_segment_ ("ftp_mail_", tsegp, code);
+	if tsegp = null () then call error (455, code, "Unable to create workspace.");
+	mail_format_ptr = addr (tsegp -> saved_mail.mf);
+
+	mail_format.version = mail_format_version_3;
+	mail_format.sent_from = host_name;
+
+	if Argument ^= "" then do;
+	     call reset_xrsq;
+	     if type = "XSEN" then mail_format.wakeup = "1"b;
+	     call ftp_mail_mailer_$validate (Argument, mail_format_ptr, code);
+	     if code ^= 0 then call error (450, code, "Validating destination.");
+	     end;
+
+	if type ^= "MLFL" then do;
+	     call ioa_$ioa_switch (ftp_data.iocb_ptr, "350  Input");
+	     call iox_$modes (ftp_data.iocb_ptr, "rawi", old_modes, code);
+	     long_rec = "0"b;
+	     do while ("1"b);
+		call iox_$get_line (ftp_data.iocb_ptr, addr (line), length (line), nelemt, code);
+		if (code = 0) & ^long_rec & (nelemt = 3) & (substr (line, 1, 3) = ".
+") then go to have_input;
+		if /* case */ code = 0 then long_rec = "0"b;
+		else if code = error_table_$long_record then long_rec = "1"b;
+		else call error (0, code, "Reading from command stream.");
+
+		substr (mail_format.text, mail_format.text_len + 1, nelemt) = substr (line, 1, nelemt);
+		mail_format.text_len = mail_format.text_len + nelemt;
+	     end;
+have_input:
+	     call iox_$modes (ftp_data.iocb_ptr, old_modes, (""), code);
+	     end;
+	else do;
+	     call file_transfer_$mail_transfer (addr (ftp_data), addr (mail_format.text), mail_format.text_len, code);
+	     if code ^= 0 then call error (0, code, "Unable to receive mail.");
+	     end;
+
+	call canonicalize_ (addr (mail_format.text), mail_format.text_len, addr (mail_format.text),
+	     mail_format.text_len, code);
+	if code ^= 0 then call error (0, code, "Error canonicalizing mail text.");
+
+	i = 1;
+	mail_format.lines = -1;
+	do nelemt = 1 repeat (nelemt + i) while ((i > 0) & (nelemt <= mail_format.text_len + 1));
+	     mail_format.lines = mail_format.lines + 1;
+	     i = index (substr (mail_format.text, nelemt), "
+");
+	end;
+
+	if /* case */ Argument ^= "" then do;
+	     call mail_it (type, Argument, code);
+	     call reply (type, code);
+	     end;
+
+	else if ftp_data.mail_info.i = 2 then do;
+	     if ftp_data.mail_info.segptrb ^= null ()
+	     then call release_temp_segment_ ("ftp_mail_", ftp_data.mail_info.segptrb, code);
+	     ftp_data.mail_info.segptrb = tsegp;
+	     tsegp = null ();
+	     saved_mail.type = type;
+	     call ioa_$ioa_switch (ftp_data.iocb_ptr, "256  Mail stored.");
+	     return;
+	     end;
+
+	else if (ftp_data.mail_info.n_users <= 0) | (ftp_data.mail_info.i ^= 1)
+	then call error (450, 0, "No recipients given.");
+
+	else do;
+	     do i = 1 to ftp_data.mail_info.n_users;
+		call mail_it (type, ftp_data.mail_info.addressee (i).user_name, code);
+	     end;
+	     call reply (type, 0);
+	     ftp_data.mail_info.n_users = 0;
+	     end;
+
+
+close_all_boxes:
+	if tsegp ^= null () then call release_temp_segment_ ("ftp_mail_", tsegp, code);
+	return;
+
+/* * * * * * * * * * ABORT * * * * * * *  * */
+
+abort:
+     entry (P_IB_ptr);
+	call reset_xrsq;
+	return;
+
+/* * * * * * * * * * MAIL_IT * * * * * * * * * */
+
+mail_it:
+     procedure (Which, Argument, Code);
+dcl  Which char (4) aligned parameter;
+dcl  Argument varying char (*);
+dcl  Code fixed bin (35) parameter;
+
+	on record_quota_overflow goto rqo_error;
+
+	if (Which = "XSEN") | (Which = "XSEM") | (Which = "XMAS") then do;
+	     mail_format.wakeup = "1"b;
+	     call ftp_mail_mailer_ (Argument, mail_format_ptr, Code);
+	     if ((Which = "XSEM") & (code = 0)) | (Which = "XSEN") then return;
+	     end;
+
+	mail_format.wakeup = "0"b;
+	call ftp_mail_mailer_ (Argument, mail_format_ptr, Code);
+	return;
+
+rqo_error:
+	Code = error_table_$rqover;
+     end mail_it;
+
+/* * * * * * * * * * REPLY * * * * * * * * * */
+
+reply:
+     procedure (Which, Code);
+dcl  Which char (4) aligned parameter;
+dcl  Code fixed bin (35) parameter;
+
+	if Code ^= 0
+	then call error (450, Code, "Sending mail");
+	else if Which = "MLFL"
+	     then call ioa_$ioa_switch (ftp_data.iocb_ptr, "252  Mail transfer complete.");
+	     else call ioa_$ioa_switch (ftp_data.iocb_ptr, "256  Mail complete.");
+     end reply;
+
+/* * * * * * * * * RESET_XRSQ * * * * * * * * * */
+
+reset_xrsq:
+     procedure;
+	if ftp_data.mail_info.i = 2
+	then if ftp_data.mail_info.segptrb ^= null ()
+	     then call release_temp_segment_ ("ftp_mail_", ftp_data.mail_info.segptrb, code);
+	ftp_data.mail_info.n_users = 0;
+	ftp_data.mail_info.segptrb = null ();
+     end reset_xrsq;
+
+/* * * * * * * * * * ERROR * * * * * * * * * */
+
+error:
+     procedure (Reply, Code, Message);
+dcl  Reply fixed bin parameter;
+dcl  Code fixed bin (35) parameter;
+dcl  Message char (*) parameter;
+dcl  code_message char (100) aligned;
+
+	if anonymous
+	then call net_log_$net_error_log (0, Code, "ftp_mail_", "^a From ^a to ^a.", Message, host_name, Argument);
+	if Reply > 0 then do;
+	     if Code = 0
+	     then code_message = "";
+	     else call convert_status_code_ (Code, (""), code_message);
+	     call ioa_$ioa_switch (ftp_data.iocb_ptr, "^d  ^a ^a", Reply, code_message, Message);
+	     end;
+	goto close_all_boxes;
+     end error;
+
+/* * * * * * * * * * * * * * * * * * * */
+
+%include ftp_server_data;
+%include mail_format;
+%include line_types;
+%include terminal_info;
+
+     end ftp_mail_;					/* ftp_mail_ */
+   
+
+
+
+		    ftp_mail_info_.alm              09/23/77  1031.6rew 09/22/77  1725.3        9684
+
+
+
+"  ******************************************************
+"  *                                                    *
+"  *                                                    *
+"  * Copyright (c) 1972 by Massachusetts Institute of   *
+"  * Technology and Honeywell Information Systems, Inc. *
+"  *                                                    *
+"  *                                                    *
+"  ******************************************************
+
+"  A Pogran Program, 12/9/76
+"
+"  This module contains constants for use by the ftp_mail_ program,
+"  Specifying the locations of the "Mailbox link directory", the
+"  Network Server's home directory, and the Network Server's access name.
+"
+"  This module must be changed and reassembled whenever any of these
+"  items changes.
+
+
+	name	ftp_mail_info_
+
+	segdef	mailbox_link_directory
+	segdef	mailer_directory
+	segdef	mailer_process_group_id
+
+mailbox_link_directory:
+	aci	">udd>CNet>mailboxes",168
+
+mailer_directory:
+	aci	">udd>CNet>Network_Server",168
+
+mailer_process_group_id:
+	aci	"Network_Server.*.*",32
+
+	end
+
+
+
+
+		    ftp_read_ascii_.pl1             09/23/77  1031.6rew 09/22/77  1725.6       68571
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+ftp_read_ascii_: proc (file_ptr, file_offset, sock_index, wait_chn, amount_read,
+          transfer_mode, code);
+
+dcl  sock_state fixed bin (6);
+dcl (transfer_mode, header_code) fixed bin,
+    (file_offset, amount_read, amount_converted, this_length, bytes_read, file_pos, this_block_count,
+     area_remaining) fixed bin (24),
+     code fixed bin (35),
+     sock_index bit (36),
+     wait_chn fixed binary (71),
+     current_pos fixed bin (24) initial (0),
+     end_of_mess fixed bin (24) initial (0);
+
+dcl (bits_read, bits_to_read) fixed bin (24);
+
+dcl (end_of_file_flag, data_not_marker) bit (1) aligned,
+     eof_reached bit (1) aligned initial ("0"b),
+          cr_flag             bit(1) initial("0"b),
+     heading_decoded bit (1) aligned initial ("0"b);
+
+dcl file_ptr ptr;
+
+dcl (addr, divide, length, substr, unspec) builtin;
+
+dcl  1 wait_list aligned automatic,
+        2 count fixed binary (17) initial (1),
+        2 channel fixed binary (71) initial (wait_chn);
+
+dcl  not_used (4) fixed bin (71),
+     big_buffer bit (14400) aligned;
+
+dcl (error_table_$net_invalid_state, error_table_$net_socket_closed, error_table_$area_too_small) external fixed bin (35);
+
+dcl  ncp_$read_data entry (bit (36), ptr, fixed bin (24), fixed bin (24), fixed bin (6), fixed bin (35)),
+     ipc_$block entry (ptr, ptr, fixed bin (35)),
+     net_ascii_to_nine_ entry (bit(1), ptr, fixed bin (24), fixed bin (24), ptr, fixed bin (24), fixed bin (24));
+
+          bits_to_read = 9437184 - file_offset;
+          go to join;
+
+read_with_count:
+          entry (file_ptr, file_offset, amount_to_read, sock_index, wait_chn, amount_read,
+                    transfer_mode, code);
+
+dcl amount_to_read fixed bin (24);
+
+          bits_to_read = amount_to_read;
+
+join:     amount_read, bits_read, code = 0;
+          file_pos = file_offset;
+
+read_it:  area_remaining = divide (length (big_buffer) - end_of_mess, 8, 24, 0);
+          call ncp_$read_data (sock_index, addr (substr (big_buffer, end_of_mess + 1, 1)),
+          area_remaining, bytes_read, sock_state, code);
+          if code ^= 0
+          then if code ^= error_table_$area_too_small | bytes_read = 0
+          then do;
+               if code = error_table_$net_invalid_state |
+               code = error_table_$net_socket_closed then if sock_state = 1 then code = 0;
+               return;
+          end;
+          if bytes_read = 0 then do;
+               call ipc_$block (addr (wait_list), addr (not_used (1)), code);
+               if code ^= 0 then return;
+               goto read_it;
+          end;
+          end_of_mess = end_of_mess + 8 * bytes_read;
+          goto decode_type (transfer_mode);
+
+decode_type (2):                                            /* DECODE TEXT TRANSFER MODE */
+          if substr (big_buffer, end_of_mess - 7, 8) = "11000001"b /* CHECK FOR EOF */
+          then do;
+               eof_reached = "1"b;
+               end_of_mess = end_of_mess - 8;
+               if end_of_mess = 0 then return;
+          end;
+
+decode_type (1):                                            /* DECODE STREAM TRANSFER MODE */
+          call net_ascii_to_nine_ (cr_flag, addr (big_buffer), 0, end_of_mess,
+               file_ptr, file_pos, amount_converted);
+          bits_read = bits_read + end_of_mess;
+          amount_read = amount_read + amount_converted;
+          file_pos = file_pos + amount_converted;
+          if eof_reached | bits_read >= bits_to_read then return;
+          end_of_mess = 0;
+          goto read_it;
+
+decode_type (3):                                            /* DECODE BLOCK TRANSFER MODE */
+          if heading_decoded then goto pull_data;
+          this_length = end_of_mess - current_pos;
+          if this_length < 24 then do;                      /* HAVENT GOT THE WHOLE HEADER YET */
+               if current_pos ^= 0 then do;
+                    substr (big_buffer, 1, 24) = substr (big_buffer, current_pos + 1, 24);
+                    current_pos = 0;
+                    end_of_mess = this_length;
+               end;
+               goto read_it;
+          end;
+          else do;                                          /* DECODE THIS HEADER */
+               unspec (header_code) = "0000000000000000000000000000"b || substr (big_buffer, current_pos + 1, 8);
+               goto handle_header (header_code);
+          end;
+
+handle_header (0):                                          /* ORDINARY DATA */
+handle_header (3):                                          /* SUSPECTED BUGGY DATA */
+          end_of_file_flag = "0"b;
+          data_not_marker = "1"b;
+          goto get_count;
+
+handle_header (4):                                          /* RESTART MARKER */
+                                                            /* These are currently discarded, but may be used in the future */
+          end_of_file_flag = "0"b;
+          data_not_marker = "0"b;
+get_count:                                                  /* get the count field from the header */
+          unspec (this_block_count) = "00000000000000000000"b ||
+          substr (big_buffer, current_pos + 9, 16);
+          this_block_count = this_block_count * 8;
+          current_pos = current_pos + 24;
+          heading_decoded = "1"b;
+          goto pull_data;
+
+handle_header (1):                                          /* END OF RECORD */
+                                                            /* SHOULD NEVER GET THIS, IF WE DO ERROR */
+          code = 1;
+          return;
+
+handle_header (2):                                          /* END OF FILE */
+          data_not_marker = "1"b;
+          end_of_file_flag = "1"b;
+          goto get_count;
+
+pull_data: this_length = end_of_mess - current_pos;
+          if this_length >= this_block_count then do;
+               if this_length = 0 then if end_of_file_flag then return;
+               if data_not_marker then do;
+                    call net_ascii_to_nine_ (cr_flag, addr (big_buffer), current_pos, this_block_count,
+                         file_ptr, file_pos, amount_converted);
+                    bits_read = bits_read + this_block_count;
+                    amount_read = amount_read + amount_converted;
+                    file_pos = file_pos + amount_converted;
+               end;
+               if end_of_file_flag | bits_read >= bits_to_read then return;
+               heading_decoded = "0"b;
+               current_pos = current_pos + this_block_count;
+               if current_pos = end_of_mess then do;
+                    current_pos, end_of_mess = 0;
+                    goto read_it;
+               end;
+               goto decode_type (3);
+          end;
+          else do;
+               if data_not_marker then do;
+                    call net_ascii_to_nine_ (cr_flag, addr (big_buffer), current_pos, this_length,
+                    file_ptr, file_pos, amount_converted);
+                    amount_read = amount_read + amount_converted;
+                    file_pos = file_pos + amount_converted;
+               end;
+               current_pos, end_of_mess = 0;
+               this_block_count = this_block_count - this_length;
+               goto read_it;
+          end;
+     end;
+ 
+
+
+
+		    ftp_read_image_.pl1             09/23/77  1031.6rew 09/22/77  1725.3       50769
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+ftp_read_image_: proc (file_ptr, file_offset, sock_index,
+	wait_chn, amount_read, transfer_mode, bytesize, code);
+
+dcl  (file_offset, amount_read) fixed bin (24),
+     transfer_mode fixed bin,
+     bytesize fixed bin (8),
+      code fixed bin (35),
+      sock_index bit (36);
+dcl  wait_chn fixed binary (71);
+dcl  (read_pos, bytes_read, bits_read, bits_to_read, current_pos, last_pos_used) fixed bin (24),
+     sock_state fixed bin (6),
+     (header_code, this_block_count, blocklet, pad) fixed bin;
+
+dcl  file_ptr ptr,
+    (end_of_file_flag, data_not_marker) bit (1) aligned,
+    (addr, mod, max, min, substr, unspec, divide) builtin;
+
+dcl  1 wait_list aligned automatic,
+        2 count fixed binary (17) initial (1),
+        2 channel fixed binary (71) initial (wait_chn);
+
+dcl  not_used (4) fixed bin (71),
+     long_string bit (1000) aligned based,
+    (error_table_$net_invalid_state, error_table_$net_socket_closed) external fixed bin (35),
+     ipc_$block entry (ptr, ptr, fixed bin (35)),
+     ncp_$read_data entry (bit (36), ptr, fixed bin (24), fixed bin (24), fixed bin (6), fixed bin (35));
+
+read:	proc;
+read_it:	     
+	     call ncp_$read_data (sock_index, addr (substr (file_ptr -> long_string, read_pos + 1, 1)),
+	     	divide (bits_to_read - amount_read, bytesize, 24, 0), bytes_read, sock_state, code);
+	     bits_read = bytes_read * bytesize;
+	     amount_read = amount_read + bits_read;
+	     read_pos = read_pos + bits_read;
+	     if amount_read >= bits_to_read
+	     then return;
+	     if code ^= 0 then do;
+		if code = error_table_$net_invalid_state |
+		code = error_table_$net_socket_closed then code = 0; /* check for his close */
+		goto ext_return;
+	     end;
+	     if bytes_read = 0 then do;
+		call ipc_$block (addr (wait_list), addr (not_used (1)), code);
+		if code ^= 0 then goto ext_return;
+		goto read_it;
+	     end;
+	end;
+
+	bits_to_read = 9437184 - file_offset;
+	go to join;
+
+read_with_count:
+	entry (file_ptr, file_offset, amount_to_read, sock_index, wait_chn, amount_read,
+		transfer_mode, bytesize, code);
+
+dcl  amount_to_read fixed bin (35);
+
+	bits_to_read = amount_to_read;
+
+join:	amount_read = 0;
+	current_pos = file_offset;
+	goto input_data (transfer_mode);
+
+ext_return: return;					/* used by internal routine read */
+
+input_data (1):					/* stream transfer */
+	read_pos = current_pos;
+in1:	call read;
+	go to in1;
+
+input_data (2):					/* text transfer, bytesize must be 8 */
+	read_pos = current_pos;
+in2:	call read;
+	if substr (file_ptr -> long_string, read_pos - 7, 8) = "11000001"b /* eof */ then do;
+	     substr (file_ptr -> long_string, read_pos - 7, 8) = "00000000"b;
+	     amount_read = amount_read - 8;
+	     return;
+	end;
+	goto in2;
+
+input_data (3):					/* block transfer */
+	pad = bytesize - (mod (23, bytesize) + 1);	/* to do stupid right adjusting */
+	read_pos = current_pos;
+	last_pos_used = current_pos;
+in3:	call read;
+	last_pos_used = max (read_pos, last_pos_used);
+in3a:	if read_pos - current_pos < 24 then goto in3	/* havent got whole header yet */;
+	unspec (header_code) = "0000000000000000000000000000"b ||
+	substr (file_ptr -> long_string, current_pos + pad + 1, 8);
+	goto handle_header (header_code);
+
+handle_header (0):					/* ordinary data */
+handle_header (3):					/* suspected buggy data */
+	end_of_file_flag = "0"b;
+	data_not_marker = "1"b;
+	goto get_count;
+
+handle_header (4):					/* restart marker */
+	data_not_marker = "0"b;
+	end_of_file_flag = "0"b;
+	goto get_count;
+
+handle_header (2):					/* end of file */
+	data_not_marker = "1"b;
+	end_of_file_flag = "1"b;
+	goto get_count;
+
+handle_header (1):					/* end of record */
+	code = 1;					/* should never get this */
+	return;					/* if we do error */
+
+get_count: unspec (this_block_count) = "00000000000000000000"b ||
+	substr (file_ptr -> long_string, current_pos + pad + 9, 16);
+	this_block_count = this_block_count * bytesize;
+	current_pos = current_pos + 24 + pad;
+	bits_read = bits_read - 24 - pad;
+
+/* following code to shuffle data around in the segment */
+shuffle_data: blocklet = min (bits_read, this_block_count);
+	this_block_count = this_block_count - blocklet;
+	if data_not_marker then do;
+	     if blocklet ^= 0 then if file_offset + amount_read < current_pos then
+	     substr (file_ptr -> long_string, file_offset + amount_read + 1, blocklet) =
+	     substr (file_ptr -> long_string, current_pos + 1, blocklet);
+	     amount_read = amount_read + blocklet;
+	end;
+	current_pos = current_pos + blocklet;
+
+	if this_block_count ^= 0 then do;		/* this block not yet complete */
+	     current_pos, read_pos = file_offset + amount_read;
+	     call read;
+	     last_pos_used = max (read_pos, last_pos_used);
+	     goto shuffle_data;
+	end;
+	else do;					/* ready to do next block */
+	     if ^ end_of_file_flag then do;
+		if current_pos < read_pos then goto in3a;
+		current_pos, read_pos = file_offset + amount_read;
+		goto in3;
+	     end;
+	     else do;				/* finish up the eof block */
+		last_pos_used = last_pos_used - (file_offset + amount_read);
+		if last_pos_used > 0 then
+		substr (file_ptr -> long_string, file_offset + amount_read + 1, last_pos_used) = ""b;
+						/* blank the rest of the junk in file */
+		return;
+	     end;
+	end;
+     end;
+   
+
+
+
+		    ftp_server_listen_.pl1          09/23/77  1031.6rew 09/22/77  1725.1       47439
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+ftp_server_listen_:
+          procedure (P_IB_ptr);
+
+/*  A Pogran Program 01/16/73
+
+    This module acts as the listener for a File Transfer server process.
+    It also includes the "QUIT", or "ABORT" handler.
+    It is called by ftp_server_overseer_ after the File Transfer default handler has been established.
+
+    This module also implements the ftp_server command, which transforms a user's
+    process into an ftp server process.  The standard default handler remains in effect.
+
+    The ftp_server_test command is the same as the ftp_server command, except that the
+    standard  QUIT handler remais in effect, and the user is not required to be logged in via the Network.
+
+    Last modified by Ken Pogran 02/20/73
+    Last modified by D. M. Wells in June 1976, to allow "ftpxxx" form of
+        control channel names, enable quits via the input stream.
+    Last modified by D. M. Wells to use line type to determine net channels.  */
+
+declare   P_IB_ptr  ptr;
+
+%include ftp_server_data;
+
+declare 1 ftp_data aligned like ftp_data_template;
+declare   quit_flag           bit (1),
+          command_line        char (256),
+          nelemt              fixed bin(21),
+          code                fixed bin (35);
+
+declare   1 tty_info automatic aligned,
+             2 id char (4) unaligned,
+             2 baud_rate fixed bin (17) unaligned,
+             2 line_type fixed bin (17) unaligned,
+             2 reserved bit (36) unaligned,
+             2 term_type fixed bin (17);
+
+declare   ioa_$ioa_switch                         entry options (variable),
+          com_err_                      entry options (variable),
+          condition_                    entry (char (*), entry),
+          iox_$get_line                 entry (ptr, ptr, fixed bin(21), fixed bin(21), fixed bin(35)),
+          iox_$control                  entry (ptr, char (*), ptr, fixed bin (35)),
+          ftp_command_processor_        entry (ptr, char (*), bit (1)),
+          ftp_initialization_$cleanup   entry (ptr, bit (1)),
+          ftp_server_overseer_$ftp_logout entry (ptr, bit (1));
+
+declare iox_$user_io external pointer;
+declare   error_table_$badcall external fixed bin (35);
+
+declare   (addr, length, null, substr) builtin;
+
+% include line_types;
+
+set_abort_label:
+          P_IB_ptr -> ftp_data_template.abort_return_label = set_abort_label;
+
+          quit_flag = ""b;
+          call condition_ (P_IB_ptr -> ftp_data_template.quit_condition, ftp_quit);
+
+          if P_IB_ptr -> ftp_data_template.quit_condition = "quit"
+          then call iox_$control (iox_$user_io, "quit_enable", null (), code);
+
+          call read_command_line ();
+
+          return;
+
+bye:      entry (P_IB_ptr, hold);              /*  This entry implements the "BYE" and "REIN" commands.   */
+
+declare   hold      bit (1);  /* Tells if logout hold ("REIN") wanted */
+
+          if ^ P_IB_ptr -> ftp_data_template.ftp_server_process
+          then      do;
+                    if hold             /* "REIN" asked for */
+                    then      do;
+                              call ioa_$ioa_switch (P_IB_ptr -> ftp_data_template.iocb_ptr, "504  TELNET users should use BYE rather than REIN.");
+                              return;
+                              end;
+
+                    call ftp_initialization_$cleanup (P_IB_ptr, "0"b);
+
+                    go to P_IB_ptr -> ftp_data_template.static_return_label;
+                    end;
+
+          call ftp_server_overseer_$ftp_logout (P_IB_ptr, hold);
+
+
+read_command_line:
+          procedure ();
+
+          do while ("1"b);
+               call iox_$get_line (P_IB_ptr -> ftp_data_template.iocb_ptr, addr (command_line), length (command_line), nelemt, code);
+               if code ^= 0
+               then return;
+
+               if nelemt > 1
+               then do;
+                    call ftp_command_processor_ (P_IB_ptr, substr (command_line, 1, nelemt - 1), quit_flag);
+                    if quit_flag
+                    then return;
+                    end;
+               end;
+
+          return;
+
+          end read_command_line;
+
+ftp_quit:
+          procedure();
+
+          call ioa_$ioa_switch (P_IB_ptr -> ftp_data_template.iocb_ptr, "020  SYNC received.  Enter command.");
+
+          P_IB_ptr -> ftp_data_template.rename_in_progress = "0"b;
+          quit_flag = "1"b;
+          call condition_ (P_IB_ptr -> ftp_data_template.quit_condition, ftp_double_quit);
+
+          call read_command_line ();
+
+          return;
+
+          end ftp_quit;
+
+
+
+ftp_double_quit:
+          procedure ();                 /* Got another QUIT before we did anything about the first one */
+
+          call ioa_$ioa_switch (P_IB_ptr -> ftp_data_template.iocb_ptr, "021  SYNC ignored.");
+          return;
+
+          end ftp_double_quit;
+
+          end ftp_server_listen_;
+ 
+
+
+
+		    ftp_server_overseer_.pl1        09/23/77  1031.6rew 09/22/77  1725.6       81711
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+ftp_server_overseer_:
+          procedure;
+
+/*  A Pogran Program 01/16/73
+
+    This module is the process overseer for a user's file transfer server process.
+    It is the first in a chain of modules which restrict a user to performing only file transfer
+    functions in his process.  All unexpected errors (conditions) are considered fatal.
+
+    Also included in this module are the following:
+    1)  The default handler for conditions occuring during file transfer,
+    2)  The entry to "log out" a file transfer process.
+
+    Modified by Ken Pogran to call condition_ and add handlers for cput and alrm, 09/24/74.
+    Modified 2/14/75 (Happy Valentine's Day!) by Ken Pogran to:
+          1.  Add no_handler entry point for debugging
+          2.  Change call to cpu_time_and_paging_ to hcs_$get_process_usage so that memory usage may be
+              printed upon logout.
+    Last modified by Ken Pogran 02/18/75
+    Last modified by D. M. Wells to not count on AS saying "hangup",
+          to not deactivate socket, and to not setup timer handlers.
+    Last modified by S. T. Kent to use iox and to consolidate internal-external static.  */
+
+
+declare   1 logout_info internal static options (constant) aligned,
+            2 version         fixed bin initial (0),
+            2 hold            bit (1) initial ("0"b) unaligned,
+            2 brief           bit (1) initial ("1"b) unaligned,       /* He will _n_o_t get standard logout message! */
+            2 pad             bit (34) unaligned initial (""b);
+
+declare   condition_                    entry (char (*), entry),
+          ioa_$ioa_switch                         entry options (variable),
+          terminate_process_            entry (char (*), ptr),
+          condition_interpreter_        entry (ptr, ptr, fixed bin, fixed bin, ptr, char (*), ptr, ptr),
+          ftp_initialization_$init_ftp_data entry (ptr),
+          ftp_server_listen_            entry  (ptr);
+
+%include ftp_server_data;
+
+declare iox_$user_io  external ptr;
+declare 1 ftp_data aligned like ftp_data_template;
+
+declare   first_time bit (1) initial ("1"b);
+declare (addr, divide, empty, float, length, mod, null) builtin;
+          call condition_ ("any_other", ftp_default_handler_);
+
+no_handler:
+          entry;                        /* Come in without special handler, for debugging purposes.  /*/
+
+          call ftp_initialization_$init_ftp_data (addr (ftp_data));
+
+          call initialize_process ();
+
+          ftp_data.ftp_server_process = "1"b;
+          ftp_data.iocb_ptr = iox_$user_io;
+          ftp_data.static_return_label = flush_ftp_process;
+
+          call ftp_server_listen_ (addr(ftp_data));
+
+          /*  The listener never returns (it says here . . .) */
+
+flush_ftp_process:
+          call logout_process (addr (ftp_data));
+
+
+          return;
+
+ftp_server:
+          entry ();
+
+          call initialize_server ();
+
+          ftp_data.ftp_server_process = "0"b;
+
+          call ftp_server_listen_ (addr (ftp_data));
+
+          return;
+
+ftp_server_test:
+          entry ();
+
+          call initialize_server ();
+
+          ftp_data.ftp_server_process = "0"b;
+          ftp_data.quit_condition = "program_interrupt";
+
+          call ftp_server_listen_ (addr (ftp_data));
+
+          return;
+
+
+ftp_logout:
+          entry (P_IB_ptr, logout_hold);                 /*  This entry implements the "BYE" and "REIN" commands  */
+
+declare P_IB_ptr pointer;
+
+/* Note:  We currently ignore the fact that REIN rather than BYE was requested.  This will remain true
+   until the Answering Service handles FTP dialups properly, rather than in the present limited manner. */
+
+declare   logout_hold         bit (1);            /* If "1"b, indicates he typed REIN rather than BYE */
+
+          call logout_process (P_IB_ptr);
+
+
+          return;
+
+leave_server_environment:
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "231  Leaving File Transfer server environment.");
+
+          return;
+
+initialize_process:
+          procedure;
+
+declare   code                fixed bin (35),
+          error               condition,
+          date_and_time       char (24),
+          name                char (22) internal static,
+          project             char (9) internal static,
+          login_time          fixed bin (71),
+          cpu_secs            fixed bin,
+          home_dir            char (168),
+          old_modes           char (200);
+
+declare   1 process_statistics aligned,
+            2 num_items       fixed bin initial (5),
+            2 num_returned    fixed bin,
+            2 total_cpu       fixed bin (71),
+            2 memory_usage    fixed bin (71),
+            2 page_faults     fixed bin (35),
+            2 bs_page_faults  fixed bin (35),
+            2 virtual_cpu     fixed bin (71);
+
+declare   clock_                        entry returns (fixed bin (71)),
+          change_wdir_                  entry (char (168), fixed bin (35)),
+          date_time_                    entry (fixed bin (71), char (*)),
+          hcs_$get_process_usage        entry (ptr, fixed bin (35)),
+          user_info_$homedir            entry (char (*)),
+          user_info_$login_data         entry (char (*), char (*), char (*), fixed bin, fixed bin, fixed bin,
+                                                  fixed bin (71), char (*)),
+          iox_$modes                    entry (ptr, char (*), char (*), fixed bin(35)) ;
+
+
+          call user_info_$login_data (name, project, "", 0, 0, 0, login_time, "");
+          call date_time_ (login_time, date_and_time);
+          ftp_data.iocb_ptr = iox_$user_io;
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "230  ^a ^a logged in for file transfer: ^a", name, project, date_and_time);
+
+          call iox_$modes (ftp_data.iocb_ptr, "^erkl", old_modes, code);
+          call user_info_$homedir (home_dir);
+          call change_wdir_ (home_dir, code);
+
+          return;
+
+logout_process:
+          entry(P_IB_ptr);           /* This entry implements the file transfer "BYE" command. */
+
+declare P_IB_ptr pointer;
+
+          call hcs_$get_process_usage (addr (process_statistics), code);
+          cpu_secs = divide (virtual_cpu, 1000000, 17, 0);
+          call date_time_ (clock_(), date_and_time);
+
+          if cpu_secs > 60
+          then      call ioa_$ioa_switch (ftp_data.iocb_ptr, "231- ^a ^a logged out ^a
+231  CPU usage ^d min ^d sec, memory usage ^.1f units.",
+                              name, project, date_and_time, divide (cpu_secs, 60, 17, 0), mod (cpu_secs, 60),
+                              float (memory_usage)/1000);
+          else      call ioa_$ioa_switch (ftp_data.iocb_ptr, "231- ^a ^a logged out ^a^/231  CPU usage ^d sec, memory usage ^.1f units.",
+                              name, project, date_and_time, cpu_secs, float (memory_usage)/1000);
+
+          call terminate_process_ ("logout", addr (logout_info));               /*  Goodbye! */
+
+          on error;
+          end initialize_process;
+
+initialize_server:
+          procedure ();
+
+          call ftp_initialization_$init_ftp_data (addr (ftp_data));
+
+          ftp_data.iocb_ptr = iox_$user_io;
+          ftp_data.static_return_label = leave_server_environment;
+
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "230  File Transfer server environment established.");
+
+          return;
+
+          end initialize_server;
+
+ftp_default_handler_:
+          procedure (mcptr, cond_name, wcptr, infoptr, continue);
+
+declare   mcptr     ptr,
+          wcptr     ptr,
+          infoptr   ptr,
+          cond_name char (*),
+          continue  bit (1);
+
+declare   code                fixed bin(35),
+          message_length      fixed bin,
+          message_string               char(message_length) based (message_ptr),
+          message_area        area (250),
+          message_ptr         pointer;
+
+          if cond_name = "finish"
+          then      return;
+
+          if first_time
+          then      do;
+                    first_time = "0"b;
+                    call condition_interpreter_ (addr (message_area), message_ptr, message_length, 1,
+                              mcptr, cond_name, wcptr, infoptr);
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "435- Unexpected error encountered:");
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "^a", substr (message_string, 9));
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "435  File transfer process terminated.");
+                    end;
+
+          call terminate_process_ ("logout", addr (logout_info));     /*  Goodbye! */
+
+          end ftp_default_handler_;
+
+          end ftp_server_overseer_;
+ 
+
+
+
+		    ftp_server_status_.pl1          09/23/77  1031.6rew 09/22/77  1725.3      130068
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+ftp_server_status_:
+          procedure (P_IB_ptr, argument);
+
+declare   argument char (*) varying,
+          P_IB_ptr  ptr;
+
+declare   1 ftp_data aligned like ftp_data_template defined (P_IB_ptr -> ftp_data_template);
+
+/* A Pogran Program 02/13/73
+
+    This module implements the "STAT", "NLST" and "LIST" commands of the File Transfer Protocol.
+    A STAT command with no arguments, or with an argument which begins with
+    a hyphen, is taken to be a "system" or "user" or "ftp" status request.  A STAT command
+    with a pathname argument is taken to be either a directory listing request, if the
+    branch specified is a directory, or a segment status request if the branch is a segment.
+
+    The "LIST" command (implemented by the entry ftp_server_status_$list) eventually will
+    return the file-system status information given by STAT over the FTP data socket,
+    rather than the Telnet socket.  But that comes later.
+
+    The "NLST" command (implemented by ftp_server_status_$namelist) returns a list of the names of all
+    segments contained in a directory, over the FTP data socket.
+
+    Modified by K. T. Pogran 02/26/73
+    Modfied to add NLST and upgrade to new condition info structure by Ken Pogran, 3/3/75
+    Last modified by Ken Pogran, 3/4/75
+    Last modified by D. M. Wells to get rid of all 455 reply codes.  */
+
+declare   pathname            char (168),
+          dirname             char (168),
+          ename               char (32),
+          code                fixed bin (35),
+          type                fixed bin (2),
+          bitcnt              fixed bin (24),
+          short_message       char (8) aligned,
+          error_message       char (100) aligned,
+          reply_code          char (3);
+
+declare   name                char (32),
+          project             char (12),
+          account             char (4),
+          anon                fixed bin (1),
+          standby             fixed bin (1),
+          weight              fixed bin,
+          login_time          fixed bin (71),
+          login_word          char (8),
+          idcode              char (4),
+          tty_type            fixed bin,
+          channel             char (6),
+          host_number         fixed bin (16),
+          host_name           char (32) initial (""),
+          host_string         char (40) varying,
+          date_time           char (24),
+          page_faults         fixed bin,
+          cpu_time            fixed bin (71),
+          pre_pages           fixed bin,
+          cpu_secs            fixed bin,
+          cpu_min             fixed bin,
+          cpu_usage           char (16),
+          len                 fixed bin (24);
+
+declare   entry_count         fixed bin,
+          eptr                pointer,
+          nptr                pointer,
+          text_pos            fixed bin (24),
+          i                   fixed bin;
+
+declare   text char (text_pos) based (ftp_data.text_ptr);
+
+declare   1 entries (entry_count) aligned based (eptr),
+           (2 type            bit (2),
+            2 nnames          bit (16),
+            2 nindex          bit (18)) unaligned;
+
+declare   names (100) char (32) aligned based (nptr);
+
+
+%include ftp_server_data;
+
+declare   Directory           fixed bin (2) initial (2);
+
+declare   expand_pathname_              entry (char (*), char (*), char (*), fixed bin (35)),
+          absolute_pathname_            entry (char (*), char (*), fixed bin (35)),
+          hcs_$status_minf              entry (char (*), char (*), fixed bin, fixed bin (2), fixed bin (24), fixed bin (35)),
+          user_info_$login_data         entry (char (*), char (*), char (*), fixed bin (1), fixed bin (1), fixed bin,
+                                                  fixed bin (71), char (*)),
+          user_info_$tty_data           entry (char (*), fixed bin, char (*)),
+          host_id_$number               entry (fixed bin (16), char (*), fixed bin (35)),
+          host_id_$symbol               entry (fixed bin (16), char (*), fixed bin (35)),
+          date_time_                    entry (fixed bin (71), char (*)),
+          clock_                        entry returns (fixed bin (71)),
+          cpu_time_and_paging_          entry (fixed bin, fixed bin (71), fixed bin),
+          ioa_$rsnnl                    entry options (variable),
+          get_wdir_                     entry returns (char (168)),
+          ioa_$ioa_switch               entry options (variable),
+          condition_                    entry (char (*), entry),
+          list                          entry (char (*), char (*), char (*)),
+          status                        entry (char (*)),
+          convert_status_code_          entry (fixed bin (35), char (8) aligned, char (100) aligned);
+
+declare   get_system_free_area_         entry returns (pointer),
+          hcs_$star_                    entry (char (*), char (*), fixed bin (2), ptr, fixed bin, ptr, ptr,
+                                                  fixed bin (35)),
+          hcs_$make_seg                 entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35)),
+          check_star_name_$path         entry (char (*), fixed bin (35)),
+          ftp_initialization_$socket_init entry (ptr, fixed bin (35)),
+          file_transfer_$list_transfer  entry (ptr, ptr, fixed bin(24));
+
+
+declare  (error_table_$moderr,
+          error_table_$incorrect_access,
+          error_table_$no_dir,
+          error_table_$noentry) fixed bin (35) external;
+
+declare   (length, substr, index, divide, fixed, verify, reverse, null) builtin;
+
+          if ftp_data.foreign_host = -1
+          then call ftp_initialization_$socket_init (addr (ftp_data), (0));
+
+          if substr (argument, 1, 1) = "-" | length (argument) = 0    /* Does he want "system" status or "file" status? */
+          then      do;
+                    call user_info_$login_data (name, project, account, anon, standby, weight, login_time, login_word);
+                    call user_info_$tty_data (idcode, tty_type, channel);
+                    call host_id_$number (host_number, idcode, code);
+                    if code = 0
+                    then      do;
+                              call host_id_$symbol (host_number, host_name, code);
+                              if code ^= 0
+                              then      host_name = "";
+                              end;
+                    if host_name ^= ""
+                    then      host_string = "from " || host_name;
+                    else      host_string = "";
+                    call date_time_ (login_time, date_time);
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "100- ^a ^a logged in at ^a ^a", name, project, date_time, host_string);
+                    call date_time_ (clock_ (), date_time);
+                    call cpu_time_and_paging_ (page_faults, cpu_time, pre_pages);
+                    cpu_secs = divide (cpu_time + 500000, 1000000, 17, 0);
+                    if cpu_secs > 60
+                    then      do;
+                              cpu_min = divide (cpu_secs, 60, 17, 0);
+                              cpu_secs = cpu_secs - cpu_min * 60;
+                              call ioa_$rsnnl ("^d min ^d sec", cpu_usage, len, cpu_min, cpu_secs);
+                              end;
+                    else call ioa_$rsnnl ("^d sec", cpu_usage, len, cpu_secs);
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "^5xCPU usage ^a at ^a^/^5xWorking directory is ^a", cpu_usage,
+                              substr (date_time, 11, 6), get_wdir_ ());
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "^5xData socket is ^d at ^a",
+                              ftp_data.foreign_read_socket,
+                              ftp_data.foreign_host_name);
+                    call ioa_$ioa_switch (ftp_data.iocb_ptr, "100  Files will be transferred in ^a ^d-bit ^a.", mode_name (ftp_data.transfer_mode),
+                              ftp_data.byte_size, type_name (ftp_data.representation_type));
+                    end;
+          else      do;
+                    pathname = argument;
+                    call expand_pathname_ (pathname, dirname, ename, code);
+                    if code ^= 0
+                    then      go to bad_path;
+                    call hcs_$status_minf (dirname, ename, 0, type, bitcnt, code);
+                    if code ^= 0
+                    then      go to error_reply;
+
+                    call condition_ ("command_error", status_error);
+
+                    if type = Directory
+                    then      do;
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "151- Listing of ^a>^a:", dirname, ename);
+                              call list ("-pathname", pathname, "-all");
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "151  Directory listing complete.");
+                              end;
+                    else      do;
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "150- Status of ^a>^a:", dirname, ename);
+                              call status (pathname);
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "150  Status complete.");
+                              end;
+                    end;
+          return;
+
+bad_path:
+          call convert_status_code_ (code, short_message, error_message);
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "550  ^a ^a", error_message, pathname);
+          return;
+
+error_reply:
+          if code = error_table_$moderr | code = error_table_$incorrect_access
+          then      reply_code = "451";
+          else if code = error_table_$noentry | code = error_table_$no_dir
+          then      reply_code = "450";
+          else      reply_code = "451";
+          call convert_status_code_ (code, short_message, error_message);
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "^a  ^a  ^a>^a", reply_code, error_message, dirname, ename);
+          return;
+
+list:     entry (P_IB_ptr, argument);
+
+          call ioa_$ioa_switch (ftp_data.iocb_ptr, "506  LIST is not implemented at this time; use STAT or NLST.");
+          return;
+
+
+namelist:
+          entry (P_IB_ptr, argument);
+
+          pathname = argument;
+          call check_star_name_$path (pathname, code);
+          if code = 0
+          then      do;
+                    ename = "**";
+                    call absolute_pathname_ (pathname, dirname, code);
+                    end;
+          else      if code = 1 | code = 2
+                    then      call expand_pathname_ (pathname, dirname, ename, code);
+          if code ^= 0
+          then      go to bad_path;
+
+          call hcs_$star_ (dirname, ename, 2 /* no info about links */, get_system_free_area_ (), entry_count,
+                    eptr, nptr, code);
+          if code ^= 0
+          then      go to bad_path;
+
+          if ftp_data.text_ptr = null
+          then      do;
+                    call hcs_$make_seg ("", "namelist_temp", "", 1010b, ftp_data.text_ptr, code);
+                    if code ^= 0
+                    then      do;
+                              call ioa_$ioa_switch (ftp_data.iocb_ptr, "453  Cannot create required workspace; Multics FTP Server error.");
+                              return;
+                              end;
+                    end;
+
+          text_pos = 0;
+
+          do i = 1 to entry_count;
+                    if entries(i).type = "01"b    /* Non-directory segment -- we DON'T handle MSF's yet!  */
+                    then      do;
+                              substr (text, text_pos + 1, 32) = names (fixed (entries(i).nindex, 17));
+                              text_pos = text_pos + 33 - verify (reverse (substr (text, text_pos + 1, 32)), " ");
+                              substr (text, text_pos + 1, 1) = "
+";                            text_pos = text_pos + 1;
+                              end;
+                    end;
+
+          if text_pos = 0
+          then      if ename = "**"
+                    then      call ioa_$ioa_switch (ftp_data.iocb_ptr, "450  There are no segments in ^a.", dirname);
+                    else      call ioa_$ioa_switch (ftp_data.iocb_ptr, "450  There are no segments in ^a which match the star name ^a.",
+                                        dirname, ename);
+          else      call file_transfer_$list_transfer (addr (ftp_data), ftp_data.text_ptr, text_pos);
+
+          return;
+
+
+status_error:
+          procedure (mc_ptr, cond_name, wc_ptr, info_ptr, continue);
+
+declare   mc_ptr              pointer,
+          cond_name           char (*),
+          wc_ptr              pointer,
+          info_ptr            pointer,
+          continue            bit (1);
+
+declare   1 info_struc        aligned based (info_ptr),
+            2 info_length     fixed bin,
+            2 version         fixed bin,
+            2 action_flags    bit (36),
+            2 info_string     char (256) varying,
+            2 status_code     fixed bin (35),
+            2 name_ptr        pointer,
+            2 name_lth        fixed bin,
+            2 errmess_ptr     pointer,
+            2 errmess_lth     fixed bin,
+            2 max_err_lth     fixed bin,
+            2 print_sw        bit (1);
+
+declare   errmess char (max_err_lth) based (errmess_ptr);
+
+declare   message   char (256) varying,
+          pos       fixed bin;
+
+          continue = "0"b;
+          print_sw = "1"b;
+          pos = index (errmess, ": ");
+          if pos = 0
+          then      pos = 1;
+          else      pos = pos + 2;
+          message = substr (errmess, pos, errmess_lth - pos);
+
+          if status_code = 0
+          then      if message = "** not found."  /* Lousy system message */
+                    then      message = "Directory is empty.";        /* Nice message */
+
+          errmess_lth = length (message) + 6;
+          substr (errmess, 1, errmess_lth) = "     " || message || "
+";
+
+          end status_error;
+
+          end  ftp_server_status_;
+
+
+
+
+		    ftp_write_ascii_.pl1            09/23/77  1031.6rew 09/22/77  1725.1       38124
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+ftp_write_ascii_: proc (file_ptr, file_offset, file_count, sock_index, wait_chn,
+          transfer_mode, code);
+
+dcl  sock_state fixed bin (6),
+     transfer_mode fixed bin,
+ (file_offset, file_count, remaining_file_count, this_length,
+     converted_length, current_file_offset, current_pos, end_of_data,
+     bytes_written) fixed bin (24),
+     code fixed bin (35);
+dcl  wait_chn fixed binary (71);
+dcl  sock_index bit (36);
+
+dcl  file_ptr ptr;
+
+dcl  done_flag bit (1) aligned initial ("0"b);
+
+dcl (addr, length, substr, divide, unspec) builtin;
+
+dcl  1 wait_list aligned automatic,
+        2 count fixed binary (17) initial (1),
+        2 channel fixed binary (71) initial (wait_chn);
+
+dcl  not_used (4) fixed bin (71),
+     big_buffer bit (32048) aligned;
+
+dcl  net_ascii_to_eight_ entry (ptr, fixed bin (24), fixed bin (24), ptr, fixed bin (24), fixed bin (24)),
+     ncp_$write_data entry (bit (36), ptr, fixed bin (24), fixed bin (24), fixed bin (6), fixed bin (35)),
+     ipc_$block entry (ptr, ptr, fixed bin (35)),
+     ncp_$close_connection entry (bit (36), fixed bin (6), fixed bin (35));
+
+          current_file_offset = file_offset;
+          remaining_file_count = file_count;
+
+send_loop: if remaining_file_count > 9 * divide (length (big_buffer) - 24, 16, 24, 0)
+          then this_length = 9 * divide (length (big_buffer) - 24, 16, 24, 0);
+          else do;
+               this_length = remaining_file_count;
+               done_flag = "1"b;
+          end;
+          call net_ascii_to_eight_ (file_ptr, current_file_offset, this_length, addr (big_buffer),
+          24, converted_length);
+          current_file_offset = current_file_offset + this_length;
+          remaining_file_count = remaining_file_count - this_length;
+          goto setup_for_sending (transfer_mode);
+
+setup_for_sending (2):                                      /* SETUP FOR TEXT TRANSFER MODE */
+                                                            /* IF EOF THEN PUT IN EOF MARKER */
+          current_pos = 24;
+          end_of_data = 24 + converted_length;
+          if done_flag then do;
+               substr (big_buffer, end_of_data + 1, 8) = "11000001"b; /* EOF MARKER */
+               end_of_data = end_of_data + 8;
+          end;
+          goto write_loop;
+
+setup_for_sending (1):                                      /* SETUP FOR STREAM TRANSFER MODE */
+          current_pos = 24;
+          end_of_data = 24 + converted_length;
+          goto write_loop;
+
+setup_for_sending (3):                                      /* SETUP BLOCK TRANSFER MODE */
+          current_pos = 0;
+          end_of_data = 24 + converted_length;
+          converted_length = divide (converted_length, 8, 24, 0);
+          substr (big_buffer, 1, 24) = "00000000"b          /* MARKER FOR DATA */
+          || substr (unspec (converted_length), 21, 16);
+          if done_flag then substr (big_buffer, 1, 8) = "00000010"b /* eof marker */;
+
+write_loop: do while (current_pos < end_of_data);
+               call ncp_$write_data (sock_index, addr (substr (big_buffer, current_pos + 1, 1)),
+               divide (end_of_data - current_pos, 8, 24, 0), bytes_written, sock_state, code);
+               if code ^= 0 then return;
+               current_pos = current_pos + 8 * bytes_written;
+               if bytes_written = 0 then do;
+                    call ipc_$block (addr (wait_list), addr (not_used (1)), code);
+                    if code ^= 0 then return;
+               end;
+          end;
+
+          if ^ done_flag then goto send_loop;
+          if transfer_mode = 1 /* MUST CLOSE SOCKET TO INDICATE EOF */ then do;
+               call ncp_$close_connection (sock_index, sock_state, code);
+               if code ^= 0 then return;
+          end;
+
+          return;
+     end;
+
+
+
+
+		    ftp_write_image_.pl1            09/23/77  1031.6rew 09/22/77  1725.6       38601
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+ftp_write_image_: proc (file_ptr, file_offset, file_count, sock_index,
+          wait_chn, transfer_mode, his_bytesize, code);
+
+dcl  sock_state fixed bin (6),
+     (bytesize, his_bytesize) fixed bin (8),
+     transfer_mode fixed bin (17),
+    (file_offset, file_count, 
+     out_pos, out_end, current_out_pos, bytes_written, byte_count, pad) fixed bin (24),
+     code fixed bin (35);
+dcl  sock_index bit (36);
+
+dcl (file_ptr, out_ptr) ptr,
+    wait_chn fixed binary (71),
+    (divide, addr, mod) builtin;
+
+dcl  1 wait_list aligned automatic,
+        2 count fixed binary (17) initial (1),
+        2 channel fixed binary (71) initial (wait_chn);
+
+dcl  ncp_$close_connection entry (bit (36), fixed bin (6), fixed bin (35)),
+     not_used (4) fixed bin (71),
+     ncp_$write_data entry (bit (36), ptr, fixed bin (24), fixed bin (24), fixed bin (6), fixed bin (35)),
+     ipc_$block entry (ptr, ptr, fixed bin (35)),
+     long_overlay bit (1000) aligned based,
+     internal_buffer bit (256) aligned;
+
+          bytesize = his_bytesize;
+          goto setup (transfer_mode);
+
+error_return: return;                                       /* for use by internal procs */
+
+setup (3):                                                  /* setup for block transfer */
+          internal_buffer = ""b;                            /* zero buffer */
+          byte_count = divide (file_count + bytesize - 1, bytesize, 24, 0);
+          pad = bytesize - (mod (23, bytesize) + 1);        /* to do the stupid right adjusting */
+          substr (internal_buffer, pad + 1, 24) = "00000010"b /* eof marker */ ||
+          substr (unspec (byte_count), 21, 16);
+          out_pos = 0;                                      /* setup to send this header */
+          out_end = pad + 24;
+          out_ptr = addr (internal_buffer);
+          call send_data;
+          goto send_actual_file;
+
+setup (1):                                                  /* setup for stream transfer */
+setup (2):                                                  /* setup for text transfer */
+                                                            /* note mode 2 only valid for bytesize = 8 */
+                                                            /* no setup necessary, send file */
+
+send_actual_file: out_pos = file_offset;
+          out_end = file_offset + file_count;
+          out_ptr = file_ptr;
+          call send_data;
+          goto finish (transfer_mode);
+
+finish (1):                                                 /* close socket for eof signal */
+          call ncp_$close_connection (sock_index, sock_state, code);
+          return;
+
+finish (2):                                                 /* send code for eof then return */
+          substr (internal_buffer, 1, 8) = "11000001"b;     /* eof marker */
+          out_pos = 0;
+          out_end = 8;
+          out_ptr = addr (internal_buffer);
+          call send_data;
+          return;
+
+finish (3):                                                 /* dont need to do anything more */
+          return;
+
+send_data: proc;
+               current_out_pos = out_pos;
+               do while (current_out_pos < out_end);
+                    call ncp_$write_data (sock_index, addr (substr (out_ptr -> long_overlay,
+                    current_out_pos + 1, 1)), divide (out_end + bytesize - current_out_pos - 1, bytesize, 24, 0),
+                    bytes_written, sock_state, code);
+                    if code ^= 0 then goto error_return;
+                    current_out_pos = current_out_pos + bytesize * bytes_written;
+                    if bytes_written = 0 then do;
+                         call ipc_$block (addr (wait_list), addr (not_used (1)), code);
+                         if code ^= 0 then goto error_return;
+                    end;
+               end;
+          end;
+
+     end;
+   
+
+
+
+		    net_ascii_to_eight_.pl1         09/23/77  1031.6rew 09/22/77  1723.9       20250
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+net_ascii_to_eight_: proc (nine_ptr, nine_offset, nine_count, eight_ptr, eight_offset, eight_count);
+
+dcl (eight_count, nine_count, eight_offset, nine_offset, i, j) fixed bin (24);
+
+dcl (eight_ptr, nine_ptr, net_ptr, mult_ptr) ptr;
+
+dcl  substr builtin;
+
+dcl  working_bits bit (8) aligned,
+     cr_flag bit (1) ,
+     long_string bit (1048576) aligned based;
+
+
+          net_ptr = eight_ptr;
+          mult_ptr = nine_ptr;
+          j = eight_offset;
+
+          do i = nine_offset + 1 to (nine_offset + nine_count) - 8 by 9;
+               working_bits = substr (mult_ptr -> long_string, i + 1, 8);
+               if working_bits = "00001010"b /* new line */ then do;
+                    substr (net_ptr -> long_string, j + 1, 8) = "00001101"b /* carriage return */ ;
+                    j = j + 8;
+               end;
+               substr (net_ptr -> long_string, j + 1, 8) = working_bits;
+               j = j + 8;
+          end;
+
+          eight_count = j - eight_offset;
+          return;
+
+
+net_ascii_to_nine_: entry (cr_flag, eight_ptr, eight_offset, eight_count, nine_ptr, nine_offset, nine_count);
+
+          net_ptr = eight_ptr;
+          mult_ptr = nine_ptr;
+          j = nine_offset;
+
+          do i = eight_offset to (eight_offset + eight_count) - 8 by 8;
+               working_bits = substr (net_ptr -> long_string, i + 1, 8);
+               if working_bits = "00001101"b /* carriage return */ then cr_flag = "1"b;
+               else if cr_flag then do;
+                    cr_flag = "0"b;
+                    if working_bits = "00001010"b /* line feed */ then j = j - 9;
+               end;
+               substr (mult_ptr -> long_string, j + 1, 9) = "0"b || working_bits;
+               j = j + 9;
+          end;
+
+          nine_count = j - nine_offset;
+     end;
+  
+
+
+
+		    netml_responder_.pl1            10/28/80  1503.8rew 10/28/80  1232.5       75663
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+netml_responder_:
+     procedure;
+
+/*  A Pogran Program, 02/14/74 (Happy Valentine's Day, Judy!)
+
+   This procedure implements major portions of the stripped-down
+   File Transfer Server for the mail-receiving process, NETML.CNet.
+
+   Modified by Ken Pogran to add Development Machine commands, 09/18/74
+   Modified to remove use of special version of ntw_, etc. by Ken Pogran, 09/23/74
+   Modified to put replace_ntw back in due to a bug in the installed ntw_, Ken Pogran, 09/24/74
+   Modified by Ken Pogran to establish handlers for cput and alrm, 09/24/74
+   Modified by Ken Pogran, 09/24/74
+   Modified by Ken Pogran, 2/21/75 to accept default TYPE, MODE, and BYTE requests,
+   and remove call to replace_ntw.
+   Modified by Ken Pogran 3/12/75 to incorporate auditing suggestions made by Doug Wells.
+   Modified by D. M. Wells 08/27/76 to not deactivate sockets and to not set up
+   timer manager handlers; timer handlers are now setup automatically;
+   processes are not allowed to detach sockets, and it costs time.
+   Modified by S.T. Kent 11/13/76 to permit use in a tasking environment.
+   Modified by C. Hornig May 1980 for XRSQ etc. */
+
+declare first_time bit (1) initial ("1"b),
+        tasking bit (1) initial ("0"b),
+        testing bit (1) initial ("0"b),
+        task_iocb_ptr ptr,
+        nelemt fixed bin (24),
+        command_length fixed bin (24),
+        command_line char (256),
+        response_line char (256),
+        response_len fixed binary (24),
+        code fixed bin (35),
+        argument char (128) varying,
+        command char (4),
+        arg_begin fixed bin;
+
+declare upper_case char (26) internal static options (constant) initial ("ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+        lower_case char (26) internal static options (constant) initial ("abcdefghijklmnopqrstuvwxyz");
+
+declare 1 logout_info internal static options (constant) aligned,
+	2 version fixed bin initial (0),
+	2 hold bit (1) unaligned initial ("0"b),
+	2 brief bit (1) unaligned initial ("1"b),
+	2 unused bit (34) unaligned initial (""b);
+
+declare 1 editing_chars_structure aligned internal static options (constant),
+	2 version fixed bin initial (1),
+	2 editing_chars (3) bit (9) aligned initial ((3) (1)"111111111"b);
+
+declare iox_$user_io external ptr;
+
+%include ftp_server_data;
+
+declare 1 ftp_data aligned like ftp_data_template;
+
+
+declare condition_ entry (char (*), entry),
+        ioa_$ioa_switch entry options (variable),
+        ioa_$rs entry options (variable),
+        iox_$control entry (ptr, char (*), ptr, fixed bin (35)),
+        iox_$get_line entry (ptr, ptr, fixed bin (24), fixed bin (24), fixed bin (35)),
+        iox_$modes entry (ptr, char (*), char (*), fixed bin (35)),
+        iox_$put_chars entry (ptr, ptr, fixed bin (24), fixed bin (35)),
+        net_log_ constant entry options (variable),
+        terminate_process_ entry (char (*), ptr),
+        ftp_initialization_$init_ftp_data entry (ptr),
+        ftp_mail_$anonymous_mail entry (ptr, char (*), char (*) varying),
+        ftp_mail_$abort entry (ptr);
+
+declare (addr, length, substr, index, null, verify, translate) builtin;
+
+
+	testing = "0"b;
+	call setup (iox_$user_io);
+	call condition_ ("any_other", netml_default_handler);
+	go to read_command_line;
+
+task_mode:
+     entry (task_iocb_ptr);
+
+	testing = "0"b;
+	call setup (task_iocb_ptr);
+	call condition_ ("any_other", netml_default_handler);
+	tasking = "1"b;
+	go to read_command_line;
+
+test:
+     entry;
+
+	testing = "1"b;
+	call setup (iox_$user_io);
+
+	goto read_command_line;
+
+read_command_line:
+	call iox_$get_line (ftp_data.iocb_ptr, addr (command_line), length (command_line), nelemt, code);
+	if code ^= 0 then return;
+	if nelemt = 1 then go to read_command_line;
+
+	command_length = index (substr (command_line, 1, nelemt - 1), " ") - 1;
+	if command_length = -1 then command_length = nelemt - 1;
+	command = translate (substr (command_line, 1, command_length), upper_case, lower_case);
+
+	if command = "BYE" then do;
+	     call ftp_mail_$abort (addr (ftp_data));
+	     call ioa_$ioa_switch (ftp_data.iocb_ptr, "231  Mail Server Process terminated.");
+	     if tasking | testing then return;
+
+	     call terminate_process_ ("logout", addr (logout_info));
+	     end;
+	else if command = "NOOP"
+	     then call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  NOOP command accepted.");
+
+	     else if command = "MAIL" | command = "MLFL" | command = "XSEN" | command = "XSEM" | command = "XMAS"
+		     | command = "XRSQ" | command = "XRCP" then do;
+		     call get_argument ();
+		     call ftp_mail_$anonymous_mail (addr (ftp_data), command, argument);
+		     end;
+		else if command = "TYPE" then do;
+			call get_argument ();
+			if argument = "A" | argument = "a"
+			then call reply_ok ("type", "ASCII");
+			else call reply_not_ok ("type");
+			end;
+		     else if command = "BYTE" then do;
+			     call get_argument ();
+			     if argument = "8"
+			     then call reply_ok ("byte size", "8");
+			     else call reply_not_ok ("byte size");
+			     end;
+			else if command = "MODE" then do;
+				call get_argument ();
+				if argument = "S" | argument = "s"
+				then call reply_ok ("transfer mode", "Stream");
+				else call reply_not_ok ("transfer mode");
+				end;
+			     else if command = "FORM" then do;
+				     call get_argument ();
+				     if argument = "U" | argument = "u"
+				     then call reply_ok ("form", "Unformatted");
+				     else call reply_not_ok ("form");
+				     end;
+				else if command = "STRU" then do;
+					call get_argument ();
+					if argument = "F" | argument = "f"
+					then call reply_ok ("structure", "File");
+					else call reply_not_ok ("structure");
+					end;
+				     else call ioa_$ioa_switch (ftp_data.iocb_ptr,
+					     "504  Command not implemented in Mail Server Process environment:  ^a"
+					     , command);
+	go to read_command_line;
+
+
+/* this internal procedure establishes defaults in ftp_data including the
+   iocb pointer to be used.  */
+
+setup:
+     procedure (iocb_ptr);
+
+declare iocb_ptr ptr parameter;
+
+	call ftp_initialization_$init_ftp_data (addr (ftp_data));
+
+	ftp_data.iocb_ptr = iocb_ptr;
+	call ioa_$ioa_switch (ftp_data.iocb_ptr, "230  Mail Server Process ready.");
+
+	if ^testing then do;
+	     call iox_$control (ftp_data.iocb_ptr, "set_editing_chars", addr (editing_chars_structure), (0));
+	     call iox_$modes (ftp_data.iocb_ptr, "can,^erkl,^esc", (""), (0));
+	     end;
+	return;
+     end setup;
+
+
+get_argument:
+     procedure;
+
+	arg_begin = verify (substr (command_line, command_length + 1, nelemt - command_length - 1), " ");
+	if arg_begin = 0
+	then arg_begin = nelemt;
+	else arg_begin = arg_begin + command_length;
+	argument = substr (command_line, arg_begin, nelemt - arg_begin);
+     end get_argument;
+
+
+reply_ok:
+     procedure (which, param);
+declare (which, param) char (*);
+
+	call ioa_$ioa_switch (ftp_data.iocb_ptr, "200  Default ^a ^a accepted.", which, param);
+     end reply_ok;
+
+
+reply_not_ok:
+     procedure (which);
+declare which char (*);
+
+	call ioa_$ioa_switch (ftp_data.iocb_ptr,
+	     "506  Non-default ^a ^a not accepted in Mail Server Process Environment.", which, argument);
+     end reply_not_ok;
+
+netml_default_handler:
+     procedure (mcptr, cond_name, wcptr, infoptr, continue);
+
+declare mcptr ptr,
+        wcptr ptr,
+        infoptr ptr,
+        cond_name char (*),
+        continue bit (1);
+
+	if cond_name = "finish" then return;
+
+	if cond_name = "io_error" then goto finnish;
+
+	if first_time then do;
+	     first_time = "0"b;
+	     call ioa_$rs ("435  Unexpected fatal error ""^a"".", response_line, response_len, cond_name);
+	     call iox_$put_chars (ftp_data.iocb_ptr, addr (response_line), response_len, (0));
+	     if tasking | testing then do;
+		call net_log_ (1, "^a", substr (response_line, 1, response_len - 1));
+		goto finnish;
+		end;
+	     end;
+
+	call terminate_process_ ("logout", addr (logout_info));
+
+     end netml_default_handler;
+
+
+finnish:						/* wonderful people those Finns */
+     end netml_responder_;
+ 
+
+
+
+		    ftp_mail_mailer_.pl1            07/17/81  1758.1rew 07/17/81  1540.2       77895
+
+
+
+/* ******************************************************
+   *                                                    *
+   *                                                    *
+   * Copyright (c) 1972 by Massachusetts Institute of   *
+   * Technology and Honeywell Information Systems, Inc. *
+   *                                                    *
+   *                                                    *
+   ****************************************************** */
+
+/* format: style4,delnl,insnl,tree,ifthenstmt,indnoniterend */
+ftp_mail_mailer_:
+     procedure (Destination, Mail_ptr, Code) options (separate_static);
+
+/* ftp_mail_mailer_: Interim mail delivery module for network mail systems. */
+/* Written by C. Hornig, May 1980. */
+
+dcl  (
+     Destination varying char (*),
+     Mail_ptr ptr,
+     Code fixed bin (35)
+     ) parameter;
+
+dcl  (
+     UP init ("ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+     LOW init ("abcdefghijklmnopqrstuvwxyz")
+     ) char (26) static options (constant);
+
+dcl  (error_table_$id_not_found) fixed bin (35) external;
+
+dcl  expand_pathname_ entry (char (*), char (*), char (*), fixed bin (35));
+dcl  hcs_$initiate entry (char (*), char (*), char (*), fixed bin (1), fixed bin (2), ptr, fixed bin (35)),
+     hcs_$make_seg entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35)),
+     hcs_$set_bc_seg entry (ptr, fixed bin (24), fixed bin (35)),
+     hcs_$terminate_noname entry (ptr, fixed bin (35)),
+     hcs_$wakeup entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35)),
+     ioa_$rsnnl entry () options (variable),
+     mailbox_$open entry (char (*), char (*), fixed bin, fixed bin (35)),
+     mailbox_$close entry (fixed bin, fixed bin (35)),
+     mailbox_$wakeup_add_index
+	entry (fixed bin, pointer, fixed bin (24), bit (4) aligned, bit (72) aligned, fixed bin (35)),
+     user_info_ entry (character (*), character (*), character (*)),
+     date_time_ entry (fixed bin (71), character (*)),
+     host_id_$number entry (fixed bin (32), character (*), fixed bin (35)),
+     request_id_ entry (fixed bin (71)) returns (character (19)),
+     message_segment_$add_file
+	entry (character (*), character (*), pointer, fixed bin (24), bit (72) aligned, fixed bin (35));
+
+dcl  cp ptr static init (null ());
+dcl  whoptr ptr static init (null ());
+
+dcl  xptr ptr;
+dcl  xtext char (1000000) based (xptr);
+
+dcl  1 qmi aligned like queue_msg_info;
+dcl  1 nmf aligned,
+       2 header like mail_format.header,
+       2 text char (14);
+dcl  i fixed bin;
+dcl  dest varying char (128) aligned;
+dcl  link_e char (32);
+dcl  link_dir char (168);
+dcl  person varying char (32);
+dcl  mbx_idx fixed bin;
+dcl  code fixed bin (35);
+dcl  validate bit aligned;
+
+dcl  (addr, after, before, clock, currentsize, index, length, null, pointer, reverse, rtrim, string, substr, translate,
+     unspec) builtin;
+%page;
+/* * * * * * * * * * * FTP_MAIL_MAILER_ * * * * * * * * * * */
+
+	validate = "0"b;
+	goto common;
+
+/* * * * * * * * * * VALIDATE * * * * * * * * * */
+
+validate:
+     entry (Destination, Mail_ptr, Code);
+
+	validate = "1"b;
+
+common:
+	if Mail_ptr = null () then do;		/* if there is no mail to send d */
+	     mail_format_ptr = addr (nmf);		/* use default parameters */
+	     unspec (nmf) = ""b;
+	     end;
+	else mail_format_ptr = Mail_ptr;
+
+	dest = Destination;
+
+	if length (Destination) > 5
+	then					/* this might be RFC 780 format */
+	     if translate (substr (Destination, 1, 4), UP, LOW) = "TO:<" then do;
+		dest = substr (before (dest, ">"), 5);	/* take the part between the <>'s */
+		do while (index (dest, ",") > 0);	/* reorder the source route */
+		     dest = after (dest, ",")		/* A@B,C@D -> C@D@B */
+			|| reverse (before (reverse (before (dest, ",")), "@"));
+		end;
+		end;
+
+	link_dir, link_e = "";
+
+	if index (dest, "@") > 0 then goto forward;	/* handle forwarding requests */
+
+	call get_link_target (mlsys_data_$mailbox_link_directory, dest || ".mbx", link_dir, link_e, code);
+						/* Maybe it is in the link table */
+	if code ^= 0				/* try with case mapping if necessary */
+	then call get_link_target (mlsys_data_$mailbox_link_directory, translate (dest, UP, LOW) || ".mbx", link_dir,
+		link_e, code);
+	if code = 0 then goto got_path;
+
+	if index (dest, ".") = 0 then do;		/* maybe it is Person ID */
+	     if whoptr = null ()			/* try to see if he is logged in */
+	     then call hcs_$initiate (">system_control_dir", "whotab", "", 0, 0, whoptr, code);
+
+	     if whoptr ^= null ()
+	     then do i = 1 to whotab.laste;
+		if (whotab.e (i).anon = 0) & (dest = whotab.e (i).person) then do;
+		     call ioa_$rsnnl (">udd>^a>^a", link_dir, (0), whotab.e (i).project, dest);
+		     link_e = dest || ".mbx";
+		     if (whotab.e (i).active > 0) & (whotab.e (i).proc_type = 1) then goto got_path;
+		     ;				/* if he is not interactive then there might be a better choice */
+		     end;
+	     end;
+	     if link_e = "" then do;
+		Code = error_table_$id_not_found;	/* nothing logged in */
+		goto return_to_caller;
+		end;
+	     else goto got_path;			/* only absentee jobs logged in */
+	     end;
+
+	person = before (dest, ".");
+	link_dir = ">udd>" || after (dest, ".") || ">" || person;
+	link_e = person || ".mbx";
+
+got_path:
+	if link_dir = ">FORWARD" then do;		/* handle case of automatic forwarding */
+	     dest = rtrim (link_e);
+	     goto forward;
+	     end;
+
+	call mailbox_$open (link_dir, link_e, mbx_idx, Code);
+						/* normal case */
+	if Code ^= 0 then goto return_to_caller;
+	call mailbox_$wakeup_add_index (mbx_idx, mail_format_ptr, 36 * currentsize (mail_format),
+	     mail_format.wakeup || mail_format.urgent || "0"b || validate, (""b), Code);
+	if Code ^= 0 then goto return_to_caller;
+	if ^validate & ^mail_format.wakeup then do;
+	     nmf.version = mail_format_version_3;
+	     nmf.sent_from = mail_format.sent_from;
+	     nmf.lines = 1;
+	     nmf.text_len = length (nmf.text);
+	     string (nmf.switches) = ""b;
+	     nmf.switches.wakeup, nmf.switches.notify = "1"b;
+	     nmf.text = "You have mail.";
+	     call mailbox_$wakeup_add_index (mbx_idx, addr (nmf), 36 * currentsize (nmf), "1000"b, (""b), code);
+	     end;
+
+	goto return_to_caller;
+
+
+forward:
+	qmi.foreign_host_name = reverse (before (reverse (link_e), "@"));
+	call host_id_$number (qmi.foreign_host, qmi.foreign_host_name, Code);
+	if Code ^= 0 then goto return_to_caller;
+
+	if ^validate then do;
+	     qmi.foreign_user = reverse (after (reverse (link_e), "@"));
+	     call user_info_ (qmi.person, qmi.project, (""));
+	     qmi.dirname = mlsys_data_$pool_directory;
+	     qmi.subject = "";
+	     string (qmi.flags) = ""b;
+	     qmi.flags.in_use = "1"b;
+	     qmi.times_attempted = 0;
+	     qmi.to_list, qmi.cc_list = "";
+	     qmi.time_to_send = clock ();
+	     call date_time_ (qmi.time_to_send, qmi.date_time);
+	     qmi.ename = "send_mail_." || request_id_ (qmi.time_to_send);
+
+	     call hcs_$make_seg (qmi.dirname, qmi.ename, "", 01010b, xptr, Code);
+						/* make the seg to be mailed */
+	     if xptr = null () then goto return_to_caller;
+	     substr (xtext, 1, mail_format.text_len) = mail_format.text;
+	     call hcs_$set_bc_seg (xptr, 9 * mail_format.text_len, code);
+	     call hcs_$terminate_noname (xptr, code);
+
+	     call message_segment_$add_file (mlsys_data_$mailer_directory, "outgoing_mail.ms", addr (qmi),
+		36 * currentsize (qmi), (""b), Code);
+	     if Code ^= 0 then goto return_to_caller;
+
+	     if cp = null ()
+	     then call hcs_$initiate (mlsys_data_$mailer_directory, "server_com_seg", "", 0, 0, cp, code);
+	     if cp ^= null ()
+	     then call hcs_$wakeup (cp -> net_mailer_com_seg.net_mailer_process_id,
+		     cp -> net_mailer_com_seg.mailer_event_channel, 0, (0));
+	     end;
+	goto return_to_caller;
+
+
+return_to_caller:
+	if mbx_idx ^= 0 then call mailbox_$close (mbx_idx, (0));
+	return;
+
+/* * * * * * * * * * * GET_LINK_TARGET * * ** * * * * * * */
+
+get_link_target:
+     procedure (Ldir, Le, Tdir, Te, Code);
+dcl  (Ldir, Le, Tdir, Te) char (*) parameter;
+dcl  Code fixed bin (35);
+
+%include status_structures;
+
+dcl  get_system_free_area_ entry returns (ptr);
+dcl  hcs_$status_ entry (char (*), char (*), fixed bin (1), ptr, ptr, fixed bin (35));
+
+dcl  1 lkdata aligned like status_branch;
+
+	status_ptr = addr (lkdata);
+	status_area_ptr = get_system_free_area_ ();
+	call hcs_$status_ (Ldir, Le, 0, status_ptr, status_area_ptr, Code);
+	if Code ^= 0 then return;
+	if status_link.type ^= Link then do;
+	     Tdir = Ldir;
+	     Te = Le;
+	     end;
+	else call expand_pathname_ ((status_pathname), Tdir, Te, Code);
+	free status_pathname;
+     end get_link_target;
+%page;
+%include mail_format;
+%include mlsys_data;
+%include mlsys_net_mailer_info;
+%include whotab;
+
+     end ftp_mail_mailer_;
+
+
+
+
+		    bull_copyright_notice.txt       08/30/05  1008.4r   08/30/05  1007.3    00020025
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group Bull including Bull HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell Bull Inc., Groupe Bull
+and Bull HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato.Users consider that Multics provided the best software architecture for 
+managing computer hardware properly and for executing programs. Many subsequent operating systems
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, Bull or Bull HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by Bull HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

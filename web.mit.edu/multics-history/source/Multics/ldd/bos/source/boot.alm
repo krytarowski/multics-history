@@ -1,0 +1,873 @@
+" ***********************************************************
+" *                                                         *
+" * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+" *                                                         *
+" ***********************************************************
+" The BOS BOOT command.
+" Modified on 5/16/72 by Bill Silver to run on 645F.
+" Modified 7/5/73 by N. I. Morris
+" Modified 8/79 by R.J.C. Kissel to take account of expanded BOS.
+" Modified 1/82 by J. Bongiovanni to clear memory faster
+" Modified 3/82 by J. Bongiovanni for new label format
+" Modified 2/82 by Benson I. Margulies for the first step
+"	      in Bootload Multics integration: booting tapes
+"	      with bootable labels compatably.
+" Modified 10/82 by J. Bongiovanni to fix non-zero IOM port problem with above
+" Modified 10/83 by E. N. Kittlitz to fix clock printing.
+
+" This program initiates the bootstrapping of the Multics system.
+" It reads in the first record of the Multics System Tape
+" starting at location 14000(8).  It places the configuration data
+" at location 12000(8), and transfers to 14040(8).
+" At that time, the following index registers contain information:
+" X0	IOM mailbox address
+" X1	address of interrupt vector
+" X2	address of Multics bootstrapping program
+
+" For bootable tapes, this programs simulates the IOM bootload program.
+" It relocates the label to 30(8), and fabricates bootload_info,
+" and the appropriate LPW and SCW data. A fault is used to transfer
+" control to the label in absolute mode.
+
+"  ******************************************************
+"  *                                                    *
+"  *                                                    *
+"  * Copyright (c) 1972 by Massachusetts Institute of   *
+"  * Technology and Honeywell Information Systems, Inc. *
+"  *                                                    *
+"  *                                                    *
+"  ******************************************************
+
+
+
+	include	mstr
+	include	make_data_macros
+	include	iom_word_macros
+
+
+	include	bosequ
+	include	fault_vector
+
+
+	bool	bootstrap1_orig,14000	address where bootstrap1 will be loaded.
+	bool	config_rec_orig,12000	address where config data will be loaded.
+
+" The following declarations are internal to  "boot"  only.
+
+	bool	rewind_code,70
+	bool	reset_status_code,40
+	bool	fwd_space_file_code,45
+	bool	read_tape_bin_code,05
+
+	equ	tapeno,3		"bootload tape number
+
+" 
+
+	include	fgbx
+	include	fs_vol_label
+	include	old_fs_vol_label
+	include	disk_pack
+
+
+" 
+
+	stx2	x2_save		Save X2 for return.
+	tsx2	init_io		"init IOM
+	tsx2	ttyinit
+	arg	ttyrequest
+
+	tsx2	cvinit		init address conversion package
+
+	tsx2	initint		init for interrupts
+	arg	execint
+
+" Ask for an SDW for a little bit of memory, just to get the
+" core-clobbering test made by makesdw.
+
+	lda	16,du
+	tsx2	makesdw
+	 tra	ret_error		Whew!
+
+" Now search the configuration table for an  intk  card entry.
+" This card is usually not found.  "boot" will build its own intk
+" card entry in the configuration table.
+
+fndink:	lda	=aintk		Look for  intk  card entry.
+	tsx2	getconf		
+	tra	*+2		Not found => build one.
+	tra	inkfnd		Found => don't build entry.
+
+	lca	1,dl		Look for 1st unused entry.
+	tsx2	getconf
+	tra	table_full	Configuration table full.
+
+	lda	=aintk		Store "intk" in name field
+	sta	com|0,7		of this entry.
+
+" Set default values on INTK card.
+
+inkfnd:
+	eax3	0,7		X3 -> INTK card
+	lca	1,dl		wipe out current card
+	rpt	arglen-3,1
+	sta	com|3,3		clear out with fence
+
+	eax3	0,7		again, x3 -> card.
+	lda	=awarm		Get WARM
+	sta	com|1,3		set first parameter
+	lda	=3,dl		get default tape number
+	sta	com|2,3		set second parameter
+	lda	=v2/2,2/0,26/,6/2	set conversion and count word
+	sta	com|15,3		..
+
+" Setup tape channel number in  ccw  and  dkmbx.  We get it from common.
+
+	lda	com|tapechanno	Channel number now in  AU.
+	stca	ccw,70		Store in bits  0 - 17 in  ccw.
+	als	9
+	stba	dkmbx+1,40	Store in bits 36 - 44 in  dkmbx
+
+" Restore X2 so we can get the arguments to  boot.
+
+	ldx2	x2_save
+	ldx1	mem|0,2		Get the argument list address.
+
+" 
+
+" This loop parses the argument to "boot".
+" An argument that is a number less than 16 is a tape number.
+" The arguments "warm" and "cold" tell what kind of boot Multics is to
+" perform.   All other arguments are placed on the INTK card.
+
+	eax7	3,3		get index for storing into INTK card
+	ldq	=v4/,2/2		get conversion bits for card
+	stq	cvbits		and save
+
+bargl:	eax1	1,1		step input parameter index
+	lda	mem|0,1		get next argument
+	cmpa	=-1		fence?
+	tze	barge		if so, all finished
+
+	cmpa	=h  warm		warm?
+	tze	bargl		already set on INTK card
+	cmpa	=h  cold		cold?
+	tze	setc		set on INTK card
+
+	ldq	mem|arglen+1,1	decimal conversion in Q
+	tmoz	*+3		tape number?
+	cmpq	=16,dl		..
+	tmoz	settap		if so, set tape number
+
+	tsx2	ljust		must be characters
+	tsx2	geas		convert to ASCII
+	sta	com|0,7		and place on card
+
+	ldq	cvbits		get conversion bits
+	orsq	com|15,3		insert conversion bits
+	qrl	2		and shift for next parameter
+	stq	cvbits		save bits
+	aos	com|15,3		bump parameter count
+
+	eax7	1,7		step to next parameter
+	tra	bargl		loop
+
+
+setc:	lda	=acold		set cold boot
+	sta	com|1,3		place as first parameter
+	tra	bargl		and loop
+
+
+" If it is a tape number argument we must store it in the  CCW  and in
+" the mailbox.  This will overlay the default tape number.
+
+settap:	stq	com|2,3		set on INTK card
+	qls	12		Position to store in CCW.
+	stcq	ccw,04
+	qls	12		Position to store in mailbox.
+	stcq	dkmbx,20		"store for bootload mailbox
+	tra	bargl		Go get next arg.
+
+" 
+
+" All of the arguments have been processed.  Before doing more work
+" start rewinding the tape.
+
+barge:	tsx2	xio_wait		Will ret when status returned.
+	zero			"Zero word => non-data transfer.
+	zero	ccw,rewind_code	Start the tape rewinding
+	tra	*+1		Ignore bad status.
+
+" There must be configuration cards for  cpu, iom, and mem.
+" If any of the three are not found then  "boot" will be aborted.
+
+	lda	=4acpu 		Look for  cpu  card entry.
+	tsx2	getconf
+	tra	noconf
+
+	lda	=4aiom 		Look for  iom  card entry.
+	tsx2	getconf
+	tra	noconf
+
+	lda	=4amem 		Look for  mem  card entry.
+	tsx2	getconf
+	tra	noconf
+
+" Clear out any old stuff in the flagbox area.
+
+	fld	0,dl		Clear AQ.
+	staq	fgb|fgbx.hc_dbr
+	staq	fgb|fgbx.sst_sdw
+	stz	fgb|fgbx.cpus
+	stz	fgb|fgbx.rtb
+	stz	fgb|fgbx.slt_segno
+
+" If the arguments to "boot" specify a cold boot,
+" then the operator will be asked if this is OK.
+
+	lda	com|1,3		cold boot?
+	cmpa	=acold
+	tze	coldboot		Yes, ask operator for OK.
+"
+"
+"	Not a cold boot. Check the clock on the RPV.
+"
+	tsx2	find_root		See where root is.
+	 tra	err_no_root
+
+	sta	root_dev		Save the RPV dev loc.
+
+	lda	=4aclok		Try for the clock card.
+	tsx2	getconf
+	tra	boot.no_clok_card
+	ldq	com|3,7		Get offset hedge word, in hours.
+	stq	fixnum_hour_delta
+	tmi	clck0
+	mpy	=3600,dl		Multiply to seconds
+	mpy	=1000000		Microseconds
+	staq	clock_delta
+clck0:	lda	LABEL_ADDR,dl	Get label address
+	tsx2	mulbos		"Convert it"
+	arg	root_dev		DEVT word
+	 tra	err_root_problem
+	tsx2	rdev		Read the rpv label
+	arg	root_dev
+	arg	bf|0
+	 tra	err_root_problem
+"
+"	Got the clock at bf|label.time_unmounted.
+"
+	lda	bf|label.volmap_version	Check label format
+	tmoz	pre_MR10_label		Old
+	cmpa	2,dl			MR 10.x
+	tpnz	pre_MR10_label		No
+	rccl	com|low_order_port,*
+	sblaq	bf|label.time_unmounted
+	tmi	clckerr
+	tra	clck1
+pre_MR10_label:
+	rccl	com|low_order_port,*
+	sblaq	bf|old_label.time_unmounted
+	tmi	clckerr
+	tra	clck1
+
+clckerr:
+	tsx2	erpt
+	acc	"The clock time is behind the time on the"
+	tsx2	erpt
+	acc	"RPV label. Will not boot."
+	tra	nogo
+clck1:	szn	fixnum_hour_delta
+	tmi	clock_check_ok	No check parm, go ahead.
+	sblaq	clock_delta
+	tmi	clock_check_ok
+clock_check.query:
+	tsx2	erpt
+	acc	"The system clock reads "
+	rccl	com|low_order_port,*
+	tsx2	clockprint
+	tsx2	erpt
+	acc	"and the RPV was last used"
+	ldaq	bf|label.time_map_updated
+	tsx2	clockprint
+	tsx2	erpt
+	acc	"This is more than the ^d hours on the CLOK card."
+	arg	fixnum_hour_delta
+	tsx2	erpt
+	acc	"Do you wish to proceed^g"
+	arg	=h!!????
+	tsx2	readtty
+	tra	clockchk.payon
+	lda	line
+	cmpa	=hyes   "
+	tze	clock_check_ok
+	cmpa	=hno    "
+	tze	nogo
+clockchk.payon:
+	tsx2	erpt
+	acc	"Please answer yes or no."
+	tra	clock_check.query
+
+clockprint:
+	stx2	printclock_x
+	tsx2	cv_clock
+	tsx2	erpt
+	acc	"^a ^d ^d ^d:^d:^d ^a ^a"
+	arg	rdclock.month_name
+	arg	rdclock.day_of_month
+	arg	rdclock.year
+	arg	rdclock.hr
+	arg	rdclock.min
+	arg	rdclock.sec
+	arg	rdclock.zone_name
+	arg	rdclock.day_name
+printclock_x:
+	tra	*-*
+err_no_root:
+	tsx2	erpt
+	acc	"Cannot find RPV. Boot aborted."
+	tra	nogo
+err_root_problem:
+	tsx2	erpt
+	acc	"Cannot read root label. Boot aborted."
+	tra	nogo
+boot.no_clok_card:
+	tsx2	erpt
+	acc	"CLOK card missing. Boot aborted."
+	tra	nogo
+
+	even
+pclk1temp: dec	0,0
+clock_delta:
+	dec	0,0
+pclk2temp: dec	0
+root_dev: dec	0
+fixnum_hour_delta:
+	dec	0
+clock_check_ok:
+
+" 
+
+" Call to rewind the tape.  It may already be rewinding.  On an error
+" keep trying to rewind.
+
+examine_tape_label:
+intact:	tsx2	xio_wait
+	zero			"Non data transfer.
+	zero	ccw,rewind_code
+	tra	*-3		On error retry rewind.
+
+" Make sure tape is mounted in correct density.
+	tsx2	itaper
+	arg	ccw
+
+" Read in the MST label record, to see if it is a bootable tape
+
+	tsx2	xio_wait
+	vfd	18/tbuff,12/0
+	zero	ccw,read_tape_bin_code
+	tra	intact		" Rewind and retry on read error
+
+" Now have a look at the data therein
+
+	lda	tbuff+mstr.head+mstr_header.c1 "Inspect the header sentinel
+	cmpa	=v36/header_c1
+	tze	tape_label.non_bootable	 " Ordinary Multics Tape
+
+	lda	tbuff+mst_label.head+mstr_header.c1 " Bootable?
+	cmpa	=v36/header_c1
+	tze	tape_label.bootable
+
+	tsx2	erpt
+	acc	"tape does not have a valid label."
+	tra	nogo
+
+
+" Bootable tape label. Time to pretend we are an IOM!
+
+" Tell All about the tape we read.
+
+vid.tape_reel_id:
+	desc9a	tbuff+mst_label.vid+volume_identifier.tape_reel_id,32
+
+	bool	iom_boot_read_loc,000030
+
+	make_pcw	boot_info.bootload_pcw,
+		0, 			" Bootload chan takes this
+		0,			" no particular
+		0,			" ditto
+		nondata,
+		proceed
+
+	          bool	iom_0_base_addr,001400
+		bool	iom_0_mbx_addr,001200
+
+boot_info.info:
+	vfd	18/iom_0_base_addr,18/iom_0_mbx_addr
+	make_idcw	boot_info.idcw,05,0,record,terminate
+	make_ddcw boot_info.ddcw,iom_boot_read_loc,0,iotd	
+	
+
+	bool	iom_0_system_fault_addr,000010
+system_fault_vector_data:
+	vfd	18/0,o18/616200
+
+	equ	fault_channel_dcw_addr,iom_0_mbx_addr+7
+fault_channel_dcw:
+	vfd	o12/012,6/2,18/2
+	vfd	18/0,o18/004000
+
+channel_mbx_data:
+	vfd	18/3,6/2,12/3
+	vfd	36/0
+	vfd	18/iom_0_mbx_addr,18/0
+	
+bootable_tape.fgbx_sentinel:
+	flagbox_sentinel
+
+tape_label.bootable:
+
+boot_the_tape:	
+
+	tsx2	erpt
+	acc	"Booting tape ^A."
+	arg	vid.tape_reel_id
+
+" So much for the word from our sponsor. Now for the work.
+
+" Save BOS common directory on disk, so RUNCOMS continue apace.
+
+	lda	com|dir
+	tsx2	wtsec
+	nop	com|0
+	dis	*		" gotta work.
+
+" Notify Bootload Multics that we are here
+
+	mlr	(),(pr)
+	desc9a	bootable_tape.fgbx_sentinel,32
+	desc9a	fgb|fgbx.sentinel,32
+
+" First setup PCW in bootload info so that label can read rest of tape
+
+	lda	ccw			channel in AU
+	als	9			PCW is vfd 3/0,6/CHANNEL
+	ana	=o077000,du		other stuff in ccw
+	sta	boot_info.bootload_pcw+1	only nonzero part
+	
+	lda	com|iom_mbbase		AU -> IOM Mailbox base
+	lda	mem|1,au			A = IOM connect word
+	ana	=o7,dl			Strip out SCU port number
+	orsa	boot_info.bootload_pcw+1	And give to Benson
+
+	lda	ccw			device # into A<18:24>
+	als	12			into position of device
+	ana	=o007700,du		in case of trash
+	orsa	boot_info.bootload_pcw
+	orsa	boot_info.idcw
+
+" Move iom bootload info to location 0-4
+
+	mlr	(),(pr)
+	desc9a	boot_info.bootload_pcw,4*5
+	desc9a	mem|0,4*5
+	
+	lda	1024*4,dl
+	mlr	(rl),(pr,rl)
+	desc9a	tbuff,al
+	desc9a	mem|iom_boot_read_loc,al
+
+	lda	system_fault_vector_data
+	sta	mem|iom_0_system_fault_addr
+
+	lda	fault_channel_dcw
+	sta	mem|fault_channel_dcw_addr
+	lda	fault_channel_dcw+1		odd addr cant be ldaq
+	sta	mem|fault_channel_dcw_addr+1
+
+	lda	ccw			channel # in AU
+	ana	=o000077,du		get rid of other bits
+	als	2			times 4
+	ada	iom_0_mbx_addr,du		Add to base addr
+	als	2			Convert words to chars
+	mlr	(),(pr,au)
+	desc9a	channel_mbx_data,3*4
+	desc9a	mem|0,3*4			x5 has addr
+	
+	ldq	(econf-conf)*4,dl
+	mlr	(pr,rl),(pr,rl)
+	desc9a	com|conf,ql
+	desc9a	mem|config_rec_orig,ql
+
+" Now produce an abs mode transfer into the label
+
+	lda	tra_label_lda
+
+	sta	mem|fv.fpair+FAULT_NO_DRL*2
+	drl
+
+" That drl should start the boot label program
+
+	lda	=o525252,du		in case it dont
+	dis	0			die in lights
+
+tra_label_lda:
+	tra       iom_boot_read_loc+mst_label.lda_instr	the lda for IOM 0
+
+" Conventional MST
+
+tape_label.non_bootable:
+
+" 
+
+" The following code will zero all of memory  except the memory that
+" is used by BOS itself - at the beginning of memory.  The entries
+" in the  "coreblocks"  array in bos_common are used to tell what memory is
+" available on the system.  Each entry in  coreblocks  represents  one system
+" port  and contains the following data:
+"
+"	Bits	 0 - 17 	=  number of 1st 64-word block of mem on this port
+"		18 - 35	=  number of 64-word blocks on this port
+"
+" NOTE: the block numbers begin with block (0).  If there is no memory on
+" this port then its coreblocks word will equal (-1).
+"
+
+" We will use segment  tmp  when zeroing memory.  The  SDW.ADDR field of  tmp  is
+" set up for each  32K block of memory cleared.
+" ** 32K  is the size of the smallest system controller that the  645F  system
+" will support.  **
+"
+" There are two memory clearing routines: a fast routine using MLR and a slow
+" routine using STAQ.  The fast is attempted first for each block to be cleared.
+" If it encounters an error, the slow routine retries (in order to print the
+" address where the problem occurred)
+"
+" NOTE: IT IS ASSUMED THAT THE SIZE OF MEMORY USED BY  BOS  IS LESS THAN  ** 32K **.
+
+clearmem:
+	tsx2	getportinfo	Pick up current config switch settings.
+	eax7	8		There are 8 ports.
+	lda	((32*1024/16)-1)*8,du  Use effective bound  of 32K.
+	era	ds|tmp*2+1	Put it into BOUND field of tmp SDW.
+	ana	sdw.bound,du	Only BOUND field of SDW is changed.
+	ersa	ds|tmp*2+1
+
+zero_loop:
+	eax7	-1,7		Have all the ports been processed?
+	tmi	zero_loop_end	Tra if  yes.
+
+	lxl6	com|coreblocks,7	No, get number of 64-word blocks on this port.
+"				NOTE: Although expressed in terms of
+"				64-word blocks the size of a memory on a
+"				port must be a multiple of  32K.
+	tmi	zero_loop		(-1) => none - no mem on this port.
+
+	lda	com|coreblocks,7	There is mem - get starting block number.
+	ana	-1,du		Zero out number of blocks.
+	tnz	port_loop		If starting block number not = 0 then skip
+"				special case.
+
+	ldq	com|corearea	Get num of 64 word blocks in BOS memory.
+	qls	6		Q * 64 = num words in BOS memory.
+	eax1	0,ql		Save in  X1.
+	tra	port_loop1	Skip setting X1  to zero.
+
+port_loop:
+	eax1	0		Set X1  to start at the beginning of this
+"				memory - this is the non-low-order case.
+port_loop1:
+	stca	ds|tmp*2,74	Store segment address in SDW.
+	cams			"Clear ass. mem. for new seg.
+	eax5	pl_flt		set up for catching fault
+	stx5	wantflt,*		if memory not there
+
+	eaa	0,1		begin address within 32K block
+	arl	18		AL = address modulo 32K
+	neg		        " AL = -address module 32K
+	ada	32*1024,dl	AL = words left in 32K block
+	als	2		AL = chars left in 32K block
+
+	epp	xs1,tmp|0,1	xs1 -> begin address
+	mlr	(),(pr,rl),fill(000) clear block to zeros
+	desc9a	0,0
+	desc9a	xs1|0,al
+	nop	0,dl		for safety, to make sure we catch
+	nop	0,dl		  any fault
+	tra	port_loop_end	32K block is flushed
+
+" The following is executed only if a fault occurs on the MLR above
+
+pl_flt:	eax5	bl_flt		faults will print message
+	stx5	wantflt,*	
+	lls	72		Clear A and Q
+
+block_loop:
+	staq	tmp|0,1		Zero two words.
+	nop	0,dl		delay so store fault happens before x1 changes
+	nop	0,dl
+	eax1	2,1
+	cmpx1	1024*32,du	Have we zeroed all 32K words?
+	tmi	block_loop	If not keep looping.
+
+port_loop_end:
+	stz	wantflt,*		No longer interested in faults.
+	eax6	-32*1024/64,6	Is this the last 32K block?
+	tze	zero_loop		If yes go process next port.
+	lda	ds|tmp*2		If no get tmp SDW.
+	adla	1024*32/64,du	Add 32K to its base (24bit addr).
+	tra	port_loop		Process next 32K on this port.
+
+
+" Now zero out the core image on the disk. 
+
+zero_loop_end:
+	lda	com|corearea	Get data about core image on disk.
+	ana	=o7777,dl		Mask the sector length
+	als	18		Use num records for SDW base addr.
+	stca	ds|tmp*2,74	Set up tmp SDW to -> to area just cleared.
+	cams			"Clear ass. mem. for new seg.
+
+	lda	com|corearea	Call to clear mem image on disk.
+	tsx2	wtsec
+	nop	tmp|0
+	dis	*
+
+" Skip over the first EOF mark to position the tape before the first data record.
+	tsx2	xio_wait		Skip over the first file mark.
+	zero			"Non data transfer.
+	zero	ccw,fwd_space_file_code
+	tra	*+1		On error check status.
+	ana	=o170000,du	Clear all but major status.
+	cmpa	=o040000,du	Should indicate  EOF.
+	tnz	intact		If not try whole operation again.
+
+
+" Now we will read in the first data record from the MST tape.
+
+	tsx2	xio_wait		Read in the first data record.
+	vfd	18/tbuff,12/0	DCW argument word.
+	zero	ccw,read_tape_bin_code
+	tra	intact		If error retry everything.
+
+" Get length of MST record from the record header.
+	ldq	tbuff+4		data length in bits
+	qrl	18		right-justify
+	div	36,dl		compute # of words
+	adlq	63+8,dl		round up and add record header lth
+	qrl	6		and compute # of 64-word sectors needed
+	stq	trecs		to contain MST record
+
+" 
+
+" Clear everything in  bos_common  below  port_array.  This will
+" clear all of the machine conditions belonging to  BOS  and
+" present the Multics system with an "initialized" machine.
+
+	mlr	(),(pr),fill(0)	clear common
+	desc9a	*,0
+	desc9a	com|0,(low_order_port-1)*4
+
+	ldx0	com|iom_mbbase	Set Multics X0 = IOM Mailbox addr.
+	stx0	com|regs+0	X0 picked up from mach conds.
+
+	lda	mem|1,0
+	stca	dkmbx+1,01	Set cow in mailbox image.
+
+" Write out the IOM mailbox image into BOS saved core image on disk.
+	eaa	0,0		X0 = core address of mailbox.
+	arl	6+6		Divide by 64 and shift to sector addr. position
+	ada	com|corearea	Add sector address of beginning of core image.
+	ana	=o777777770000	Only interested in sector addr.
+	ada	=1,dl		AL = num records to write.
+	tsx2	wtsec		Write out mailbox.
+	nop	pgm|dkmbx
+	dis	*
+
+" When Multics is given control,  X2  must contain the address of the
+" beginning of the first record read from the MST tape.  
+	eax2	bootstrap1_orig	Address for loading bootstrap1.
+	stx2	com|regs+1	X2 = bootstrap1 base.
+
+" Set up to enter bootstrap1 at 40(8).  The ILC word in the machine
+" conditions area of common will be set to this value.
+	eaa	32,2		A = addr(bootstrap1)+40(8).
+	ora	scu.ir.abs+scu.ir.bm,dl	Set abs and bm indicators.
+	sta	com|scu+scu.ilc_word Set PPR.IC and IR.
+	lda	scu.cu.rfi,dl	restart inst from start of cycle
+	sta	com|scu+scu.cu_stat_word
+	lda	scu.ppr.p,dl	must place machine in privileged mode
+	sta	com|scu+scu.ppr.p_word	..
+
+" Set the mode registers.  The history registers will be turned on until
+" a fault is encountered.  The cache will be turned off.  The lockup fault
+" grace time will be set to the maximum.
+	lda	=o61,dl		turn on history registers
+	ldq	=o3,dl		turn off cache
+	staq	com|modereg	set mode registers
+
+
+" The first record of the MST tape will now be written out on the disk.
+	eaa	0,2		X2 still = addr(bootstrap1 origin).
+	arl	6+6		Divide by 64 to get record addr.
+	ada	com|corearea	Add record addr of core image.
+	ana	=o777777770000	Leave beginning record addr.
+	ora	trecs		Insert # of records needed for MST record.
+	tsx2	wtsec		Write first MST record = bootstrap1.
+	nop	pgm|tbuff
+	dis	*
+
+
+" Set up the eight memory controller masks in bos_common.
+" They will all have the same mask.
+	eax7	16		Load loop index.
+	ldaq	mcmsk		Get mask.
+	staq	com|mcm-2,7
+	eax7	-2,7
+	tnz	*-2
+
+" Now write out the configuration table on the disk.  It will go in the
+" core image starting at  6000 octal.
+	lda	com|corearea	Get first rec num of core image.
+	ada	=v24/config_rec_orig/64	Add rec address to 1st rec number.
+	ana	=o777777770000	Clear num records field.
+	ada	econf/64-conf/64,dl	Add num recs needed for config tab.
+	tsx2	wtsec
+	nop	com|conf
+	dis	*
+
+
+" Now return to  setup.  Load the  A  so  setup will chain to the "contin" command.
+	lda	=hcontin		Chain into contin.
+x2_save:	eax2	*		Return to  setup.
+	tra	mem|1,2
+ret_error:lca	1,dl
+	tra	x2_save
+" 
+
+coldboot:	tsx2	erpt		"ask about cold boot
+	acc	'do you wish to boot cold^g'
+	arg	=h!!????
+
+	tsx2	readtty		"get answer
+	tra	coldboot
+	ldq	line
+	cmpq	=hyes   "		"yes
+	tnz	nogo		"if not, do nothing
+
+	tra	examine_tape_label
+" 
+
+
+table_full:
+	tsx2	erpt		If configuration table full.
+	acc	'configuration table full'
+	tra	nogo
+
+
+noconf:	sta	config_card_name
+	tsx2	erpt		"if no config deck
+	acc	'no ^a card in config deck'
+	arg	config_card_name
+	tra	nogo
+
+
+bl_flt:				"Here if faulted while zeroing memory.
+	stz	wantflt,*
+	eax1	0,1		check block offset
+	tnz	bl_flt1		not at beginning - complain
+	ldx5	ds|tmp*2		was this the first access to this port
+	cmpx5	com|coreblocks,7
+	tnz	zero_loop		no - continue with next port
+
+bl_flt1:	stx7	x7_save		save across erpt call
+	stz	bl_flt_loc	store block offset
+	sxl1	bl_flt_loc	after zeroing the word
+	lda	ds|tmp*2		Pick up SDW faulted on.
+	arl	sdw.add_shift	Position the address field.
+	asa	bl_flt_loc	add in the block address
+bl_flt2:	tsx2	erpt
+	acc	'Unable to access memory loc ^w, continue^g'
+	arg	bl_flt_loc
+	arg	=h!!????
+
+	tsx2	readtty		get answer
+	tra	bl_flt2
+	ldq	line
+	cmpq	=hyes   "
+	tnz	nogo
+	ldx7	x7_save		Restore index to port table
+	tra	zero_loop		And go back to it
+
+ttyrequest:
+execint:
+nogo:	lca	1,dl		Return to setup without chaining.
+	tra	x2_save
+
+
+" 
+
+ccw:	vfd	18/0,6/tapeno
+bl_flt_loc:
+	oct	0		location of fault
+x7_save:	bss	,1
+trecs:	bss	,1
+cvbits:	bss	,1
+
+	even
+mcmsk:	oct	00000000017,00000000017	mcm for no interrupts.
+config_card_name:
+	oct	0
+
+
+
+	mod	64
+dkmbx:
+	vfd	o6/05,6/tapeno,6/0,o3/7,3/0,6/0,6/0
+	vfd	9/0,27/0
+
+
+	mod	64
+tbuff:
+	bss	,1040		"buffer for Multics standard tape record
+	include	eis_micro_ops
+	include	rdclock
+	include	bos_sdw
+	include 	mc
+	include	bos_tv
+	include	bos_common
+	end
+"
+"
+"                                          -----------------------------------------------------------
+"
+"
+"
+" Historical Background
+"
+" This edition of the Multics software materials and documentation is provided and donated
+" to Massachusetts Institute of Technology by Group Bull including Bull HN Information Systems Inc. 
+" as a contribution to computer science knowledge.  
+" This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+" Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell Bull Inc., Groupe Bull
+" and Bull HN Information Systems Inc. to the development of this operating system. 
+" Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+" renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+" of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture for
+" managing computer hardware properly and for executing programs. Many subsequent operating systems
+" incorporated Multics principles.
+" Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+" as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+"
+"                                          -----------------------------------------------------------
+"
+" Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+" fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+" and that both the copyright notice and historical background and this permission notice appear in supporting
+" documentation, and that the names of MIT, HIS, Bull or Bull HN not be used in advertising or publicity pertaining
+" to distribution of the programs without specific prior written permission.
+"    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+"    Copyright 2006 by Bull HN Information Systems Inc.
+"    Copyright 2006 by Bull SAS
+"    All Rights Reserved
+"
+"

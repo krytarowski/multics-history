@@ -1,0 +1,1521 @@
+
+
+
+
+		    hc_device_acct_.pl1             11/11/89  1134.8r   11/11/89  0800.9       83871
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+hc_device_acct_: proc (a_event_ptr);
+
+/* * This procedure is an interface between RCP and the answering service.
+   * It is on the system tape and it runs in ring 4 in the initializer process.
+   * It receives wakeups sent by RCP from ring 1 in user processes, at the time
+   * of device assignments, attachments, and unassignments, and it calls the
+   * appropriate device_acct_ entry points to cause the users to be charged for
+   * their use of the I/O devices.
+   *
+   * The init entry point is called by hc_initlzr_auxl_init_, which is called by
+   * as_init_. That entry point creates an event call channel with the main entry
+   * point as its handler, and passes the channel id to RCP via a call to
+   * rcp_sys_$init_account_chan. The target of that gate, rcp_mount_timer_$account_init,
+   * stores the channel and process id's in rcp_data, where they will be available
+   * to all processes (in ring 1).
+   *
+   * Modification history:
+   * Initial coding July 1977 by T. Casey
+   * Modified October 1977 by T. Casey to pick up device user's process id which is
+   *	passed in the event message, rather than using the sender_procid of
+   *	the wakeup, which is the initializer process for a force unassign.
+   *
+*/
+
+/* DECLARATIONS */
+
+/* Parameters */
+
+dcl  a_event_ptr ptr;
+dcl  a_code fixed bin (35);
+
+/* Internal Static */
+
+dcl  already_init bit (1) aligned int static init (""b);
+
+/* External Static */
+
+dcl  error_table_$action_not_performed ext static fixed bin (35);
+
+/* External Entries */
+
+dcl  as_$dump entry options (variable);
+dcl  as_$find_process entry (bit (36), fixed bin, ptr);
+dcl  condition_ entry (char (*), entry);
+dcl (device_acct_$off, device_acct_$on, device_acct_$setup) entry (fixed bin, char (*), ptr);
+dcl  get_process_id_ entry returns (bit (36));
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed bin (71), entry, ptr, fixed bin, fixed bin (35));
+dcl  ipc_$unmask_ev_calls entry (fixed bin (35));
+dcl (ioa_$rsnnl, sys_log_, sys_log_$error_log) entry options (variable);
+dcl  rcp_sys_$init_account_chan entry (fixed bin (71), fixed bin (35));
+dcl  system_info_$device_prices entry (fixed bin, ptr);
+
+/* Automatic */
+
+dcl  err_msg char (50);
+dcl  devname char (32);
+
+dcl  chn_id fixed bin (71);
+dcl  code fixed bin (35);
+dcl  devid fixed bin;
+dcl  l fixed bin;
+dcl  n_devtab_entries fixed bin;
+dcl  process_type fixed bin;
+
+dcl  utep ptr;
+
+/* Builtin */
+
+dcl (addr, null) builtin;
+
+/* Structures and based variables, and their pointers */
+
+dcl  event_ptr ptr;
+
+dcl 1 event_info based (event_ptr),
+    2 channel_id fixed bin (71),
+    2 msg like rcp_account_msg,
+    2 sender_procid bit (36),
+    2 origin,
+      3 dev_signal bit (18) unal,
+    2 ring fixed bin (17) unal,
+    2 data_ptr ptr;
+
+dcl  ev_msg (2) bit (36) based (addr (event_info.msg));
+
+dcl 1 devtab_copy (16) aligned,
+    2 device_id char (8),
+    2 device_price (0:7) float bin;
+
+/* Include Files */
+
+%include rcp_account_msg;
+
+%include rcp_resource_types;
+
+%include devid;
+
+
+/* PROCEDURE */
+
+
+/* Being an event-call handler, we must catch any conditions that could cause
+   the stack to be unwound, take an asdump, and return to ipc_. If the stack gets
+   unwound around ipc_, this event channel stays inhibited forever, since ipc_
+   has no cleanup handler.
+*/
+
+	call condition_ ("any_other", any_other_handler);
+
+/* This code is temporary and non-general. Rather than attempt a complete
+   mapping between the devices known to RCP and those known to device_acct_
+   (which is currently impossible), it merely enables charging for the use of
+   tapes and I/O disks (which are the only devices known to both subsystems).
+   Eventually, device_acct_ and the rest of accounting should use RCP device codes.
+*/
+
+	event_ptr = a_event_ptr;
+
+/* Validate the event message */
+
+	if event_info.ring ^= 1 then do;		/* it must be from ring 1 */
+	     err_msg = "not from ring 1";
+ev_msg_err:
+	     call sys_log_ (2, "hc_device_acct_: RCP accounting wakeup ^a. Sender: ^w; ring: ^d; message: ^w ^w",
+		err_msg, event_info.sender_procid, event_info.ring, ev_msg);
+						/* note that ev_msg, a 2-element array, uses the last 2 ^w's */
+	     return;
+	end;
+
+	if event_info.sender_procid ^= event_info.device_user_procid then /* if wakeup sender ^= device user */
+	     if event_info.sender_procid ^= get_process_id_ () then /* and sender not initializer either */
+		call sys_log_ (0, "hc_device_acct_: RCP accounting wakeup: sender process (^w) ^= device user process (^w)",
+		event_info.sender_procid, event_info.device_user_procid);
+
+/* Translate device type */
+
+	if event_info.devtype = TAPE_DRIVE_DTYPEX then	/* map RCP code for tape */
+	     devid = devtab_ix_tape;			/* into device_acct_ code for tape */
+	else if event_info.devtype = DISK_DRIVE_DTYPEX then /* map RCP code for disk */
+	     devid = devtab_ix_disk;			/* into device_acct_ code for disk */
+	else return;				/* this device is not one that we know how to charge for */
+
+/* Get pointer to user table entry */
+
+	utep = null;
+	call as_$find_process (event_info.device_user_procid, process_type, utep);
+	if utep = null then do;
+	     if event_info.action = RCP_ACCTMSG_unassign then return; /* must be a force_unassign for a destroyed process */
+	     call sys_log_ (0, "hc_device_acct_: Unable to find user table entry for process ^w",
+		event_info.device_user_procid);
+						/* don't bother the operator with this one,
+						   but log it for the system programmers */
+	     return;
+	end;
+
+/* Build device name. device_acct_ wants one, but we don't want to bother
+   looking at rcp_data in ring 1 to get the real one, so build a meaningful one
+   from the offset in rcp_data. */
+
+	devname = "";
+	call ioa_$rsnnl ("rcp_data_relp_^.3b", devname, l, event_info.rcp_data_relp);
+
+/* Now call the appropriate device_acct_ entry */
+
+	if event_info.action = RCP_ACCTMSG_assign then
+	     call device_acct_$on (devid, devname, utep);
+	else if event_info.action = RCP_ACCTMSG_unassign then
+	     call device_acct_$off (devid, devname, utep);
+	else if event_info.action = RCP_ACCTMSG_attach then
+	     call device_acct_$setup (devid, devname, utep);
+	else do;
+	     err_msg = "with invalid action code";
+	     goto ev_msg_err;
+	end;
+
+/* All done */
+
+return_to_ipc_:					/* come here via nonlocal goto from the any_other handler */
+	return;
+
+
+init:	entry (a_code);
+
+	a_code = 0;				/* until something goes wrong */
+	if already_init then return;			/* A.S. initialization is restartable */
+
+	call ipc_$create_ev_chn (chn_id, code);
+	if code ^= 0 then do;
+ev_chn_err:
+	     call sys_log_ (2, "hc_device_acct_: Error creating event channel for RCP device accounting (code ^d)", code);
+	     a_code = error_table_$action_not_performed;	/* ipc_ returns nonstandard codes (1 thru 5) */
+	     return;
+	end;
+
+	call ipc_$decl_ev_call_chn (chn_id, hc_device_acct_, null (), (0), code);
+	if code ^= 0 then goto ev_chn_err;
+
+	call rcp_sys_$init_account_chan (chn_id, code);
+	if code ^= 0 then do;
+	     call sys_log_$error_log (2, code, "hc_device_acct_", "From rcp_sys_$init_account_chan");
+	     a_code = code;
+	     return;
+	end;
+
+	call system_info_$device_prices (n_devtab_entries, addr (devtab_copy));
+	do devtab_ix_tape = 1 to n_devtab_entries	/* look up tape in devtab */
+		while (devtab_copy (devtab_ix_tape).device_id ^= dev_id (dev_tape));
+	end;
+	if devtab_ix_tape = n_devtab_entries + 1 then	/* if not there, we won't charge for tape */
+	     devtab_ix_tape = 0;
+
+	do devtab_ix_disk = 1 to n_devtab_entries	/* look up disk in devtab */
+		while (devtab_copy (devtab_ix_disk).device_id ^= dev_id (dev_disk));
+	end;
+	if devtab_ix_disk = n_devtab_entries + 1 then	/* if not there, we won't charge for disk */
+	     devtab_ix_disk = 0;
+
+	already_init = "1"b;			/* if we got here with no errors, remember it not to init again */
+
+	return;
+
+
+
+any_other_handler: proc (mcp, cname, cop, inp, cont);
+
+dcl (mcp, cop, inp) ptr, cname char (*), cont bit (1);
+
+	     if cname = "quit" | cname = "cput" | cname = "alrm" | cname = "program_interrupt" then do;
+		cont = "1"b;			/* let someone else handle it */
+		return;				/* return to signal_ */
+	     end;
+
+	     call sys_log_ ("hc_device_acct_: signal ^a", cname);
+	     call as_$dump ("hc_device_acct_");
+	     code = 0;				/* someone we call (like device_acct_)
+						   might have event calls masked */
+	     do while (code = 0);			/* be sure to get completely unmasked */
+		call ipc_$unmask_ev_calls (code);	/* code = 4 means "you were not masked" */
+	     end;
+	     goto return_to_ipc_;			/* go get this event call channel uninhibited */
+
+	end any_other_handler;
+
+     end hc_device_acct_;
+ 
+
+
+
+		    hc_initlzr_auxl_init_.pl1       11/11/89  1134.8r   11/11/89  0800.9       25704
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-06-05,GJohnson), approve(86-06-05,MCR7387),
+     audit(86-06-10,Martinson), install(86-07-11,MR12.0-1091):
+     Correct error message documentation.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4 */
+hc_initlzr_auxl_init_: proc;
+init: entry;					/* to avoid coordinated installation */
+
+/* * This procedure is an interface between as_init_ and the procedures in
+   * bound_hc_initlzr_auxl_. This bound segment contains procedures that are,
+   * themselves, interfaces between the answering service and subsystems on the
+   * system tape. The intention is to avoid, as much as possible, coordinated
+   * hardcore and answering service installations, whenever new subsystems that are
+   * to be initialized or used by the answering service are added to the system tape.
+   *
+   * Modification history:
+   * Initial coding July 1977 by T. Casey
+   * Modified April 1982 by E. N. Kittlitz. new initialization.
+*/
+
+/* DECLARATIONS */
+
+
+/* External Entries */
+
+dcl  hc_device_acct_$init entry (fixed bin (35));
+dcl  lv_request_$init entry;
+dcl  rcp_mount_timer_poll_$init_rcp_mount_timers entry;
+dcl  sub_err_ entry () options (variable);
+dcl  sys_log_$error_log entry options (variable);
+
+/* External static */
+
+dcl  error_table_$out_of_sequence fixed bin (35) ext static;
+
+/* Automatic */
+dcl  code fixed bin (35);
+
+
+/* PROCEDURE */
+
+	if ^sc_stat_$Multics_typed | sc_stat_$Go_typed then
+	     call sub_err_ (error_table_$out_of_sequence, "hc_initlzr_auxl_init_", "s");
+	call rcp_mount_timer_poll_$init_rcp_mount_timers;
+	call lv_request_$init;
+	call hc_device_acct_$init (code);
+	if code ^= 0 then do;
+	     call sys_log_$error_log (2, code, "hc_initlzr_auxl_init_", "From hc_device_acct_$init");
+	     call sub_err_ (0, "hc_initlzr_auxl_init_", "s");
+	end;
+	return;
+
+%include sc_stat_;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   hc_initlrz_auxl_init_: MESSAGE. From hc_device_acct_$init.
+
+   S:	as (severity2)
+
+   T:	$init
+
+   M:	An error was detected while initializing device accounting.
+
+   A:	$notify
+
+   END MESSAGE DOCUMENTATION */
+
+     end hc_initlzr_auxl_init_;
+
+
+
+
+
+		    lv_request_.pl1                 08/16/90  1228.9rew 08/16/90  1223.2      233190
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) BULL HN Information Systems Inc., 1990   *
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: off */
+
+lv_request_: proc (msgp);
+	go to interrupt;
+
+/* lv_request_: a mdxhdx poor man's RCP. Bernard Greenberg 09/09/76. Thanks to THVV's tape_opr_. */
+/* Modified July 1977 by T. Casey to add calls to device_acct_ and fix up masking and unmasking */
+/* Modified November 1981, E. N. Kittlitz.  user_table_entry conversion. */
+/* Modified December 1981, J. Bongiovanni, for poll_mounts, allow mounting LV with no processes attached */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-04-28,GDixon), approve(87-07-13,MCR7741),
+     audit(87-05-07,Parisek), install(87-08-04,MR12.1-1055):
+     Updated for change to user_table_entry.incl.pl1.
+  2) change(87-07-31,GDixon), approve(87-07-31,MCR7741),
+     audit(87-08-03,Parisek), install(87-08-04,MR12.1-1055):
+      A) Provide operator message documentation for sys_log_ calls.
+      B) Change to use get_userid_$info to provide standard-format group ids
+         in error messages.
+      C) Reorganization variable declarations according to standards.
+      D) Put out LV attach/detach messages in a more standard format similar
+         to messages emitted by as_access_audit_.  Some day, we should
+         create a new entrypoint in as_access_audit_ to emit these messages.
+  3) change(88-04-18,Farley), approve(88-05-26,MCR7880),
+     audit(88-05-31,Parisek), install(88-07-05,MR12.2-1052):
+     Modified attach_list entry to use standard argument parsing and allow
+     multiple LVs (or -all).  Entry is now callable via the Initializer's
+     list_lv_attachments (llva) request.  Added "signal_io_" to the
+     any_other_handler's list of conditions to pass on, so Initializer I/O
+     will work properly.
+  4) change(90-07-04,Schroth), approve(90-07-16,MCR8184),
+     audit(90-07-30,WAAnderson), install(90-08-16,MR12.4-1024):
+     Ensure event call channels are unmasked on exit.
+                                                   END HISTORY COMMENTS */
+
+
+/* AUTOMATIC */
+
+dcl  argl fixed bin (21);
+dcl  argp ptr;
+dcl  argx fixed bin;
+dcl  array (200) fixed bin;				/* return result lvax's from wds */
+dcl  d_lvname char (32);				/* dlv time lvname */
+dcl  demounting bit (1);				/* interrupt time task */
+dcl  dtx fixed bin;
+dcl (ec, xec) fixed bin (35);
+dcl  ev_calls_masked bit (1) aligned;			/* to remember if we mask event calls */
+dcl (i, n) fixed bin;				/* index and length in 'array' array */
+dcl  list_all_vols bit (1) aligned;
+dcl  lvax fixed bin;				/* lvat index */
+dcl  lvname char (32);				/* lv name of interest */
+dcl (lvx, pvx) fixed bin;				/* disk table indices */
+dcl  my_evchn fixed bin (71);				/* init_time event chan */
+dcl  n_devtab_entries fixed bin;
+dcl  n_vols_to_list fixed bin;
+dcl  nargs fixed bin;
+dcl  next_time fixed bin (71);
+dcl  pid bit (36) aligned;
+dcl  result fixed bin;				/* generated test mhv result */
+dcl  shown_lvat_header bit (1);
+dcl  status char (25);				/* Status of attachment for report */
+dcl  unit_string char (200) varying;
+dcl  user_procid bit(36) aligned;
+dcl  user_procname char (33);				/* user process name */
+dcl  vols_to_list (10) char (32);
+dcl  vtlx fixed bin;				/* vols_to_list index */
+
+dcl 1 devtab_copy (16) aligned,
+    2 device_id char (8),
+    2 device_price (0:7) float bin;
+
+dcl 1 local_lvate aligned like lvate;
+
+dcl 1 mount_transmission aligned,			/* message sent in bits by lv_request_communicator_ */
+    2 req char (4) unaligned,				/* "moun", "demo", or "poll" */
+    2 lvax fixed bin (17) unal,			/* lvat index */
+    2 other fixed bin (17) unaligned;			/* mbz */
+
+/* STATIC */
+
+dcl  ALARM___ char (8) static init ("alarm___") options (constant); /* timer message */
+dcl  FALSE bit (1) static init ("0"b) options (constant);
+dcl  LV_RING fixed bin init (1) static;			/* ring of lv_request_communicator_ */
+dcl  SL0 fixed bin init (0) int static;			/* = SL_LOG_SILENT, log messages only */
+dcl  TRUE bit (1) static init ("1"b) options (constant);
+dcl  initialized bit (1) static init ("0"b);		/* set up ok */
+dcl  myprocessid bit (36) aligned static;		/* for ev msg checks */
+dcl  testing bit (1) static init ("0"b);		/* test environment */
+
+
+/* BASED */
+
+dcl  arg char (argl) based (argp);
+
+dcl 1 evmessage based (msgp) aligned,			/* ipc message */
+    2 evchn fixed bin (71),
+    2 bits bit (72),				/* data */
+    2 sender bit (36),
+    2 origin,
+      3 devs fixed bin (17) unal,
+      3 ring fixed bin (17) unal;
+
+/* PARAMETERS */
+
+dcl  msgp ptr parm;					/* ipc message ptr */
+dcl  a_pid bit (36) aligned parm;			/* processid being termed */
+dcl  a_lvx fixed bin parm;				/* mhv/dhv communication */
+dcl  a_dtp ptr parm;				/* disk_table COPY ptr */
+dcl  a_lvname char (*) parm;				/* lv parameter at dhv time */
+
+/* BUILTINS */
+
+dcl (addr, addrel, hbound, null, rtrim, unspec) builtin;
+
+/* ENTRIES & EXTERNAL */
+
+dcl  as_$find_process entry (bit (36) aligned, fixed bin, ptr);
+dcl  com_err_ entry () options (variable);
+dcl  condition_ entry (char (*), entry);
+dcl  cu_$arg_count entry (fixed bin, fixed bin (35));
+dcl  cu_$arg_ptr entry (fixed bin, ptr, fixed bin (21), fixed bin (35));
+dcl (device_acct_$on, device_acct_$off) entry (fixed bin, char (*), ptr);
+dcl  disk_table_$dhv entry (char (*));
+dcl  disk_table_$dry_run_mhv entry (char (*), fixed bin);
+dcl  disk_table_$get_dtp entry returns (ptr);		/* this guy returns a fresh copy each time */
+dcl  disk_table_$mhv entry (char (*));
+dcl  error_table_$noarg fixed bin (35) ext;
+dcl  error_table_$resource_unavailable fixed bin (35) ext;
+dcl  get_process_id_ entry returns (bit (36) aligned);
+dcl  get_ring_ entry returns (fixed bin);
+dcl  get_userid_$info entry (bit(36) aligned, char(*), char(*), char(*), fixed bin, fixed bin, fixed bin, fixed bin(35));
+dcl  initializer_mdc_$check_mount entry (fixed bin, char (*), char (*) varying);
+dcl  initializer_mdc_$free_lvate entry (fixed bin);
+dcl  initializer_mdc_$init_lvat entry (fixed bin (71), fixed bin (35));
+dcl  initializer_mdc_$invalidate_lvate entry (fixed bin);
+dcl  initializer_mdc_$lvat_scan_lv entry (char (*), (*) fixed bin, fixed bin);
+dcl  initializer_mdc_$mhvmessage entry (fixed bin, char (*));
+dcl  initializer_mdc_$poll_mounts entry ((*) fixed bin, fixed bin, fixed bin (71));
+dcl  initializer_mdc_$respond_mount_lv entry (fixed bin, fixed bin, fixed bin (35), fixed bin (35));
+dcl  initializer_mdc_$retrieve_lvate entry (fixed bin, ptr, fixed bin (35));
+dcl  initializer_mdc_$scan_process_lvat entry (bit (36) aligned, (*) fixed bin, fixed bin);
+dcl  initializer_mdc_$set_lvat_info entry (fixed bin, bit (36) aligned, fixed bin);
+dcl  ioa_ entry options (variable);
+dcl (ioa_$rsnnl, as_$dump) entry options (variable);
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed bin (71), entry, ptr, fixed bin, fixed bin (35));
+dcl (ipc_$mask_ev_calls, ipc_$unmask_ev_calls) entry (fixed bin (35));
+dcl (sys_log_, sys_log_$error_log) entry options (variable);
+dcl  system_info_$device_prices entry (fixed bin, ptr);
+dcl  timer_manager_$alarm_wakeup entry (fixed bin(71), bit(2), fixed bin(71));
+
+
+dcl  command_error condition;
+
+/* --------------------------------------------------------- */
+
+init1:	entry;
+
+	SL0 = SL_LOG;				/* for real debugging */
+
+init:	entry;
+
+	call ipc_$create_ev_chn (my_evchn, ec);
+	call ipc_$decl_ev_call_chn (my_evchn, lv_request_, null, 1, ec);
+
+	if ec = 0 then call initializer_mdc_$init_lvat (my_evchn, ec);
+	if ec ^= 0 then do;
+	     call sys_log_$error_log (SL_LOG_BEEP, ec, "lv_request_",
+		"Cannot initialize logical volume mounting software.");
+	     return;
+	end;
+
+	myprocessid = get_process_id_ ();
+
+	call system_info_$device_prices (n_devtab_entries, addr (devtab_copy));
+	do devtab_ix_lv = 1 to n_devtab_entries		/* look up lv in devtab */
+		while (devtab_copy (devtab_ix_lv).device_id ^= dev_id (dev_lv));
+	end;
+	if devtab_ix_lv = n_devtab_entries + 1 then	/* if not there, we won't charge for logical volumes */
+	     devtab_ix_lv = 0;
+
+	initialized = "1"b;
+	return;
+
+/* --------------------------------------------------------- */
+
+dhv:	entry (a_lvname);				/* Called to purge lv from table */
+
+	if ^initialized then return;
+	lvname = a_lvname;
+	call initializer_mdc_$lvat_scan_lv (lvname, array, n);
+	do i = 1 to n;
+
+	     lvax = array (i);
+	     call get (lvax);
+	     call find_u (lvate.pid);
+
+	     if lvate.waiting then do;
+		call sys_log_ (SL0,
+		     "lv_request_: Denied LV ^a to ^a ^12.3b.", lvname,
+		     user_procname, user_procid);
+		call initializer_mdc_$respond_mount_lv (lvax, 2, error_table_$resource_unavailable, ec);
+		if ec ^= 0 then call beef ("Cancelling pending mount via dlv");
+	     end;
+	     if lvate.mounted then do;
+		call detach;
+		call initializer_mdc_$invalidate_lvate (lvax);
+	     end;
+	end;
+	return;
+
+/* --------------------------------------------------------- */
+
+attach_list: entry;
+
+	if ^initialized then do;
+	     call ioa_ ("lv_request_: Logical volume software has not been initialized.");
+	     return;
+	end;
+
+/* Called on CALL SIDE ONLY, can call ioa_ */
+
+	call cu_$arg_count (nargs, ec);
+	if ec ^= 0 then do;
+	     call com_err_ (ec, "lv_request_", "Getting argument count.");
+	     return;
+	end;
+	if nargs < 1 then do;
+	     call com_err_ (error_table_$noarg, "lv_request_", "Logical volume name or -all.");
+	     return;
+	end;
+
+	list_all_vols = FALSE;
+	n_vols_to_list = 0;
+	do argx = 1 to nargs;
+	     call cu_$arg_ptr (argx, argp, argl, ec);
+	     if ec ^= 0 then do;
+		call com_err_ (ec, "lv_request_", "Getting arg ^d.", argx);
+		return;
+	     end;
+	     if arg = "-all" | arg = "-a" then list_all_vols = TRUE;
+	     else do;
+		n_vols_to_list = n_vols_to_list + 1;
+		if n_vols_to_list ^> hbound (vols_to_list, 1)
+		     then vols_to_list (n_vols_to_list) = arg;
+		else do;
+		     call ioa_ ("lv_request_: Too many LVs specified. All LVs past ""^a"" will be ignored.", vols_to_list (n_vols_to_list - 1));
+		     argx = nargs;			/* simulate end of args */
+		     n_vols_to_list = hbound (vols_to_list, 1);
+		end;
+	     end;
+	end;
+
+	dtp = disk_table_$get_dtp ();
+
+	shown_lvat_header = "0"b;
+	if list_all_vols then
+	     do lvx = 1 to dt.n_lv_entries;
+	     if dt.lv_array (lvx).used then do;
+		lvname = dt.lv_array (lvx).lvname;
+		call list_vol_attachments;
+	     end;
+	end;
+
+	else do vtlx = 1 to n_vols_to_list;
+	     lvname = vols_to_list (vtlx);
+	     do lvx = 1 to dt.n_lv_entries
+		while (lvname ^= dt.lv_array (lvx).lvname);
+	     end;
+	     if lvx ^> dt.n_lv_entries then
+		call list_vol_attachments;
+	     else call ioa_ ("^/LV ""^a"" is not defined.", lvname);
+	end;
+
+	if list_all_vols & ^shown_lvat_header then
+	     call ioa_ ("^/No LV Attachments.");
+	return;
+
+/* --------------------------------------------------------- */
+
+list_vol_attachments: proc;
+
+	     call initializer_mdc_$lvat_scan_lv (lvname, array, n);
+
+	     if n = 0 then do;
+		if ^list_all_vols then
+		     call ioa_ ("^/No attachments to LV ""^a"".", lvname);
+		return;
+	     end;
+
+	     call ioa_ ("^/LV ""^a"" Attachments:^/", lvname);
+	     if ^shown_lvat_header then do;
+		call ioa_ ("User^35tProcess_id^49tStatus^/");
+		shown_lvat_header = "1"b;
+	     end;
+
+	     do i = 1 to n;
+		lvax = array (i);
+		call get (lvax);
+		call find_u (lvate.pid);
+		if lvate.mounted then status = "In use";
+		else if lvate.detach_requested then status = "Detaching";
+		else if lvate.waiting | lvate.pending_mount then status = "Waiting for mount";
+		else if lvate.invalidated then status = "Invalidated";
+		else status = "??????";
+
+		call ioa_ ("^33a ^12.3b  ^a", user_procname, user_procid,
+		     status);
+	     end;
+
+	     return;
+	end list_vol_attachments;
+
+/* --------------------------------------------------------- */
+
+cleanup_process: entry (a_pid);
+
+	if ^initialized then return;
+	call find_u (a_pid);
+	pid = a_pid;
+	call initializer_mdc_$scan_process_lvat (pid, array, n);
+
+	do i = 1 to n;
+
+	     lvax = array (i);
+	     call get (lvax);
+	     lvname = lvate.lvname;
+	     if lvate.mounted then call detach;
+	     call initializer_mdc_$free_lvate (lvax);
+	end;
+	return;
+
+/* --------------------------------------------------------- */
+
+mhv_complete: entry (a_lvx, a_dtp);
+
+	if ^initialized then return;
+	lvx = a_lvx;
+	lvname = a_lvname;
+	dtp = a_dtp;
+	lvep = addr (dt.lv_array (lvx));
+	lvname = lve.lvname;
+
+	call initializer_mdc_$lvat_scan_lv (lvname, array, n);
+	do i = 1 to n;
+	     lvax = array (i);
+	     call get (lvax);
+	     if lvate.pending_mount then do;
+		call find_u (lvate.pid);
+		call initializer_mdc_$respond_mount_lv (lvax, 1, 0, ec);
+		if ec ^= 0 then call beef ("Sending mount ready message");
+		else call attach;
+	     end;
+	end;
+	return;
+
+/* --------------------------------------------------------- */
+
+
+interrupt:
+
+	ev_calls_masked = "0"b;
+
+	call condition_ ("any_other", any_other_handler);
+
+	if ^ (evmessage.sender = myprocessid | evmessage.ring = LV_RING) then do;
+	     call find_u (evmessage.sender);
+	     call sys_log_ (SL0,
+		"lv_request_: Spurious wakeup ^24.3b received from ^a ^12.3b ^d",
+		evmessage.bits, user_procname, user_procid,
+		evmessage.ring);
+	     return;
+	end;
+
+
+	unspec (mount_transmission) = evmessage.bits;
+
+	if evmessage.bits = unspec (ALARM___) | mount_transmission.req = "poll"
+	     then do;
+	     call poll_mounts;
+	     return;
+	end;
+	
+
+/* must be real requst */
+
+	if mount_transmission.other ^= 0 | (mount_transmission.req ^= "moun" & mount_transmission.req ^= "demo")
+	then do;
+	     call sys_log_ (SL_LOG_BEEP,
+		"lv_request_ : bad transmission: ^24.3b", evmessage.bits);
+	     return;
+	end;
+
+	lvax = mount_transmission.lvax;
+	demounting = mount_transmission.req = "demo";
+	call get (lvax);
+	if xec ^= 0 then do;
+badlvax:	     call sys_log_ (SL_LOG_BEEP,
+		"lv_request_: bad LV attach table index ^d in ^[demount^;mount^] request",
+		lvax, demounting);
+	     return;
+	end;
+
+	if evmessage.sender ^= lvate.pid then go to badlvax;
+	call find_u (evmessage.sender);
+	lvname = lvate.lvname;			/* For attach/detach messages */
+
+
+	if demounting then do;
+	     if lvate.mounted then call detach;
+	     call initializer_mdc_$free_lvate (lvax);
+	     call initializer_mdc_$scan_process_lvat (evmessage.sender, array, n);
+	     if n = 0 then do;
+		if utep ^= null then ute.lvs_attached = "0"b;
+	     end;
+	     return;
+	end;
+
+/* Mount a logical volume. */
+
+	dtp = disk_table_$get_dtp ();
+
+	do lvx = 1 to dt.n_lv_entries;
+	     lvep = addr (dt.lv_array (lvx));
+	     if lve.hv_mounted & lve.lvname = lvname then do;
+		call initializer_mdc_$set_lvat_info (lvax, lve.lvid, lvx);
+		call initializer_mdc_$respond_mount_lv (lvax, 1, 0, ec);
+		if ec = 0 then do;
+		     call attach;
+		     if utep ^= null () then ute.lvs_attached = "1"b;
+		end;
+		else call beef ("Mount already ready");
+		return;
+	     end;
+	end;
+
+/*  */
+/* Must generate a mhv */
+
+	ev_calls_masked = "1"b;			/* remember to unmask below */
+	call ipc_$mask_ev_calls (ec);			/* Must protect initializer from ioa_ */
+	if ec ^= 0 then do;
+	     call sys_log_$error_log (SL_LOG_BEEP, ec, "lv_request_",
+		"Masking event calls.");
+	     go to no_avail;
+	end;
+
+	on command_error;				/* Ignore command errors, too */
+						/* distk_table_ is into com_err_. */
+
+
+	call disk_table_$dry_run_mhv (lvname, result);
+
+	if result = 0 then go to mhv_it;		/* if can hack without dhvs, do it now */
+
+	do lvx = 1 to dt.n_lv_entries;
+	     lvep = addr (dt.lv_array (lvx));
+	     if (lve.hv_mounted | lve.mounting) & ^lve.public then do;   /* can only demount in-use privates */
+		d_lvname = lve.lvname;
+		call initializer_mdc_$lvat_scan_lv (d_lvname, array, n);
+		if n = 0 then do;
+		     do pvx = 1 to dt.n_entries;
+			dtep = addr (dt.array (pvx));
+			if dte.lvx = lvx then do;
+			     lve.good_candidate = "1"b;
+			     dte.used = "0"b;
+			     dte.pre_accepted = "1"b;
+			end;
+		     end;
+		     if lve.good_candidate then do;	/* Now try trial mhv */
+			call disk_table_$dry_run_mhv (lvname, result);
+			if result = 0 then go to dlv_and_mhv;
+		     end;
+		end;
+	     end;
+	end;
+
+/*	No amount of dhvery will make this volume mountable */
+
+no_avail:
+	call sys_log_ (SL0, "No drives available to mount ^a for ^a ^12.3b",
+	     lvname, user_procname, user_procid);
+	call initializer_mdc_$respond_mount_lv (lvax, 3, error_table_$resource_unavailable, ec);
+	if ec ^= 0 then call beef ("Drive availability denial");
+unmask:	if ev_calls_masked then			/* if we masked event calls above */
+	     call ipc_$unmask_ev_calls ((0));		/* then unmask. otherwise leave mask alone */
+	return;
+
+/*  */
+/*  If we dlv marked lve's, there will be enough space */
+
+dlv_and_mhv:
+	n = 0;
+	do lvx = 1 to dt.n_lv_entries;
+	     lvep = addr (dt.lv_array (lvx));
+	     if lve.good_candidate then do;
+		n = n + 1;
+		array (n) = lvx;
+	     end;
+	end;
+
+	do i = 1 to n;
+	     lvep = addr (dt.lv_array (array (i)));
+	     call disk_table_$dhv ((lve.lvname));
+	end;
+
+/*  See if it all worked */
+
+	do i = 1 to n;
+	     lvep = addr (dt.lv_array (array (i)));
+	     if lve.demounting then go to no_avail;
+	end;
+
+/* Drives logically free. Now mhv */
+
+mhv_it:	call sys_log_ (SL0,
+	     "lv_request_: Beginning mount of LV ^a for ^a ^12.3b.",
+	     lvname, user_procname, user_procid);
+	call disk_table_$mhv (lvname);
+
+	do lvx = 1 to dt.n_lv_entries;
+	     lvep = addr (dt.lv_array (lvx));
+	     if lve.lvname = lvname then do;
+		if lve.hv_mounted then go to unmask;	/* lv_request_$mhv_complete took care */
+		if lve.mounting then do;
+		     call initializer_mdc_$respond_mount_lv (lvax, 4, 0, ec);
+		     call initializer_mdc_$mhvmessage (lvax, user_procname);
+						/* beep beep */
+		     if ec ^= 0 then call beef ("Sending response to wait for mount");
+		end;
+		if utep ^= null () then ute.lvs_attached = "1"b;
+		go to unmask;
+	     end;
+	end;
+
+	go to no_avail;				/* Somehow didn't make it */
+						/*  */
+
+/* Subroutines */
+
+beef:	proc (beef);				/* Can't send message */
+
+dcl  beef char (*);
+
+	     call sys_log_$error_log (SL_LOG_BEEP, ec, "lv_request_",
+		"Cannot send message to ^a ^12.3b: ^a", user_procname,
+		user_procid, beef);
+
+	     return;
+	end;
+
+attach:	proc;
+
+	     call sys_log_ (SL0,
+		"lv_request_: ATTACH^20tLV ^a to ^a ^12.3b.",
+		lvname, user_procname, user_procid);
+	     if utep ^= null
+		then call device_acct_$on (devtab_ix_lv, lvname, utep);
+	end;
+
+detach:	proc;
+
+	     call sys_log_ (SL0,
+		"lv_request_: DETACH^20tLV ^a from ^a ^12.3b.", lvname,
+		user_procname, user_procid);
+
+	     if utep ^= null then
+		call device_acct_$off (devtab_ix_lv, lvname, utep);
+
+	end;
+
+get:	proc (a_lvax);
+
+dcl  a_lvax fixed bin;
+
+	     lvatep = addr (local_lvate);
+	     call initializer_mdc_$retrieve_lvate (a_lvax, lvatep, xec);
+	end;
+
+
+find_u:	proc (pid);
+
+dcl  ape char (24);
+dcl  aprj char(12);
+dcl  tag char(1);
+dcl  anon fixed bin;
+
+dcl  pid bit (36) aligned;
+
+	     if testing then do;
+		call get_userid_$info(pid, ape, aprj, tag, 0, anon, 0, ec);
+		if ec = 0 then utep = addrel (null, 1);
+		else utep = null;
+	     end;
+	     else do;
+		call as_$find_process (pid, (0), utep);
+		if utep ^= null then do;
+		     ape = ute.person;
+		     aprj = ute.project;
+		     tag = ute.tag;
+		     anon = ute.anonymous;
+		end;
+	     end;
+	     if utep = null then user_procname = "PROCESSID";
+	     else call ioa_$rsnnl("^[*^]^a.^a.^a", user_procname, (0),
+		(anon=1), ape, aprj, tag);
+	     user_procid = pid;
+
+	     return;
+
+	end;
+
+
+any_other_handler: proc (mcp, cname, cop, inp, cont);
+
+dcl (mcp, cop, inp) ptr, cname char (*), cont bit (1);
+
+	     if testing | ^initialized
+	     | cname = "quit" | cname = "alrm" | cname = "program_interrupt"
+	     | cname = "cput" | cname = "signal_io_" then do;
+		cont = "1"b;
+		return;
+	     end;
+
+	     call sys_log_ (SL_LOG_BEEP,
+		"lv_request_: Unexpected condition ^a occurred.", cname);
+	     call as_$dump ("lv_request_");
+	     ec = 0;
+	     do while (ec = 0);			/* be sure to get completely unmasked */
+		call ipc_$unmask_ev_calls (ec);
+	     end;
+	     go to unmask;				/* nonlocal goto. return to ipc_ to get this ev chn uninhibited */
+	end;
+
+
+/* Subroutine to check for pending mounts whose timeout has expired */
+
+poll_mounts:
+	proc;
+	
+	dtp = disk_table_$get_dtp ();
+
+	call initializer_mdc_$poll_mounts (array, n, next_time);
+	if n > 0 
+	     then do i = 1 to n;
+	     call get (array (i));
+	     do lvx = 1 to dt.n_lv_entries
+		while (dt.lv_array (lvx).lvname ^= lvate.lvname | ^dt.lv_array (lvx).used);
+	     end;
+	     if lvx <= dt.n_lv_entries then do;
+		unit_string = "";
+		do dtx = 1 to dt.n_entries;
+		     dtep = addr (dt.array (dtx));
+		     if dte.lvx = lvx
+			then if dte.pre_accepted
+			then unit_string = unit_string || rtrim (dte.pvname) || " (" || rtrim (dte.drive_name) || ") ";
+		end;
+		if unit_string ^= "" then do;
+		     call find_u (lvate.pid);
+		     call initializer_mdc_$check_mount (array (i),
+			user_procname, unit_string);
+		end;
+	     end;
+	end;
+	
+	if next_time > 0
+	     then call timer_manager_$alarm_wakeup (next_time, "00"b, evmessage.evchn);
+
+
+	end;
+
+
+test:	entry;
+
+	LV_RING = get_ring_ ();
+	testing = "1"b;
+	SL0 = SL_LOG;
+	return;
+
+
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   lv_request_: ERROR_MESSAGE. Cannot initialize logical volume mounting
+   software.
+
+   S:	$as2
+
+   T:	$init
+
+   M:	Initialization of the logical volume attach table failed.  
+   ERROR_MESSAGE is the text associated with the error code returned by
+   initializer_mdc_$init_lvat.
+
+   A:	$notify_sa
+
+
+   Message:
+   lv_request_: Denied LV LVNAME to PERSON.PROJECT.TAG PROCESSID
+
+   S:	$as0
+
+   T:	When dismounting a logical volume.
+
+   M:	The user process identified by PERSON.PROJECT.TAG and PROCESSID
+   was waiting to mount a logical volume LVNAME which is being dismounted
+   by the operator.  The mount request was therefore denied.
+
+   A:	$ignore
+
+   
+   Message:
+   lv_request_: Spurious wakeup EVENT_MESSAGE received from PERSON.PROJECT.TAG
+   PROCESSID RINGNO
+ 
+   S:	$as0
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	A wakeup was received on the lv_request_ interrupt event channel
+   with event data EVENT_MESSAGE from the process with PERSON.PROJECT.TAG,
+   PROCESSID and RINGNO.  This message is invalid because it did not come
+   from the Initializer, ring 1 environment.
+
+   A:	$ignore
+
+
+   Message:
+   lv_request_: bad transmission:  EVENT_MESSAGE
+
+   S:	$as2
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	An unexpected EVENT_MESSAGE was received by the mount/demount
+   interrupt handler.  $err
+
+   A:	$notify_sa
+
+
+   Message:
+   lv_request_: bad LV attach table index N in {DE}MOUNT request
+
+   S:	$as2
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	The Logical Volume attach table index given in the event message
+   associated with the mount or demount interrupt is invalid.  $err
+
+   A:	$notify_sa
+
+
+   Message:
+   lv_request_:  ERROR_MESSAGE.  Masking event calls.
+
+   S:	$as2
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	An error occurred while attempting to mask event call wakeups.
+   ERROR_MESSAGE is the text associated with the error code returned by
+   ipc_$mask_ev_calls.  $err
+
+   A:	$notify_sa
+
+
+   Message:
+   lv_request_: No drives available to mount LV LVNAME for PERSON.PROJECT.TAG
+   PROCESSID
+
+   S:	$as0
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	Drives needed to mount the volumes of LVNAME were in use or
+   deleted.  The logical volume could not be mounted for the process identified
+   by PERSON.PROJECT.TAG and PROCESSID.
+
+   A:	$ignore
+
+
+   Message:
+   lv_request_:  Beginning mount of LV LVNAME for PERSON.PROJECT.TAG PROCESSID
+
+   S:	$as0
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	The volumes associated with LVNAME are now being mounted for
+   the process identified by PERSON.PROJECT.TAG and PROCESSID.
+
+   A:	$ignore
+
+
+   Message:
+   lv_request_: Cannot send message to PERSON.PROJECT.TAG PROCESSID: ADDED_INFO
+
+   S:	$as2
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	The Initializer is attempting to respond to a request to mount
+   or demount a logical volume, but is unable to send a wakeup to the user
+   process.  The process may have logged out.  $err
+
+   A:	$notify_sa
+
+
+   Message:
+   lv_request_: ATTACHED LV LVNAME to PERSON.PROJECT.TAG PROCESSID.
+
+   S:	$as0
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	This message records attachment of logical volume LVNAME to the
+   process identified by PERSON.PROJECT.TAG and PROCESSID.
+
+   A:	 $ignore
+
+
+   Message:
+   lv_request_: DETACHED LV LVNAME from PERSON.PROJECT.TAG PROCESSID.
+
+   S:	$as0
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	This message records detachment of logical volume LVNAME from the
+   process identified by PERSON.PROJECT.TAG and PROCESSID.
+
+   A:	 $ignore
+
+   
+   Message:
+   lv_request_: Unexpected condition CONDNAME occurred.
+
+   S:	$as2
+
+   T:	When processing a disk mount/demount interrupt.
+
+   M:	Condition CONDNAME was signalled unexpectedly during a mount or
+   demount request.  An answering service dump is created to further document
+   the cause of the error.
+
+   A:	$notify_sa.
+
+
+   END MESSAGE DOCUMENTATION */
+
+ %include devid;
+ %include disk_table;
+ %include lv_atttbl;
+ %include sys_log_constants;
+ %include user_attributes;
+ %include user_table_entry;
+
+     end;
+  
+
+
+
+		    rcp_mount_timer_poll_.pl1       11/11/89  1134.8rew 11/11/89  0800.9       61587
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+rcp_mount_timer_poll_$init_rcp_mount_timers: init: procedure;
+
+/* rcp_mount_timer_poll_  Bernard Greenberg 10/28/76
+   Designed by Greenberg and Silver */
+
+/*  A brother of lv_request_, a friend of rcp_ */
+
+/* Critical internal static variables */
+
+dcl  RCP_RING fixed bin static init (1);		/* changes for test entry */
+dcl  DELTA fixed bin (71) static init (240000000);	/* 4 minutes */
+dcl  SL0 fixed bin static init (0);			/* similarly */
+dcl  channel fixed bin (71) static init (0);		/* event channel for all doings */
+dcl  my_processid bit (36) aligned static init ("0"b);
+dcl  hx fixed bin static init (1);			/* first available table index */
+
+dcl 1 tbl (100) static internal,			/* the actual polling table */
+    2 time fixed bin (71) aligned,			/* maturation time */
+    2 off bit (18) aligned;				/* rcp identifying offset */
+
+/* DIVERS CONSTANTS */
+
+dcl  ABS_MICROSECONDS bit (2) static init ("00"b) options (constant); /* for timer_manager_ */
+dcl  ALARM___ char (8) static init ("alarm___") options (constant);
+dcl  KEY char (4) static init ("rcmt") options (constant);	/* RCP messages */
+dcl  myname char (32) init ("rcp_mount_timer_poll_") static options (constant);
+
+
+/* AUTOMATIC STORAGE */
+
+dcl  i fixed bin;
+dcl  now fixed bin (71);
+dcl  recheck_flag bit (1) aligned;
+dcl  sender bit (36) aligned;
+dcl  code fixed bin (35);
+
+/* Format of transmissions from RCP */
+
+dcl 1 mess,
+    2 key char (4),					/* "rcmt" */
+    2 off bit (18) unaligned,				/* rcp_data_ offset */
+    2 mbz bit (18) unaligned;				/* like it says */
+
+/* BASED */
+
+dcl  mptr ptr parameter;				/* sorta like based */
+
+/* IPC message format */
+
+dcl 1 evmsg based (mptr) aligned,
+    2 channel fixed bin (71),
+    2 data bit (72),				/* transmission */
+    2 pid bit (36),					/* sender */
+    2 devsignal fixed bin (17) unaligned,
+    2 ring fixed bin (17) unaligned;
+
+/* ENTRIES */
+
+dcl (sys_log_, sys_log_$error_log) entry options (variable);
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed bin (71), entry, ptr, fixed bin, fixed bin (35));
+dcl  timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2), fixed bin (71));
+dcl  rcp_sys_$init_mount_timer entry (fixed bin (71), fixed bin (35));
+dcl  rcp_sys_$check_mount_timer entry (bit (18) aligned, bit (1) aligned, fixed bin (35));
+dcl  clock_ entry returns (fixed bin (52));
+dcl  get_process_id_ entry returns (bit (36) aligned);
+dcl  get_ring_ entry returns (fixed bin);
+
+
+/* ------------------------------------------------------- */
+
+/* Init entry point */
+
+
+	unspec (tbl) = "0"b;			/* for test re-inits */
+
+	my_processid = "0"b;			/* ditto */
+	hx = 1;
+
+
+	call ipc_$create_ev_chn (channel, code);
+	if code ^= 0 then do;
+	     call sys_log_$error_log (2, code, myname, "Cannot create event channel");
+	     return;
+	end;
+
+	call ipc_$decl_ev_call_chn (channel, interrupt, null (), 10, code);
+	if code ^= 0 then do;
+	     call sys_log_$error_log (2, code, myname, "Cannot declare event call channel");
+	     return;
+	end;
+
+	call rcp_sys_$init_mount_timer (channel, code);
+
+	if code ^= 0 then do;
+	     call sys_log_$error_log (2, code, myname, "Error from rcp_sys_$init_mount_timer");
+	     return;
+	end;
+
+	my_processid = get_process_id_ ();
+	return;
+
+
+
+
+/* -------------------------------------------------------- */
+interrupt: entry (mptr);
+
+	if my_processid = "0"b then return;		/* ignore if not init */
+
+/* Entry for timer interrupts and RCP wakeups */
+
+	now = clock_ ();
+
+	if ^legal_message ()
+	then return;
+
+	if ^good_message ()
+	then do;
+	     call sys_log_ (SL0, "^a: Bad message from pid ^w: ^w ^w", myname, sender, evmsg.data);
+	     return;
+	end;
+
+	if mess.key = KEY then do;			/* Slot wanted */
+
+	     do i = 1 by 1 while (i < hx);
+		if tbl (i).off = mess.off then do;
+		     call set_timer (i);		/* Simply reorganize slot. */
+		     return;
+		end;
+	     end;
+
+	     if hx > hbound (tbl, 1) then do;
+		call sys_log_ (SL0, "^a: No slot available for pid ^w, ^o", myname, sender, fixed (mess.off, 18));
+		return;
+	     end;
+
+
+	     hx = hx + 1;
+	     tbl (i).off = mess.off;
+	     call set_timer (i);
+	     return;
+	end;
+	else if unspec (evmsg.data) = unspec (ALARM___) then do; /* a timer */
+	     do i = 1 by 1 while (i < hx);
+		call check_time (i);
+	     end;
+	     return;
+	end;
+
+/* --------------------------------------------------------- */
+
+check_time: proc (j);
+
+dcl  j fixed bin;
+
+	     do while (tbl (j).time < now);
+		if tbl (j).time = 0 then return;
+		call rcp_sys_$check_mount_timer ((tbl (j).off), recheck_flag, code);
+		if code ^= 0 then do;
+		     call sys_log_$error_log (SL0, code, myname, "From pid ^w on ^o",
+			sender, fixed (tbl (j).off, 18));
+		     call new_tenant;
+		end;
+		else if recheck_flag then call set_timer (j);
+		else call new_tenant;
+	     end;
+	     return;
+
+new_tenant:    procedure;				/* move up tbl (hx) into tbl (j) */
+
+		hx = hx -1;			/* Can't possibly be 1 if new_tenant called */
+		if hx ^= j then tbl (j) = tbl (hx);
+		unspec (tbl (hx)) = "0"b;
+
+	     end new_tenant;
+
+	end check_time;
+
+/* ---------------------------------------------------------- */
+
+set_timer: procedure (k);				/*  Put time in slot, set off bomb */
+
+dcl  k fixed bin;
+
+	     tbl (k).time = now + DELTA;
+	     call timer_manager_$alarm_wakeup (tbl (k).time, ABS_MICROSECONDS, channel);
+	end set_timer;
+
+/* --------------------------------------------------------- */
+
+legal_message: procedure returns (bit (1));
+
+	     sender = evmsg.pid;			/* copy out */
+
+	     if evmsg.ring = RCP_RING then return ("1"b);
+	     if sender = my_processid then return ("1"b);
+	     return ("0"b);
+
+	end legal_message;
+
+/* --------------------------------------------------------- */
+
+good_message: procedure returns (bit (1));
+
+	     unspec (mess) = evmsg.data;		/* copy good stuff */
+
+	     if evmsg.data = unspec (ALARM___) then return ("1"b);
+	     if mess.key = KEY then return ("1"b);
+	     return ("0"b);
+
+	end good_message;
+
+/* ----------------------------------------------------------- */
+
+test:	entry;
+	SL0 = 1;					/* all messages come out */
+	RCP_RING = get_ring_ ();
+	DELTA = 120000000;				/* don't have all nite */
+	return;
+
+
+     end;
+
+
+
+
+		    bull_copyright_notice.txt       08/30/05  1008.4r   08/30/05  1007.3    00020025
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group Bull including Bull HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell Bull Inc., Groupe Bull
+and Bull HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato.Users consider that Multics provided the best software architecture for 
+managing computer hardware properly and for executing programs. Many subsequent operating systems
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, Bull or Bull HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by Bull HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

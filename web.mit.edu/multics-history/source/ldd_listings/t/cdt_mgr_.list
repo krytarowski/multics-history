@@ -1,0 +1,2089 @@
+	COMPILATION LISTING OF SEGMENT cdt_mgr_
+	Compiled by: Multics PL/I Compiler, Release 30, of February 16, 1988
+	Compiled at: Honeywell Bull, Phoenix AZ, SysM
+	Compiled on: 07/20/88  1023.2 mst Wed
+	    Options: optimize map
+
+        1 /****^  ***********************************************************
+        2*        *                                                         *
+        3*        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        4*        *                                                         *
+        5*        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        6*        *                                                         *
+        7*        * Copyright (c) 1972 by Massachusetts Institute of        *
+        8*        * Technology and Honeywell Information Systems, Inc.      *
+        9*        *                                                         *
+       10*        *********************************************************** */
+       11 
+       12 /* cdt_mgr_.pl1 -- entries to manage cdt with tree of channel names */
+       13 /* format: style2 */
+       14 
+       15 cdt_mgr_:
+       16      procedure;					/** This entry is not retained */
+       17 
+       18 /* Initial Coding -- Benson I. Margulies December 1981 */
+       19 /* Fix to change daughter ptr when new entry added to head of daughter list
+       20*	BIM 7/82 */
+       21 /* Modified 1984-08-27 BIM for login auth ranges, com channel AIM. */
+       22 
+       23 
+       24 /****^  HISTORY COMMENTS:
+       25*  1) change(87-06-08,Beattie), approve(87-04-06,MCR7656),
+       26*     audit(87-07-14,Parisek), install(87-08-04,MR12.1-1055):
+       27*     Initialize variables used to control use of IOCBs.
+       28*                                                   END HISTORY COMMENTS */
+       29 
+       30 
+       31 	declare ix		 fixed bin;
+       32 	declare code		 fixed bin (35);
+       33 	declare (fnpx, cdtx)	 fixed bin;
+       34 	declare first_cdtep		 pointer;
+       35 	declare first_cdte_offset	 fixed bin (18) unsigned;
+       36 	declare name_offset		 fixed bin (18) unsigned;
+       37 	declare cdte_size		 fixed bin (18) unsigned;
+       38 	declare thread_order	 (2711) fixed bin unaligned;
+       39 						/* max possible needed */
+       40 
+       41 
+       42 	declare parse_fnp_name_	 entry (char (*), fixed bin);
+       43 	declare sort_items_$char	 entry (ptr, fixed bin (24));
+       44 
+       45 	declare error_table_$badcall	 fixed bin (35) ext static;
+       46 	declare error_table_$unimplemented_version
+       47 				 fixed bin (35) ext static;
+       48 	declare error_table_$namedup	 fixed bin (35) ext static;
+       49 	declare error_table_$noentry	 fixed bin (35) ext static;
+       50 	declare as_error_table_$cdte_in_use_wrong
+       51 				 fixed bin (35) ext static;
+       52 	declare as_error_table_$illegal_top_mpx_name
+       53 				 fixed bin (35) ext static;
+       54 	declare as_error_table_$salvage_cdt
+       55 				 fixed bin (35) ext static;
+       56 
+       57 	declare (addr, addrel, after, before, bin, currentsize, divide, index, length, null, rel, reverse,
+       58 	        rtrim, substr, unspec) builtin;
+       59 
+       60 
+       61 /* cdt_mgr_$thread: process an entire cdt, threading cdt entries. */
+       62 /* CDT_pointer is a pointer to the cdt segment. */
+       63 
+       64 
+       65 /* This program calls sub_err_ with an info structure for errors */
+       66 /* to permit more explicit disgnosis. Callers should handle */
+       67 /* the sub_error_ condition with a callername of "cdt_mgr_" */
+       68 /* to avoid spurious command levels. */
+       69 
+       70 thread:
+       71      entry (CDT_pointer, Code);
+       72 
+       73 
+       74 	declare (
+       75 	        CDT_pointer		 pointer,
+       76 	        Code		 fixed bin (35)
+       77 	        )			 parameter;
+       78 
+       79 	cdtp = CDT_pointer;
+       80 	Code = 0;
+       81 
+       82 	if cdt.version < CDT_version
+       83 	then do;
+       84 		call signal_error (error_table_$unimplemented_version, "CDT version is ^d, must be ^d", cdt.version,
+       85 		     CDT_version);
+       86 		Code = error_table_$unimplemented_version;
+       87 		go to RETURN;
+       88 	     end;
+       89 
+       90 /**** first init the fnpes */
+       91 /**** since fnpe's are not in the array of cdtes, they cannot be threaded */
+       92 /**** as siblings. */
+       93 /**** the -2 in fnpe.threads.next_sister is used to identify fnpes */
+       94 
+       95 
+       96 	do fnpx = 1 to 8;
+       97 	     fnpep = addr (cdt.fnp_entry (fnpx));
+       98 	     fnpe.next_sister = -2;			/* invalid -- identifies fnpe */
+       99 	     fnpe.prev_sister = -2;
+      100 	     fnpe.mother = 0;			/* top of tree */
+      101 	     fnpe.daughter = 0;			/* null for now */
+      102 	     fnpe.daughter_count = 0;
+      103 	end;
+      104 
+      105 /**** Now look at each cdte and thread it in. If some parent does not */
+      106 /**** exist, then the channel is remembered for postprocessing */
+      107 /**** cdt.n_cdtes may be wrong, due to threading lossage, since it is */
+      108 /**** maintained along with threads. If it is, the code fixes it and */
+      109 /**** retries.  */
+      110 
+      111 /**** cdt.current_size might be wrong as well, so we check for putative */
+      112 /**** cdte's for the entire length of the cdt. This depends on the fact */
+      113 /**** that unused cdte's past the end contain NOW_FREE. */
+      114 
+      115 /**** note that much of this checking is not needed for the cv_cmf case, */
+      116 /**** but there is no time now (10.0) to make a salvage vs. nonsalvage */
+      117 /**** distinction. */
+      118 
+      119 
+      120 /**** Find the last nonzero anything in the segment. */
+      121 
+      122 	declare cdt_cur_length	 fixed bin;
+      123 
+      124 	begin;
+      125 	     declare 1 SB		      aligned like status_branch;
+      126 	     declare d		      char (168);
+      127 	     declare e		      char (32);
+      128 	     declare sys_info$max_seg_size  fixed bin (35) ext static;
+      129 
+      130 	     unspec (SB) = ""b;
+      131 	     call hcs_$fs_get_path_name (cdtp, d, (0), e, (0));
+      132 	     call hcs_$status_long (d, e, 1 /* chase */, addr (SB), null (), (0));
+      133 	     if SB.current_length > 0
+      134 	     then cdt_cur_length = SB.current_length * 1024;
+      135 						/* its in records */
+      136 	     else cdt_cur_length = sys_info$max_seg_size; /* its in words */
+      137 	end;
+      138 
+      139 	begin;
+      140 	     declare cdt_as_chars	      char (4 * cdt_cur_length) unaligned based (cdtp);
+      141 						/* chars because bit string ops not optimized by compiler */
+      142 	     declare first_non_nullx	      fixed bin (21);
+      143 	     declare first_non_null	      fixed bin (18) unsigned;
+      144 	     declare (length, low, reverse, verify)
+      145 				      builtin;
+      146 	     declare add_char_offset_	      entry (ptr, fixed bin (21)) returns (ptr) reducible;
+      147 
+      148 	     first_non_nullx = verify (reverse (cdt_as_chars), low (1));
+      149 						/* This is exceedingly unlikely to be nonzero, but ... */
+      150 
+      151 	     first_non_nullx = length (cdt_as_chars) - first_non_nullx;
+      152 						/* ASSUME that it will not be zero !? */
+      153 
+      154 	     first_non_null = bin (rel (add_char_offset_ (cdtp, first_non_nullx)), 18);
+      155 	     if first_non_null < bin (rel (addr (cdt.cdt_entry (1))), 18)
+      156 	     then go to EMPTY_CDT;			/* hmmm */
+      157 
+      158 	     do ix = 1 repeat 1 + ix;
+      159 		if bin (rel (addr (cdt.cdt_entry (ix))), 18) ^< first_non_null
+      160 		then go to FOUND_LAST_CDTE;
+      161 	     end;
+      162 
+      163 FOUND_LAST_CDTE:
+      164 	     cdt.current_size = ix;
+      165 	end;					/* the block that finds currentsize */
+      166 
+      167 
+      168 RETRY_CDT_NAME_SORT:
+      169 	begin;
+      170 	     declare last_in_use_cdtx	      fixed bin;
+      171 	     declare 1 sort_info	      aligned,
+      172 		     2 n_cdtes	      fixed bin (24) init (cdt.n_cdtes),
+      173 		     2 cdte_name_ptrs     (cdt.n_cdtes) pointer unaligned;
+      174 
+      175 	     ix = 0;
+      176 
+      177 	     do cdtx = 1 to cdt.current_size;
+      178 		cdtep = addr (cdt.cdt_entry (cdtx));
+      179 		if cdte.in_use ^= NOW_FREE
+      180 		then do;
+      181 			last_in_use_cdtx = cdtx;	/* might be smaller than the value calculated above */
+      182 			ix = ix + 1;
+      183 			sort_info.cdte_name_ptrs (ix) = addr (cdte.name);
+      184 		     end;
+      185 		else unspec (cdte.threads) = ""b;
+      186 	     end;
+      187 
+      188 	     cdt.current_size = last_in_use_cdtx;	/* correct silently */
+      189 
+      190 	     if ix ^= cdt.n_cdtes
+      191 	     then do;
+      192 		     call signal_warning (as_error_table_$cdte_in_use_wrong,
+      193 			"There were ^d non-free channels within the current CDT size (^d), but cdt.n_cdtes was ^d.",
+      194 			ix, cdt.current_size, cdt.n_cdtes);
+      195 		     cdt.n_cdtes = ix;
+      196 		     go to RETRY_CDT_NAME_SORT;
+      197 		end;
+      198 
+      199 	     call sort_items_$char (addr (sort_info), 32);
+      200 
+      201 	     first_cdtep = addr (cdt.cdt_entry (1));
+      202 	     first_cdte_offset = bin (rel (first_cdtep));
+      203 	     name_offset = bin (rel (addr (first_cdtep -> cdte.name))) - first_cdte_offset;
+      204 	     cdte_size = currentsize (cdte);
+      205 
+      206 	     do ix = 1 to cdt.n_cdtes;		/* now turn the array of pointers to names */
+      207 						/* into an array of cdtx's. This is a bit messy */
+      208 
+      209 /**** Given a cdtep derived from the name ptr, we can get the relative */
+      210 /**** offset from the first cdte, and divide by cdte size for an index. */
+      211 /**** the first cdte will come out as 0, so we add one. */
+      212 
+      213 		cdtep = addrel (sort_info.cdte_name_ptrs (ix), -name_offset);
+      214 		thread_order (ix) = divide (bin (rel (cdtep)) - first_cdte_offset, cdte_size, 18, 0) + 1;
+      215 	     end;
+      216 	end;					/* Free up the array of pointers */
+      217 
+      218 /**** Now we have a vector of cdtx's that represents the sort order */
+      219 /**** of the cdte names. so we can thread each one in trivially. */
+      220 /**** Since threading from scratch is not a time-critical operation, */
+      221 /**** it is done by calling the thread_in_cdte procedure once for each */
+      222 
+      223 	do ix = 1 to cdt.current_size;		/* wipe old threads */
+      224 	     unspec (cdt.cdt_entry (ix).threads) = ""b;
+      225 	end;
+      226 	unspec (cdt.threads) = ""b;
+      227 
+      228 	do ix = 1 to cdt.n_cdtes;
+      229 	     call thread_in_cdte ((thread_order (ix)));	/* unaligned to aligned across this call */
+      230 	end;
+      231 
+      232 /* This should be a threaded cdt. */
+      233 
+      234 EMPTY_CDT:
+      235 	return;
+      236 
+      237 
+      238 thread_in_cdte:
+      239      procedure (cdtx);
+      240 
+      241 	declare cdtx		 fixed bin;
+      242 	declare parent_name		 character (32);
+      243 	declare parentx		 fixed bin;	/* cdt or fnpx */
+      244 	declare sisx		 fixed bin;
+      245 	declare l_cdtep		 pointer;
+      246 	declare 1 lcdte		 aligned like cdte based (l_cdtep);
+      247 	declare p_cdtep		 pointer;
+      248 	declare 1 pcdte		 aligned like cdte based (p_cdtep);
+      249 	declare 1 lthreads		 aligned like channel_threads based (threads_ptr);
+      250 	declare threads_ptr		 pointer;
+      251 	declare fnpe_sw		 bit (1) aligned;
+      252 
+      253 	l_cdtep = addr (cdt.cdt_entry (cdtx));
+      254 
+      255 	parent_name = reverse (after (reverse (lcdte.name), "."));
+      256 	if parent_name = ""
+      257 	then parent_name = lcdte.name;
+      258 
+      259 	if parent_name = lcdte.name			/* is it top level? */
+      260 	then do;					/* check for conflict with fnp names and handle
+      261*	            top level threads */
+      262 
+      263 /**** inside this block, parent_XXX are really current_XXX */
+      264 
+      265 
+      266 		call parse_fnp_name_ (parent_name, fnpx);
+      267 
+      268 		if fnpx > 0			/* Legal FNP */
+      269 		then do;
+      270 			call signal_error (as_error_table_$illegal_top_mpx_name,
+      271 			     "Non-FNP channel ^a has name reserved for FNP's.", parent_name);
+      272 			Code = as_error_table_$illegal_top_mpx_name;
+      273 			go to RETURN;
+      274 		     end;
+      275 
+      276 /**** valid top level mpx name. Thread into top level chain */
+      277 
+      278 		lcdte.threads.mother = 0;		/* top of tree */
+      279 		lcdte.threads.daughter, lcdte.threads.daughter_count = 0;
+      280 
+      281 		if cdt.threads.daughter = 0		/* first nonfnp top mpx */
+      282 		then do;
+      283 			cdt.threads.daughter = cdtx;
+      284 			cdt.threads.daughter_count = 1;
+      285 			lcdte.threads.prev_sister, lcdte.threads.next_sister = 0;
+      286 						/* cleaner */
+      287 		     end;
+      288 
+      289 		else do;
+      290 			do parentx = cdt.threads.daughter repeat (cdt.cdt_entry (parentx).next_sister)
+      291 			     while (cdt.cdt_entry (parentx).next_sister ^= 0
+      292 			     & parent_name > cdt.cdt_entry (parentx).name);
+      293 			end;			/* stop on end-of-the-line or < */
+      294 
+      295 
+      296 /* p_cdtep points to ELDER SISTER OR YOUNGER SISTER ! */
+      297 
+      298 			p_cdtep = addr (cdt.cdt_entry (parentx));
+      299 
+      300 			if parent_name < pcdte.name
+      301 			then do;			/* goes in before */
+      302 				lcdte.prev_sister = pcdte.prev_sister;
+      303 				pcdte.prev_sister = cdtx;
+      304 				lcdte.next_sister = parentx;
+      305 				cdt.threads.daughter_count = cdt.threads.daughter_count + 1;
+      306 			     end;
+      307 
+      308 			else if parent_name > pcdte.name
+      309 						/* end of chain */
+      310 			then do;
+      311 				pcdte.next_sister = cdtx;
+      312 						/* was 0 */
+      313 				lcdte.prev_sister = parentx;
+      314 				lcdte.next_sister = 0;
+      315 				cdt.threads.daughter_count = cdt.threads.daughter_count + 1;
+      316 			     end;
+      317 
+      318 			else do;			/* OOPS */
+      319 				call signal_error (error_table_$namedup,
+      320 				     "Channel ^a already in cdt. newx = ^d, oldx = ^d.", lcdte.name, cdtx,
+      321 				     parentx);
+      322 
+      323 /***** Return here is a request to fix it, because its the live cdt. */
+      324 
+      325 				call signal_warning (0, "Deleting second copy of ^a (at ^d).", lcdte.name, cdtx);
+      326 				lcdte.in_use = NOW_FREE;
+      327 			     end;
+      328 		     end;
+      329 	     end;					/* top level mpx case */
+      330 
+      331 	else do;					/* non-top-level */
+      332 		call find_channel (parent_name, parentx, fnpe_sw, code);
+      333 						/* fnpe_sw is "1"b if parent is a FNP */
+      334 
+      335 		if code ^= 0
+      336 		then do;
+      337 			call signal_error (code, "Channel ^a: parent channel ^a not in cdt.", lcdte.name,
+      338 			     parent_name);
+      339 
+      340 /***** return here indicates that it was the service CDT that was busted, *****/
+      341 /***** and repairs should be attempted */
+      342 			call signal_warning (0, "Deleting orphan channel ^a (^d).", lcdte.name, cdtx);
+      343 			lcdte.in_use = NOW_FREE;
+      344 		     end;
+      345 
+      346 		if fnpe_sw
+      347 		then threads_ptr = addr (cdt.fnp_entry (-parentx).threads);
+      348 		else threads_ptr = addr (cdt.cdt_entry (parentx).threads);
+      349 
+      350 		lcdte.daughter, lcdte.daughter_count = 0;
+      351 		lcdte.mother = parentx;
+      352 		if lthreads.daughter = 0		/* first daughter */
+      353 		then do;
+      354 			lthreads.daughter = cdtx;
+      355 			lthreads.daughter_count = 1;
+      356 			lcdte.next_sister, lcdte.prev_sister = 0;
+      357 		     end;
+      358 		else do;
+      359 
+      360 			do sisx = lthreads.daughter	/** **/
+      361 			     repeat (cdt.cdt_entry (sisx).next_sister)
+      362 						/** **/
+      363 			     while (cdt.cdt_entry (sisx).next_sister ^= 0
+      364 						/** **/
+      365 			     & lcdte.name > cdt.cdt_entry (sisx).name);
+      366 			end;			/* stop on end-of-the-line or < */
+      367 
+      368 			p_cdtep = addr (cdt.cdt_entry (sisx));
+      369 						/* pcdte is ELDER OR YOUNGER SISTER */
+      370 
+      371 			if lcdte.name < pcdte.name
+      372 			then do;			/* before */
+      373 				lcdte.prev_sister = pcdte.prev_sister;
+      374 				pcdte.prev_sister = cdtx;
+      375 				lcdte.next_sister = sisx;
+      376 				if lcdte.prev_sister > 0
+      377 				then cdt.cdt_entry (lcdte.prev_sister).next_sister = cdtx;
+      378 				else lthreads.daughter = cdtx;
+      379 						/* This is now head of chain */
+      380 				lthreads.daughter_count = lthreads.daughter_count + 1;
+      381 			     end;
+      382 			else if lcdte.name > pcdte.name
+      383 			then do;
+      384 				lcdte.prev_sister = sisx;
+      385 				lcdte.next_sister = 0;
+      386 				pcdte.next_sister = cdtx;
+      387 				lthreads.daughter_count = lthreads.daughter_count + 1;
+      388 			     end;
+      389 			else do;
+      390 				call signal_error (error_table_$namedup,
+      391 				     "Channel ^a already in CDT. newx = ^d, oldx = ^d.", lcdte.name, cdtx, sisx);
+      392 				call signal_warning (0, "Deleting duplicate channel ^a (^d).", lcdte.name, cdtx);
+      393 				lcdte.in_use = NOW_FREE;
+      394 			     end;
+      395 		     end;				/* nontrivial chain */
+      396 	     end;					/* non-top-level */
+      397 
+      398      end thread_in_cdte;				/* thats all for that */
+      399 
+      400 
+      401 find_channel:
+      402      procedure (name, idx, fnpe_sw, code);
+      403 
+      404 	declare name		 character (32);
+      405 	declare target_name		 character (32);
+      406 	declare idx		 fixed bin;
+      407 	declare fnpe_sw		 bit (1) aligned;
+      408 	declare code		 fixed bin (35);
+      409 
+      410 	declare correct_level	 bit (1) aligned;
+      411 	declare new_compare_length	 fixed bin;
+      412 	declare x			 fixed bin;
+      413 	declare compare_length	 fixed bin (21);
+      414 	declare ltp		 pointer;
+      415 	declare start_threads_ptr	 pointer;
+      416 	declare daughters_seen	 fixed bin;
+      417 	declare total_channels_seen	 fixed bin;
+      418 	declare first_name		 character (32) aligned;
+      419 
+      420 /**** we call signal_error for inconsistencies, return code for channel-not-found */
+      421 /**** this entrypoint always starts at the top. find_channel_start is called */
+      422 
+      423 
+      424 	target_name = name;
+      425 
+      426 /**** with a cdtx or fnpx to start at. It enters further down, after the top level */
+      427 /**** stuff. */
+      428 
+      429 /**** we establish the search start point by checking for the FNP case. */
+      430 /**** it is too painful to make the efficient searcher deal with that. */
+      431 
+      432 	code = 0;
+      433 	first_name = before (target_name, ".");
+      434 
+      435 	call parse_fnp_name_ ((first_name), fnpx);
+      436 
+      437 	if fnpx > 0
+      438 	then do;					/* forsure */
+      439 		if first_name = target_name		/* thats all they wanted */
+      440 		then do;
+      441 			idx = -fnpx;
+      442 			fnpe_sw = "1"b;
+      443 			return;
+      444 		     end;
+      445 		start_threads_ptr = addr (cdt.fnp_entry (fnpx).threads);
+      446 		compare_length = index (substr (target_name, 3), ".");
+      447 		if compare_length = 0
+      448 		then do;
+      449 			compare_length = length (rtrim (target_name));
+      450 			correct_level = "1"b;
+      451 		     end;
+      452 		else do;
+      453 			compare_length = compare_length + 1;
+      454 						/* dont look for trailing . */
+      455 			correct_level = "0"b;
+      456 		     end;
+      457 	     end;
+      458 	else do;
+      459 		start_threads_ptr = addr (cdt.threads); /* start with toplevel chain */
+      460 		compare_length = index (target_name, ".");
+      461 		if compare_length = 0
+      462 		then do;
+      463 			correct_level = "1"b;	/* looking at this level for final answer */
+      464 			compare_length = length (rtrim (target_name));
+      465 		     end;
+      466 		else do;
+      467 			compare_length = compare_length - 1;
+      468 						/* channels cant end in . */
+      469 			correct_level = "0"b;
+      470 		     end;
+      471 	     end;
+      472 	fnpe_sw = "0"b;				/* guaranteed */
+      473 
+      474 	ltp = start_threads_ptr;
+      475 	total_channels_seen = 0;
+      476 
+      477 /**** ltp must be a pointer to a thread block for the parent */
+      478 /**** of the next list to examine when control gets here */
+      479 
+      480 RECURSE_DOWN:
+      481 	begin;
+      482 	     declare search_name	      character (compare_length) defined (target_name) position (1);
+      483 	     daughters_seen = 0;
+      484 
+      485 	     if ltp -> channel_threads.daughter = 0	/* no more */
+      486 	     then do;
+      487 		     code = error_table_$noentry;
+      488 		     return;
+      489 		end;
+      490 
+      491 	     do x = ltp -> channel_threads.daughter	/** **/
+      492 		repeat (cdt.cdt_entry (x).threads.next_sister)
+      493 						/** **/
+      494 		while (x ^= 0);
+      495 
+      496 		daughters_seen = daughters_seen + 1;
+      497 		total_channels_seen = total_channels_seen + 1;
+      498 		if daughters_seen > ltp -> channel_threads.daughter_count
+      499 		then do;
+      500 			call signal_error (as_error_table_$salvage_cdt, "Too many daughters for cdtx = ^d.",
+      501 			     cdt.cdt_entry (x).threads.mother);
+      502 			go to RETURN;		/* Force a return */
+      503 		     end;
+      504 		if total_channels_seen > cdt.n_cdtes
+      505 		then do;
+      506 			call signal_error (as_error_table_$salvage_cdt, "Too many channels found via threads");
+      507 			go to RETURN;
+      508 		     end;
+      509 
+      510 		if cdt.cdt_entry (x).name = search_name
+      511 		then do;				/* matches so far */
+      512 			if correct_level		/* as far as it has to */
+      513 			then do;
+      514 				if cdt.cdt_entry (x).in_use = NOW_FREE
+      515 				then call signal_error (as_error_table_$salvage_cdt,
+      516 					"cdt entry found, but in_use is NOW_FREE.");
+      517 				idx = x;
+      518 				return;		/* found */
+      519 			     end;
+      520 			new_compare_length = index (substr (target_name, compare_length + 2), ".");
+      521 			if new_compare_length = 0
+      522 			then do;
+      523 				correct_level = "1"b;
+      524 				compare_length = length (rtrim (target_name));
+      525 			     end;
+      526 			else compare_length = compare_length + new_compare_length;
+      527 			ltp = addr (cdt.cdt_entry (x).threads);
+      528 			go to RECURSE_DOWN;		/* out and into block */
+      529 		     end;
+      530 		else if cdt.cdt_entry (x).name > search_name /* cant possibly match */
+      531 		     | cdt.cdt_entry (x).threads.next_sister = 0
+      532 						/* noplace else to look */
+      533 		then do;
+      534 			code = error_table_$noentry;
+      535 			if cdt.cdt_entry (x).threads.next_sister = 0
+      536 			     & daughters_seen ^= ltp -> channel_threads.daughter_count
+      537 			then do;
+      538 				call signal_error (as_error_table_$salvage_cdt, "Missing daughters for cdtx ^d.",
+      539 				     cdt.cdt_entry (x).threads.mother);
+      540 				go to RETURN;
+      541 			     end;
+      542 			return;
+      543 		     end;
+      544 	     end;					/* the do loop */
+      545 	end RECURSE_DOWN;
+      546      end find_channel;
+      547 
+      548 
+      549 
+      550 signal_error:
+      551      procedure options (variable);
+      552 
+      553 	declare alp		 pointer;
+      554 	declare cu_$arg_list_ptr	 entry (ptr);
+      555 	declare code_ptr		 pointer;
+      556 	declare code		 fixed bin (35) based (code_ptr);
+      557 	declare cu_$arg_ptr		 entry (fixed bin, ptr, fixed bin (21), fixed bin (35));
+      558 	declare ioa_$general_rs	 entry (ptr, fixed bin, fixed bin, char (*), fixed bin (21), bit (1) aligned,
+      559 				 bit (1) aligned);
+      560 
+      561 	declare sub_err_		 entry () options (variable);
+      562 	declare errormsg		 character (168);
+      563 	declare flag		 character (1);
+      564 	declare warning		 bit (1) aligned;
+      565 
+      566 	warning = "0"b;
+      567 	go to COMMON;
+      568 signal_warning:
+      569      entry options (variable);
+      570 	warning = "1"b;
+      571 
+      572 COMMON:
+      573 	call cu_$arg_list_ptr (alp);
+      574 
+      575 	call cu_$arg_ptr (1, code_ptr, (0), (0));
+      576 	call ioa_$general_rs (alp, 2, 3, errormsg, (0), "1"b, "0"b);
+      577 	if warning
+      578 	then flag = "c";
+      579 	else flag = "h";
+      580 	call sub_err_ (code, "cdt_mgr_", flag, cdtp, (0), "^a", errormsg);
+      581      end signal_error;
+      582 
+      583 
+      584 
+      585 find_cdt_channel:
+      586      entry (CDT_pointer, Channel_name, Channel_idx, FNP_sw, Code);
+      587 	declare (
+      588 	        Channel_name	 character (32),
+      589 	        Channel_idx		 fixed bin,
+      590 	        FNP_sw		 bit (1) aligned
+      591 	        )			 parameter;
+      592 
+      593 	cdtp = CDT_pointer;
+      594 	call find_channel (Channel_name, Channel_idx, FNP_sw, Code);
+      595 
+      596 RETURN:
+      597 	return;
+      598 
+      599 thread_in_cdt_channel:
+      600      entry (CDT_pointer, Channel_idx);
+      601 	cdtp = CDT_pointer;
+      602 	call thread_in_cdte (Channel_idx);
+      603 	cdt.n_cdtes = cdt.n_cdtes + 1;
+      604 	return;
+      605 
+      606 thread_out_cdt_channel:
+      607      entry (CDT_pointer, Channel_idx);
+      608 
+      609 	cdtp = CDT_pointer;
+      610 
+      611 	call thread_out_cdte (Channel_idx);
+      612 	cdt.n_cdtes = cdt.n_cdtes - 1;
+      613 	if Channel_idx = cdt.current_size
+      614 	then cdt.current_size = cdt.current_size - 1;
+      615 	return;
+      616 
+      617 thread_out_cdte:
+      618      procedure (cdtx);
+      619 	declare cdtx		 fixed bin;
+      620 
+      621 	if cdtx < 0
+      622 	then call signal_error (error_table_$badcall, "thread_out of a FNP. fnpx = ^d.", -cdtx);
+      623 
+      624 	cdtep = addr (cdt.cdt_entry (cdtx));
+      625 	if cdte.threads.prev_sister ^= 0		/* not first in chain */
+      626 	then do;
+      627 		cdt.cdt_entry (cdte.threads.prev_sister).next_sister = cdte.threads.next_sister;
+      628 		if cdte.threads.next_sister ^= 0
+      629 		then cdt.cdt_entry (cdte.threads.next_sister).threads.prev_sister = cdte.threads.prev_sister;
+      630 	     end;
+      631 	else do;					/* head of chain or singleton */
+      632 		if cdte.threads.next_sister ^= 0
+      633 		then cdt.cdt_entry (cdte.threads.next_sister).prev_sister = 0;
+      634 		if cdte.threads.mother < 0		/* FNP */
+      635 		then cdt.fnp_entry (-cdte.threads.mother).daughter = cdte.threads.next_sister;
+      636 		else if cdte.threads.mother > 0	/* random chn */
+      637 		then cdt.cdt_entry (cdte.threads.mother).daughter = cdte.threads.next_sister;
+      638 		else if cdte.threads.mother = 0	/* toplevel */
+      639 		then cdt.threads.daughter = cdte.threads.next_sister;
+      640 	     end;
+      641 
+      642 /**** now to fix mother ****/
+      643 
+      644 	if cdte.threads.mother < 0
+      645 	then cdt.fnp_entry (-cdte.threads.mother).daughter_count =
+      646 		cdt.fnp_entry (-cdte.threads.mother).daughter_count - 1;
+      647 	else if cdte.threads.mother > 0
+      648 	then cdt.cdt_entry (cdte.threads.mother).daughter_count =
+      649 		cdt.cdt_entry (cdte.threads.mother).daughter_count - 1;
+      650 	else cdt.threads.daughter_count = cdt.threads.daughter_count - 1;
+      651      end thread_out_cdte;
+      652 
+      653 
+      654 
+      655 init:
+      656      entry (System_dir, CDT_pointer, Code);
+      657 
+      658 	declare System_dir		 character (*);
+      659 	declare CDT		 char (3) init ("cdt") internal static options (constant);
+      660 
+      661 /* initiate the CDT, note that it is initiated, check for damage,
+      662*   rethread if there is and caller restarts error. */
+      663 
+      664 /* if it were not for the damn initializer segfault special case, */
+      665 /* we could just have a seg_fault_error handler. No */
+      666 /* such luck. However, we establish the handler, so that the */
+      667 /* change when the faults come back will be small */
+      668 
+      669 
+      670 	declare initiate_file_	 entry (character (*), character (*), bit (*), pointer, fixed binary (24),
+      671 				 fixed binary (35));
+      672 	declare terminate_file_	 entry (pointer, fixed binary (24), bit (*), fixed binary (35));
+      673 	declare hcs_$force_write	 entry (ptr, bit (36), fixed bin (35));
+      674 	declare hcs_$fs_get_path_name	 entry (ptr, char (*), fixed bin, char (*), fixed bin (35));
+      675 	declare hcs_$status_long	 entry (char (*), char (*), fixed bin (1), ptr, ptr, fixed bin (35));
+      676 
+      677 	declare seg_fault_error	 condition;
+      678 	declare error_table_$seg_busted
+      679 				 fixed bin (35) ext static;
+      680 	declare as_error_table_$cdt_not_shut_down
+      681 				 ext static fixed bin (35);
+      682 
+      683 /* The goal here it to detect inconsistent cdt's without having */
+      684 /* to track around checking for inconsistencies. The claim is that */
+      685 /* the only way a cdt can get inconsistent is by a crash during installation. */
+      686 /* The only way we could detect that, though, is by force_writing some */
+      687 /* indication that something was happening whenever an installation was */
+      688 /* done. The only existing force_write primitive writes all modified pages, */
+      689 /* so the performance penalty would be excessive. Instead, we just detect */
+      690 /* any crash in between AS startup and shutdown. In that case, we signal */
+      691 /* the need for a salvage. Since a salvage is not that expensive, and */
+      692 /* crashes are (cross fingers) fairly rare, this seems appropriate. */
+      693 /* the salvaging is not done here. The caller of this entry is expected */
+      694 /* to have a sub_error_ handler in which the codes error_table_$seg_busted */
+      695 /* and as_error_table_$cdt_not_shut_down are detected. The caller might elect */
+      696 /* to give system operations the oportunity to install a cdt instead */
+      697 /* of just salvaging this one. */
+      698 
+      699 	cdtp, CDT_pointer = null ();
+      700 	Code = 0;
+      701 
+      702 	call initiate_file_ (System_dir, CDT, RW_ACCESS, cdtp, (0), code);
+      703 
+      704 	if code = error_table_$noentry
+      705 	then do;
+      706 		Code = code;			/* expected possibility */
+      707 		return;
+      708 	     end;
+      709 
+      710 	if cdtp = null
+      711 	then do;
+      712 		call signal_error (code, "Could not initiate ^a>^a.", System_dir, CDT);
+      713 		Code = code;
+      714 		return;
+      715 	     end;
+      716 
+      717 	on seg_fault_error
+      718 	     begin;
+      719 		call signal_error (error_table_$seg_busted, "Damage switch set on ^a>^a.", System_dir, CDT);
+      720 /**** if we get here, we are to continue */
+      721 
+      722 	     end;
+      723 
+      724 	if cdt.cdt_is_live
+      725 	then do;
+      726 		code = as_error_table_$cdt_not_shut_down;
+      727 		call signal_error (code, "^a>^a was not shut down in last session.", System_dir, CDT);
+      728 
+      729 /**** if we are returned to, we are to continue. If salvaging was to ****/
+      730 /**** be done, caller has done it ****/
+      731 	     end;
+      732 
+      733 	cdt.cdt_is_live = "1"b;
+      734 
+      735 	cdt.cdt_entry.iocbp (*) = null ();		/* these must start out null for each bootload */
+      736 	cdt.cdt_entry.use_iocb (*) = "0"b;
+      737 
+      738 	call hcs_$force_write (cdtp, (36)"0"b, (0));	/* do the best we can */
+      739 
+      740 /* for now, this will cause mux-mgr to call the thread entrypoint and then */
+      741 /* return to us. the reason for this somewhat convoluted approach is */
+      742 /* that someday it may be desirable to allow system operations to intervene */
+      743 /* before these auto-salvages, perhaps to install a different cdt. */
+      744 
+      745 	if cdt.version ^= CDT_version
+      746 	then call signal_error (error_table_$unimplemented_version, "CDT version is ^d, should be ^d.", cdt.version,
+      747 		CDT_version);
+      748 
+      749 	CDT_pointer = cdtp;
+      750 	Code = 0;
+      751 	return;
+      752 
+      753 
+      754 shut:
+      755      entry (CDT_pointer);				/* orderly shutdown */
+      756 
+      757 
+      758 	cdtp = CDT_pointer;
+      759 	cdt.cdt_is_live = "0"b;
+      760 	call terminate_file_ (cdtp, (0), TERM_FILE_TERM | TERM_FILE_FORCE_WRITE, (0));
+      761 	CDT_pointer, cdtp = null;
+      762 	return;
+      763 
+      764 
+  1     1 /* BEGIN INCLUDE FILE ... author_dcl.incl.pl1 */
+  1     2 
+  1     3 /* This include file declares the "author" substructure
+  1     4*   in a form suitable for using the PL/I "like" attribute.
+  1     5*
+  1     6*   Written 750304 by PG
+  1     7**/
+  1     8 
+  1     9 dcl 1 author_dcl aligned based,
+  2     1 /* BEGIN INCLUDE FILE author.incl.pl1 */
+  2     2 
+  2     3 /* the "author" items must always be the first ones in the table. The
+  2     4*   module which moves the converted table to the System Control process
+  2     5*   fills in these data items and assumes them to be at the head of the segment
+  2     6*   regardless of the specific table's actual declaration. The variables
+  2     7*   "lock" and "last_install_time" used to be "process_id" and "ev_channel"
+  2     8*    respectively. For tables installed in multiple processes, these
+  2     9*    are to be used to lock out multiple installations. */
+  2    10 
+  2    11 /*  Lock should be used as a modification lock. Since, in general,
+  2    12*    entries may not be moved in system tables, even by installations,
+  2    13*    it is sufficient for only installers and programs that change threads
+  2    14*    to set or respect the lock. Simply updating data in an entry
+  2    15*    requires no such protection.
+  2    16*
+  2    17*    Last_install_time is used by readers of system tables to detect
+  2    18*    installations or other serious modifications. By checking it before
+  2    19*    and after copying a block of data, they can be protected against
+  2    20*    modifications.
+  2    21*
+  2    22*    Modules that set the lock should save proc_group_id, and then
+  2    23*    put their group id there for the time they hold the lock.
+  2    24*    if they do not actually install the, they should restore the group id.
+  2    25**/
+  2    26 
+  2    27     2 author aligned,				/* validation data about table's author */
+  2    28       3 proc_group_id char (32),			/* process-group-id  (personid.projectid.tag) */
+  2    29       3 lock bit (36),				/* installation lock */
+  2    30       3 update_attributes bit (1) unal,			/* update/add/delete attributes */
+  2    31       3 update_authorization bit (1) unal,		/* update only authorizations */
+  2    32       3 deferral_notified bit (1) unal,			/* installer notified of deferral of installation */
+  2    33       3 pad bit (33) unaligned,
+  2    34       3 last_install_time fixed bin (71),
+  2    35       3 table char (4),				/* name of table, e.g., SAT MGT TTT RTDT PDT etc. */
+  2    36       3 w_dir char (64),				/* author's working directory */
+  2    37 
+  2    38 /* END INCLUDE FILE author.incl.pl1 */
+  1    10 
+  1    11     2 pad;
+  1    12 
+  1    13 /* END INCLUDE FILE ... author_dcl.incl.pl1 */
+      765 
+  3     1 /* BEGIN INCLUDE FILE ... cdt.incl.pl1 */
+  3     2 
+  3     3 /* format: style3,idind25,indcomtxt */
+  3     4 
+  3     5 /* Channel Definition Table.
+  3     6*   This table lists all of the hardware channels (ports) connected
+  3     7*   to the system, and maintains the attributes of each one.
+  3     8*
+  3     9*   PG 741230
+  3    10*   Modified by Mike Grady 5/6/76 to add FNP info.
+  3    11*   Modified by Tom Casey 7/29/76 to add more FNP info and a few other things.
+  3    12*   Modified by Robert Coren 6/13/77 to make terminal types be character strings.
+  3    13*   Modified July 1979 by T. Casey to add several variables for MR8.0 process preservation facility.
+  3    14*   Modified December 1980 by E. N. Kittlitz to eliminate cdte.phone_no.
+  3    15*   Modified March 1981 by Robert Coren to add "listening" flag for multiplexers and to add TANDD_SERVICE service_type.
+  3    16*   Modified April 1981 by E. N. Kittlitz to add cdte.dial_ev_chn, cdte.recent_wakeup_time, cdte.recent_wakeup_count.
+  3    17*   Modified July 1981 by T. Casey for MR9.0 to add dialup_flags.detach_after_hangup
+  3    18*   Modified December 1981 by E. N. Kittlitz for cdte.leave_edited, cdte.hold_arg,
+  3    19*   Modified September 1981 by Benson I. Margulies for cdt_mgr_'s tree of multiplexer's.
+  3    20*   Modified August 1982 by E. N. Kittlitz for check_acs.
+  3    21*   Modified January 1983 by Keith Loepere for generic_destination.
+  3    22*   Modified August 1983 by Robert Coren to add mpxe.check and mpxe.retry_load.
+  3    23*   Modified 831216 by E. N. Kittlitz for required_access_class.
+  3    24*   Modified 84-04-01 by BIM to finish communications AIM:
+  3    25*   access class ranges,
+  3    26*   access_control flags.
+  3    27**/
+  3    28 
+  3    29 
+  3    30 /****^  HISTORY COMMENTS:
+  3    31*  1) change(87-03-17,Beattie), approve(87-04-06,MCR7656),
+  3    32*     audit(87-07-13,Parisek), install(87-08-04,MR12.1-1056):
+  3    33*     Add support for answering service to use IOCBs when tty_ cannot be
+  3    34*     used to service login channels.
+  3    35*                                                   END HISTORY COMMENTS */
+  3    36 
+  3    37 
+  3    38 dcl	CDT_version_5	     fixed bin internal static initial (5) options (constant);
+  3    39 dcl	CDT_version	     fixed bin internal static initial (6) options (constant);
+  3    40 
+  3    41 dcl	(cdtp, cdtep, fnpep, mpxep)
+  3    42 			     ptr;
+  3    43 
+  3    44 dcl	1 cdt		     based (cdtp) aligned,	/* all of the system channels */
+  3    45 	  2 author	     like author_dcl.author,	/* standard header */
+  3    46 	  2 max_size	     fixed bin,		/* maximum number of cdte's in 255K */
+  3    47 	  2 current_size	     fixed bin,		/* number of last cdte. */
+  3    48 	  2 version	     fixed bin,
+  3    49 	  2 freep		     fixed bin,		/* chain of free cdte's */
+  3    50 	  2 n_cdtes	     fixed bin,		/* number of used cdte's */
+  3    51 	  2 meters_last_reset    fixed bin (71),	/* clock time dialup meters were reset */
+  3    52 	  2 realtime_in_dialup   fixed bin (71),	/* Dialup meter */
+  3    53 	  2 cpu_in_dialup	     fixed bin (71),	/* .. */
+  3    54 	  2 pf_in_dialup	     fixed bin,		/* .. */
+  3    55 	  2 pp_in_dialup	     fixed bin,		/* .. */
+  3    56 	  2 entries_to_dialup    fixed bin,		/* .. */
+  3    57 	  2 flags,
+  3    58 	    3 go		     bit (1) unal,		/* ans. serv. said "go ahead and answer the phones" */
+  3    59 	    3 cdt_is_live	     bit (1) unal,		/* cdt is active */
+  3    60 	    3 mux_mgr_system_init
+  3    61 			     bit (1) unal,		/* mux mgr has loaded top-levels */
+  3    62 	    3 pad1	     bit (33) unal,
+  3    63 	  2 acceptable_fnp_tbf   fixed bin,		/* acceptable minutes between FNP crashes */
+  3    64 	  2 spare_channel_count  fixed bin,		/* number of extra channels to leave room for in ring0 */
+  3    65 	  2 threads	     aligned like channel_threads,
+  3    66 						/* root of non-fnp-top-level-multiplexers */
+  3    67 	  2 pad2		     (31) bit (36) aligned,	/* pad header to 80 words */
+  3    68 	  2 fnp_entry	     dim (8) like fnpe,	/* max of 8 FNPs for now */
+  3    69 	  2 cdt_entry	     dim (2500) like cdte;	/* # of cdte's in 255K */
+  3    70 
+  3    71 
+  3    72 dcl	1 cdte		     based (cdtep) aligned,	/* a channel */
+  3    73 	  2 in_use	     fixed bin,		/* see dialup_values. 0=NOW_FREE */
+  3    74 /**** * These variables are filled in when the CDTE is created by cv_cmf. They are not dynamic. */
+  3    75 	  2 pad1		     bit (36) aligned,
+  3    76 	  2 name		     char (32),		/* ASCII name of channel */
+  3    77 	  2 access_class	     (2) bit (72) aligned,	/* access class range */
+  3    78 	  2 comment	     char (48),		/* printable message about channel */
+  3    79 	  2 charge_type	     fixed bin (17) unal,	/* billing group */
+  3    80 	  2 service_type	     fixed bin (17) unal,	/* service group (AS, ftp, mc) */
+  3    81 	  2 line_type	     fixed bin (17) unal,	/* tty line type (protocol) */
+  3    82 	  2 baud_rate	     fixed bin (17) unal,	/* 110, 133, 150, etc. */
+  3    83 	  2 modem_type	     fixed bin (17) unal,	/* type of modem on this channel */
+  3    84 	  2 pad2		     bit (18) unaligned,
+  3    85 	  2 answerback	     char (8),		/* answerback string expected */
+  3    86 	  2 initial_terminal_type
+  3    87 			     char (32) unal,	/* as specified in the CMF */
+  3    88 	  2 mpx_data	     unal,		/* data used only for multiplexed channels */
+  3    89 	    3 mpx_type	     fixed bin (17),	/* type of multiplexing used */
+  3    90 	    3 mpx_service	     fixed bin (17),	/* service type, active or inactive */
+  3    91 	  2 flags,
+  3    92 	  ( 3 attributes,
+  3    93 	      4 ck_answerback    bit (1),		/* ON means that ansbk must equal our records */
+  3    94 	      4 audit_access_error
+  3    95 			     bit (1),		/* ON means ck that person auth is inside access class range  */
+  3    96 						/*    this implies that the access_class describes a range of
+  3    97*						   legitimate user auths. */
+  3    98 	      4 hardwired	     bit (1),		/* ON means it is */
+  3    99 	      4 set_modes	     bit (1),		/* ON means to set initial modes at dialup */
+  3   100 	      4 dont_read_answerback
+  3   101 			     bit (1),		/* ON means don't try to read answerback */
+  3   102 	      4 pada	     bit (4),
+  3   103 	    3 access_control     unaligned,		/* As below */
+  3   104 	      4 dial_out	     bit (1),		/* dialing user must be on ACS */
+  3   105 	      4 priv_attach	     bit (1),		/* PA_ user must be on ACS */
+  3   106 	      4 dial_server	     bit (1),		/* accept_dials process must be on acs */
+  3   107 	      4 login	     bit (1),		/* logging in user must be on acs */
+  3   108 	      4 slave_dial	     bit (1),		/* dialing user must give -user and be on acs */
+  3   109 	      4 pado	     bit (3),
+  3   110 	    3 options,
+  3   111 	      4 execute_initial_command
+  3   112 			     bit (1),		/* ON means to do it */
+  3   113 	      4 attached_by_operator
+  3   114 			     bit (1),		/* ON means temporary attachment. */
+  3   115 	      4 private_line     bit (1),		/* ON means private_line sync modem in use */
+  3   116 	      4 bsc_ebcdic	     bit (1),		/* ON means bsc would like to use ebcdic code set */
+  3   117 	      4 bsc_transparent  bit (1),		/* ON means bsc is in transparent mode */
+  3   118 	      4 vip_pollselect   bit (1),		/* ON means VIP line is multidrop */
+  3   119 	      4 autobaud	     bit (1),		/* ON means auto baud detection this channel */
+  3   120 	      4 generic_destination_present
+  3   121 			     bit (1),		/* ON means that the initial_command field contains
+  3   122*						   a generic destination to match on dial_out or priv attach */
+  3   123 	      4 use_iocb	     bit (1),		/* ON means to use IOCB operations to support channel */
+  3   124 	      4 pado	     bit (9)
+  3   125 	      )		     unaligned,
+  3   126 	  2 initial_command	     char (64),		/* pseudo first input line */
+  3   127 /**** The following variables represent dynamic control info, and
+  3   128*      are used mostly by dialup_ and asu_ */
+  3   129 	  2 event		     fixed bin (71),	/* event call channel for channel events */
+  3   130 	  2 current_service_type fixed bin (17) unal,	/* Current usage of line. */
+  3   131 	  2 tra_vec	     fixed bin (17) unal,	/* which section of dialup_ to do next */
+  3   132 	  2 count		     fixed bin (17) unal,	/* How many login tries he's had. */
+  3   133 	  2 dialup_flags	     unal,		/* flag bits for dialup to maintain */
+  3   134 	    3 ppm		     bit (1) unal,		/* print preaccess message for IBM terminals */
+  3   135 	    3 cpo		     bit (1) unal,		/* conditional printer-off (depends on answerback */
+  3   136 	    3 wakeup_handler     bit (1) unal,		/* says who is wakeup handler for this channel */
+  3   137 						/* 0 = dialup_, 1 = mc_tty_ */
+  3   138 	    3 save_arg	     bit (1) unal,		/* -save login arg given */
+  3   139 	    3 nosave_arg	     bit (1) unal,		/* -nosave login arg given */
+  3   140 	    3 detach_after_hangup
+  3   141 			     bit (1) unal,		/* remember WAIT_DETACH when setting WAIT_BEFORE_HANGUP */
+  3   142 	    3 leave_edited	     bit (1) unal,		/* user control of edited mode */
+  3   143 	    3 hold_arg	     bit (1) unal,		/* -hold arg given */
+  3   144 	    3 no_hold_arg	     bit (1) unal,		/* -no_hold arg given */
+  3   145 	    3 immediate_arg	     bit (1) unal,		/* -immediate arg given */
+  3   146 	    3 current_access_class_valid
+  3   147 			     bit (1) unal,		/* dialup_ or lg_ctl_ has determined the current_access_class */
+  3   148 	    3 pad		     bit (7) unal,
+  3   149 	  2 twx		     fixed bin,		/* channel device index */
+  3   150 	  2 state		     fixed bin,		/* channel state */
+  3   151 	  2 tty_id_code	     char (4),		/* channel id (answerback) */
+  3   152 	  2 current_terminal_type
+  3   153 			     char (32) unal,	/* most recently-set terminal type */
+  3   154 	  2 process	     ptr unal,		/* ptr to ATE owning this channel */
+  3   155 	  2 dialed_to_procid     bit (36),		/* Dialed channels remember owner's proc id */
+  3   156 	  2 next_channel	     fixed bin (17) unal,	/* cdte index of next channel for this process */
+  3   157 	  2 cur_line_type	     fixed bin (17) unal,	/* line type of currently dialed terminal */
+  3   158 	  2 current_access_class (2) bit (72) aligned,	/* This is a range, but at this time it must be a null range.
+  3   159*						   We do not yet define multi-class connections, but we will someday. */
+  3   160 	  2 disconnected_ate_index
+  3   161 			     fixed bin (17) unal,	/* index of ate of disconnected process */
+  3   162 	  2 dial_ctl_ring	     fixed bin (3) unsigned unaligned,
+  3   163 						/* used by dial_ctl_ to record ring of priv_attach or dial_out attachments */
+  3   164 	  2 dial_rq_privileged   bit (1) unaligned,	/* used by dial ctl to record comm priv from priv_attach or dial_out request */
+  3   165 	  2 pad3		     bit (14) unaligned,
+  3   166 /**** The following variables are kept for metering purposes. */
+  3   167 	  2 n_dialups	     fixed bin,		/* number of times channel has been dialed up */
+  3   168 	  2 n_logins	     fixed bin,		/* number of login sessions on this channel */
+  3   169 	  2 dialed_up_time	     fixed bin (35),	/* total time channel was dialed up (seconds) */
+  3   170 	  2 dialup_time	     fixed bin (71),	/* time of present dialup */
+  3   171 	  2 disconnected_proc_command
+  3   172 			     fixed bin (12) unsigned unal,
+  3   173 						/* 1 to 5 for -list,-create,-connect,-new_proc,-destroy */
+  3   174 	  2 disconnected_proc_number
+  3   175 			     fixed bin (12) unsigned unal,
+  3   176 						/* {N} in -connect {N}, -new_proc {N}, -destroy {N} */
+  3   177 	  2 n_disconnected_procs fixed bin (12) unsigned unal,
+  3   178 						/* number of disconnected processes that user has */
+  3   179 	  2 recent_wakeup_count  fixed bin,		/* counter to detect channel wakeup loop */
+  3   180 	  2 recent_wakeup_time   fixed bin (71),	/* time of first wakeup in suspected channel wakeup loop */
+  3   181 	  2 dial_ev_chn	     fixed bin (71),	/* Dialed channels remember master's IPC channel */
+  3   182 /**** cdt_mgr_ uses these to maintain the tree of channels. They ****/
+  3   183 /**** really belong in the mpxe, but it is full up, and the cdte ****/
+  3   184 /**** had the space. */
+  3   185 	  2 threads	     aligned like channel_threads,
+  3   186 /**** The use name is that of the user who gave the dial or slave ****/
+  3   187 /**** preaccess request. ****/
+  3   188 	  2 user_name	     unaligned,
+  3   189 	    3 person	     char (20) unaligned,
+  3   190 	    3 project	     char (9) unaligned,
+  3   191 	    3 pad		     char (3) unaligned,	/* no tag */
+  3   192 	  2 iocbp		     ptr unaligned;		/* 104 words */
+  3   193 
+  3   194 
+  3   195 dcl	generic_destination	     based char (32);	/* used to match destinations on dial_out and priv_attach,
+  3   196*						   overlays initial_command field for slave and autocall lines */
+  3   197 
+  3   198 
+  3   199 
+  3   200 dcl	1 fnpe		     based (fnpep) aligned,	/* an FNP */
+  3   201 						/* These variables are filled in from the CMF */
+  3   202 	  2 type		     fixed bin,		/* type of this FNP, DN355, DN6670, etc. */
+  3   203 	  2 memory	     fixed bin,		/* amount of memory on this FNP */
+  3   204 	  2 nlslas	     fixed bin,		/* number of lslas on this FNP */
+  3   205 	  2 nhslas	     fixed bin,		/* number of hslas on this FNP */
+  3   206 	  2 service_type	     fixed bin,		/* service type */
+  3   207 	  2 mpx_type	     fixed bin,		/* type of multiplexer on this fnp */
+  3   208 	  2 coreimage	     char (168),		/* pathname of image, maybe in >sl1 */
+  3   209 /**** The following are used during system operation to remember the state of the FNP */
+  3   210 	  2 boot_segp	     ptr,			/* ptr to seg used for bootload */
+  3   211 	  2 boot_ev_chan	     fixed bin (71),	/* for ring0 to report crashes and bootload complete */
+  3   212 	  2 mpxe		     like mpxe,		/* standard multiplexer data */
+  3   213 	  2 threads	     aligned like channel_threads,
+  3   214 						/* same mpx threads as channel */
+  3   215 	  2 pad3		     (25) fixed bin;	/* pad to 96 words per entry */
+  3   216 
+  3   217 /* This structure describes the data necessary to control a multiplexer.
+  3   218*   For FNP's., a copy appears in the fnpe. For communications lines, it
+  3   219*   overlays the initial_command field in the cdte. */
+  3   220 
+  3   221 dcl	1 mpxe		     based (mpxep) aligned,
+  3   222 	  2 state		     fixed bin,		/* current state, up, down, loading */
+  3   223 	  2 current_service_type fixed bin,		/* usually = service type, unless cdt installation changes it */
+  3   224 	  2 current_mpx_type     fixed bin,		/* type of multiplexer currently running */
+  3   225 	  2 n_bootloads	     fixed bin,		/* count of load attempts */
+  3   226 	  2 time_initial_load    fixed bin (71),	/* time this MPX first completed a load */
+  3   227 	  2 time_last_load	     fixed bin (71),	/* time MPX last completed a bootload */
+  3   228 	  2 time_last_crash	     fixed bin (71),	/* time MPX last crashed */
+  3   229 	  2 time_load_start	     fixed bin (71),	/* time current load started */
+  3   230 	  2 last_tbf	     fixed bin,		/* number of minutes this MPX was up last bootload */
+  3   231 	  2 flags		     unal,
+  3   232 	    3 go		     bit (1),		/* start MPX after it loads */
+  3   233 	    3 listening	     bit (1),		/* listen has been done on subchannels */
+  3   234 	    3 check	     bit (1),		/* loaded with check option */
+  3   235 	    3 retry_load	     bit (1),		/* reload if load fails */
+  3   236 	    3 pad1	     bit (32),
+  3   237 	  2 pad2		     (2) fixed bin;		/* pad to 16 words */
+  3   238 
+  3   239 /* These threads define the tree of multiplexers in the cdt. */
+  3   240 /* next_sister and prev_sister link nodes at the same level, ordered */
+  3   241 /* by alpha sort order of the channel name. Daughter points to the */
+  3   242 /* first child of this node, if any. Daughter count is the number */
+  3   243 /* of children, as a consistency check. Mother is a back pointer to */
+  3   244 /* the parent, present in all the children, not just the first. */
+  3   245 /* threads are cdt indexes. If positive, they index the cdt_entry array */
+  3   246 /* in cdt, if negative, they are the negative of an index into the fnp_entry */
+  3   247 /* array. If zero, they refer to the top of the non-fnp mpx tree. */
+  3   248 
+  3   249 dcl	1 channel_threads	     aligned based,
+  3   250 	  2 next_sister	     fixed bin unaligned,
+  3   251 	  2 prev_sister	     fixed bin unaligned,
+  3   252 	  2 daughter	     fixed bin unaligned,
+  3   253 	  2 mother	     fixed bin unaligned,	/* negative is a fnpx, positive a cdtx */
+  3   254 	  2 pad		     bit (18) unaligned,
+  3   255 	  2 daughter_count	     fixed bin unaligned;
+  3   256 
+  3   257 /* Values for cdte.service_type field */
+  3   258 
+  3   259 dcl	(
+  3   260 	ANS_SERVICE	     init (1),		/* login or dial */
+  3   261 	FTP_SERVICE	     init (2),		/* file transfer service */
+  3   262 	MC_SERVICE	     init (3),		/* message coordinator */
+  3   263 	SLAVE_SERVICE	     init (4),		/* special channel */
+  3   264 	DIAL_SERVICE	     init (5),		/* transient state */
+  3   265 	DIAL_OUT_SERVICE	     init (6),		/* auto call line */
+  3   266 	MPX_SERVICE	     init (8),		/* ring0 demultiplexed line */
+  3   267 	TANDD_SERVICE	     init (9)		/* transient state, attached for T & D */
+  3   268 	)		     fixed bin internal static options (constant);
+  3   269 
+  3   270 /* Values for service type in both cdte and fnpe */
+  3   271 
+  3   272 dcl	(
+  3   273 	INACTIVE		     init (7),		/* not to be used, even though configured */
+  3   274 	ACTIVE		     init (1)
+  3   275 	) /* for FNP only, configured and to be used */
+  3   276 			     fixed bin internal static options (constant);
+  3   277 
+  3   278 /* Value for both cdte.in_use and fnpe.state */
+  3   279 
+  3   280 dcl	NOT_CONFIGURED	     fixed bin int static init (-1) options (constant);
+  3   281 						/* was not configured at Multics bootload time */
+  3   282 
+  3   283 /* NOTE: an INACTIVE channel can be made active by operator command or CDT installation,
+  3   284*   but a NOT_CONFIGURED channel can not be used until its multiplexer is reloaded */
+  3   285 
+  3   286 /* Value for cdte.in_use */
+  3   287 
+  3   288 dcl	CHANNEL_DELETED	     fixed bin int static init (-2);
+  3   289 						/* channel deleted by CDT installation */
+  3   290 
+  3   291 /* NOTE: a configured channel being deleted by a CDT installation is set to CHANNEL_DELETED.
+  3   292*   multiplexer_mgr_ sets cdte.in_use to NOW_FREE at the next reload of its multiplexer.
+  3   293*   A NOT_CONFIGURED channel is set to NOW_FREE immediately when deleted by a CDT installation. */
+  3   294 
+  3   295 
+  3   296 /* Values for mpxe.state field */
+  3   297 
+  3   298 dcl	(
+  3   299 	FNP_FREE		     init (0),		/* this fnpe is not used */
+  3   300 	FNP_UNKNOWN	     init (1),		/* FNP is in some unknown state */
+  3   301 	FNP_DOWN		     init (2),		/* FNP crashed, not yet reloaded */
+  3   302 	FNP_BOOT		     init (3),		/* FNP has been booted, but no response yet */
+  3   303 	FNP_UP		     init (4)		/* FNP is up and running fine */
+  3   304 	)		     fixed bin internal static options (constant);
+  3   305 
+  3   306 dcl	(
+  3   307 	MPX_FREE		     init (0),		/* this mpxe is not used */
+  3   308 	MPX_UNKNOWN	     init (1),		/* MPX is in some unknown state */
+  3   309 	MPX_DOWN		     init (2),		/* MPX crashed, not yet reloaded */
+  3   310 	MPX_BOOT		     init (3),		/* MPX has been booted, but no response yet */
+  3   311 	MPX_UP		     init (4)		/* MPX is up and running fine */
+  3   312 	)		     fixed bin internal static options (constant);
+  3   313 
+  4     1 /* BEGIN INCLUDE FILE ... fnp_types.incl.pl1 */
+  4     2 
+  4     3 
+  4     4 
+  4     5 /****^  HISTORY COMMENTS:
+  4     6*  1) change(88-06-15,Berno), approve(88-07-13,MCR7928),
+  4     7*     audit(88-06-15,Parisek), install(88-07-19,MR12.2-1061):
+  4     8*     Add data needed for the uncp multiplexer (DSA gateway) interface
+  4     9*     implementation.
+  4    10*                                                   END HISTORY COMMENTS */
+  4    11 
+  4    12 
+  4    13 /* Values for fnpe.type field */
+  4    14 /*
+  4    15*   Created 79 May 14 by Art Beattie by splitting information out from cdt.incl.pl1
+  4    16*   Added in March 1982 - DN7100.fd.
+  4    17**/
+  4    18 
+  4    19 dcl (DN355 init (1),				/* a DataNet 355 FNP */
+  4    20      DN6600 init (2),				/* a DataNet 6600 FNP */
+  4    21      DN6670 init (3),				/* a Honeywell Bull Network Processor (18x) */
+  4    22      DN7100 init (4)				/* The DSA Datanet architecture (DN7) */
+  4    23      ) fixed bin internal static options (constant);
+  4    24 
+  4    25 dcl  fnp_types (4) char (8) int static options (constant)
+  4    26      init ("DN355", "DN6600", "DN6670", "DN7100");
+  4    27 
+  4    28 dcl  fnp_models (4) fixed bin (17) int static options (constant)
+  4    29      init (355, 6600, 6670, 7100);
+  4    30 	
+  4    31 dcl  supported_fnp (4) bit (1) int static options (constant)
+  4    32      init ("0"b, "0"b, "1"b, "1"b);
+  4    33 
+  4    34 
+  4    35 /* END INCLUDE FILE ... fnp_types.incl.pl1 */
+  3   314 
+  3   315 
+  3   316 /* END INCLUDE FILE ... cdt.incl.pl1 */
+      766 
+  5     1 /* BEGIN INCLUDE FILE ... dialup_values.incl.pl1 */
+  5     2 
+  5     3 /* format: style4 */
+  5     4 
+  5     5 /* Values for "cdte.tra_vec" used by dialup_ and others. */
+  5     6 
+  5     7 /* Modified by T. Casey April 1976 to add WAIT_NEW_PASSWORD
+  5     8*   -		in 1977 and 1978 to add WAIT_(GREETING_MSG DELETE_CHANNEL)
+  5     9*   -		and in October 1979 to add WAIT_CONNECT_REQUEST
+  5    10*   Modified by Robert Coren in May 1981 to add TANDD_ATTACH values and 
+  5    11*		WAIT_DISCARD_WAKEUP
+  5    12*   Modified by T. Casey, July 1981, for MR9.0, to add WAIT_BEFORE_HANGUP.
+  5    13*   Modified by E. N. Kittlitz, July 1982, to add TTY_MASKED.
+  5    14**/
+  5    15 
+  5    16 /****^  HISTORY COMMENTS:
+  5    17*  1) change(87-04-20,GDixon), approve(87-07-13,MCR7741),
+  5    18*     audit(87-07-16,Brunelle), install(87-08-04,MR12.1-1056):
+  5    19*     Add constant arrays naming cdte.state, cdte.tra_vec and ute.active values.
+  5    20*  2) change(87-05-11,GDixon), approve(87-07-13,MCR7741),
+  5    21*     audit(87-07-16,Brunelle), install(87-08-04,MR12.1-1056):
+  5    22*     Add named constants for instance tags.
+  5    23*                                                   END HISTORY COMMENTS */
+  5    24 
+  5    25 dcl  (WAIT_DIALUP init (1),				/* Channel waiting for dialup. */
+  5    26      WAIT_ANSWERBACK initial (2),			/* WRU sent, waiting for reply */
+  5    27      WAIT_LOGIN_LINE init (3),			/* Greeting typed, wait for login command. */
+  5    28      WAIT_LOGIN_ARGS init (4),			/* Want rest of login line */
+  5    29      WAIT_OLD_PASSWORD init (5),			/* "-cpw" was specified. Wait for old password. */
+  5    30      WAIT_PASSWORD init (6),				/* Waiting for password. (If "-cpw", repeat of new one.) */
+  5    31      WAIT_NEW_PASSWORD init (7),			/* "-cpw" was specified. Wait for new password */
+  5    32      WAIT_LOGOUT_SIG init (8),			/* Channel is hooked up. Wait for logout. */
+  5    33      WAIT_LOGOUT init (9),				/* A logout has been requested. Wait for process to die */
+  5    34      WAIT_LOGOUT_HOLD init (10),			/* As above but don't hang up when it dies. */
+  5    35      WAIT_DETACH init (11),				/* As above but ignore channel afterwards. */
+  5    36      WAIT_NEW_PROC init (12),				/* As above but make new process and continue. */
+  5    37      WAIT_REMOVE init (13),				/* As above but completely expunge channel. */
+  5    38      WAIT_FIN_PRIV_ATTACH init (14),			/* When channel dials up, connect it to user */
+  5    39      WAIT_DIAL_RELEASE init (15),			/* Waiting for master process to release. */
+  5    40      WAIT_DIAL_OUT init (16),				/* Waiting for auto call to complete */
+  5    41      WAIT_HANGUP init (17),				/* Wait for the hangup event to occur for a channel */
+  5    42      WAIT_SLAVE_REQUEST init (18),			/* Ignore line until someone asks */
+  5    43      WAIT_GREETING_MSG init (19),			/* Print greeting message and wait for login line */
+  5    44      WAIT_DELETE_CHANNEL init (20),			/* Channel deleted - mark cdte after process is destroyed */
+  5    45      WAIT_CONNECT_REQUEST init (21),			/* logged in; awaiting request re disconnected processes */
+  5    46      WAIT_TANDD_HANGUP init (22),			/* when channel hangs up, proceed with t & d attachment */
+  5    47      WAIT_FIN_TANDD_ATTACH init (23),			/* when channel dials up, finish t & d attachment */
+  5    48      WAIT_DISCARD_WAKEUPS init (24),			/* disregard all wakeups on channel */
+  5    49      WAIT_BEFORE_HANGUP init (25),			/* allow output to print before hanging up */
+  5    50      WAIT_DESTROY_REQUEST init (26),			/* waiting to continue with destroy request after process has destroyed itself */
+  5    51      WAIT_NEW_PROC_REQUEST init (27)			/* waiting to continue with new_proc request after process has destroyed itself */
+  5    52      ) fixed bin internal static options (constant);
+  5    53 
+  5    54 dcl  TRA_VEC_VALUES (0:13) char (32) aligned int static options (constant) init
+  5    55 						/* names of ute.destroy_flag values */
+  5    56 	("", "wait dialup", "wait answerback", "wait login line", /*  0-3  */
+  5    57 	"wait login args", "wait old password", "wait password",  /*  4-6  */
+  5    58 	"wait new password", "wait logout signal", "wait logout", /*  7-9  */
+  5    59 	"wait logout hold", "wait detach", "wait new proc",       /* 10-12 */
+  5    60 	"wait remove");				        /*   -13 */
+  5    61 
+  5    62 /* Values for "cdte.state", typewriter state. */
+  5    63 
+  5    64 dcl  (TTY_MASKED init (-1),				/* Terminal channel is there, but masked by MCS */
+  5    65      TTY_HUNG init (1),				/* Terminal channel is there, but dead. */
+  5    66      TTY_KNOWN init (2),				/* Channel being "listened" to, awaiting dialup. */
+  5    67      TTY_DIALED init (5)				/* Channel is dialed up. This is normal state. */
+  5    68      ) fixed bin internal static options (constant);
+  5    69 
+  5    70 dcl  STATE_VALUES (-1:5) char (15) aligned int static options (constant) init
+  5    71 						/* names of cdte.state values */
+  5    72 	("masked", "dead", "hung up", "listening", "", "", "dialed up");
+  5    73 
+  5    74 /* Values for "cdte.in_use" and "ate.active" */
+  5    75 
+  5    76 dcl  (NOW_FREE init (0),				/* Entry is empty. */
+  5    77      NOW_HUNG_UP init (1),				/* Entry is usable but tty is hung up. */
+  5    78      NOW_LISTENING init (2),				/* Entry is waiting for phone call. */
+  5    79      NOW_DIALED init (3),				/* Entry is connected but login not complete. */
+  5    80      NOW_LOGGED_IN init (4),				/* Entry is logged in but no process. */
+  5    81      NOW_HAS_PROCESS init (5),			/* Entry has a valid process. */
+  5    82      NOW_DIALING init (6),				/* Entry (auto_call line) is dialing */
+  5    83      NOW_DIALED_OUT init (7)				/* Entry (auto_call line) is in use */
+  5    84      ) fixed bin internal static options (constant);
+  5    85 
+  5    86 dcl  ACTIVE_VALUES (0:5) char (18) aligned int static options (constant) init
+  5    87 						/* names of ute.active values */
+  5    88 	("free", "hung-up", "listening", "dialed", "logged in, no proc", "logged in & proc");
+  5    89 
+  5    90 
+  5    91 /**** Values for ute.tag */
+  5    92 
+  5    93 dcl (TAG_INTERACTIVE init("a"),
+  5    94      TAG_UFT init("f"),
+  5    95      TAG_ABSENTEE init("m"),
+  5    96      TAG_PROXY init("p"),
+  5    97      TAG_DAEMON init("z")
+  5    98      ) char(1) int static options(constant);
+  5    99 
+  5   100 
+  5   101 /**** Following are constants used to indicate to the process termination
+  5   102*      handler the reason for the process termination.  They are used by
+  5   103*      uc_proc_term_handler_, as well as uc_ls_new_proc_request_ and
+  5   104*      uc_ls_destroy_request_. */
+  5   105 
+  5   106 dcl  (
+  5   107      PT_FPE initial (1),
+  5   108      PT_LOGOUT initial (4),
+  5   109      PT_NEW_PROC_AUTH initial (13),
+  5   110      PT_HANGUP initial (20),
+  5   111      PT_SHUTDOWN initial (21),
+  5   112      PT_BUMP initial (22),
+  5   113      PT_ALARM initial (23),
+  5   114      PT_DETACH initial (24),
+  5   115      PT_UNBUMP initial (25),
+  5   116      PT_OPERATOR_TERMINATE initial (27),
+  5   117      PT_DESTROY_REQUEST initial (30),
+  5   118      PT_NEW_PROC_REQUEST initial (31)
+  5   119      ) fixed bin (17) internal static options (constant);
+  5   120 
+  5   121 /**** Values for ute.preempted:
+  5   122*  -1  user unbumped after term signal sent
+  5   123*   0  user unbumped; ignore alarm___
+  5   124*   1  value internally used in load_ctl_
+  5   125*   2  user bumped; when alarm___ comes in, send term signal
+  5   126*   3  term signal sent; destroy process if termsgnl, alarm___, or cpulimit 
+  5   127*      signals come in
+  5   128*   4  user bumped; process sick, so destroy without sending term signal
+  5   129*   5  trm_ signal sent, termsgnl received; (if still 3, we never got the 
+  5   130*      termsgnl).						       */
+  5   131 
+  5   132 dcl  (
+  5   133      PREEMPT_UNBUMP initial (-1),
+  5   134      PREEMPT_UNBUMP_IGNORE_ALARM initial (0),
+  5   135      PREEMPT_LOAD_CTL initial (1),
+  5   136      PREEMPT_BUMPED initial (2),
+  5   137      PREEMPT_TERM_SENT initial (3),
+  5   138      PREEMPT_BUMPED_NO_TERM initial (4),
+  5   139      PREEMPT_TERMSGNL_RECEIVED initial (5)
+  5   140      ) fixed bin (17) internal static options(constant);
+  5   141 
+  5   142 dcl  PREEMPT_VALUES (-1:5) char(28) varying int static options(constant) init(
+  5   143 	"unbumped",
+  5   144 	"not bumped, ignore alarm___",
+  5   145 	"load_ctl_",
+  5   146 	"bumped",
+  5   147 	"bumped, trm_ sent",
+  5   148 	"bumped without trm_",
+  5   149 	"bumped, termsgnl received");
+  5   150 
+  5   151 /* END INCLUDE FILE ... dialup_values.incl.pl1 */
+      767 
+  6     1 /* BEGIN INCLUDE FILE ... access_mode_values.incl.pl1
+  6     2*
+  6     3*   Values for the "access mode" argument so often used in hardcore
+  6     4*   James R. Davis 26 Jan 81  MCR 4844
+  6     5*   Added constants for SM access 4/28/82 Jay Pattin
+  6     6*   Added text strings 03/19/85 Chris Jones
+  6     7**/
+  6     8 
+  6     9 
+  6    10 /* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+  6    11 dcl	(
+  6    12 	N_ACCESS		   init ("000"b),
+  6    13 	R_ACCESS		   init ("100"b),
+  6    14 	E_ACCESS		   init ("010"b),
+  6    15 	W_ACCESS		   init ("001"b),
+  6    16 	RE_ACCESS		   init ("110"b),
+  6    17 	REW_ACCESS	   init ("111"b),
+  6    18 	RW_ACCESS		   init ("101"b),
+  6    19 	S_ACCESS		   init ("100"b),
+  6    20 	M_ACCESS		   init ("010"b),
+  6    21 	A_ACCESS		   init ("001"b),
+  6    22 	SA_ACCESS		   init ("101"b),
+  6    23 	SM_ACCESS		   init ("110"b),
+  6    24 	SMA_ACCESS	   init ("111"b)
+  6    25 	)		   bit (3) internal static options (constant);
+  6    26 
+  6    27 /* The following arrays are meant to be accessed by doing either 1) bin (bit_value) or
+  6    28*   2) divide (bin_value, 2) to come up with an index into the array. */
+  6    29 
+  6    30 dcl	SEG_ACCESS_MODE_NAMES  (0:7) init ("null", "W", "E", "EW", "R", "RW", "RE", "REW") char (4) internal
+  6    31 			   static options (constant);
+  6    32 
+  6    33 dcl	DIR_ACCESS_MODE_NAMES  (0:7) init ("null", "A", "M", "MA", "S", "SA", "SM", "SMA") char (4) internal
+  6    34 			   static options (constant);
+  6    35 
+  6    36 dcl	(
+  6    37 	N_ACCESS_BIN	   init (00000b),
+  6    38 	R_ACCESS_BIN	   init (01000b),
+  6    39 	E_ACCESS_BIN	   init (00100b),
+  6    40 	W_ACCESS_BIN	   init (00010b),
+  6    41 	RW_ACCESS_BIN	   init (01010b),
+  6    42 	RE_ACCESS_BIN	   init (01100b),
+  6    43 	REW_ACCESS_BIN	   init (01110b),
+  6    44 	S_ACCESS_BIN	   init (01000b),
+  6    45 	M_ACCESS_BIN	   init (00010b),
+  6    46 	A_ACCESS_BIN	   init (00001b),
+  6    47 	SA_ACCESS_BIN	   init (01001b),
+  6    48 	SM_ACCESS_BIN	   init (01010b),
+  6    49 	SMA_ACCESS_BIN	   init (01011b)
+  6    50 	)		   fixed bin (5) internal static options (constant);
+  6    51 
+  6    52 /* END INCLUDE FILE ... access_mode_values.incl.pl1 */
+      768 
+  7     1 /* --------------- BEGIN include file status_structures.incl.pl1 --------------- */
+  7     2 
+  7     3 /* Revised from existing include files 09/26/78 by C. D. Tavares */
+  7     4 
+  7     5 /* This include file contains branch and link structures returned by
+  7     6*   hcs_$status_ and hcs_$status_long. */
+  7     7 
+  7     8 dcl 1 status_branch aligned based (status_ptr),
+  7     9     2 short aligned,
+  7    10       3 type fixed bin (2) unaligned unsigned,		/* seg, dir, or link */
+  7    11       3 nnames fixed bin (16) unaligned unsigned,		/* number of names */
+  7    12       3 names_relp bit (18) unaligned,			/* see entry_names dcl */
+  7    13       3 dtcm bit (36) unaligned,			/* date/time contents last modified */
+  7    14       3 dtu bit (36) unaligned,			/* date/time last used */
+  7    15       3 mode bit (5) unaligned,			/* caller's effective access */
+  7    16       3 raw_mode bit (5) unaligned,			/* caller's raw "rew" modes */
+  7    17       3 pad1 bit (8) unaligned,
+  7    18       3 records_used fixed bin (18) unaligned unsigned,	/* number of NONZERO pages used */
+  7    19 
+  7    20 /* Limit of information returned by hcs_$status_ */
+  7    21 
+  7    22     2 long aligned,
+  7    23       3 dtd bit (36) unaligned,			/* date/time last dumped */
+  7    24       3 dtem bit (36) unaligned,			/* date/time branch last modified */
+  7    25       3 lvid bit (36) unaligned,			/* logical volume ID */
+  7    26       3 current_length fixed bin (12) unaligned unsigned,	/* number of last page used */
+  7    27       3 bit_count fixed bin (24) unaligned unsigned,	/* reported length in bits */
+  7    28       3 pad2 bit (8) unaligned,
+  7    29       3 copy_switch bit (1) unaligned,			/* copy switch */
+  7    30       3 tpd_switch bit (1) unaligned,			/* transparent to paging device switch */
+  7    31       3 mdir_switch bit (1) unaligned,			/* is a master dir */
+  7    32       3 damaged_switch bit (1) unaligned,		/* salvager warned of possible damage */
+  7    33       3 synchronized_switch bit (1) unaligned,		/* DM synchronized file */
+  7    34       3 pad3 bit (5) unaligned,
+  7    35       3 ring_brackets (0:2) fixed bin (6) unaligned unsigned, 
+  7    36       3 uid bit (36) unaligned;			/* unique ID */
+  7    37 
+  7    38 dcl 1 status_link aligned based (status_ptr),
+  7    39     2 type fixed bin (2) unaligned unsigned,		/* as above */
+  7    40     2 nnames fixed bin (16) unaligned unsigned,
+  7    41     2 names_relp bit (18) unaligned,
+  7    42     2 dtem bit (36) unaligned,
+  7    43     2 dtd bit (36) unaligned,
+  7    44     2 pathname_length fixed bin (17) unaligned,		/* see pathname */
+  7    45     2 pathname_relp bit (18) unaligned;			/* see pathname */
+  7    46 
+  7    47 dcl  status_entry_names (status_branch.nnames) character (32) aligned
+  7    48 	based (pointer (status_area_ptr, status_branch.names_relp)),
+  7    49 						/* array of names returned */
+  7    50      status_pathname character (status_link.pathname_length) aligned
+  7    51 	based (pointer (status_area_ptr, status_link.pathname_relp)),
+  7    52 						/* link target path */
+  7    53      status_area_ptr pointer,
+  7    54      status_ptr pointer;
+  7    55 
+  7    56 dcl (Link initial (0),
+  7    57      Segment initial (1),
+  7    58      Directory initial (2)) fixed bin internal static options (constant);
+  7    59 						/* values for type fields declared above */
+  7    60 
+  7    61 /* ---------------- END include file status_structures.incl.pl1 ---------------- */
+      769 
+  8     1 /* BEGIN INCLUDE FILE ... terminate_file.incl.pl1 */
+  8     2 /* format: style2,^inddcls,idind32 */
+  8     3 
+  8     4 declare 1 terminate_file_switches	based,
+  8     5 	2 truncate		bit (1) unaligned,
+  8     6 	2 set_bc			bit (1) unaligned,
+  8     7 	2 terminate		bit (1) unaligned,
+  8     8 	2 force_write		bit (1) unaligned,
+  8     9 	2 delete			bit (1) unaligned;
+  8    10 
+  8    11 declare TERM_FILE_TRUNC		bit (1) internal static options (constant) initial ("1"b);
+  8    12 declare TERM_FILE_BC		bit (2) internal static options (constant) initial ("01"b);
+  8    13 declare TERM_FILE_TRUNC_BC		bit (2) internal static options (constant) initial ("11"b);
+  8    14 declare TERM_FILE_TERM		bit (3) internal static options (constant) initial ("001"b);
+  8    15 declare TERM_FILE_TRUNC_BC_TERM	bit (3) internal static options (constant) initial ("111"b);
+  8    16 declare TERM_FILE_FORCE_WRITE		bit (4) internal static options (constant) initial ("0001"b);
+  8    17 declare TERM_FILE_DELETE		bit (5) internal static options (constant) initial ("00001"b);
+  8    18 
+  8    19 /* END INCLUDE FILE ... terminate_file.incl.pl1 */
+      770 
+      771      end cdt_mgr_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    07/19/88  1536.1  cdt_mgr_.pl1                      >special_ldd>install>MR12.2-1061>cdt_mgr_.pl1
+765          1    09/09/75  2007.3  author_dcl.incl.pl1               >ldd>include>author_dcl.incl.pl1
+1-10         2    04/21/82  1211.8  author.incl.pl1                   >ldd>include>author.incl.pl1
+766          3    08/06/87  0913.0  cdt.incl.pl1                      >ldd>include>cdt.incl.pl1
+3-314        4    07/19/88  1524.1  fnp_types.incl.pl1                >special_ldd>install>MR12.2-1061>fnp_types.incl.pl1
+767          5    08/06/87  0913.4  dialup_values.incl.pl1            >ldd>include>dialup_values.incl.pl1
+768          6    04/11/85  1452.6  access_mode_values.incl.pl1       >ldd>include>access_mode_values.incl.pl1
+769          7    11/22/82  0955.7  status_structures.incl.pl1        >ldd>include>status_structures.incl.pl1
+770          8    04/06/83  1239.4  terminate_file.incl.pl1           >ldd>include>terminate_file.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+CDT                             000001 constant        char(3)                  initial packed unaligned dcl 659 set ref 702* 712*
+                                                                                  719* 727*
+CDT_pointer                            parameter       pointer                  dcl 74 set ref 70 79 585 593 599 601 606 609 655
+                                                                                  699* 749* 754 758 761*
+CDT_version                     000033 constant        fixed bin(17,0)          initial dcl 3-39 set ref 82 84* 745 745*
+Channel_idx                            parameter       fixed bin(17,0)          dcl 587 set ref 585 594* 599 602* 606 611* 613
+Channel_name                           parameter       char(32)                 packed unaligned dcl 587 set ref 585 594*
+Code                                   parameter       fixed bin(35,0)          dcl 74 set ref 70 80* 86* 272* 585 594* 655 700*
+                                                                                  706* 713* 750*
+FNP_sw                                 parameter       bit(1)                   dcl 587 set ref 585 594*
+NOW_FREE                               constant        fixed bin(17,0)          initial dcl 5-76 ref 179 326 343 393 514
+RW_ACCESS                       000000 constant        bit(3)                   initial packed unaligned dcl 6-11 set ref 702*
+SB                              002653 automatic       structure                level 1 dcl 125 set ref 130* 132 132
+System_dir                             parameter       char                     packed unaligned dcl 658 set ref 655 702* 712* 719*
+                                                                                  727*
+TERM_FILE_FORCE_WRITE                  constant        bit(4)                   initial packed unaligned dcl 8-16 ref 760
+TERM_FILE_TERM                         constant        bit(3)                   initial packed unaligned dcl 8-14 ref 760
+add_char_offset_                000052 constant        entry                    external dcl 146 ref 154
+addr                                                   builtin function         dcl 57 ref 97 132 132 155 159 178 183 199 199 201
+                                                                                  203 253 298 346 348 368 445 459 527 624
+addrel                                                 builtin function         dcl 57 ref 213
+after                                                  builtin function         dcl 57 ref 255
+alp                             000100 automatic       pointer                  dcl 553 set ref 572* 576*
+as_error_table_$cdt_not_shut_down
+                                000046 external static fixed bin(35,0)          dcl 680 ref 726
+as_error_table_$cdte_in_use_wrong
+                                000024 external static fixed bin(35,0)          dcl 50 set ref 192*
+as_error_table_$illegal_top_mpx_name
+                                000026 external static fixed bin(35,0)          dcl 52 set ref 270* 272
+as_error_table_$salvage_cdt     000030 external static fixed bin(35,0)          dcl 54 set ref 500* 506* 514* 538*
+author                                 based           structure                level 2 dcl 1-9
+author_dcl                             based           structure                level 1 dcl 1-9
+before                                                 builtin function         dcl 57 ref 433
+bin                                                    builtin function         dcl 57 ref 154 155 159 202 203 214
+cdt                                    based           structure                level 1 dcl 3-44
+cdt_as_chars                           based           char                     packed unaligned dcl 140 ref 148 151
+cdt_cur_length                  002625 automatic       fixed bin(17,0)          dcl 122 set ref 133* 136* 148 151
+cdt_entry              1520            based           structure                array level 2 dcl 3-44 set ref 155 159 178 201 253
+                                                                                  298 368 624
+cdt_is_live              53(01)        based           bit(1)                   level 3 packed packed unaligned dcl 3-44 set ref 724
+                                                                                  733* 759*
+cdte                                   based           structure                level 1 dcl 3-72 set ref 204
+cdte_name_ptrs            1     000101 automatic       pointer                  array level 2 packed packed unaligned dcl 171 set
+                                                                                  ref 183* 213
+cdte_size                       000110 automatic       fixed bin(18,0)          unsigned dcl 37 set ref 204* 214
+cdtep                           002636 automatic       pointer                  dcl 3-41 set ref 178* 179 183 185 204 213* 214 624*
+                                                                                  625 627 627 628 628 628 632 632 634 634 634 636
+                                                                                  636 636 638 638 644 644 644 647 647 647
+cdtp                            002634 automatic       pointer                  dcl 3-41 set ref 79* 82 84 97 131* 148 151 154* 155
+                                                                                  159 163 171 171 177 178 188 190 192 192 195 201
+                                                                                  206 223 224 226 228 253 281 283 284 290 290 290
+                                                                                  293 298 305 305 315 315 346 348 360 360 366 368
+                                                                                  376 445 459 500 504 510 514 527 530 530 535 538
+                                                                                  544 580* 593* 601* 603 603 609* 612 612 613 613
+                                                                                  613 624 627 628 632 634 636 638 644 644 647 647
+                                                                                  650 650 699* 702* 710 724 733 735 736 738* 745 745
+                                                                                  749 758* 759 760* 761*
+cdtx                            000103 automatic       fixed bin(17,0)          dcl 33 in procedure "cdt_mgr_" set ref 177* 178 181*
+cdtx                                   parameter       fixed bin(17,0)          dcl 241 in procedure "thread_in_cdte" set ref 238
+                                                                                  253 283 303 311 319* 325* 342* 354 374 376 378 386
+                                                                                  390* 392*
+cdtx                                   parameter       fixed bin(17,0)          dcl 619 in procedure "thread_out_cdte" ref 617 621
+                                                                                  621 624
+channel_threads                        based           structure                level 1 dcl 3-249
+code                            000101 automatic       fixed bin(35,0)          dcl 32 in procedure "cdt_mgr_" set ref 332* 335 337*
+                                                                                  702* 704 706 712* 713 726* 727*
+code                                   parameter       fixed bin(35,0)          dcl 408 in procedure "find_channel" set ref 401 432*
+                                                                                  487* 534*
+code                                   based           fixed bin(35,0)          dcl 556 in procedure "signal_error" set ref 580*
+code_ptr                        000102 automatic       pointer                  dcl 555 set ref 575* 580
+compare_length                  003023 automatic       fixed bin(21,0)          dcl 413 set ref 446* 447 449* 453* 453 460* 461 464*
+                                                                                  467* 467 482 520 524* 526* 526
+correct_level                   003020 automatic       bit(1)                   dcl 410 set ref 450* 455* 463* 469* 512 523*
+cu_$arg_list_ptr                000054 constant        entry                    external dcl 554 ref 572
+cu_$arg_ptr                     000056 constant        entry                    external dcl 557 ref 575
+current_length            7     002653 automatic       fixed bin(12,0)          level 3 packed packed unsigned unaligned dcl 125 set
+                                                                                  ref 133 133
+current_size             36            based           fixed bin(17,0)          level 2 dcl 3-44 set ref 163* 177 188* 192* 223 613
+                                                                                  613* 613
+currentsize                                            builtin function         dcl 57 ref 204
+d                               002665 automatic       char(168)                packed unaligned dcl 126 set ref 131* 132*
+daughter                  1            based           fixed bin(17,0)          level 2 in structure "lthreads" packed packed
+                                                                                  unaligned dcl 249 in procedure "thread_in_cdte"
+                                                                                  set ref 352 354* 360 378*
+daughter                 57            based           fixed bin(17,0)          level 3 in structure "cdt" packed packed unaligned
+                                                                                  dcl 3-44 in procedure "cdt_mgr_" set ref 281 283*
+                                                                                  290 638*
+daughter                105            based           fixed bin(17,0)          level 3 in structure "fnpe" packed packed unaligned
+                                                                                  dcl 3-200 in procedure "cdt_mgr_" set ref 101*
+daughter               1655            based           fixed bin(17,0)          array level 4 in structure "cdt" packed packed
+                                                                                  unaligned dcl 3-44 in procedure "cdt_mgr_" set ref
+                                                                                  636*
+daughter                135            based           fixed bin(17,0)          level 3 in structure "lcdte" packed packed unaligned
+                                                                                  dcl 246 in procedure "thread_in_cdte" set ref 279*
+                                                                                  350*
+daughter                225            based           fixed bin(17,0)          array level 4 in structure "cdt" packed packed
+                                                                                  unaligned dcl 3-44 in procedure "cdt_mgr_" set ref
+                                                                                  634*
+daughter                  1            based           fixed bin(17,0)          level 2 in structure "channel_threads" packed packed
+                                                                                  unaligned dcl 3-249 in procedure "cdt_mgr_" ref
+                                                                                  485 491
+daughter_count           60(18)        based           fixed bin(17,0)          level 3 in structure "cdt" packed packed unaligned
+                                                                                  dcl 3-44 in procedure "cdt_mgr_" set ref 284* 305*
+                                                                                  305 315* 315 650* 650
+daughter_count            2(18)        based           fixed bin(17,0)          level 2 in structure "channel_threads" packed packed
+                                                                                  unaligned dcl 3-249 in procedure "cdt_mgr_" ref
+                                                                                  498 535
+daughter_count          106(18)        based           fixed bin(17,0)          level 3 in structure "fnpe" packed packed unaligned
+                                                                                  dcl 3-200 in procedure "cdt_mgr_" set ref 102*
+daughter_count            2(18)        based           fixed bin(17,0)          level 2 in structure "lthreads" packed packed
+                                                                                  unaligned dcl 249 in procedure "thread_in_cdte"
+                                                                                  set ref 355* 380* 380 387* 387
+daughter_count          136(18)        based           fixed bin(17,0)          level 3 in structure "lcdte" packed packed unaligned
+                                                                                  dcl 246 in procedure "thread_in_cdte" set ref 279*
+                                                                                  350*
+daughter_count         1656(18)        based           fixed bin(17,0)          array level 4 in structure "cdt" packed packed
+                                                                                  unaligned dcl 3-44 in procedure "cdt_mgr_" set ref
+                                                                                  647* 647
+daughter_count          226(18)        based           fixed bin(17,0)          array level 4 in structure "cdt" packed packed
+                                                                                  unaligned dcl 3-44 in procedure "cdt_mgr_" set ref
+                                                                                  644* 644
+daughters_seen                  003030 automatic       fixed bin(17,0)          dcl 416 set ref 483* 496* 496 498 535
+divide                                                 builtin function         dcl 57 ref 214
+e                               002737 automatic       char(32)                 packed unaligned dcl 127 set ref 131* 132*
+error_table_$badcall            000014 external static fixed bin(35,0)          dcl 45 set ref 621*
+error_table_$namedup            000020 external static fixed bin(35,0)          dcl 48 set ref 319* 390*
+error_table_$noentry            000022 external static fixed bin(35,0)          dcl 49 ref 487 534 704
+error_table_$seg_busted         000044 external static fixed bin(35,0)          dcl 678 set ref 719*
+error_table_$unimplemented_version
+                                000016 external static fixed bin(35,0)          dcl 46 set ref 84* 86 745*
+errormsg                        000104 automatic       char(168)                packed unaligned dcl 562 set ref 576* 580*
+first_cdte_offset               000106 automatic       fixed bin(18,0)          unsigned dcl 35 set ref 202* 203 214
+first_cdtep                     000104 automatic       pointer                  dcl 34 set ref 201* 202 203
+first_name                      003032 automatic       char(32)                 dcl 418 set ref 433* 435 439
+first_non_null                  002750 automatic       fixed bin(18,0)          unsigned dcl 143 set ref 154* 155 159
+first_non_nullx                 002747 automatic       fixed bin(21,0)          dcl 142 set ref 148* 151* 151 154*
+flag                            000156 automatic       char(1)                  packed unaligned dcl 563 set ref 577* 579* 580*
+flags                  1570            based           structure                array level 3 in structure "cdt" dcl 3-44
+                                                                                  in procedure "cdt_mgr_"
+flags                    53            based           structure                level 2 in structure "cdt" dcl 3-44 in procedure
+                                                                                  "cdt_mgr_"
+fnp_entry               120            based           structure                array level 2 dcl 3-44 set ref 97
+fnpe                                   based           structure                level 1 dcl 3-200
+fnpe_sw                         003000 automatic       bit(1)                   dcl 251 in procedure "thread_in_cdte" set ref 332*
+                                                                                  346
+fnpe_sw                                parameter       bit(1)                   dcl 407 in procedure "find_channel" set ref 401 442*
+                                                                                  472*
+fnpep                           002640 automatic       pointer                  dcl 3-41 set ref 97* 98 99 100 101 102
+fnpx                            000102 automatic       fixed bin(17,0)          dcl 33 set ref 96* 97* 266* 268 435* 437 441 445
+hcs_$force_write                000036 constant        entry                    external dcl 673 ref 738
+hcs_$fs_get_path_name           000040 constant        entry                    external dcl 674 ref 131
+hcs_$status_long                000042 constant        entry                    external dcl 675 ref 132
+idx                                    parameter       fixed bin(17,0)          dcl 406 set ref 401 441* 517*
+in_use                                 based           fixed bin(17,0)          level 2 in structure "cdte" dcl 3-72 in procedure
+                                                                                  "cdt_mgr_" ref 179
+in_use                                 based           fixed bin(17,0)          level 2 in structure "lcdte" dcl 246 in procedure
+                                                                                  "thread_in_cdte" set ref 326* 343* 393*
+in_use                 1520            based           fixed bin(17,0)          array level 3 in structure "cdt" dcl 3-44
+                                                                                  in procedure "cdt_mgr_" set ref 514
+index                                                  builtin function         dcl 57 ref 446 460 520
+initiate_file_                  000032 constant        entry                    external dcl 670 ref 702
+ioa_$general_rs                 000060 constant        entry                    external dcl 558 ref 576
+iocbp                  1667            based           pointer                  array level 3 packed packed unaligned dcl 3-44 set
+                                                                                  ref 735*
+ix                              000100 automatic       fixed bin(17,0)          dcl 31 set ref 158* 159* 161* 163 175* 182* 182 183
+                                                                                  190 192* 195 206* 213 214* 223* 224* 228* 229*
+l_cdtep                         002772 automatic       pointer                  dcl 245 set ref 253* 255 256 259 278 279 279 285 285
+                                                                                  302 304 313 314 319 325 326 337 342 343 350 350
+                                                                                  351 356 356 360 371 373 375 376 376 382 384 385
+                                                                                  390 392 393
+last_in_use_cdtx                000100 automatic       fixed bin(17,0)          dcl 170 set ref 181* 188
+lcdte                                  based           structure                level 1 dcl 246
+length                                                 builtin function         dcl 57 in procedure "cdt_mgr_" ref 449 464 524
+length                                                 builtin function         dcl 144 in begin block on line 139 ref 151
+long                      4     002653 automatic       structure                level 2 dcl 125
+low                                                    builtin function         dcl 144 ref 148
+lthreads                               based           structure                level 1 dcl 249
+ltp                             003024 automatic       pointer                  dcl 414 set ref 474* 485 491 498 527* 535
+mother                  105(18)        based           fixed bin(17,0)          level 3 in structure "fnpe" packed packed unaligned
+                                                                                  dcl 3-200 in procedure "cdt_mgr_" set ref 100*
+mother                  135(18)        based           fixed bin(17,0)          level 3 in structure "cdte" packed packed unaligned
+                                                                                  dcl 3-72 in procedure "cdt_mgr_" set ref 634 634
+                                                                                  636 636 638 644 644 644 647 647 647
+mother                 1655(18)        based           fixed bin(17,0)          array level 4 in structure "cdt" packed packed
+                                                                                  unaligned dcl 3-44 in procedure "cdt_mgr_" set ref
+                                                                                  500* 538*
+mother                  135(18)        based           fixed bin(17,0)          level 3 in structure "lcdte" packed packed unaligned
+                                                                                  dcl 246 in procedure "thread_in_cdte" set ref 278*
+                                                                                  351*
+mpxe                                   based           structure                level 1 dcl 3-221
+n_cdtes                         000101 automatic       fixed bin(24,0)          initial level 2 in structure "sort_info" dcl 171
+                                                                                  in begin block on line 168 set ref 171*
+n_cdtes                  41            based           fixed bin(17,0)          level 2 in structure "cdt" dcl 3-44 in procedure
+                                                                                  "cdt_mgr_" set ref 171 171 190 192* 195* 206 228
+                                                                                  504 603* 603 612* 612
+name                                   parameter       char(32)                 packed unaligned dcl 404 in procedure "find_channel"
+                                                                                  ref 401 424
+name                   1522            based           char(32)                 array level 3 in structure "cdt" dcl 3-44
+                                                                                  in procedure "cdt_mgr_" set ref 290 360 510 530
+name                      2            based           char(32)                 level 2 in structure "lcdte" dcl 246 in procedure
+                                                                                  "thread_in_cdte" set ref 255 256 259 319* 325*
+                                                                                  337* 342* 360 371 382 390* 392*
+name                      2            based           char(32)                 level 2 in structure "cdte" dcl 3-72 in procedure
+                                                                                  "cdt_mgr_" set ref 183 203
+name                      2            based           char(32)                 level 2 in structure "pcdte" dcl 248 in procedure
+                                                                                  "thread_in_cdte" ref 300 308 371 382
+name_offset                     000107 automatic       fixed bin(18,0)          unsigned dcl 36 set ref 203* 213
+new_compare_length              003021 automatic       fixed bin(17,0)          dcl 411 set ref 520* 521 526
+next_sister             134            based           fixed bin(17,0)          level 3 in structure "pcdte" packed packed unaligned
+                                                                                  dcl 248 in procedure "thread_in_cdte" set ref 311*
+                                                                                  386*
+next_sister             104            based           fixed bin(17,0)          level 3 in structure "fnpe" packed packed unaligned
+                                                                                  dcl 3-200 in procedure "cdt_mgr_" set ref 98*
+next_sister            1654            based           fixed bin(17,0)          array level 4 in structure "cdt" packed packed
+                                                                                  unaligned dcl 3-44 in procedure "cdt_mgr_" set ref
+                                                                                  290 293 360 366 376* 530 535 544 627*
+next_sister             134            based           fixed bin(17,0)          level 3 in structure "cdte" packed packed unaligned
+                                                                                  dcl 3-72 in procedure "cdt_mgr_" set ref 627 628
+                                                                                  628 632 632 634 636 638
+next_sister             134            based           fixed bin(17,0)          level 3 in structure "lcdte" packed packed unaligned
+                                                                                  dcl 246 in procedure "thread_in_cdte" set ref 285*
+                                                                                  304* 314* 356* 375* 385*
+null                                                   builtin function         dcl 57 ref 132 132 699 710 735 761
+options                1570(17)        based           structure                array level 4 packed packed unaligned dcl 3-44
+p_cdtep                         002774 automatic       pointer                  dcl 247 set ref 298* 300 302 303 308 311 368* 371
+                                                                                  373 374 382 386
+parent_name                     002760 automatic       char(32)                 packed unaligned dcl 242 set ref 255* 256 256* 259
+                                                                                  266* 270* 290 300 308 332* 337*
+parentx                         002770 automatic       fixed bin(17,0)          dcl 243 set ref 290* 290 290* 293 298 304 313 319*
+                                                                                  332* 346 348 351
+parse_fnp_name_                 000010 constant        entry                    external dcl 42 ref 266 435
+pcdte                                  based           structure                level 1 dcl 248
+prev_sister             134(18)        based           fixed bin(17,0)          level 3 in structure "lcdte" packed packed unaligned
+                                                                                  dcl 246 in procedure "thread_in_cdte" set ref 285*
+                                                                                  302* 313* 356* 373* 376 376 384*
+prev_sister             134(18)        based           fixed bin(17,0)          level 3 in structure "cdte" packed packed unaligned
+                                                                                  dcl 3-72 in procedure "cdt_mgr_" set ref 625 627
+                                                                                  628
+prev_sister            1654(18)        based           fixed bin(17,0)          array level 4 in structure "cdt" packed packed
+                                                                                  unaligned dcl 3-44 in procedure "cdt_mgr_" set ref
+                                                                                  628* 632*
+prev_sister             134(18)        based           fixed bin(17,0)          level 3 in structure "pcdte" packed packed unaligned
+                                                                                  dcl 248 in procedure "thread_in_cdte" set ref 302
+                                                                                  303* 373 374*
+prev_sister             104(18)        based           fixed bin(17,0)          level 3 in structure "fnpe" packed packed unaligned
+                                                                                  dcl 3-200 in procedure "cdt_mgr_" set ref 99*
+rel                                                    builtin function         dcl 57 ref 154 155 159 202 203 214
+reverse                                                builtin function         dcl 144 in begin block on line 139 ref 148
+reverse                                                builtin function         dcl 57 in procedure "cdt_mgr_" ref 255 255
+rtrim                                                  builtin function         dcl 57 ref 449 464 524
+search_name                            defined         char                     packed unaligned dcl 482 ref 510 530
+seg_fault_error                 002626 stack reference condition                dcl 677 ref 717
+sisx                            002771 automatic       fixed bin(17,0)          dcl 244 set ref 360* 360 360* 366 368 375 384 390*
+sort_info                       000101 automatic       structure                level 1 dcl 171 set ref 199 199
+sort_items_$char                000012 constant        entry                    external dcl 43 ref 199
+start_threads_ptr               003026 automatic       pointer                  dcl 415 set ref 445* 459* 474
+status_branch                          based           structure                level 1 dcl 7-8
+sub_err_                        000062 constant        entry                    external dcl 561 ref 580
+substr                                                 builtin function         dcl 57 ref 446 520
+sys_info$max_seg_size           000050 external static fixed bin(35,0)          dcl 128 ref 136
+target_name                     003010 automatic       char(32)                 packed unaligned dcl 405 set ref 424* 433 439 446
+                                                                                  449 460 464 510 510 520 524 530 530
+terminate_file_                 000034 constant        entry                    external dcl 672 ref 760
+thread_order                    000111 automatic       fixed bin(17,0)          array packed unaligned dcl 38 set ref 214* 229
+threads                 224            based           structure                array level 3 in structure "cdt" dcl 3-44
+                                                                                  in procedure "cdt_mgr_" set ref 346 445
+threads                 134            based           structure                level 2 in structure "cdte" dcl 3-72 in procedure
+                                                                                  "cdt_mgr_" set ref 185*
+threads                  56            based           structure                level 2 in structure "cdt" dcl 3-44 in procedure
+                                                                                  "cdt_mgr_" set ref 226* 459
+threads                 134            based           structure                level 2 in structure "pcdte" dcl 248 in procedure
+                                                                                  "thread_in_cdte"
+threads                 104            based           structure                level 2 in structure "fnpe" dcl 3-200 in procedure
+                                                                                  "cdt_mgr_"
+threads                 134            based           structure                level 2 in structure "lcdte" dcl 246 in procedure
+                                                                                  "thread_in_cdte"
+threads                1654            based           structure                array level 3 in structure "cdt" dcl 3-44
+                                                                                  in procedure "cdt_mgr_" set ref 224* 348 527
+threads_ptr                     002776 automatic       pointer                  dcl 250 set ref 346* 348* 352 354 355 360 378 380
+                                                                                  380 387 387
+total_channels_seen             003031 automatic       fixed bin(17,0)          dcl 417 set ref 475* 497* 497 504
+unspec                                                 builtin function         dcl 57 set ref 130* 185* 224* 226*
+use_iocb               1570(25)        based           bit(1)                   array level 5 packed packed unaligned dcl 3-44 set
+                                                                                  ref 736*
+verify                                                 builtin function         dcl 144 ref 148
+version                  37            based           fixed bin(17,0)          level 2 dcl 3-44 set ref 82 84* 745 745*
+warning                         000157 automatic       bit(1)                   dcl 564 set ref 566* 570* 577
+x                               003022 automatic       fixed bin(17,0)          dcl 412 set ref 491* 491* 500 510 514 517 527 530
+                                                                                  530 535 538* 544
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+ACTIVE                                 internal static fixed bin(17,0)          initial dcl 3-272
+ACTIVE_VALUES                          internal static char(18)                 initial array dcl 5-86
+ANS_SERVICE                            internal static fixed bin(17,0)          initial dcl 3-259
+A_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 6-11
+A_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 6-36
+CDT_version_5                          internal static fixed bin(17,0)          initial dcl 3-38
+CHANNEL_DELETED                        internal static fixed bin(17,0)          initial dcl 3-288
+DIAL_OUT_SERVICE                       internal static fixed bin(17,0)          initial dcl 3-259
+DIAL_SERVICE                           internal static fixed bin(17,0)          initial dcl 3-259
+DIR_ACCESS_MODE_NAMES                  internal static char(4)                  initial array packed unaligned dcl 6-33
+DN355                                  internal static fixed bin(17,0)          initial dcl 4-19
+DN6600                                 internal static fixed bin(17,0)          initial dcl 4-19
+DN6670                                 internal static fixed bin(17,0)          initial dcl 4-19
+DN7100                                 internal static fixed bin(17,0)          initial dcl 4-19
+Directory                              internal static fixed bin(17,0)          initial dcl 7-56
+E_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 6-11
+E_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 6-36
+FNP_BOOT                               internal static fixed bin(17,0)          initial dcl 3-298
+FNP_DOWN                               internal static fixed bin(17,0)          initial dcl 3-298
+FNP_FREE                               internal static fixed bin(17,0)          initial dcl 3-298
+FNP_UNKNOWN                            internal static fixed bin(17,0)          initial dcl 3-298
+FNP_UP                                 internal static fixed bin(17,0)          initial dcl 3-298
+FTP_SERVICE                            internal static fixed bin(17,0)          initial dcl 3-259
+INACTIVE                               internal static fixed bin(17,0)          initial dcl 3-272
+Link                                   internal static fixed bin(17,0)          initial dcl 7-56
+MC_SERVICE                             internal static fixed bin(17,0)          initial dcl 3-259
+MPX_BOOT                               internal static fixed bin(17,0)          initial dcl 3-306
+MPX_DOWN                               internal static fixed bin(17,0)          initial dcl 3-306
+MPX_FREE                               internal static fixed bin(17,0)          initial dcl 3-306
+MPX_SERVICE                            internal static fixed bin(17,0)          initial dcl 3-259
+MPX_UNKNOWN                            internal static fixed bin(17,0)          initial dcl 3-306
+MPX_UP                                 internal static fixed bin(17,0)          initial dcl 3-306
+M_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 6-11
+M_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 6-36
+NOT_CONFIGURED                         internal static fixed bin(17,0)          initial dcl 3-280
+NOW_DIALED                             internal static fixed bin(17,0)          initial dcl 5-76
+NOW_DIALED_OUT                         internal static fixed bin(17,0)          initial dcl 5-76
+NOW_DIALING                            internal static fixed bin(17,0)          initial dcl 5-76
+NOW_HAS_PROCESS                        internal static fixed bin(17,0)          initial dcl 5-76
+NOW_HUNG_UP                            internal static fixed bin(17,0)          initial dcl 5-76
+NOW_LISTENING                          internal static fixed bin(17,0)          initial dcl 5-76
+NOW_LOGGED_IN                          internal static fixed bin(17,0)          initial dcl 5-76
+N_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 6-11
+N_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 6-36
+PREEMPT_BUMPED                         internal static fixed bin(17,0)          initial dcl 5-132
+PREEMPT_BUMPED_NO_TERM                 internal static fixed bin(17,0)          initial dcl 5-132
+PREEMPT_LOAD_CTL                       internal static fixed bin(17,0)          initial dcl 5-132
+PREEMPT_TERMSGNL_RECEIVED              internal static fixed bin(17,0)          initial dcl 5-132
+PREEMPT_TERM_SENT                      internal static fixed bin(17,0)          initial dcl 5-132
+PREEMPT_UNBUMP                         internal static fixed bin(17,0)          initial dcl 5-132
+PREEMPT_UNBUMP_IGNORE_ALARM            internal static fixed bin(17,0)          initial dcl 5-132
+PREEMPT_VALUES                         internal static varying char(28)         initial array dcl 5-142
+PT_ALARM                               internal static fixed bin(17,0)          initial dcl 5-106
+PT_BUMP                                internal static fixed bin(17,0)          initial dcl 5-106
+PT_DESTROY_REQUEST                     internal static fixed bin(17,0)          initial dcl 5-106
+PT_DETACH                              internal static fixed bin(17,0)          initial dcl 5-106
+PT_FPE                                 internal static fixed bin(17,0)          initial dcl 5-106
+PT_HANGUP                              internal static fixed bin(17,0)          initial dcl 5-106
+PT_LOGOUT                              internal static fixed bin(17,0)          initial dcl 5-106
+PT_NEW_PROC_AUTH                       internal static fixed bin(17,0)          initial dcl 5-106
+PT_NEW_PROC_REQUEST                    internal static fixed bin(17,0)          initial dcl 5-106
+PT_OPERATOR_TERMINATE                  internal static fixed bin(17,0)          initial dcl 5-106
+PT_SHUTDOWN                            internal static fixed bin(17,0)          initial dcl 5-106
+PT_UNBUMP                              internal static fixed bin(17,0)          initial dcl 5-106
+REW_ACCESS                             internal static bit(3)                   initial packed unaligned dcl 6-11
+REW_ACCESS_BIN                         internal static fixed bin(5,0)           initial dcl 6-36
+RE_ACCESS                              internal static bit(3)                   initial packed unaligned dcl 6-11
+RE_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 6-36
+RW_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 6-36
+R_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 6-11
+R_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 6-36
+SA_ACCESS                              internal static bit(3)                   initial packed unaligned dcl 6-11
+SA_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 6-36
+SEG_ACCESS_MODE_NAMES                  internal static char(4)                  initial array packed unaligned dcl 6-30
+SLAVE_SERVICE                          internal static fixed bin(17,0)          initial dcl 3-259
+SMA_ACCESS                             internal static bit(3)                   initial packed unaligned dcl 6-11
+SMA_ACCESS_BIN                         internal static fixed bin(5,0)           initial dcl 6-36
+SM_ACCESS                              internal static bit(3)                   initial packed unaligned dcl 6-11
+SM_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 6-36
+STATE_VALUES                           internal static char(15)                 initial array dcl 5-70
+S_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 6-11
+S_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 6-36
+Segment                                internal static fixed bin(17,0)          initial dcl 7-56
+TAG_ABSENTEE                           internal static char(1)                  initial packed unaligned dcl 5-93
+TAG_DAEMON                             internal static char(1)                  initial packed unaligned dcl 5-93
+TAG_INTERACTIVE                        internal static char(1)                  initial packed unaligned dcl 5-93
+TAG_PROXY                              internal static char(1)                  initial packed unaligned dcl 5-93
+TAG_UFT                                internal static char(1)                  initial packed unaligned dcl 5-93
+TANDD_SERVICE                          internal static fixed bin(17,0)          initial dcl 3-259
+TERM_FILE_BC                           internal static bit(2)                   initial packed unaligned dcl 8-12
+TERM_FILE_DELETE                       internal static bit(5)                   initial packed unaligned dcl 8-17
+TERM_FILE_TRUNC                        internal static bit(1)                   initial packed unaligned dcl 8-11
+TERM_FILE_TRUNC_BC                     internal static bit(2)                   initial packed unaligned dcl 8-13
+TERM_FILE_TRUNC_BC_TERM                internal static bit(3)                   initial packed unaligned dcl 8-15
+TRA_VEC_VALUES                         internal static char(32)                 initial array dcl 5-54
+TTY_DIALED                             internal static fixed bin(17,0)          initial dcl 5-64
+TTY_HUNG                               internal static fixed bin(17,0)          initial dcl 5-64
+TTY_KNOWN                              internal static fixed bin(17,0)          initial dcl 5-64
+TTY_MASKED                             internal static fixed bin(17,0)          initial dcl 5-64
+WAIT_ANSWERBACK                        internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_BEFORE_HANGUP                     internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_CONNECT_REQUEST                   internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_DELETE_CHANNEL                    internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_DESTROY_REQUEST                   internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_DETACH                            internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_DIALUP                            internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_DIAL_OUT                          internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_DIAL_RELEASE                      internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_DISCARD_WAKEUPS                   internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_FIN_PRIV_ATTACH                   internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_FIN_TANDD_ATTACH                  internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_GREETING_MSG                      internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_HANGUP                            internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_LOGIN_ARGS                        internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_LOGIN_LINE                        internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_LOGOUT                            internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_LOGOUT_HOLD                       internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_LOGOUT_SIG                        internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_NEW_PASSWORD                      internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_NEW_PROC                          internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_NEW_PROC_REQUEST                  internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_OLD_PASSWORD                      internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_PASSWORD                          internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_REMOVE                            internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_SLAVE_REQUEST                     internal static fixed bin(17,0)          initial dcl 5-25
+WAIT_TANDD_HANGUP                      internal static fixed bin(17,0)          initial dcl 5-25
+W_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 6-11
+W_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 6-36
+fnp_models                             internal static fixed bin(17,0)          initial array dcl 4-28
+fnp_types                              internal static char(8)                  initial array packed unaligned dcl 4-25
+generic_destination                    based           char(32)                 packed unaligned dcl 3-195
+mpxep                                  automatic       pointer                  dcl 3-41
+status_area_ptr                        automatic       pointer                  dcl 7-47
+status_entry_names                     based           char(32)                 array dcl 7-47
+status_link                            based           structure                level 1 dcl 7-38
+status_pathname                        based           char                     dcl 7-47
+status_ptr                             automatic       pointer                  dcl 7-47
+supported_fnp                          internal static bit(1)                   initial array packed unaligned dcl 4-31
+terminate_file_switches                based           structure                level 1 packed packed unaligned dcl 8-4
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+COMMON                          003314 constant        label                    dcl 572 ref 567
+EMPTY_CDT                       001140 constant        label                    dcl 234 ref 155
+FOUND_LAST_CDTE                 000646 constant        label                    dcl 163 ref 159
+RECURSE_DOWN                    002777 constant        label                    dcl 480 ref 528
+RETRY_CDT_NAME_SORT             000651 constant        label                    dcl 168 ref 196
+RETURN                          001202 constant        label                    dcl 596 ref 87 273 502 507 540
+cdt_mgr_                        000337 constant        entry                    external dcl 15
+find_cdt_channel                001146 constant        entry                    external dcl 585
+find_channel                    002625 constant        entry                    internal dcl 401 ref 332 594
+init                            001277 constant        entry                    external dcl 655
+shut                            001653 constant        entry                    external dcl 754
+signal_error                    003275 constant        entry                    internal dcl 550 ref 84 270 319 337 390 500 506 514
+                                                                                  538 621 712 719 727 745
+signal_warning                  003305 constant        entry                    internal dcl 568 ref 192 325 342 392
+thread                          000351 constant        entry                    external dcl 70
+thread_in_cdt_channel           001207 constant        entry                    external dcl 599
+thread_in_cdte                  001726 constant        entry                    internal dcl 238 ref 229 602
+thread_out_cdt_channel          001237 constant        entry                    external dcl 606
+thread_out_cdte                 003473 constant        entry                    internal dcl 617 ref 611
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      4270        4354    3700        4300
+Length      4760    3700        64         367     370           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+cdt_mgr_                           1864 external procedure  is an external procedure.  
+begin block on line 124                 begin block         shares stack frame of external procedure cdt_mgr_.  
+begin block on line 139                 begin block         shares stack frame of external procedure cdt_mgr_.  
+begin block on line 168             122 begin block         uses auto adjustable storage.  
+thread_in_cdte                          internal procedure  shares stack frame of external procedure cdt_mgr_.  
+find_channel                            internal procedure  shares stack frame of external procedure cdt_mgr_.  
+begin block on line 480                 begin block         shares stack frame of external procedure cdt_mgr_.  
+signal_error                        164 internal procedure  is declared options(variable).  
+thread_out_cdte                         internal procedure  shares stack frame of external procedure cdt_mgr_.  
+on unit on line 717                  92 on unit               
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+begin block on line 168  000100 last_in_use_cdtx            begin block on line 168
+                         000101 sort_info                   begin block on line 168
+cdt_mgr_                 000100 ix                          cdt_mgr_
+                         000101 code                        cdt_mgr_
+                         000102 fnpx                        cdt_mgr_
+                         000103 cdtx                        cdt_mgr_
+                         000104 first_cdtep                 cdt_mgr_
+                         000106 first_cdte_offset           cdt_mgr_
+                         000107 name_offset                 cdt_mgr_
+                         000110 cdte_size                   cdt_mgr_
+                         000111 thread_order                cdt_mgr_
+                         002625 cdt_cur_length              cdt_mgr_
+                         002634 cdtp                        cdt_mgr_
+                         002636 cdtep                       cdt_mgr_
+                         002640 fnpep                       cdt_mgr_
+                         002653 SB                          begin block on line 124
+                         002665 d                           begin block on line 124
+                         002737 e                           begin block on line 124
+                         002747 first_non_nullx             begin block on line 139
+                         002750 first_non_null              begin block on line 139
+                         002760 parent_name                 thread_in_cdte
+                         002770 parentx                     thread_in_cdte
+                         002771 sisx                        thread_in_cdte
+                         002772 l_cdtep                     thread_in_cdte
+                         002774 p_cdtep                     thread_in_cdte
+                         002776 threads_ptr                 thread_in_cdte
+                         003000 fnpe_sw                     thread_in_cdte
+                         003010 target_name                 find_channel
+                         003020 correct_level               find_channel
+                         003021 new_compare_length          find_channel
+                         003022 x                           find_channel
+                         003023 compare_length              find_channel
+                         003024 ltp                         find_channel
+                         003026 start_threads_ptr           find_channel
+                         003030 daughters_seen              find_channel
+                         003031 total_channels_seen         find_channel
+                         003032 first_name                  find_channel
+signal_error             000100 alp                         signal_error
+                         000102 code_ptr                    signal_error
+                         000104 errormsg                    signal_error
+                         000156 flag                        signal_error
+                         000157 warning                     signal_error
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+r_e_as              enter_begin_block   leave_begin_block   call_ext_out_desc   call_ext_out        call_int_this_desc
+call_int_other_desc return_mac          tra_ext_1           alloc_auto_adj      enable_op           shorten_stack
+ext_entry           ext_entry_desc      int_entry           reverse_cs          set_chars_eis       divide_fx3
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+add_char_offset_              cu_$arg_list_ptr              cu_$arg_ptr                   hcs_$force_write
+hcs_$fs_get_path_name         hcs_$status_long              initiate_file_                ioa_$general_rs
+parse_fnp_name_               sort_items_$char              sub_err_                      terminate_file_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+as_error_table_$cdt_not_shut_down                           as_error_table_$cdte_in_use_wrong
+as_error_table_$illegal_top_mpx_name                        as_error_table_$salvage_cdt   error_table_$badcall
+error_table_$namedup          error_table_$noentry          error_table_$seg_busted
+error_table_$unimplemented_version                          sys_info$max_seg_size
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     15 000336        70 000344        79 000363        80 000366        82 000367        84 000372        86 000420
+     87 000423        96 000424        97 000431        98 000435        99 000437       100 000441       101 000443
+    102 000445       103 000447       130 000451       131 000454       132 000507       133 000552       136 000561
+    148 000564       151 000602       154 000604       155 000622       158 000630       159 000633       161 000644
+    163 000646       168 000651       171 000654       175 000664       177 000665       178 000676       179 000702
+    181 000704       182 000706       183 000707       184 000712       185 000713       186 000716       188 000720
+    190 000723       192 000726       195 000761       196 000765       199 000770       201 001005       202 001012
+    203 001015       204 001024       206 001026       213 001037       214 001044       215 001065       216 001067
+    223 001070       224 001101       225 001107       226 001111       228 001115       229 001125       230 001136
+    234 001140       585 001141       593 001162       594 001165       596 001202       599 001203       601 001221
+    602 001224       603 001232       604 001234       606 001235       609 001251       611 001254       612 001262
+    613 001265       615 001272       655 001273       699 001317       700 001322       702 001323       704 001363
+    706 001367       707 001370       710 001371       712 001375       713 001426       714 001430       717 001431
+    719 001445       722 001500       724 001501       726 001505       727 001510       733 001541       735 001544
+    736 001560       738 001573       745 001611       749 001644       750 001646       751 001647       754 001650
+    758 001663       759 001666       760 001670       761 001722       762 001725       238 001726       253 001730
+    255 001735       256 001771       259 002001       266 002005       268 002022       270 002024       272 002050
+    273 002053       278 002054       279 002057       281 002063       283 002070       284 002074       285 002076
+    287 002102       290 002103       293 002123       298 002125       300 002130       302 002134       303 002137
+    304 002142       305 002145       306 002152       308 002153       311 002155       313 002161       314 002164
+    315 002166       316 002173       319 002174       325 002231       326 002263       329 002265       332 002266
+    335 002270       337 002272       342 002322       343 002353       346 002355       348 002366       350 002373
+    351 002400       352 002402       354 002406       355 002412       356 002414       357 002420       360 002421
+    366 002442       368 002444       371 002447       373 002454       374 002456       375 002461       376 002464
+    378 002500       380 002504       381 002512       382 002513       384 002515       385 002517       386 002521
+    387 002525       388 002533       390 002534       392 002570       393 002622       398 002624       401 002625
+    424 002627       432 002633       433 002634       435 002644       437 002664       439 002666       441 002672
+    442 002675       443 002677       445 002700       446 002704       447 002715       449 002716       450 002730
+    451 002732       453 002733       455 002734       457 002735       459 002736       460 002741       461 002752
+    463 002753       464 002755       465 002767       467 002770       469 002772       472 002773       474 002775
+    475 002776       482 002777       483 003001       485 003002       487 003007       488 003013       491 003014
+    496 003020       497 003021       498 003022       500 003031       502 003062       504 003063       506 003067
+    507 003107       510 003110       512 003121       514 003123       517 003145       518 003150       520 003151
+    521 003170       523 003171       524 003173       525 003205       526 003206       527 003207       528 003212
+    530 003213       534 003227       535 003233       538 003240       540 003266       542 003267       544 003270
+    546 003273       550 003274       566 003302       567 003303       568 003304       570 003312       572 003314
+    575 003323       576 003344       577 003414       579 003421       580 003423       581 003472       617 003473
+    621 003475       624 003525       625 003533       627 003540       628 003545       630 003554       632 003555
+    634 003565       636 003601       638 003610       644 003614       647 003634       650 003647       651 003655
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

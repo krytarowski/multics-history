@@ -1,0 +1,581 @@
+	COMPILATION LISTING OF SEGMENT free_oldest_request_
+	Compiled by: Multics PL/I Compiler, Release 28e, of February 14, 1985
+	Compiled at: Honeywell Multics Op. - System M
+	Compiled on: 03/13/85  1132.9 mst Wed
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        4*   *                                                         *
+        5*   * Copyright (c) 1972 by Massachusetts Institute of        *
+        6*   * Technology and Honeywell Information Systems, Inc.      *
+        7*   *                                                         *
+        8*   *********************************************************** */
+        9 
+       10 
+       11 free_oldest_request_: proc;
+       12 
+       13 /* Procedure to free oldest inactive request and associated descriptor.
+       14*   *  Normally invoked in response to alarm call set when request was
+       15*   *  completed, but also called by find_next_request_ if it didn't have space
+       16*   *  to allocate a fresh message.
+       17*   *
+       18*   *  This procedure will also delete the file if the user so requested (first
+       19*   * making sure he has "m" access on the directory containing it).
+       20**/
+       21 
+       22 /* Coded August 1973 by Robert S. Coren */
+       23 /* Modified by J. Stern, 12/27/74 */
+       24 /* Modified by J. Stern, 11/25/75 */
+       25 /* Modified by J. C. Whitmore, 4/78, to use the new queue_msg_hdr format */
+       26 /* Modified by C. Marker, 02/23/85, to use version 5 message segments */
+       27 
+       28 dcl  desc_off fixed bin (18);
+       29 dcl  desc_p ptr;					/* pointer to a descriptor */
+       30 
+       31 dcl  code fixed bin (35);
+       32 dcl  mask_code fixed bin (35);
+       33 dcl  acc_mode fixed bin (5);				/* access in form returned by get_user_effmode */
+       34 
+       35 dcl  dirname char (168);
+       36 dcl  ename char (32);
+       37 dcl  ddir char (168);				/* directory portion of directory name */
+       38 dcl  dent char (32);				/* entry portion of directory name */
+       39 
+       40 dcl  force_bit bit (1) aligned;
+       41 dcl  mask_bit bit (1) aligned;
+       42 dcl  clean_bit bit (1) aligned;
+       43 
+       44 dcl  mp ptr;
+       45 dcl  message_len fixed bin (18);
+       46 dcl  based_message bit (message_len) aligned based;
+       47 
+       48 dcl  access_class bit (72) aligned;
+       49 
+       50 dcl  cleanup condition;
+       51 
+       52 dcl  aim_check_$equal entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+       53 dcl  clock_ entry returns (fixed bin (71));
+       54 dcl  delete_$path entry (char(*), char(*), bit(6), char(*), fixed bin(35));
+       55 dcl  expand_pathname_ entry (char(*), char(*), char(*), fixed bin(35));
+       56 dcl  hcs_$get_access_class entry (char(*), char(*), bit(72) aligned,
+       57 	fixed bin(35));
+       58 dcl  hcs_$get_link_target entry (char(*), char(*), char(*), char(*),
+       59 	fixed bin(35));
+       60 dcl  hcs_$get_user_effmode  entry (char(*), char(*), char(*), fixed bin,
+       61 	fixed bin(5), fixed bin(35));
+       62 dcl  hcs_$status_ entry (char(*), char(*), fixed bin(1), ptr, ptr,
+       63 	fixed bin(35));
+       64 dcl  ipc_$mask_ev_calls entry (fixed bin (35));
+       65 dcl  ipc_$unmask_ev_calls entry (fixed bin (35));
+       66 dcl  unthread_descriptor_ entry (ptr);
+       67 
+       68 dcl (addr, fixed, null, ptr, rel, bit) builtin;
+       69 
+       70 dcl 1 branch aligned,
+       71     2 pad1 fixed bin,
+       72     2 dtm bit (36),					/* date-time modified */
+       73     2 pad2 (2) fixed bin;
+       74 
+       75 /**/
+       76 
+       77 /* get pointer to oldest request */
+       78 
+       79 	mask_code = -1;
+       80 	on cleanup begin;
+       81 	     if mask_code = 0 then call ipc_$unmask_ev_calls (code);
+       82 	end;
+       83 	call ipc_$mask_ev_calls (mask_code);
+       84 	mask_bit = "1"b;
+       85 	clean_bit, force_bit = "0"b;
+       86 join:
+       87 
+       88 	desc_off = iodc_static.first_req_done;
+       89 	if desc_off = 0 then go to out;		/* no requests threaded, don't bother */
+       90 
+       91 	desc_p, mseg_message_info_ptr = ptr (iodc_static.descr_seg_ptr, desc_off);
+       92 
+       93 /* if cleanup entry we want to free them all, but not delete uncompleted ones */
+       94 
+       95 	if clean_bit
+       96 	then do;
+       97 	     if ^desc_p -> request_descriptor.finished
+       98 	     then desc_p -> request_descriptor.dont_delete = "1"b;
+       99 	     mseg_message_info.ms_ptr = ptr (iodc_static.req_seg_ptr, rel (mseg_message_info.ms_ptr));
+      100 						/* segment number was left by previous coordinator process */
+      101 	     go to free_it;				/* skip other checks */
+      102 	end;
+      103 
+      104 	do while (desc_p -> request_descriptor.saved);
+      105 
+      106 /* find one that's not saved */
+      107 
+      108 	     desc_off = desc_p -> request_descriptor.next_done;
+      109 	     if desc_off = 0 then return;
+      110 	     desc_p = ptr (iodc_static.descr_seg_ptr, desc_off);
+      111 	end;
+      112 
+      113 /* make sure it's old enough */
+      114 
+      115 	if (clock_ () - desc_p -> request_descriptor.time_done) >= iodc_static.time_interval | force_bit
+      116 	then do;
+      117 free_it:
+      118 
+      119 	     call unthread_descriptor_ (desc_p);
+      120 
+      121 	     mp = desc_p -> mseg_message_info.ms_ptr;
+      122 
+      123 	     if mp -> queue_msg_hdr.delete_sw		/* user requested deletion */
+      124 	     then if ^desc_p -> request_descriptor.dont_delete /* and it's okay */
+      125 		then do;
+      126 
+      127 /* check access on directory containing actual segment */
+      128 /* so if it's a link, chase it */
+      129 
+      130 		     call hcs_$get_link_target ((mp -> queue_msg_hdr.dirname), (mp -> queue_msg_hdr.ename), dirname, ename, code);
+      131 		     if code ^= 0 then go to skip_it;	/* can't deal with this */
+      132 
+      133 
+      134 /* make sure the file hasn't been modified since */
+      135 /* the request was done */
+      136 
+      137 		     call hcs_$status_ (dirname, ename, 1, addr (branch), null, code);
+      138 		     if code ^= 0 then go to skip_it;
+      139 		     if fixed (branch.dtm || (16)"0"b, 52) > desc_p -> request_descriptor.time_done
+      140 		     then go to skip_it;
+      141 
+      142 /* now check the directory */
+      143 
+      144 		     call expand_pathname_ (dirname, ddir, dent, code);
+      145 		     if code ^= 0 then go to skip_it;	/* God help us */
+      146 
+      147 		     call hcs_$get_access_class (ddir, dent, access_class, code);
+      148 		     if code ^= 0 then go to skip_it;
+      149 		     if ^aim_check_$equal (desc_p -> mseg_message_info.sender_authorization, access_class)
+      150 		     then go to skip_it;
+      151 
+      152 		     call hcs_$get_user_effmode (ddir, dent, desc_p -> mseg_message_info.sender_id,
+      153 			desc_p -> mseg_message_info.sender_level, acc_mode, code);
+      154 		     if code ^= 0 then go to skip_it;
+      155 		     if (bit (acc_mode, 5) & "00010"b) ^= "0"b
+      156 		     then call delete_$path (dirname, ename, "000100"b, "", code);
+      157 		end;
+      158 
+      159 skip_it:
+      160 						/* now actually free the descriptor and the request */
+      161 
+      162 	     message_len = desc_p -> mseg_message_info.ms_len;
+      163 	     free mp -> based_message in (req_area);
+      164 	     free desc_p -> request_descriptor in (descr_area);
+      165 
+      166 	end;
+      167 
+      168 out:	if mask_bit
+      169 	then call ipc_$unmask_ev_calls (code);
+      170 
+      171 	return;
+      172 
+      173 force:	entry;
+      174 
+      175 /* called when a request must be freed to make space */
+      176 
+      177 	clean_bit, mask_bit = "0"b;
+      178 	force_bit = "1"b;
+      179 	go to join;
+      180 
+      181 
+      182 
+      183 /* ************************************ */
+      184 
+      185 
+      186 
+      187 /* ************************************ */
+      188 
+      189 cleanup:	entry;
+      190 
+      191 /* called at initialization time to delete segments from requests */
+      192 /* performed in previous session */
+      193 
+      194 	clean_bit = "1"b;
+      195 	mask_bit, force_bit = "0"b;
+      196 	go to join;
+      197 
+      198 
+      199 init:	entry (a_ptr);
+      200 
+      201 dcl  a_ptr ptr;
+      202 
+      203 	stat_p = a_ptr;
+      204 	return;
+      205 
+      206 /**/
+      207 
+  1     1 /* BEGIN INCLUDE FILE...iodc_static.incl.pl1 */
+  1     2 
+  1     3 dcl stat_p ptr int static init(null);
+  1     4 
+  1     5 dcl 1 iodc_static aligned based(stat_p),
+  1     6 	2 dctp ptr,		/* pointer to device class table */
+  1     7 	2 qgtp ptr,		/* pointer to queue group table */
+  1     8 	2 wait_list_ptr ptr,	/* pointer to waiting list segment */
+  1     9 	2 req_seg_ptr ptr,		/* pointer to base of request segment */
+  1    10 	2 descr_seg_ptr ptr,	/* pointer to base of request descriptor segment */
+  1    11 	2 save_first_req_p ptr,	/* pointer to req_desc_seg.first_saved */
+  1    12 	2 first_req_done fixed bin(18),	/* offset of first descriptor on "saved" list */
+  1    13 	2 last_req_done fixed bin(18),	/* offset of last  descriptor on "saved" list */
+  1    14 	2 time_interval fixed bin(71),	/* time interval to elapse between completion */
+  1    15 					/* and deletion of request */
+  1    16 	2 max_q fixed bin,			/* maximum number of priority queues */
+  1    17 	2 timer_chan fixed bin(71);		/* event channel for timer wakeups */
+  1    18 
+  1    19 dcl req_area area(131096) based(iodc_static.req_seg_ptr);
+  1    20 
+  1    21 dcl 1 req_desc_seg aligned based (iodc_static.descr_seg_ptr),
+  1    22 	2 first_saved fixed bin(18),		/* offset of head of saved list */
+  1    23 	2 pad fixed bin,
+  1    24 	2 descr_area area (65560);		/* area where request descriptors are allocated */
+  1    25 
+  1    26 /* END INCLUDE FILE...iodc_static.incl.pl1 */
+      208 
+      209 
+  2     1 /* BEGIN INCLUDE FILE . . . mseg_message_info.incl.pl1 BIM 1984-10-10 */
+  2     2 /* format: style3,idind30 */
+  2     3 
+  2     4 /* structure returned when message is read from a message segment */
+  2     5 
+  2     6 
+  2     7 dcl	mseg_message_info_ptr	pointer;
+  2     8 
+  2     9 dcl	1 mseg_message_info		based (mseg_message_info_ptr) aligned,
+  2    10 	  2 version		char (8) aligned,
+  2    11 	  2 message_code		fixed bin,
+  2    12 	  2 control_flags		unaligned,
+  2    13 	    3 own			bit (1),
+  2    14 	    3 delete		bit (1),
+  2    15 	    3 pad			bit (34),
+  2    16 	  2 ms_ptr		ptr,		/* pointer to message */
+  2    17 	  2 ms_len		fixed bin (24),	/* length of message  in bits */
+  2    18 	  2 ms_id			bit (72),		/* unique ID of message */
+  2    19 						/* input in some cases */
+  2    20 	  2 ms_access_class		bit (72),		/* message access class */
+  2    21 	  2 sender_id		char (32) unaligned,/* process-group ID of sender */
+  2    22 	  2 sender_process_id	bit (36) aligned,	/* if nonzero, process that sent */
+  2    23 	  2 sender_level		fixed bin,	/* validation level of sender */
+  2    24 	  2 sender_authorization	bit (72),		/* access authorization of message sender */
+  2    25 	  2 sender_max_authorization	bit (72),		/* max authorization of sending process */
+  2    26 	  2 sender_audit		bit (36) aligned;   /* audit flags */
+  2    27 
+  2    28 declare	MSEG_MESSAGE_INFO_V1	char (8) aligned init ("msegmi01") int static options (constant);
+  2    29 
+  2    30 declare	(
+  2    31 	MSEG_READ_FIRST		init (1),
+  2    32 	MSEG_READ_LAST		init (2),
+  2    33 	MSEG_READ_SPECIFIED		init (3),
+  2    34 	MSEG_READ_BEFORE_SPECIFIED	init (4),
+  2    35 	MSEG_READ_AFTER_SPECIFIED	init (5))
+  2    36 	fixed bin int static options (constant);
+  2    37 
+  2    38 declare  (MSEG_READ_OWN		init ("1"b),
+  2    39 	MSEG_READ_DELETE		init ("01"b)
+  2    40 	)			bit (36) aligned internal static options (constant);
+  2    41 
+  2    42 /* END INCLUDE FILE . . . mseg_message_info.incl.pl1 */
+      210 
+      211 
+  3     1 /* BEGIN INCLUDE FILE ... queue_msg_hdr.incl.pl1 */
+  3     2 
+  3     3 /* This is the message header used for standard system queue messages, namely:
+  3     4*   IO daemon requests, absentee requests, retrieval requests.
+  3     5**/
+  3     6 
+  3     7 /* Written by Jerry Whitmore, Spring 1978.
+  3     8*   Modified by T. Casey, November 1978, to add values for state.
+  3     9*   Modified by R. Kovalcik, June 1982, defer_until_process_terminataion
+  3    10**/
+  3    11 
+  3    12 dcl 1 queue_msg_hdr based aligned,			/* standard header for all system queue messages */
+  3    13     2 msg_time fixed bin (71),			/* date and time of request */
+  3    14     2 hdr_version fixed bin,				/* version of this declaration */
+  3    15     2 dirname char (168),				/* directory name */
+  3    16     2 ename char (32),				/* entry name of file requested */
+  3    17     2 message_type fixed bin,				/* message format descriptor   */
+  3    18 						/* 0 = absentee request        */
+  3    19 						/* 1 = print request           */
+  3    20 						/* 2 = punch request           */
+  3    21 						/* 3 = tape request            */
+  3    22 						/* 4 = retrieval request       */
+  3    23     2 bit_flags,
+  3    24       3 delete_sw bit (1) unal,			/* delete file when done */
+  3    25       3 notify bit (1) unal,				/* user wants to be notified */
+  3    26       3 defer_until_process_termination bit (1) unal,	/* don't process request until process terminates */
+  3    27       3 padding bit (33) unal,
+  3    28     2 state fixed bin,				/* stage of processing after being queued:
+  3    29*						   0 = initial unprocessed state, 1 = deferred,
+  3    30*						   2 = in state transition, 3 = eligible, 4 = running,
+  3    31*                                                               5 = bumped, 6 = deferred_until_process_termination */
+  3    32     2 orig_queue fixed bin,				/* queue the request was submitted to */
+  3    33     2 std_length fixed bin,				/* length of std msg for this type */
+  3    34     2 dupt_lock bit (36) aligned,			/* lock word for defer until process termination */
+  3    35     2 hdr_pad (3) fixed bin;
+  3    36 
+  3    37 dcl  queue_msg_hdr_version_1 fixed bin int static options (constant) init (1); /* current version of the header */
+  3    38 
+  3    39 /* Values for queue_msg_hdr.state */
+  3    40 
+  3    41 dcl  STATE_UNPROCESSED fixed bin int static options (constant) init (0);
+  3    42 dcl  STATE_DEFERRED fixed bin int static options (constant) init (1);
+  3    43 dcl  STATE_TRANSITION fixed bin int static options (constant) init (2);
+  3    44 dcl  STATE_ELIGIBLE fixed bin int static options (constant) init (3);
+  3    45 dcl  STATE_RUNNING fixed bin int static options (constant) init (4);
+  3    46 dcl  STATE_BUMPED fixed bin int static options (constant) init (5);
+  3    47 dcl  STATE_DUPT fixed bin int static options (constant) init (6);
+  3    48 
+  3    49 /* END INCLUDE FILE ... queue_msg_hdr.incl.pl1 */
+      212 
+      213 
+  4     1 /* BEGIN INCLUDE FILE...request_descriptor.incl.pl1 */
+  4     2 
+  4     3 /* Descriptor associated with an I/O daemon request */
+  4     4 /* Coded August 1973 by Robert S. Coren */
+  4     5 /* Modified by J. C. Whitmore, 5/78, to extend driver_data to 7 words */
+  4     6 /* Modified by C. Marker, 2/23/85, changed to use mseg_message_info */
+  4     7 
+  4     8 dcl  1 request_descriptor based aligned,
+  4     9 	2 mseg_message_info_copy like mseg_message_info,
+  4    10 	2 seq_id fixed bin(35),	/* sequential number assigned by coordinator */
+  4    11 	2 q fixed bin,		/* priority queue in which request was submitted */
+  4    12 	2 contd_seq_id fixed bin(35),	/* if nonzero, this is previous seq_id of continued request */
+  4    13 	2 prev_seq_id fixed bin(35),	/* if nonzero, this is previous seq_id of restarted request */
+  4    14 	2 dev_class_index fixed bin,	/* index of device_class entry */
+  4    15 	2 spare_fb fixed bin (17) unal, /* save half a word for later */
+  4    16 	2 charge_q fixed bin (17) unal, /* priority to use for charging */
+  4    17 	2 time_done fixed bin(71),	/* clock time when request was completed */
+  4    18 	2 prev_done fixed bin(18),	/* descriptor threaded ahead of this one in saved list */
+  4    19 	2 next_done fixed bin(18),	/*      "        "     behind    "        "       "      */
+  4    20 	2 driver_data bit(252),	/* driver maintained data */
+  4    21 	2 flags,
+  4    22 	   (3 continued,		/* unfinished by one driver and given to another */
+  4    23 	    3 finished,
+  4    24 	    3 restarted,
+  4    25 	    3 cancelled,
+  4    26 	    3 dont_delete,
+  4    27 	    3 saved,		/* not to be freed */
+  4    28 	    3 keep_in_queue,	/* keep request in queue */
+  4    29 	    3 series_restart,	/* this request is part of restarted series */
+  4    30 	    3 priority_request) bit (1) unal, /* this request was given extra priority */
+  4    31 	    3 pad bit(27) unal,
+  4    32 	2 next_pending fixed bin(18);	/* thread to next pending descriptor */
+  4    33 
+  4    34 /* END INCLUDE FILE...request_descriptor.incl.pl1 */
+      214 
+      215 
+      216      end free_oldest_request_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    03/13/85  1025.6  free_oldest_request_.pl1          >spec>on>41-11>free_oldest_request_.pl1
+208          1    09/28/78  1359.8  iodc_static.incl.pl1              >ldd>include>iodc_static.incl.pl1
+210          2    01/10/85  2002.8  mseg_message_info.incl.pl1        >ldd>include>mseg_message_info.incl.pl1
+212          3    08/31/82  1636.3  queue_msg_hdr.incl.pl1            >ldd>include>queue_msg_hdr.incl.pl1
+214          4    03/12/85  1556.6  request_descriptor.incl.pl1       >spec>on>41-11>request_descriptor.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+a_ptr                                  parameter       pointer                  dcl 201 ref 199 203
+acc_mode                        000106 automatic       fixed bin(5,0)           dcl 33 set ref 152* 155
+access_class                    000262 automatic       bit(72)                  dcl 48 set ref 147* 149*
+addr                                                   builtin function         dcl 68 ref 137 137
+aim_check_$equal                000012 constant        entry                    external dcl 52 ref 149
+based_message                          based           bit                      dcl 46 ref 163
+bit                                                    builtin function         dcl 68 ref 155
+bit_flags                66            based           structure                level 2 dcl 3-12
+branch                          000272 automatic       structure                level 1 dcl 70 set ref 137 137
+clean_bit                       000255 automatic       bit(1)                   dcl 42 set ref 85* 95 177* 194*
+cleanup                         000264 stack reference condition                dcl 50 ref 80
+clock_                          000014 constant        entry                    external dcl 53 ref 115
+code                            000104 automatic       fixed bin(35,0)          dcl 31 set ref 81* 130* 131 137* 138 144* 145 147*
+                                                                                  148 152* 154 155* 168*
+ddir                            000171 automatic       char(168)                unaligned dcl 37 set ref 144* 147* 152*
+delete_$path                    000016 constant        entry                    external dcl 54 ref 155
+delete_sw                66            based           bit(1)                   level 3 packed unaligned dcl 3-12 ref 123
+dent                            000243 automatic       char(32)                 unaligned dcl 38 set ref 144* 147* 152*
+desc_off                        000100 automatic       fixed bin(18,0)          dcl 28 set ref 86* 89 91 108* 109 110
+desc_p                          000102 automatic       pointer                  dcl 29 set ref 91* 97 97 104 108 110* 115 117* 121
+                                                                                  123 139 149 152 152 159 164
+descr_area                2            based           area(65560)              level 2 dcl 1-21 ref 164
+descr_seg_ptr            10            based           pointer                  level 2 dcl 1-5 ref 91 110 164
+dirname                   3            based           char(168)                level 2 in structure "queue_msg_hdr" dcl 3-12
+                                                                                  in procedure "free_oldest_request_" ref 130
+dirname                         000107 automatic       char(168)                unaligned dcl 35 in procedure "free_oldest_request_"
+                                                                                  set ref 130* 137* 144* 155*
+dont_delete              53(04)        based           bit(1)                   level 3 packed unaligned dcl 4-8 set ref 97* 123
+dtm                       1     000272 automatic       bit(36)                  level 2 dcl 70 set ref 139
+ename                           000161 automatic       char(32)                 unaligned dcl 36 in procedure "free_oldest_request_"
+                                                                                  set ref 130* 137* 155*
+ename                    55            based           char(32)                 level 2 in structure "queue_msg_hdr" dcl 3-12
+                                                                                  in procedure "free_oldest_request_" ref 130
+expand_pathname_                000020 constant        entry                    external dcl 55 ref 144
+finished                 53(01)        based           bit(1)                   level 3 packed unaligned dcl 4-8 ref 97
+first_req_done           14            based           fixed bin(18,0)          level 2 dcl 1-5 ref 86
+fixed                                                  builtin function         dcl 68 ref 139
+flags                    53            based           structure                level 2 dcl 4-8
+force_bit                       000253 automatic       bit(1)                   dcl 40 set ref 85* 115 178* 195*
+hcs_$get_access_class           000022 constant        entry                    external dcl 56 ref 147
+hcs_$get_link_target            000024 constant        entry                    external dcl 58 ref 130
+hcs_$get_user_effmode           000026 constant        entry                    external dcl 60 ref 152
+hcs_$status_                    000030 constant        entry                    external dcl 62 ref 137
+iodc_static                            based           structure                level 1 dcl 1-5
+ipc_$mask_ev_calls              000032 constant        entry                    external dcl 64 ref 83
+ipc_$unmask_ev_calls            000034 constant        entry                    external dcl 65 ref 81 168
+mask_bit                        000254 automatic       bit(1)                   dcl 41 set ref 84* 168 177* 195*
+mask_code                       000105 automatic       fixed bin(35,0)          dcl 32 set ref 79* 81 83*
+message_len                     000260 automatic       fixed bin(18,0)          dcl 45 set ref 159* 163 163
+mp                              000256 automatic       pointer                  dcl 44 set ref 121* 123 130 130 163
+ms_len                    6            based           fixed bin(24,0)          level 2 dcl 2-9 ref 159
+ms_ptr                    4            based           pointer                  level 2 dcl 2-9 set ref 99* 99 121
+mseg_message_info                      based           structure                level 1 dcl 2-9
+mseg_message_info_ptr           000276 automatic       pointer                  dcl 2-7 set ref 91* 99 99
+next_done                43            based           fixed bin(18,0)          level 2 dcl 4-8 ref 108
+null                                                   builtin function         dcl 68 ref 137 137
+ptr                                                    builtin function         dcl 68 ref 91 99 110
+queue_msg_hdr                          based           structure                level 1 dcl 3-12
+rel                                                    builtin function         dcl 68 ref 99
+req_area                               based           area(131096)             dcl 1-19 ref 163
+req_desc_seg                           based           structure                level 1 dcl 1-21
+req_seg_ptr               6            based           pointer                  level 2 dcl 1-5 ref 99 163
+request_descriptor                     based           structure                level 1 dcl 4-8 set ref 164
+saved                    53(05)        based           bit(1)                   level 3 packed unaligned dcl 4-8 ref 104
+sender_authorization     25            based           bit(72)                  level 2 dcl 2-9 set ref 149*
+sender_id                13            based           char(32)                 level 2 packed unaligned dcl 2-9 set ref 152*
+sender_level             24            based           fixed bin(17,0)          level 2 dcl 2-9 set ref 152*
+stat_p                          000010 internal static pointer                  initial dcl 1-3 set ref 86 91 99 110 115 163 164
+                                                                                  203*
+time_done                40            based           fixed bin(71,0)          level 2 dcl 4-8 ref 115 139
+time_interval            16            based           fixed bin(71,0)          level 2 dcl 1-5 ref 115
+unthread_descriptor_            000036 constant        entry                    external dcl 66 ref 117
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+MSEG_MESSAGE_INFO_V1                   internal static char(8)                  initial dcl 2-28
+MSEG_READ_AFTER_SPECIFIED              internal static fixed bin(17,0)          initial dcl 2-30
+MSEG_READ_BEFORE_SPECIFIED             internal static fixed bin(17,0)          initial dcl 2-30
+MSEG_READ_DELETE                       internal static bit(36)                  initial dcl 2-38
+MSEG_READ_FIRST                        internal static fixed bin(17,0)          initial dcl 2-30
+MSEG_READ_LAST                         internal static fixed bin(17,0)          initial dcl 2-30
+MSEG_READ_OWN                          internal static bit(36)                  initial dcl 2-38
+MSEG_READ_SPECIFIED                    internal static fixed bin(17,0)          initial dcl 2-30
+STATE_BUMPED                           internal static fixed bin(17,0)          initial dcl 3-46
+STATE_DEFERRED                         internal static fixed bin(17,0)          initial dcl 3-42
+STATE_DUPT                             internal static fixed bin(17,0)          initial dcl 3-47
+STATE_ELIGIBLE                         internal static fixed bin(17,0)          initial dcl 3-44
+STATE_RUNNING                          internal static fixed bin(17,0)          initial dcl 3-45
+STATE_TRANSITION                       internal static fixed bin(17,0)          initial dcl 3-43
+STATE_UNPROCESSED                      internal static fixed bin(17,0)          initial dcl 3-41
+queue_msg_hdr_version_1                internal static fixed bin(17,0)          initial dcl 3-37
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+cleanup                         000545 constant        entry                    external dcl 189
+force                           000532 constant        entry                    external dcl 173
+free_it                         000157 constant        label                    dcl 117 ref 101
+free_oldest_request_            000023 constant        entry                    external dcl 11
+init                            000562 constant        entry                    external dcl 199
+join                            000073 constant        label                    dcl 86 ref 179 196
+out                             000517 constant        label                    dcl 168 ref 89
+skip_it                         000506 constant        label                    dcl 159 set ref 131 138 139 145 148 149 154
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0       774        1034     575        1004
+Length      1320     575        40         247     177           2
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+free_oldest_request_                274 external procedure  is an external procedure.  
+on unit on line 80                   68 on unit               
+
+STORAGE FOR INTERNAL STATIC VARIABLES.
+
+   LOC IDENTIFIER                  BLOCK NAME
+000010 stat_p                      free_oldest_request_
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+free_oldest_request_     000100 desc_off                    free_oldest_request_
+                         000102 desc_p                      free_oldest_request_
+                         000104 code                        free_oldest_request_
+                         000105 mask_code                   free_oldest_request_
+                         000106 acc_mode                    free_oldest_request_
+                         000107 dirname                     free_oldest_request_
+                         000161 ename                       free_oldest_request_
+                         000171 ddir                        free_oldest_request_
+                         000243 dent                        free_oldest_request_
+                         000253 force_bit                   free_oldest_request_
+                         000254 mask_bit                    free_oldest_request_
+                         000255 clean_bit                   free_oldest_request_
+                         000256 mp                          free_oldest_request_
+                         000260 message_len                 free_oldest_request_
+                         000262 access_class                free_oldest_request_
+                         000272 branch                      free_oldest_request_
+                         000276 mseg_message_info_ptr       free_oldest_request_
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+r_ge_a              call_ext_out_desc   call_ext_out        return              enable              ext_entry
+int_entry           free_based
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+aim_check_$equal              clock_                        delete_$path                  expand_pathname_
+hcs_$get_access_class         hcs_$get_link_target          hcs_$get_user_effmode         hcs_$status_
+ipc_$mask_ev_calls            ipc_$unmask_ev_calls          unthread_descriptor_
+
+NO EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     11 000022        79 000030        80 000032        81 000046        82 000057        83 000060        84 000067
+     85 000071        86 000073        89 000077        91 000100        95 000105        97 000107        99 000115
+    101 000121       104 000122       108 000126       109 000130       110 000131       111 000136       115 000137
+    117 000157       121 000165       123 000170       130 000177       131 000236       137 000240       138 000302
+    139 000304       144 000312       145 000336       147 000340       148 000365       149 000367       152 000406
+    154 000443       155 000445       159 000506       163 000511       164 000515       168 000517       171 000530
+    173 000531       177 000537       178 000541       179 000543       189 000544       194 000552       195 000554
+    196 000556       199 000557       203 000567       204 000574
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

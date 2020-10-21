@@ -1,0 +1,4551 @@
+
+
+
+
+		    as_hasp_mpx_.pl1                07/20/88  1253.4r w 07/19/88  1536.9      267588
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4 */
+
+/* HASP multiplexer:  This multiplexer processes most of the HASP RJE protocol in either host or workstation mode.
+   This multiplexer expects data from the user ring to be already compressed and converted to EBCDIC.
+   This procedure implements support of the multiplexer for the Answering Service and the cv_cmf command.
+*/
+
+/* Created:  October 1979 by G. Palter */
+/* Modified: 5 November 1980 by G. Palter to allow infinite initial connection timeout (connect_timeout= none) (TR8034) */
+/* Modified: 16 April 1981 by G. Palter to add rts_mode and message documentation */
+/* Modified: 22 July 1981 by G. Palter to use proper IPC priority for multiplexer loads/crashes */
+/* Modified: 25 November 1981 by G. Palter to add max_device_input_records parameter */
+/* Modified August 1982 by Robert Coren for additional argument to multiplexer_mgr_$mpx_crashed. */
+
+/****^  HISTORY COMMENTS:
+  1) change(86-05-13,GJohnson), approve(86-05-13,MCR7387),
+     audit(86-05-13,Martinson), install(86-05-14,MR12.0-1055):
+     Correct error message documentation.
+  2) change(87-03-20,Beattie), approve(87-04-06,MCR7656),
+     audit(87-07-16,Parisek), install(87-08-04,MR12.1-1055):
+     Add support for login service on operator console subchannel.
+                                                   END HISTORY COMMENTS */
+
+as_hasp_mpx_:
+     procedure ();
+
+	return;					/* not an entry */
+
+
+/* Parameters */
+
+dcl  P_mpx_channel_name character (*) parameter;		/* name of the multiplexer's channel */
+
+dcl  (P_cdtp,					/* -> the CDT */
+     P_cdtep,					/* -> the CDT entry of the multiplexer */
+     P_subchannel_list_ptr,				/* -> list of sub-channels for this multiplexer */
+     P_event_call_info_ptr)				/* -> description of the event wakeup */
+	pointer parameter;
+
+dcl  P_error entry (fixed binary, fixed binary, character (*), character (*), character (*), character (*))
+	variable parameter;				/* procedure to report errors for cv_cmf */
+
+dcl  P_check_sw bit (1) aligned parameter;
+dcl  P_code fixed binary (35) parameter;
+
+
+/* Remaining declarations */
+
+dcl  1 subchannel_list aligned based (subchannel_list_ptr), /* configured sub-channels */
+       2 count fixed binary,
+       2 cdteps (0 refer (subchannel_list.count)) pointer unaligned;
+dcl  subchannel_list_ptr pointer;
+
+dcl  system_area area aligned based (system_area_ptr);
+dcl  system_area_ptr pointer;
+
+dcl  code fixed binary (35);
+
+dcl  (mpx_channel_name, load_parameter_name) character (32);
+
+dcl  start_subchannel_name_idx fixed binary;
+dcl  (found_console,
+     (found_readers, found_printers, found_punches) dimension (8)) bit (1) aligned;
+
+dcl  idx fixed binary;
+dcl  event_message_array (2) bit (36);
+
+dcl  saved_cdtp pointer internal static;		/* saved for use by event call handler */
+
+dcl  NAME character (32) static options (constant) initial ("as_hasp_mpx_");
+
+dcl  error_table_$action_not_performed fixed binary (35) external;
+
+dcl  convert_ipc_code_ entry (fixed binary (35));
+dcl  error entry (fixed binary, fixed binary, character (*), character (*), character (*), character (*)) variable;
+dcl  get_process_id_ entry () returns (bit (36) aligned);
+dcl  get_system_free_area_ entry () returns (pointer);
+dcl  hphcs_$tty_control entry (character (*), character (*), pointer, fixed binary (35));
+dcl  ipc_$create_ev_chn entry (fixed binary (71), fixed binary (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed binary (71), entry, pointer, fixed binary, fixed binary (35));
+dcl  ipc_$delete_ev_chn entry (fixed binary (71), fixed binary (35));
+dcl  multiplexer_mgr_$mpx_crashed entry (character (*), bit (1) aligned, fixed binary (35));
+dcl  (multiplexer_mgr_$mpx_load_failed,
+     multiplexer_mgr_$mpx_loaded) entry (character (*), fixed binary (35));
+dcl  (sys_log_, sys_log_$error_log) entry () options (variable);
+dcl  ttt_info_$additional_info entry (character (*), character (512) varying, fixed binary (35));
+
+dcl  (addr, binary, index, length, low, maxlength, null, rtrim, search, string, substr, unspec, verify) builtin;
+%page;
+/* Load a multiplexer */
+
+hasp_load:
+     entry (P_mpx_channel_name, P_cdtp, P_cdtep, P_subchannel_list_ptr, P_check_sw, P_code);
+
+	mpx_channel_name = P_mpx_channel_name;
+	cdtp,					/* for references now */
+	     saved_cdtp = P_cdtp;			/* need for wakeup handler later */
+	cdtep = P_cdtep;
+	subchannel_list_ptr = P_subchannel_list_ptr;
+	P_code = 0;				/* assume success */
+
+	mpxep = addr (cdte.initial_command);		/* -> multiplexer data in the CDT */
+	system_area_ptr = get_system_free_area_ ();
+	hld_ptr = null ();				/* haven't allocated bootload data yet */
+
+	if cdte.event ^= 0 then
+	     call ipc_$delete_ev_chn (cdte.event, (0));	/* flush old channel */
+
+	call ipc_$create_ev_chn (cdte.event, code);
+	if code ^= 0 then do;
+EVENT_CHANNEL_LOSS: call convert_ipc_code_ (code);
+	     call sys_log_$error_log (SL_LOG, code, NAME, "Creating event channel for multiplexer ^a.",
+		mpx_channel_name);
+	     P_code = error_table_$action_not_performed;
+	     return;
+	end;
+
+	call ipc_$decl_ev_call_chn (cdte.event, hasp_wakeup_handler, cdtep, MPX_LOAD_PRIO, code);
+	if code ^= 0 then go to EVENT_CHANNEL_LOSS;
+
+	call prepare_load_data ();			/* get bootload data from channel names and additional info */
+
+	call hphcs_$tty_control (mpx_channel_name, "load_mpx", hld_ptr, code);
+	free hasp_load_data in (system_area);		/* ring-0 copies all essential data */
+
+	P_code = code;
+
+	return;
+
+
+BAD_LOAD_PARAMETER:
+	call sys_log_ (SL_LOG, "^a: Invalid ^a specification in terminal type ^a for multiplexer ^a.",
+	     NAME, load_parameter_name, cdte.initial_terminal_type, mpx_channel_name);
+
+ABORT_LOAD:
+	if hld_ptr ^= null () then
+	     free hasp_load_data in (system_area);	/* flush it */
+
+	P_code = error_table_$action_not_performed;
+	return;
+%page;
+/* Handle wakeups over the bootload event channel */
+
+hasp_wakeup_handler:
+     entry (P_event_call_info_ptr);
+
+	event_call_info_ptr = P_event_call_info_ptr;
+
+	cdtp = saved_cdtp;
+	cdtep = event_call_info.data_ptr;		/* -> channel definition of the multiplexer */
+	mpxep = addr (cdte.initial_command);
+
+	if (event_call_info.ring ^= 0) & (event_call_info.sender ^= get_process_id_ ()) then do;
+						/* not myself or ring-0, must be a lie */
+	     string (event_message_array) = unspec (event_call_info.message);
+	     call sys_log_ (SL_LOG, "^a: Unexpected wakeup (^w ^w) from process ^w.", NAME, event_message_array,
+		event_call_info.sender);
+	     return;
+	end;
+
+	mpx_channel_name = cdte.name;			/* for other reference */
+
+	if (event_call_info.message ^= HASP_MPX_UP) & (event_call_info.message ^= HASP_MPX_DOWN) & (event_call_info.message ^= HASP_MPX_MASKED) then do;
+	     call sys_log_ (SL_LOG, "^a: Wakeup for multiplexer ^a has invalid state code ^d.", NAME,
+		mpx_channel_name, event_call_info.message);
+	     return;
+	end;
+
+	call sys_log_ (SL_LOG, "^a: ^[Load^;Crash^] signalled for multiplexer ^a.", NAME,
+	     (event_call_info.message = HASP_MPX_UP), mpx_channel_name);
+
+	if mpxe.state = MPX_BOOT then			/* multiplexer is booting */
+	     if event_call_info.message = HASP_MPX_UP then
+		call multiplexer_mgr_$mpx_loaded (mpx_channel_name, code);
+	     else call multiplexer_mgr_$mpx_load_failed (mpx_channel_name, code);
+
+
+	else if mpxe.state = MPX_UP then		/* multiplexer is running */
+	     if event_call_info.message ^= HASP_MPX_UP then
+		call multiplexer_mgr_$mpx_crashed (mpx_channel_name, (event_call_info.message = HASP_MPX_DOWN), code);
+
+	return;
+%page;
+/* Dump a multiplexer */
+
+hasp_dump:
+     entry (P_mpx_channel_name, P_cdtp, P_cdtep, P_code);
+
+	P_code = 0;				/* none yet implemented (and may never be either) */
+
+	return;
+%page;
+/* Validate a HASP multiplexer:  called from cv_cmf */
+
+hasp_cv_cmf:
+     entry (P_cdtp, P_cdtep, P_mpx_channel_name, P_subchannel_list_ptr, P_error);
+
+	cdtp = P_cdtp;
+	cdtep = P_cdtep;
+	mpx_channel_name = P_mpx_channel_name;
+	subchannel_list_ptr = P_subchannel_list_ptr;
+	error = P_error;				/* error reporting procedure */
+
+
+/* Validate that the major channel is not a FNP and has a BISYNC line type */
+
+	if index (mpx_channel_name, ".") = 0 then
+	     call error (1, 2, "A HASP multiplexer cannot be configured as an FNP.  ^a", "^a", mpx_channel_name, "");
+
+	if cdte.line_type ^= LINE_BSC then
+	     call error (2, 2, "A HASP multiplexer must have a line type of BSC.  ^a", "^a", mpx_channel_name, "");
+
+
+/* Validate the names of the sub-channels */
+
+	if subchannel_list.count > 17 then
+	     call error (3, 2, "More than 17 subchannels specified for HASP multiplexer ^a.", "^a",
+		mpx_channel_name, "");
+
+	start_subchannel_name_idx = length (rtrim (cdte.name)) + 2;
+
+	found_console = "0"b;			/* haven't seen a console yet */
+	found_readers (*),				/* haven't found any devices yet either */
+	     found_printers (*),
+	     found_punches (*) = ""b;
+
+	do idx = 1 to subchannel_list.count;
+
+	     call parse_subchannel_name ("0"b, (subchannel_list.cdteps (idx)), (0), (0));
+NEXT_SUBCHANNEL:
+	end;
+
+	if ^found_console then			/* must have an operator's console */
+	     call error (7, 2, "No operator's console configured for HASP multiplexer ^a.", "^a", mpx_channel_name, "");
+
+	return;
+%page;
+/* Prepare the data structure for the "load_mpx" control order */
+
+prepare_load_data:
+     procedure ();
+
+dcl  additional_info_str character (512) varying;
+dcl  value character (32) varying;
+dcl  p pointer;
+dcl  idx fixed binary;
+
+	if subchannel_list.count > 17 then do;
+	     call sys_log_ (SL_LOG, "^a: More than 17 subchannels specified for HASP multiplexer ^a (^d).",
+		NAME, mpx_channel_name, subchannel_list.count);
+	     go to ABORT_LOAD;
+	end;
+
+	hasp_load_data_n_subchannels = subchannel_list.count;
+
+	allocate hasp_load_data in (system_area) set (hld_ptr);
+						/* sets hasp_load_data.n_subchannels */
+
+	hasp_load_data.event_channel = cdte.event;
+	hasp_load_data.configuration_data = DEFAULT_HASP_CONFIGURATION_DATA;
+
+
+/* Validate the sub-channel names:  check for duplicate sub-channel names and determine each sub-channel's device type and
+   device number */
+
+	start_subchannel_name_idx = length (rtrim (cdte.name)) + 2;
+
+	found_console = "0"b;			/* haven't seen a console yet */
+	found_readers (*),				/* haven't found any devices yet either */
+	     found_printers (*),
+	     found_punches (*) = ""b;
+
+	do idx = 1 to subchannel_list.count;
+
+	     p = subchannel_list.cdteps (idx);
+
+	     hasp_load_data.subchannels (idx).devx = p -> cdte.twx;
+
+	     call parse_subchannel_name ("1"b, p,
+		hasp_load_data.subchannels (idx).device_type, hasp_load_data.subchannels (idx).device_number);
+	end;
+
+
+/* Get configuration data from additional_info for the channel's terminal type (if any) */
+
+	if (cdte.initial_terminal_type = "") |		/* no terminal type:  use default configuration data */
+	     (cdte.initial_terminal_type = low (length (cdte.initial_terminal_type))) then
+	     return;
+
+	call ttt_info_$additional_info (cdte.initial_terminal_type, additional_info_str, code);
+	if code ^= 0 then do;
+	     call sys_log_$error_log (SL_LOG, code, NAME,
+		"Cannot get additional info from terminal type ^a for multiplexer ^a.",
+		cdte.initial_terminal_type, mpx_channel_name);
+	     go to ABORT_LOAD;
+	end;
+
+	if length (additional_info_str) = 0 then	/* no information:  use default */
+	     return;
+
+	if find_parameter ("type", value) then		/* check type of other side:  set multiplexer's type */
+	     if (value = "workstation") then
+		hasp_load_data.type = HASP_HOST;	/* foreign side is the workstation */
+	     else if (value = "host") then
+		hasp_load_data.type = HASP_WORKSTATION;
+	     else go to BAD_LOAD_PARAMETER;
+
+	call find_switch_parameter ("suspend_all_mode", hasp_load_data.suspend_all_mode);
+
+	call find_switch_parameter ("signon_mode", hasp_load_data.signon_mode);
+
+	call find_switch_parameter ("multileave_mode", hasp_load_data.multileave_mode);
+
+	call find_switch_parameter ("trace_mode", hasp_load_data.trace_mode);
+
+	if find_parameter ("rts_mode", value) then
+	     if (value = "yes") then
+		hasp_load_data.rts_mode = "1"b;
+	     else if (value = "no") then
+		hasp_load_data.rts_mode = "0"b;
+	     else go to BAD_LOAD_PARAMETER;
+	else					/* default setting depends on multiplexer's type ... */
+	     if (hasp_load_data.type = HASP_HOST) then
+	     hasp_load_data.rts_mode = "0"b;		/* ... host doesn't need to ask permission */
+	else hasp_load_data.rts_mode = "1"b;		/* ... but a workstation usually does */
+
+	call find_numeric_parameter
+	     ("block_size", hasp_load_data.max_block_size, HASP_MIN_MAX_BLOCK_SIZE, HASP_MAX_MAX_BLOCK_SIZE);
+
+	call find_numeric_or_none_parameter ("connect_timeout", hasp_load_data.ic_timeout, 1, 60, 0);
+
+	call find_numeric_parameter ("receive_timeout", hasp_load_data.receive_timeout, 1, 60);
+
+	call find_numeric_parameter ("transmit_timeout", hasp_load_data.transmit_timeout, 1, 60);
+
+	call find_numeric_parameter ("max_naks", hasp_load_data.max_naks, 5, 100);
+
+	call find_numeric_parameter ("max_device_input_records", hasp_load_data.max_device_input_records, 3, 30);
+
+	return;
+%page;
+/* Find the specified parameter in the additional_info_str and return it's value */
+
+find_parameter: procedure (P_parameter_name, P_parameter_value) returns (bit (1) aligned);
+
+dcl  P_parameter_name character (*) parameter;
+dcl  P_parameter_value character (*) varying parameter;
+
+dcl  (idx, jdx) fixed binary;
+
+	     idx = index (additional_info_str, P_parameter_name || "=");
+	     if idx = 0 then			/* not specified */
+		return ("0"b);
+
+	     load_parameter_name = P_parameter_name;
+
+	     idx = idx + length (P_parameter_name) + 1;	/* past the parameter name, pick up value */
+	     if idx > length (additional_info_str) then
+		go to BAD_LOAD_PARAMETER;		/* no parameter value */
+
+	     jdx = verify (substr (additional_info_str, idx), " ");
+	     if jdx = 0 then			/* white space only */
+		go to BAD_LOAD_PARAMETER;
+
+	     idx = idx + jdx - 1;			/* skip the whitespace */
+
+	     jdx = search (substr (additional_info_str, idx), " ,");
+	     if jdx = 0 then			/* rest of string */
+		jdx = length (additional_info_str) - idx + 2;
+	     if (jdx - 1) > maxlength (P_parameter_value) then
+		go to BAD_LOAD_PARAMETER;		/* too long */
+
+	     P_parameter_value = substr (additional_info_str, idx, (jdx - 1));
+
+	     return ("1"b);				/* got it */
+
+	end find_parameter;
+%page;
+/* Find the specified switch parameter in additional_info_str:  the value must be either "yes" or "no" */
+
+find_switch_parameter:
+	procedure (P_parameter_name, P_parameter);
+
+dcl  P_parameter_name character (*) parameter;
+dcl  P_parameter bit (1) unaligned parameter;
+
+dcl  value character (3) varying;
+
+	     if find_parameter (P_parameter_name, value) then
+						/* if the parameter is there */
+		if (value = "yes") then
+		     P_parameter = "1"b;
+
+		else if (value = "no") then
+		     P_parameter = "0"b;
+
+		else go to BAD_LOAD_PARAMETER;
+
+	     return;
+
+	end find_switch_parameter;
+%page;
+/* Find the specified numeric parameter in additional_info_str and validate it */
+
+find_numeric_parameter:
+	procedure (P_parameter_name, P_parameter_value, P_parameter_min, P_parameter_max);
+
+dcl  P_parameter_name character (*) parameter;
+dcl  (P_parameter_value, P_parameter_min, P_parameter_max) fixed binary parameter;
+
+dcl  value character (12) varying;
+dcl  numeric_value fixed binary (35);
+
+	     if find_parameter (P_parameter_name, value) then do;
+						/* if the parameter is there */
+		if verify (value, "0123456789") ^= 0 then
+		     go to BAD_LOAD_PARAMETER;	/* non-numeric string */
+
+		numeric_value = binary (value, 35, 0);
+		if (numeric_value < P_parameter_min) | (numeric_value > P_parameter_max) then
+		     go to BAD_LOAD_PARAMETER;
+
+		P_parameter_value = numeric_value;	/* a good value */
+	     end;
+
+	     return;
+
+	end find_numeric_parameter;
+
+
+
+/* Find the specified numeric parameter in additional_info_str and validate it: permit "none" as a special case */
+
+find_numeric_or_none_parameter:
+	procedure (P_parameter_name, P_parameter_value, P_parameter_min, P_parameter_max, P_none_parameter_value);
+
+dcl  P_parameter_name character (*) parameter;
+dcl  (P_parameter_value, P_parameter_min, P_parameter_max, P_none_parameter_value) fixed binary parameter;
+
+dcl  value character (12) varying;
+dcl  numeric_value fixed binary (35);
+
+	     if find_parameter (P_parameter_name, value) then do;
+						/* if the parameter is there */
+		if (value = "none") then do;
+		     P_parameter_value = P_none_parameter_value;
+		     return;			/* "none" is not necessarily the same as default */
+		end;
+
+		if verify (value, "0123456789") ^= 0 then
+		     go to BAD_LOAD_PARAMETER;	/* non-numeric string */
+
+		numeric_value = binary (value, 35, 0);
+		if (numeric_value < P_parameter_min) | (numeric_value > P_parameter_max) then
+		     go to BAD_LOAD_PARAMETER;
+
+		P_parameter_value = numeric_value;	/* a good value */
+	     end;
+
+	     return;
+
+	end find_numeric_or_none_parameter;
+
+     end prepare_load_data;
+%page;
+/* Parse a sub-channel name:  validate that the channel name is legal and not a duplicate */
+
+parse_subchannel_name:
+     procedure (P_called_from_load, P_cdtep, P_subchannel_type, P_subchannel_number);
+
+dcl  P_called_from_load bit (1) aligned parameter;
+dcl  P_cdtep pointer parameter;
+dcl  (P_subchannel_type, P_subchannel_number) fixed binary;
+
+dcl  p pointer;
+dcl  name_part character (3) varying;
+dcl  number_part character (1) varying;
+dcl  (device_number, name_lth) fixed binary;
+
+	p = P_cdtep;
+
+	name_lth = length (rtrim (p -> cdte.name)) - start_subchannel_name_idx + 1;
+	if (name_lth < 3) | (name_lth > 4) then go to BAD_NAME;
+
+	name_part = substr (p -> cdte.name, start_subchannel_name_idx, 3);
+
+	if name_lth > 3 then			/* seems to have a device number */
+	     number_part = substr (p -> cdte.name, (start_subchannel_name_idx + 3), (name_lth - 3));
+	else number_part = "";
+
+	if (name_part ^= "opr") & (name_part ^= "rdr") & (name_part ^= "prt") & (name_part ^= "pun") then
+	     go to BAD_NAME;			/* unknown device type */
+
+
+/* Determine device number */
+
+	if (name_part = "opr") then			/* the "operator's" console */
+	     if length (number_part) ^= 0 then		/* can't have a number */
+		go to BAD_NAME;
+	     else device_number = 1;
+
+	else do;					/* reader/printer/punch */
+	     if length (number_part) = 0 then		/* must have device number */
+		go to BAD_NAME;
+	     if verify (number_part, "0123456789") ^= 0 then go to BAD_NAME;
+	     device_number = binary (number_part, 17, 0);
+	     if (device_number < 1) | (device_number > 8) then go to BAD_NAME;
+	end;
+
+
+/* Determine device type and whether this is a duplicate */
+
+	if (name_part = "opr") then
+	     if found_console then go to DUPLICATE_NAME;
+	     else do;
+		found_console = "1"b;
+		P_subchannel_type = HASP_CONSOLE;
+	     end;
+
+	else if (name_part = "rdr") then
+	     if found_readers (device_number) then go to DUPLICATE_NAME;
+	     else do;
+		found_readers (device_number) = "1"b;
+		P_subchannel_type = HASP_READER;
+	     end;
+
+	else if (name_part = "prt") then
+	     if found_printers (device_number) then
+		go to DUPLICATE_NAME;
+	     else if found_punches (9 - device_number) then
+		go to OVERLAPPING_PRINTERS_AND_PUNCHES;
+	     else do;
+		found_printers (device_number) = "1"b;
+		P_subchannel_type = HASP_PRINTER;
+	     end;
+
+	else if (name_part = "pun") then		/* last possibility */
+	     if found_punches (device_number) then
+		go to DUPLICATE_NAME;
+	     else if found_printers (9 - device_number) then
+		go to OVERLAPPING_PRINTERS_AND_PUNCHES;
+	     else do;
+		found_punches (device_number) = "1"b;
+		P_subchannel_type = HASP_PUNCH;
+	     end;
+
+	if P_subchannel_type ^= HASP_CONSOLE then do;
+	     if (p -> cdte.service_type ^= SLAVE_SERVICE) then
+		go to NOT_SLAVE_SERVICE;
+	end;
+	else do;
+	     if (p -> cdte.service_type ^= SLAVE_SERVICE & p -> cdte.service_type ^= ANS_SERVICE) then
+		go to NOT_SLAVE_OR_LOGIN_SERVICE;
+
+	     if (p -> cdte.service_type = ANS_SERVICE)
+	     then do;
+		if (p -> cdte.line_type ^= LINE_HASP_OPR) then
+		     go to BAD_OPR_LINE_TYPE;
+						/* have to special case and use an IOCB */
+		p -> cdte.use_iocb = "1"b;
+	     end;
+	end;
+
+	P_subchannel_number = device_number;
+
+	return;
+
+
+/* Error handlers */
+
+BAD_NAME: if P_called_from_load
+	then do;
+	     call sys_log_ (SL_LOG, "^a: Invalid subchannel name ^a for HASP multiplexer ^a.",
+		NAME, (substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to ABORT_LOAD;
+	end;
+	else do;
+	     call error (4, 2, "Invalid subchannel name ^a for HASP multiplexer ^a.", "^a for ^a",
+		(substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to NEXT_SUBCHANNEL;
+	end;
+
+BAD_OPR_LINE_TYPE:
+	if P_called_from_load
+	then do;
+	     call sys_log_ (SL_LOG,
+		"^a: Line type for hasp operator console on multiplexer ^a must be ""HASP_OPR"" when configured for login service.",
+		NAME, cdte.name);
+	     go to ABORT_LOAD;
+	end;
+	else do;
+	     call error (8, 2,
+		"Line type for hasp operator console on multiplexer ^a must be ""HASP_OPR"" when configured for login service.",
+		"^a", (cdte.name), "");
+	     go to NEXT_SUBCHANNEL;
+	end;
+
+DUPLICATE_NAME:
+	if P_called_from_load
+	then do;
+	     call sys_log_ (SL_LOG, "^a: Duplicate subchannel name ^a for HASP multiplexer ^a.",
+		NAME, (substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to ABORT_LOAD;
+	end;
+	else do;
+	     call error (5, 2, "Duplicate subchannel name ^a for HASP multiplexer ^a.", "^a for ^a",
+		(substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to NEXT_SUBCHANNEL;
+	end;
+
+NOT_SLAVE_SERVICE:
+	if P_called_from_load
+	then do;
+	     call sys_log_ (SL_LOG, "^a: Subchannel ^a of multiplexer ^a does not have a slave service type.",
+		NAME, (substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to ABORT_LOAD;
+	end;
+	else do;
+	     call error (9, 2, "Subchannel ^a of multiplexer ^a does not have a slave service type.",
+		"subchannel ^a of multiplexer ^a",
+		(substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to NEXT_SUBCHANNEL;
+	end;
+
+NOT_SLAVE_OR_LOGIN_SERVICE:
+	if P_called_from_load
+	then do;
+	     call sys_log_ (SL_LOG, "^a: Subchannel ^a of multiplexer ^a does not have a slave or login service type.",
+		NAME, (substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to ABORT_LOAD;
+	end;
+	else do;
+	     call error (10, 2, "Subchannel ^a of multiplexer ^a does not have a slave or login service type.",
+		"subchannel ^a of mux ^a",
+		(substr (p -> cdte.name, start_subchannel_name_idx)), mpx_channel_name);
+	     go to NEXT_SUBCHANNEL;
+	end;
+
+OVERLAPPING_PRINTERS_AND_PUNCHES:
+	if P_called_from_load
+	then do;
+	     call sys_log_ (SL_LOG, "^a: Too many printers and punches configured for HASP multiplexer ^a.",
+		NAME, mpx_channel_name);
+	     go to ABORT_LOAD;
+	end;
+	else do;
+	     call error (6, 2, "Too many printers and punches configured for HASP multiplexer ^a.", "^a",
+		mpx_channel_name, "");
+	     go to NEXT_SUBCHANNEL;
+	end;
+
+     end parse_subchannel_name;
+%page;
+%include hasp_load_data;
+%page;
+%include cdt;
+%page;
+%include author_dcl;
+%page;
+%include line_types;
+%page;
+%include as_wakeup_priorities;
+
+%include event_call_info;
+%page;
+%include sys_log_constants;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   as_hasp_mpx_: ERROR_MESSAGE. Creating event channel for multiplexer TTY.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  A system error arose during the initialization of the HASP multiplexer
+   on channel TTY.
+
+   A:  $inform
+
+
+   Message:
+   as_hasp_mpx_: Invalid PARM specification in terminal type NAME for multiplexer TTY.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  The value specified for the configuration parameter PARM in the additional info string of the terminal type NAME
+   used for the HASP multiplexer on channel TTY is not acceptable to the system.
+
+   A:  Correct the value of the parameter in the TTT and reload the multiplexer.
+
+
+   Message:
+   as_hasp_mpx_: Unexpected wakeup (DATA1 DATA2) from process ID.
+
+   S:  $as1
+
+   T:  $run
+
+   M:  A message was received from the process whose processid is the 12-digit octal value ID; the contents of the message
+   are given by the two 12-digit octal values DATA1 and DATA2.  No message was expected at this time.  The wakeup is
+   ignored.
+
+   A:  $ignore
+
+
+   Message:
+   as_hasp_mpx_: Wakeup from multiplexer TTY has invalid state code VALUE.
+
+   S:  $as1
+
+   T:  $run
+
+   M:  A message was received indicating a change of state for the multiplexer on channel TTY; however, the new state of
+   the multiplexer, given by the decimal number VALUE, is not recognized by this module.
+
+   A:  $inform
+
+
+   Message:
+   as_hasp_mpx_: Load signalled for multiplexer TTY.
+
+   S:  $as1
+
+   T:  $run
+
+   M:  The physical connection and initial connection protocl for the HASP multiplexer on channel TTY has been completed
+   successfully.  The multiplexer is now ready for use.
+
+   A:  Start the appropriate I/O daemon processes for the multiplexer as indicated by the system administrators or by the
+   user who requested the multiplexer be loaded.
+
+
+   Message:
+   as_hasp_mpx_: Crash signalled for multiplexer TTY.
+
+   S:  $as1
+
+   T:  $run
+
+   M:  The physical connection for the HASP multiplexer on channel TTY has been broken either because of an error or
+   or because of a request from the remote host/workstation.
+
+   A:  Check the console for a message concerning this channel from hasp_mpx.  If such a message is found, refer to its
+   documentation for further action; otherwise, the remote host/workstation has requested termination of the connection
+   and the I/O daemons using this channel should be logged out.
+
+
+   Message:
+   as_hasp_mpx_: More than 17 subchannels specified for HASP multiplexer TTY (COUNT).
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  The definition of the HASP multiplexer on channel TTY contains too many subchannels.
+
+   A:  Correct the CDT entry for this multiplexer and reload it.
+
+
+   Message:
+   as_hasp_mpx_: ERROR_MESSAGE. Cannot get additional info from terminal type NAME for multiplexer TTY.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  The terminal type specified by NAME was not given an additional_info string in its TTT entry.  This string is
+   required to specify the configuration parameters for the HASP multiplexer on channel TTY.
+
+   A:  Check both the CDT entry for this multiplexer and the TTT entry for the terminal type.  Either the wrong terminal
+   type was specified in the CDT or the terminal type's definition is incomplete.  Correct whichever table is in error and
+   reload the multiplexer.
+
+
+   Message:
+   as_hasp_mpx_: Invalid subchannel name NAME for HASP multiplexer TTY.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  The name specified for a subchannel of the HASP multiplexer on channel TTY does not conform to the conventions
+   defined in MAM Communications for naming such channels.
+
+   A:  Correct the CDT entry for this multiplexer and reload it.
+
+
+   Message:
+   as_hasp_mpx_: Line type for hasp operator console on multiplexer TTY must be
+   "HASP_OPR" when configured for login service.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system
+   initialization.
+
+   M:  The line type must be set for HASP_OPR on a hasp operator console
+   subchannel when it is configured for login service.
+
+   A:  Correct the CDT entry for this multiplexer and reload it.
+
+
+   Message:
+   as_hasp_mpx_: Duplicate subchannel name NAME for HASP multiplexer TTY.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  The same name has been used for two or more subchannels of the HASP multiplexer on channel TTY.
+
+   A:  Correct the CDT entry for this multiplexer and reload it.
+
+
+   Message:
+   as_hasp_mpx_: Subchannel NAME of multiplexer TTY does not have TYPE service type.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  The specified subchannel of the HASP multiplexer on channel TTY was not
+   given the slave service type or, in the case of operator console
+   subchannels, slave or login.
+
+   A:  Correct the CDT entry for this multiplexer and reload it.
+
+
+   Message:
+   as_hasp_mpx_: Too many printers and punches configured for HASP multiplexer TTY.
+
+   S:  $as1
+
+   T:  In response to a load_mpx operator command or during system initialization.
+
+   M:  More than 8 card punches and line printers have been specified for the HASP multiplexer on channel TTY or a card
+   punch and line printer which use the same flow control flag have been specified.  (See MAM Communications for a
+   description of the rules for naming card punches and line printers.)
+
+   A:  Correct the CDT entry for this multiplexer and reload it.
+
+   END MESSAGE DOCUMENTATION */
+
+     end as_hasp_mpx_;
+
+
+
+
+		    as_ibm3270_mpx_.pl1             07/20/88  1253.4r w 07/19/88  1536.9      138708
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+/* AS_IBM3270_MPX_ - Anserwing service piece of IBM3270 multiplexer */
+
+/* Written October 1978 by Larry Johnson (as as_user1_mpx_) */
+/* Converted to as_vip7760_mpx_ 1/5/78 by J. Stern */
+/* Modified 5/1/79 by J. Stern to add vip7760_cv_cmf entry */
+/* Re-converted to as_ibm3270_mpx_ May 1979 by Larry Johnson */
+/* Modified June 1981 by T. Casey for MR9.0 for new wakeup priorities. */
+/* Modified August 1982 by Robert Coren for additional argument to multiplexer_mgr_$mpx_crashed. */
+
+as_ibm3270_mpx_: proc;
+
+/* Parameters */
+
+dcl  arg_mpx_chan char (*);				/* Name of the multiplexed channel */
+dcl  arg_cdtp ptr;					/* Address of the cdt */
+dcl  arg_cdtep ptr;
+dcl  arg_chan_listp ptr;				/* Pointer to a structure of channels to init  */
+dcl  arg_check_sw bit (1) aligned;			/* Says whether or not to check configuration */
+dcl  arg_event_infop ptr;
+dcl  arg_code fixed bin (35);
+dcl  arg_error_proc entry variable;
+
+/* Automatic */
+
+dcl  code fixed bin (35);
+dcl  mpx_chan char (32);
+dcl  chan_listp ptr;
+dcl  event_infop ptr;
+dcl  ev_msg_array (2) bit (36);
+dcl  load_parm char (32);
+dcl  len fixed bin;
+dcl  p ptr;
+dcl  station_addr fixed bin;
+dcl (i, j) fixed bin;
+dcl  subchan_flags (0:31) bit (1) unal;
+dcl  error_proc entry (fixed bin, fixed bin, char (*), char (*), char (*), char (*)) variable;
+dcl  cv_cmf_entry bit (1) init ("0"b);
+dcl  controller_address_param fixed bin;
+dcl  quit_key_param fixed bin;
+dcl  formfeed_key_param fixed bin;
+dcl  ascii_param bit (1);
+dcl  allow_raw3270_param bit (1);
+dcl  allow_copy_param bit (1);
+dcl  debug_param bit (1);
+dcl  error bit (1);
+
+/* Constants */
+
+dcl  name char (15) int static options (constant) init ("as_ibm3270_mpx_");
+dcl  white_space char (2) int static options (constant) init (" 	"); /* Space and tab */
+
+/* Static */
+
+dcl  static_cdtp ptr int static init (null);
+						/* Remember where cdt is */
+
+/* External */
+
+dcl  hphcs_$tty_control entry (char (*), char (*), ptr, fixed bin (35));
+dcl  ipc_$delete_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed bin (71), entry, ptr, fixed bin, fixed bin (35));
+dcl  sys_log_ entry options (variable);
+dcl  convert_ipc_code_ entry (fixed bin (35));
+dcl  sys_log_$error_log entry options (variable);
+dcl  get_process_id_ entry returns (bit (36) aligned);
+dcl  ttt_info_$additional_info entry (char (*), char (512) varying, fixed bin (35));
+dcl  ttt_info_$modes entry (char (*), char (*), fixed bin (35));
+dcl  multiplexer_mgr_$mpx_load_failed entry (char (*), fixed bin (35));
+dcl  multiplexer_mgr_$mpx_loaded entry (char (*), fixed bin (35));
+dcl  multiplexer_mgr_$mpx_crashed entry (char (*), bit (1) aligned, fixed bin (35));
+dcl  convert_status_code_ entry (fixed bin (35), char (8), char (100));
+
+dcl  error_table_$action_not_performed ext fixed bin (35);
+
+dcl  conversion condition;
+
+dcl (addr, bin, low, rtrim, ltrim, search, verify, null, string, substr, unspec, index, length)
+     builtin;
+
+/* Based */
+
+dcl 1 chan_list aligned based (chan_listp),
+						/* List of cdte entries of channels to boot */
+    2 count fixed bin,
+    2 cdte_ptr (0 refer (chan_list.count)) ptr unal;
+
+dcl 1 event_info aligned based (event_infop),
+						/* Event call argument structure */
+    2 channel_id fixed bin (71),
+    2 message fixed bin (71),
+    2 sender_procid bit (36),
+    2 origin,
+      3 dev_signal bit (18) unal,
+      3 ring bit (18) unal,
+    2 data_ptr ptr;
+
+/* Entry to load a multiplexer */
+
+ibm3270_load:
+	entry (arg_mpx_chan, arg_cdtp, arg_cdtep, arg_chan_listp, arg_check_sw, arg_code);
+
+	mpx_chan = arg_mpx_chan;
+	cdtp, static_cdtp = arg_cdtp;
+	cdtep = arg_cdtep;
+	chan_listp = arg_chan_listp;
+	mpxep = addr (cdte.initial_command);
+
+	if cdte.event ^= 0 then call ipc_$delete_ev_chn (cdte.event, code);
+	call ipc_$create_ev_chn (cdte.event, code);
+	if code ^= 0 then do;
+ev_chan_err:   call convert_ipc_code_ (code);
+	     call sys_log_$error_log (1, code, name, "Creating event channel for multiplexer ^a", mpx_chan);
+	     arg_code = error_table_$action_not_performed;
+	     return;
+	end;
+	call ipc_$decl_ev_call_chn (cdte.event, ibm3270_wakeup_handler, cdtep, MPX_LOAD_PRIO, code);
+	if code ^= 0 then go to ev_chan_err;
+
+	call get_boot_info;				/* Get bootload parameters */
+	if error then do;
+	     arg_code = error_table_$action_not_performed;
+	     return;
+	end;
+
+	load_info_nchan = chan_list.count;
+
+	begin;
+
+dcl 1 auto_load_info like load_info aligned automatic;
+
+	     load_infop = addr (auto_load_info);
+	     load_info.event_channel = cdte.event;
+	     string (load_info.flags) = "0"b;
+	     load_info.debug = debug_param;
+	     load_info.allow_copy = allow_copy_param;
+	     load_info.allow_raw3270 = allow_raw3270_param;
+	     load_info.ascii = ascii_param;
+	     load_info.quit_key = quit_key_param;
+	     load_info.formfeed_key = formfeed_key_param;
+	     load_info.controller_address = controller_address_param;
+	     load_info.nchan = load_info_nchan;
+
+	     do i = 1 to load_info.nchan;
+		chan_load_infop = addr (load_info.chan_info (i));
+		p = chan_list.cdte_ptr (i);
+		chan_load_info.devx = p -> cdte.twx;
+		call get_line_and_screen_size (p);
+	     end;
+
+	     call hphcs_$tty_control (mpx_chan, "load_mpx", load_infop, code);
+	end;
+
+	if code ^= 0 then do;
+	     arg_code = code;
+	     return;
+	end;
+
+	arg_code = 0;
+	return;
+
+/* Wakeup handler for wakeups on the bootload event channel */
+
+ibm3270_wakeup_handler:
+	entry (arg_event_infop);
+
+	event_infop = arg_event_infop;
+	cdtp = static_cdtp;
+	cdtep = event_info.data_ptr;
+	mpxep = addr (cdte.initial_command);
+
+	if event_info.ring ^= "0"b
+	then					/* If not ring-0 */
+	     if event_info.sender_procid ^= get_process_id_ ()
+	     then do;				/* Trust only myself */
+		string (ev_msg_array) = unspec (event_info.message);
+		call sys_log_ (1, "^a: Unexpected wakeup (^w ^w) from process ^w.", name, ev_msg_array,
+		     event_info.sender_procid);
+		return;
+	     end;
+
+	mpx_chan = cdte.name;
+
+	if event_info.message ^= IBM3270_MPX_UP & event_info.message ^= IBM3270_MPX_DOWN & event_info.message ^= IBM3270_MPX_MASKED
+	then do;
+	     call sys_log_ (1, "^a: Wakeup for multiplexer ^a has invalid state code: ^d.", name, mpx_chan,
+		event_info.message);
+	     return;
+	end;
+	call sys_log_ (1, "^a: ^[Load^;Crash^] signaled for multiplexer ^a.", name, (event_info.message = IBM3270_MPX_UP),
+	     mpx_chan);
+
+	if mpxe.state = MPX_BOOT
+	then do;					/* Now booting */
+	     if event_info.message ^= IBM3270_MPX_UP
+	     then					/* Boot failed */
+		call multiplexer_mgr_$mpx_load_failed (mpx_chan, code);
+	     else do;
+		call hphcs_$tty_control (mpx_chan, "start_mpx", null (), code);
+		if code = 0 then call multiplexer_mgr_$mpx_loaded (mpx_chan, code);
+		else do;
+		     call sys_log_$error_log (1, code, name, "Unable to start ^a", mpx_chan);
+		     call multiplexer_mgr_$mpx_load_failed (mpx_chan, code);
+		end;
+	     end;
+	     return;
+	end;
+
+	else if mpxe.state = MPX_UP
+	then do;					/* Currently running ok */
+	     if event_info.message ^= IBM3270_MPX_UP
+	     then					/* It crashed */
+		call multiplexer_mgr_$mpx_crashed (mpx_chan, (event_info.message = IBM3270_MPX_DOWN), code);
+	end;
+	return;
+
+/* Entry to dump a multiplexer. */
+
+ibm3270_dump:
+	entry (arg_mpx_chan, arg_cdtp, arg_cdtep, arg_code);
+
+	arg_code = 0;				/* Nothing to do really */
+	return;
+
+/* Entry called by cv_cmf to validate ibm3270 multiplexers */
+
+ibm3270_cv_cmf:
+	entry (arg_cdtp, arg_cdtep, arg_mpx_chan, arg_chan_listp, arg_error_proc);
+
+	cv_cmf_entry = "1"b;
+	cdtp = arg_cdtp;
+	cdtep = arg_cdtep;
+	mpx_chan = arg_mpx_chan;
+	chan_listp = arg_chan_listp;
+	error_proc = arg_error_proc;
+
+/* Make sure this channel is not an FNP */
+
+	if index (mpx_chan, ".") = 0			/* Single component name => FNP */
+	then call error_proc (1, 2, "An IBM3270 multiplexer cannot be configured as an FNP.  ^a", "^a", mpx_chan, "");
+
+/* Make sure line type is right */
+
+	if cdte.line_type ^= LINE_BSC
+	then call error_proc (2, 2, "An IBM3270 multiplexer must have a line type of BSC.  ^a", "^a", mpx_chan, "");
+
+/* Validate subchannel names */
+
+	string (subchan_flags) = "0"b;
+	j = length (rtrim (cdte.name)) + 1;		/* Get length of major channel name */
+	do i = 1 to chan_list.count;			/* Examine subchans */
+	     p = chan_list.cdte_ptr (i);
+	     len = length (rtrim (p -> cdte.name)) - j;
+	     if len < 3				/* Name too short */
+	     then do;
+bad_name:
+		call error_proc (4, 2, "Invalid subchannel name ^a for IBM3270 multiplexer ^a.", "^a for ^a",
+		     substr (p -> cdte.name, j + 1), mpx_chan);
+		go to next_subchan;
+	     end;
+	     if len > 3				/* Name too long, better be more components */
+	     then if substr (p -> cdte.name, j + 4, 1) ^= "."
+						/* Nope, bad name */
+		then go to bad_name;
+
+	     if verify (substr (p -> cdte.name, j + 1, 1), "dp") ^= 0
+	     then go to bad_name;
+
+	     station_addr = bin (substr (p -> cdte.name, j + 2, 2));
+	     if station_addr < 0 | station_addr > 31
+	     then go to bad_name;
+	     if subchan_flags (station_addr) then
+		call error_proc (3, 2, "IBM3270 subchannel ^a conflicts with another device with the same address.",
+		"^a", (cdte.name), "");
+	     subchan_flags (station_addr) = "1"b;
+next_subchan:
+	end;
+	call get_boot_info;				/* Validate params also */
+
+	return;
+
+/* Subroutine to prepare info structure for "load_mpx" control order */
+
+get_boot_info:
+	proc;
+
+dcl  add_info char (512) varying;
+dcl (i, j) fixed bin;
+dcl  work char (512);
+dcl  keyword char (32);
+dcl  option char (32);
+dcl  long char (100);
+dcl  short char (8);
+
+/* Set defaults */
+
+	     controller_address_param = 0;
+	     quit_key_param = PA1;
+	     formfeed_key_param = CLEAR;
+	     ascii_param = "0"b;
+	     allow_raw3270_param = "1"b;
+	     allow_copy_param = "0"b;
+	     debug_param = "0"b;
+
+	     error = "0"b;
+
+	     if cdte.initial_terminal_type = "" then return;
+	     if cdte.initial_terminal_type = low (length (cdte.initial_terminal_type)) then return;
+	     call ttt_info_$additional_info (cdte.initial_terminal_type, add_info, code);
+	     if code ^= 0 then do;
+		call convert_status_code_ (code, short, long);
+		call info_error (5, long || " Unable to get additional info in ttf for ^a, terminal type ^a",
+		     "^a, ^a", (cdte.name), cdte.initial_terminal_type);
+		return;
+	     end;
+
+	     work = ltrim (add_info, white_space);
+	     do while (work ^= "");
+		i = index (work, "=");
+		if i < 2 then do;
+		     call info_error (6, "Syntax error in additional info in ttf for ^a. ^a", "^a, ^a",
+			(cdte.name), rtrim (work));
+		     return;
+		end;
+
+		keyword = substr (work, 1, i - 1);
+		work = substr (work, i + 1);
+		i = search (work, white_space);
+		if i = 1 then option = "";
+		else if i = 0 then do;
+		     option = work;
+		     work = "";
+		end;
+		else do;
+		     option = substr (work, 1, i - 1);
+		     work = substr (work, i);
+		end;
+
+		if keyword = "controller_address" then do;
+		     on conversion go to bad_param;
+		     controller_address_param = bin (option);
+		     revert conversion;
+		     if controller_address_param < 0 | controller_address_param > 31 then do;
+bad_param:		call info_error (7, "Invalid parameter specified in ttf for ^a. ^a", "^a, ^a",
+			     (cdte.name), rtrim (keyword) || "=" || rtrim (option));
+			go to parse_next;
+		     end;
+		end;
+		else if keyword = "quit" then do;
+		     if option = "pa1" then quit_key_param = PA1;
+		     else if option = "pa2" then quit_key_param = PA2;
+		     else if option = "pa3" then quit_key_param = PA3;
+		     else go to bad_param;
+		end;
+		else if keyword = "formfeed" then do;
+		     if option = "pa1" then formfeed_key_param = PA1;
+		     else if option = "pa2" then formfeed_key_param = PA2;
+		     else if option = "pa3" then formfeed_key_param = PA3;
+		     else if option = "clear" then formfeed_key_param = CLEAR;
+		     else go to bad_param;
+		end;
+		else if keyword = "code" then do;
+		     if option = "ebcdic" then ascii_param = "0"b;
+		     else if option = "ascii" then ascii_param = "1"b;
+		     else go to bad_param;
+		end;
+		else if keyword = "allow_raw3270" then do;
+		     if option = "yes" then allow_raw3270_param = "1"b;
+		     else if option = "no" then allow_raw3270_param = "0"b;
+		     else go to bad_param;
+		end;
+		else if keyword = "allow_copy" then do;
+		     if option = "yes" then allow_copy_param = "1"b;
+		     else if option = "no" then allow_copy_param = "0"b;
+		     else go to bad_param;
+		end;
+		else if keyword = "debug" then do;
+		     if option = "yes" then debug_param = "1"b;
+		     else if option = "no" then debug_param = "0"b;
+		     else go to bad_param;
+		end;
+		else do;
+		     call info_error (8, "Invalid option specified in ttf for ^a. ^a", "^a, ^a",
+			(cdte.name), rtrim (keyword) || "=" || rtrim (option));
+		end;
+parse_next:
+		work = ltrim (work, white_space);
+	     end;
+
+	     if quit_key_param = formfeed_key_param then
+		call info_error (9, "Invalid attempt in ttf to specify same function key for quits and formfeeds. ^a",
+		"^a", (cdte.name), "");
+
+	     return;
+
+	end get_boot_info;
+
+info_error: proc (errno, long_ioa_string, short_ioa_string, arg1, arg2);
+
+dcl  errno fixed bin;
+dcl (long_ioa_string, short_ioa_string) char (*);
+dcl (arg1, arg2) char (*);
+
+	     error = "1"b;
+	     if cv_cmf_entry then call error_proc (errno, 1, long_ioa_string, short_ioa_string, arg1, arg2);
+	     else call sys_log_ (1, "^a: " || long_ioa_string, name, arg1, arg2);
+	     return;
+
+	end info_error;
+
+/* parse mode string for line length and page length */
+
+get_line_and_screen_size: proc (p);
+
+dcl  p ptr;					/* cdte pointer */
+dcl  i fixed bin;
+dcl (ll, pl) fixed bin;
+dcl  mode_string char (512);
+
+
+	     ll = 80;
+	     if p -> cdte.initial_terminal_type = "" then go to set_defaults;
+	     if p -> cdte.initial_terminal_type = low (length (cdte.initial_terminal_type)) then go to set_defaults;
+
+	     call ttt_info_$modes (p -> cdte.initial_terminal_type, mode_string, code);
+	     if code ^= 0 then go to set_defaults;
+
+	     i = index (mode_string, ",ll");
+	     if i = 0 then go to set_defaults;
+	     ll = cv_modes ();
+	     ll = 20 * divide (ll + 19, 20, 17, 0);
+
+	     i = index (mode_string, ",pl");
+	     if i = 0 then go to set_defaults;
+	     pl = cv_modes ();
+	     pl = 12 * divide (pl + 11, 12, 17, 0);
+
+set_values:    chan_load_info.line_size = ll;
+	     chan_load_info.screen_size = ll * pl;
+	     return;
+
+set_defaults:  if ll = 40 then pl = 12;
+	     else pl = 24;
+	     go to set_values;
+
+cv_modes:	     proc returns (fixed bin);
+
+dcl  j fixed bin;
+
+		on conversion go to set_defaults;
+		j = verify (substr (mode_string, i + 3), "0123456789");
+		if j < 2 then go to set_defaults;
+		return (bin (substr (mode_string, i + 3, j - 1)));
+
+	     end cv_modes;
+
+	end get_line_and_screen_size;
+
+%include ibm3270_mpx_load_data;
+
+%include cdt;
+
+%include author_dcl;
+
+%include line_types;
+
+%include as_wakeup_priorities;
+
+     end as_ibm3270_mpx_;
+
+
+
+
+		    as_lap_mpx_.pl1                 08/08/88  1525.5rew 08/08/88  1400.0      135810
+
+
+
+/****^  **************************************************************
+        *                                                            *
+        * Copyright, (C) Honeywell Bull Inc., 1988                   *
+        *                                                            *
+        * Copyright, (C) Massachusetts Institute of Technology, 1983 *
+        *                                                            *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982    *
+        *                                                            *
+        * Copyright, (C) Honeywell Information Systems Inc., 1980.   *
+        *                                                            *
+        ************************************************************** */
+
+/* format: style4,delnl,insnl,ifthenstmt,indnoniterend */
+
+/* AS_LAP_MPX_ - Anserwing service piece of lap multiplexer */
+
+/* Written October 1978 by Larry Johnson (as as_user1_mpx_) */
+/* Converted to as_vip7760_mpx_ 1/5/78 by J. Stern */
+/* Modified 7/31/79 by B.Westcott to support lap instead */
+/* Modified November 1979 by C. Hornig for installation */
+/* Modified May 1982 by D. W. Cousins for direct interface to lap_tables in the fnp */
+/* Modified August 1982 by Robert Coren for additional argument to multiplexer_mgr_$mpx_crashed. */
+/* Converted January, 1983 by Olin Sibert to support ARPAnet HDH interface. */
+
+/****^  HISTORY COMMENTS:
+  1) change(88-07-07,Beattie), approve(88-06-27,MCR7926),
+     audit(88-07-22,Brunelle), install(88-08-08,MR12.2-1082):
+     Prepared for installation.
+                                                   END HISTORY COMMENTS */
+
+as_lap_mpx_:
+     procedure;
+%page;
+/* Entry to load a multiplexer */
+
+lap_load:
+     entry (arg_mpx_chan, arg_cdtp, arg_cdtep, arg_chan_listp, arg_check_sw, arg_code);
+
+	mpx_chan = arg_mpx_chan;
+	cdtp = arg_cdtp;
+	cdtep = arg_cdtep;
+	chan_listp = arg_chan_listp;
+	mpxep = addr (cdte.initial_command);
+
+	if cdte.event ^= 0 then call ipc_$delete_ev_chn (cdte.event, code);
+	call ipc_$create_ev_chn (cdte.event, code);
+	if code ^= 0 then do;
+ev_chan_err:
+	     call sys_log_$error_log (SL_LOG, code, name, "Creating event channel for multiplexer ^a", mpx_chan);
+	     arg_code = error_table_$action_not_performed;
+	     return;
+	     end;
+	call ipc_$decl_ev_call_chn (cdte.event, lap_wakeup_handler, cdtep, (20), code);
+	if code ^= 0 then go to ev_chan_err;
+
+	unspec (boot_info) = ""b;
+	boot_info.version = LAP_LOAD_INFO_VERSION_1;
+	boot_info.event_channel = cdte.event;
+	boot_info.process_id = get_process_id_ ();
+
+	boot_info.dce_or_dte = "0"b;			/* DTE by default */
+	boot_info.lap_or_lapb = "1"b;			/* Because IMPs speak LAPB only */
+	boot_info.disc_first = "0"b;			/* Have to find out what this means.... */
+	boot_info.frame_size = 1088;			/* Max frame is 1088 bits in "packet mode" */
+	boot_info.K = 7;				/* Values from the HDH spec in BBN 1822 */
+	boot_info.N2 = 20;
+	boot_info.T1 = 300;				/* Value is in tenths of seconds */
+	boot_info.T3 = 200;
+
+	add_info = "";
+	if (cdte.initial_terminal_type ^= low (length (cdte.initial_terminal_type)))
+	     & (cdte.initial_terminal_type ^= "") then do;
+	     call ttt_info_$additional_info (cdte.initial_terminal_type, add_info, code);
+	     if code ^= 0 then do;
+		call sys_log_$error_log (SL_LOG, code, name,
+		     "Cannot get additional info for terminal type ^a for multiplexer ^a.",
+		     cdte.initial_terminal_type, mpx_chan);
+		add_info = "";
+		end;
+	     end;
+
+	if get_parm ("type=", parm) then do;		/* DCE or DTE options */
+	     if parm = "DCE" then boot_info.dce_or_dte = "1"b;
+	     else if parm = "DTE" then boot_info.dce_or_dte = "0"b;
+	     else call bad_parm ("type", "DCE", "DTE");
+	     end;
+
+	if get_parm ("link_protocol=", parm) then do;	/* LAP or LAPB options */
+	     if parm = "LAP" then boot_info.lap_or_lapb = "0"b;
+	     else if parm = "LAPB" then boot_info.lap_or_lapb = "1"b;
+	     else call bad_parm ("link_protocol", "LAP", "LAPB");
+	     end;
+
+	if get_parm ("frame_size=", parm) then do;
+	     boot_info.frame_size = cv_dec_check_ (parm, code);
+	     if code ^= 0 then call bad_conv ("frame_size");
+	     if (boot_info.frame_size < 8) | (boot_info.frame_size > 8232) | (mod (boot_info.frame_size, 8) ^= 0)
+	     then call bad_conv ("frame_size");
+	     end;
+
+	if get_parm ("K=", parm) then do;
+	     boot_info.K = cv_dec_check_ (parm, code);
+	     if code ^= 0 then call bad_conv ("K");
+	     if (boot_info.K < 1) | (boot_info.K > 7) then call bad_conv ("K");
+	     end;
+
+	if get_parm ("T1=", parm) then do;
+	     boot_info.T1 = 10.0e0 * cv_float_ (parm, code);
+	     if code ^= 0 then call bad_conv ("T1");
+	     if (boot_info.T1 < 1) | (boot_info.T1 > 500) then call bad_conv ("T1");
+						/* tenths of seconds, remember */
+	     end;
+
+	if get_parm ("T3=", parm) then do;
+	     boot_info.T3 = cv_float_ (parm, code);
+	     if code ^= 0 then call bad_conv ("T3");
+	     if (boot_info.T3 < .1e0) | (boot_info.T3 > 50e0) then call bad_conv ("T3");
+	     end;
+
+	if get_parm ("N2=", parm) then do;
+	     boot_info.N2 = cv_dec_check_ (parm, code);
+	     if code ^= 0 then call bad_conv ("N2");
+	     if (boot_info.N2 < 1) | (boot_info.N2 > 511) then call bad_conv ("N2");
+	     end;
+
+	if get_parm ("disc_first=", parm) then do;	/* disc_first yes or no */
+	     if parm = "yes" then boot_info.disc_first = "1"b;
+	     else if parm = "no" then boot_info.disc_first = "0"b;
+	     else call bad_parm ("disc_first", "yes", "no");
+	     end;
+
+	if get_parm ("trace_off=", parm) then do;	/* trace_off yes or no */
+	     if parm = "yes" then boot_info.trace_off = "1"b;
+	     else if parm = "no" then boot_info.trace_off = "0"b;
+	     else call bad_parm ("trace_off", "yes", "no");
+	     end;
+	call hphcs_$tty_control (mpx_chan, "load_mpx", addr (boot_info), arg_code);
+return_to_caller:
+	return;
+
+bad_conv:
+     procedure (String);
+dcl  String char (*) parameter;
+
+	call sys_log_$error_log (SL_LOG, error_table_$bad_conversion, name,
+	     "Converting ^a ^a to a number for multiplexer ^a.", String, parm, mpx_chan);
+	arg_code = error_table_$bad_conversion;
+	goto return_to_caller;
+     end bad_conv;
+
+get_parm:
+     procedure (Parm, Value) returns (bit (1) aligned);
+dcl  (Parm, Value) char (*);
+dcl  i fixed bin;
+
+	i = index (add_info, Parm);
+	if i = 0
+	then return ("0"b);
+	else do;
+	     Value = before (substr (add_info, i + length (Parm)), " ");
+	     return ("1"b);
+	     end;
+     end get_parm;
+
+bad_parm:
+     proc (type, value1, value2);
+dcl  (type, value1, value2) char (*) parameter;
+
+	call sys_log_$error_log (SL_LOG, 0, name, "Bad argument to parm ^a, should be ^a or ^a", type, value1, value2);
+	goto return_to_caller;			/* its bad enough to go back */
+     end bad_parm;
+%page;
+/* Wakeup handler for wakeups on the bootload event channel */
+
+lap_wakeup_handler:
+     entry (arg_event_infop);
+
+	event_call_info_ptr = arg_event_infop;
+	cdtep = event_call_info.data_ptr;
+	mpxep = addr (cdte.initial_command);
+
+	if event_call_info.ring ^= 0			/* If not ring-0 */
+	then if event_call_info.sender ^= get_process_id_ () then do;
+						/* Trust only myself */
+		call sys_log_ (SL_LOG, "^a: Unexpected wakeup (^72.3b) from process ^w.", name,
+		     unspec (event_call_info.message), event_call_info.sender);
+		return;
+		end;
+
+	mpx_chan = cdte.name;
+
+	if (event_call_info.message < 1) | (event_call_info.message > 3) then do;
+	     call sys_log_ (SL_LOG, "^a: Wakeup for multiplexer ^a has invalid state code: ^d.", name, mpx_chan,
+		event_call_info.message);
+	     return;
+	     end;
+
+	msg = "Unexpected signal";
+	if mpxe.state = MPX_BOOT
+	then if event_call_info.message ^= 1 then do;
+		msg = "Load failed";
+		call multiplexer_mgr_$mpx_load_failed (mpx_chan, code);
+		end;
+	     else do;
+		msg = "Load signalled";
+		call multiplexer_mgr_$mpx_loaded (mpx_chan, code);
+		end;
+	else if mpxe.state = MPX_UP
+	then if event_call_info.message ^= 1 then do;
+		msg = "Crash signalled";
+		call multiplexer_mgr_$mpx_crashed (mpx_chan, (event_call_info.message = 2), code);
+		end;
+	call sys_log_ (SL_LOG, "^a: ^a for multiplexer ^a.", name, msg, mpx_chan);
+	return;
+%page;
+/* Entry to dump a multiplexer. */
+
+lap_dump:
+     entry (arg_mpx_chan, arg_cdtp, arg_cdtep, arg_code);
+
+	arg_code = 0;				/* nothing to do really */
+	return;
+%page;
+/* Entry called by cv_cmf to validate LAP multiplexers */
+
+lap_cv_cmf:
+     entry (arg_cdtp, arg_cdtep, arg_mpx_chan, arg_chan_listp, arg_error_proc);
+
+	cdtp = arg_cdtp;
+	cdtep = arg_cdtep;
+	mpx_chan = arg_mpx_chan;
+	chan_listp = arg_chan_listp;
+	error_proc = arg_error_proc;
+
+/*
+   Each multiplexer is alloted 99 errors.  The multiplexer type controls which
+   block of numbers this multiplexer uses.  Multiplexer types are defined by the
+   mpx_types array in multiplexer_types.incl.pl1.  The LAP multiplexer is in
+   position 10 so it has error numbers 1001 - 1099.  The error number is the first
+   argument to the error_proc procedure.  This value is not used in any other
+   manner.
+*/
+
+/* Make sure this channel is not an FNP */
+
+	if index (mpx_chan, ".") = 0			/* single component name => FNP */
+	then call error_proc (1, ERROR_HERALD, "A LAP multiplexer cannot be configured as an FNP.  ^a", "^a", mpx_chan,
+		"");
+
+/* Validate subchannel names */
+
+	if chan_list.count ^= 1
+	then call error_proc (2, ERROR_HERALD, "A LAP multiplexer must have exactly one subchannel.  ^a.", "^a",
+		mpx_chan, "");
+
+	return;
+%page;
+/* Parameters */
+
+dcl  arg_mpx_chan char (*);				/* Name of the multiplexed channel */
+dcl  arg_cdtp ptr;					/* Address of the cdt */
+dcl  arg_cdtep ptr;
+dcl  arg_chan_listp ptr;				/* Pointer to a structure of channels to init  */
+dcl  arg_check_sw bit (1) aligned;			/* Says whether or not to check configuration */
+dcl  arg_event_infop ptr;
+dcl  arg_code fixed bin (35);
+dcl  arg_error_proc entry variable;
+
+/* Automatic */
+
+dcl  code fixed bin (35);
+dcl  add_info varying char (512);
+dcl  parm char (32);
+dcl  msg char (32);
+dcl  mpx_chan char (32);
+dcl  chan_listp ptr;
+dcl  1 boot_info aligned like lap_load_info;
+dcl  error_proc entry (fixed bin, fixed bin, char (*), char (*), char (*), char (*)) variable;
+
+/* Constants */
+
+dcl  name char (15) int static options (constant) init ("as_lap_mpx_");
+dcl  ERROR_HERALD fixed bin int static options (constant) init (2);
+
+/* External */
+
+dcl  hphcs_$tty_control entry (char (*), char (*), ptr, fixed bin (35));
+dcl  ipc_$delete_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed bin (71), entry, ptr, fixed bin, fixed bin (35));
+dcl  cv_dec_check_ entry (char (*), fixed bin (35)) returns (fixed bin (35));
+dcl  cv_float_ entry (char (*), fixed bin (35)) returns (float bin);
+dcl  sys_log_ entry options (variable);
+dcl  sys_log_$error_log entry options (variable);
+dcl  get_process_id_ entry returns (bit (36) aligned);
+dcl  multiplexer_mgr_$mpx_load_failed entry (char (*), fixed bin (35));
+dcl  multiplexer_mgr_$mpx_loaded entry (char (*), fixed bin (35));
+dcl  multiplexer_mgr_$mpx_crashed entry (char (*), bit (1) aligned, fixed bin (35));
+dcl  ttt_info_$additional_info entry (char (*), char (*) var, fixed bin (35));
+
+dcl  error_table_$action_not_performed ext fixed bin (35);
+dcl  error_table_$bad_conversion fixed bin (35) ext static;
+
+dcl  (addr, before, length, low, mod, substr, unspec, index) builtin;
+
+/* Based */
+
+dcl  1 chan_list aligned based (chan_listp),		/* List of cdte entries of channels to boot */
+       2 count fixed bin,
+       2 cdte_ptr (0 refer (chan_list.count)) ptr unal;
+%page; %include lap_simplex_data;
+%page; %include lap_line_info;
+%page; %include mcs_interrupt_info;
+%page; %include cdt;
+%page; %include author_dcl;
+%page; %include line_types;
+%page; %include event_call_info;
+%page; %include sys_log_constants;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   as_lap_mpx_: ERROR. Creating event channel for multiplexer MPX.
+
+   S: as (severity1)
+
+   T: In response to an operator load_mpx command or during system start up.
+
+   M: An ipc_ error occurred while trying to initialize the multiplexer.
+
+   A: $notify
+
+   Message:
+   as_lap_mpx_: ERROR. Cannot get additional info for terminal type TTP for multiplexer MPX.
+
+   S: as (severity1)
+
+   T: In response to an operator load_mpx command or during system start up.
+
+   M: An error occurred while retrieving the parameters of the multiplexer
+   from the TTT.
+   Either the terminal type specified in the CDT does not exist or it
+   does not contain the required additional_info field.
+
+   A: Check that the CMF and TTF contain the proper information.
+
+   Message:
+   as_lap_mpx_: Error in conversion. Converting FIELD VALUE to a number for multiplexer MPX.
+
+   S: as (severity1)
+
+   T: In response to an operator load_mpx command or during system start up.
+
+   M: It was impossible to convert a numeric parameter from the terminal_type
+   additional_info string to its internal form.
+   FIELD is the name of the parameter in error.
+   VALUE is the string which could not be converted.
+
+   A: Check the contents of the TTF entry for the terminal_type associated
+   with the multiplexer for errors.
+
+   Message:
+   as_lap_mpx_: Bad argument to parm PPPP, should be XXXX or YYYY
+
+   S: as (severity1)
+
+   T: In response to an operator load_mpx command for during system startup.
+
+   M: A bad value was specified for the PPPP parameter in the TTF entry for
+   this muliplexer.  Its value must be either XXXX or YYYY.
+
+   A: Check the contents of the TTF entry for the terminal_type associated
+   with the multiplexer for errors.
+
+   Message:
+   as_lap_mpx_: Unexpected wakeup (DATA) from process PRCID.
+
+   S: as (severity1)
+
+   T: $run
+
+   M: The multiplexer manager received a wakeup from an unexpected source.
+   The wakeup is ignored.
+
+   A: $ignore
+
+   Message:
+   as_lap_mpx_: Wakeup for multiplexer MPX has invalid state code STATE.
+
+   S: as (severity1)
+
+   T: $run
+
+   M: A wakeup with invalid data was received by the multiplexer manager.
+   The wakeup is ignored.
+
+   A: $notify
+
+   Message:
+   as_lap_mpx: Unexpected signal for multiplexer MPX.
+
+   S: as (severity1)
+
+   T: $run
+
+   M: An unknown type event was signaled for multiplexer MPX.  It will be
+   ignored.
+
+   A: $notify
+
+   Message:
+   as_lap_mpx_: Load failed for multiplexer MPX.
+
+   S: as (severity1)
+
+   T: In response to an operator load_mpx command or during system start up.
+
+   M: The attempt to load the multiplexer failed.
+   This should never happen.
+
+   A: $notify
+
+   Message:
+   as_lap_mpx_: Load signalled for multiplexer MPX.
+
+   S: as (severity1)
+
+   T: In response to an operator load_mpx command or during system start up.
+
+   M: The multiplexer has been successfully loaded.
+   It will be started unless the -no_start control argument was given when
+   the load_mpx command was typed.
+
+   A: $ignore
+
+   Message:
+   as_lap_mpx_: Crash signalled for multiplexer MPX.
+
+   S: as (severity1)
+
+   T: $run
+
+   M: The multiplexer has crashed.
+   The LAP link has entered the disconnected state.
+
+   A: $notify
+
+   END MESSAGE DOCUMENTATION */
+
+     end as_lap_mpx_;
+  
+
+
+
+		    as_mcs_mpx_.pl1                 07/20/88  1253.4r w 07/19/88  1536.9      245457
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* AS_MCS_MPX_ - Provides an interface for the answering service for fnp loading and dumping
+   that makes FNP's look like just another multiplexer */
+
+/* Written August 1978 by Larry Johnson */
+/* Changed April 1978 from as_fnp_mpx_ to as_mcs_mpx_ by Larry Johnson */
+/*	cv_cmf entry added at that time */
+/* changed July 1979 to implement fnp_crash_notify.ec */
+/* Modified 79 August 21 by Art Beattie to pass FNP type and memory size to fdump_fnp_ and add checks on FNP */
+/*	definition in mcs_cv_cmf entry. */
+/* Modified June 1981 by T. Casey for MR9.0 for new wakeup priorities. */
+/* Modified April 1982 by Robert Coren to support baud rates up to 72000. */
+/* Modified June 1982 by Robert Coren to accept memory sizes up to 256K. */
+/* Modified August 1982 by Robert Coren for additional argument to multiplexer_mgr_$mpx_crashed. */
+/* Modified November 1983 by Robert Coren to make wakeup handler check for other pending wakeups if loading times out. */
+/* Modified 83-12-15 BIM to fix grab aste protocol bug. */
+/* Modified 1984-08-28  BIM for tracing improvements to catch a mpx_mgr_ bug */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-07-28,Beattie), approve(86-07-28,MCR7481),
+     audit(86-09-19,Brunelle), install(86-10-15,MR12.0-1185):
+     Extend timeout value from 1 min to 2 min waiting for a multiplexer to
+     load.
+  2) change(87-03-20,Beattie), approve(87-04-06,MCR7656),
+     audit(87-07-16,Parisek), install(87-08-04,MR12.1-1055):
+     Prevent any FNP channel from using HASP_OPR line type which is only valid
+     for HASP multiplexer operator subchannels.
+  3) change(87-07-17,Parisek), approve(87-07-17,MCR7715),
+     audit(87-08-10,Fawcett), install(87-08-11,MR12.1-1080):
+     Establish an admin SCI environment for calling fnp_crash_notify.ec
+     within the initializer process.
+  4) change(87-08-12,Parisek), approve(87-08-12,PBF7715),
+     audit(87-08-12,Fawcett), install(87-08-13,MR12.1-1085):
+     Set sc_stat_$admin_sci_ptr to value of sc_stat_$master_sci_ptr so
+     signal_io_ will not complain.
+  5) change(87-08-18,Parisek), approve(87-08-18,PBF7715),
+     audit(87-09-03,Farley), install(87-09-10,MR12.1-1104):
+     Remove unnecessary sc_subsystem_info_ references.
+  6) change(87-09-17,Parisek), approve(87-09-18,PBF7715),
+     audit(87-09-18,Farley), install(87-09-21,MR12.1-1111):
+      a. Remove reference to sc_stat_$master_sci_ptr.
+      b. Create our own sci_ptr and set sc_stat_$admin_sci_ptr equal to our
+         sci_ptr.
+      c. Get sc_subsystem_info_ptr based on our new sc_stat_$admin_sci_ptr
+         value.
+      d. Set sc_subsystem_info.real_iocb to sc_stat_$master_iocb for
+         signal_io_.
+  7) change(87-09-23,Parisek), approve(87-09-23,PBF7715),
+     audit(87-09-23,Farley), install(87-09-23,MR12.1-1119):
+     Move sys_log_ message of FDUMP being created to a more appropriate place,
+     immediately after the call to create the FDUMP.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4,delnl,insnl,^ifthendo */
+as_mcs_mpx_:
+     proc;
+
+/* Parameters */
+
+dcl  arg_mpx_name char (*);				/* Name of the multiplxer (fnp) */
+dcl  arg_cdtp ptr;					/* Address of the cdt */
+dcl  arg_fnpep ptr;					/* Pointer to cdte entry for this fnp */
+dcl  arg_chan_listp ptr;				/* Pointer to a structure of channels to init  */
+dcl  arg_check_sw bit (1) aligned;			/* Says whether or not to check configuration */
+dcl  arg_event_infop ptr;
+dcl  arg_code fixed bin (35);
+dcl  arg_error_proc entry variable;
+
+/* Automatic */
+
+dcl  bc fixed bin(24);
+dcl  fnp_boot_timeout_mins fixed bin (71);
+dcl  code fixed bin (35);
+dcl  fnp_no fixed bin;
+dcl  mpx_name char (32);
+dcl  chan_listp ptr;
+dcl  wakeup_found fixed bin;
+dcl  ev_msg_array (2) bit (36);
+dcl  ev_msg_char char (8);
+dcl  ename char (32);
+dcl  (i, j) fixed bin;
+dcl  lsla_count (0:5) fixed bin;
+dcl  hsla_configured (0:2) bit (1);
+dcl  adapt_type bit (1);
+dcl  adapt_no fixed bin;
+dcl  chan_no fixed bin;
+dcl  recursive_event_info_ptr pointer;
+dcl  saved_admin_sci_ptr ptr;
+dcl  sci_ptr ptr;
+dcl  sync_line bit (1);
+dcl  error_proc entry (fixed bin, fixed bin, char (*), char (*), char (*), char (*)) variable;
+dcl  entry_type fixed bin (2);
+
+/* Constants */
+
+dcl  fnp_boot_timeout_secs fixed bin (71) init (120) int static options (constant);
+dcl  RELATIVE_SECONDS bit (2) init ("11"b) int static options (constant);
+dcl  name char (11) int static options (constant) init ("as_mcs_mpx_");
+dcl  sync_baud_rates (10) fixed bin int static options (constant)
+	init (1200, 1800, 2400, 4800, 7200, 9600, 19200, 40800, 50000, 72000);
+dcl  sysdir char(168) int static options (constant) init (">system_control_1");
+
+/* Static */
+
+dcl  static_cdtp ptr int static init (null);		/* Remember where cdt is */
+
+/* External */
+
+dcl  call_ec_ entry options (variable);
+dcl  get_fnp_name_ entry (fixed binary) returns (character (32));
+dcl  hcs_$status_minf entry (char (*), char (*), fixed bin (1), fixed bin (2), fixed bin (24), fixed bin (35));
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed bin (71), entry, ptr, fixed bin, fixed bin (35));
+dcl  sys_log_ entry options (variable);
+dcl  sys_log_$error_log entry options (variable);
+dcl  load_fnp_ entry (fixed bin, ptr, ptr, bit (1) aligned, fixed bin (35));
+dcl  load_fnp_$abort entry (fixed binary, pointer, fixed binary (35));
+dcl  timer_manager_$reset_alarm_wakeup entry (fixed bin (71));
+dcl  timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2), fixed bin (71));
+dcl  ipc_$drain_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$read_ev_chn entry (fixed bin (71), fixed bin, ptr, fixed bin (35));
+dcl  get_process_id_ entry returns (bit (36) aligned);
+dcl  multiplexer_mgr_$mpx_load_failed entry (char (*), fixed bin (35));
+dcl  multiplexer_mgr_$mpx_loaded entry (char (*), fixed bin (35));
+dcl  multiplexer_mgr_$mpx_crashed entry (char (*), bit (1) aligned, fixed bin (35));
+dcl  fdump_fnp_ entry (fixed bin, fixed bin, fixed bin, char (*), fixed bin (35));
+dcl  ioa_$rsnnl entry options (variable);
+dcl  parse_tty_name_ entry (char (*), fixed bin, bit (1), fixed bin, fixed bin);
+dcl  sc_create_sci_ entry (ptr, fixed bin (35));
+dcl  sc_create_sci_$destroy entry (ptr);
+dcl  ssu_$get_info_ptr entry (ptr) returns (ptr);
+     
+/* Static */
+
+dcl  error_table_$action_not_performed ext fixed bin (35);
+
+/* Builtins */
+
+dcl  (addr, bit, char, clock, hbound, index, lbound, ltrim, mod, null, rtrim, string, unspec) builtin;
+
+/* Conditions */
+dcl  cleanup condition;
+
+/* Based */
+
+dcl  1 chan_list aligned based (chan_listp),		/* List of cdte entries of channels to boot */
+       2 count fixed bin,
+       2 cdte_ptr (0 refer (chan_list.count)) ptr unal;
+
+/* Entry to load a fnp */
+
+mcs_load:
+     entry (arg_mpx_name, arg_cdtp, arg_fnpep, arg_chan_listp, arg_check_sw, arg_code);
+
+	mpx_name = arg_mpx_name;
+	cdtp, static_cdtp = arg_cdtp;
+	fnpep = arg_fnpep;
+	chan_listp = arg_chan_listp;
+	mpxep = addr (fnpe.mpxe);
+
+	call compute_fnp_no;
+
+	if fnpe.boot_ev_chan = 0
+	then do;
+	     call ipc_$create_ev_chn (fnpe.boot_ev_chan, code);
+	     if code ^= 0
+	     then do;
+ev_chan_err:
+		call sys_log_$error_log (SL_LOG, code, name, "Creating event channel for FNP ^a.", mpx_name);
+		arg_code = error_table_$action_not_performed;
+		return;
+	     end;
+	     call ipc_$decl_ev_call_chn (fnpe.boot_ev_chan, fnp_wakeup_handler, fnpep, MPX_LOAD_PRIO, code);
+	     if code ^= 0
+	     then go to ev_chan_err;
+	end;
+
+	call timer_manager_$reset_alarm_wakeup (fnpe.boot_ev_chan);
+	call ipc_$drain_chn (fnpe.boot_ev_chan, code);	/* Just in case */
+	if code ^= 0
+	then do;
+	     call sys_log_$error_log (SL_LOG, code, name, "Resetting event channel for FNP ^a.", mpx_name);
+	     arg_code = error_table_$action_not_performed;
+	     return;
+	end;
+
+	call load_fnp_ (fnp_no, cdtp, chan_listp, arg_check_sw, code);
+	if code ^= 0
+	then do;
+	     arg_code = code;
+	     mpxe.state = FNP_UNKNOWN;
+	     return;
+	end;
+
+	call timer_manager_$alarm_wakeup (fnp_boot_timeout_secs, RELATIVE_SECONDS, fnpe.boot_ev_chan);
+						/* Allow some reasonable time */
+	arg_code = 0;
+	return;
+
+/* Take a dump of an fnp */
+
+mcs_dump:
+     entry (arg_mpx_name, arg_cdtp, arg_fnpep, arg_code);
+
+	mpx_name = arg_mpx_name;
+	cdtp = arg_cdtp;
+	fnpep = arg_fnpep;
+	mpxep = addr (fnpe.mpxe);
+
+	sci_ptr = null;
+	saved_admin_sci_ptr = sc_stat_$admin_sci_ptr;
+
+	call compute_fnp_no;
+
+	call fdump_fnp_ (fnp_no, fnpe.type, fnpe.memory, ename, code);
+	if code ^= 0
+	then call sys_log_$error_log (SL_LOG, code, name, "Taking dump of FNP ^a. ^a", mpx_name, ename);
+	else do;
+	     call sys_log_ (SL_LOG, "^a: FDUMP of FNP ^a created in >dumps>^a", name, mpx_name, ename);
+						/* See if there is a fnp_crash_notify.ec */
+	     call hcs_$status_minf (sysdir, "fnp_crash_notify.ec", (1), entry_type, bc, code);
+
+	     if code ^= 0 then do;
+		call sys_log_$error_log (SL_LOG_SILENT, code, name,
+		     "^a>fnp_crash_notify.ec does not exist.", sysdir);
+		go to return_to_caller;
+	     end;
+
+	     call sc_create_sci_ (sci_ptr, code);
+	     if code ^= 0 then do;
+		call sys_log_$error_log (SL_LOG_SILENT, code, name,
+		     "Failed to establish an SCI environment.");
+		goto return_to_caller;
+	     end;
+
+	     on cleanup begin;
+		sc_stat_$admin_sci_ptr = saved_admin_sci_ptr;
+		call sc_create_sci_$destroy (sci_ptr);
+	     end;
+
+	     sc_stat_$admin_sci_ptr = sci_ptr;		/* sc_command requires sc_stat_$admin_sci_ptr to be valid */
+	     sc_subsystem_info_ptr = ssu_$get_info_ptr (sci_ptr);
+	     sc_subsystem_info.real_iocb = sc_stat_$master_iocb;
+
+	     call call_ec_ (rtrim(sysdir) || ">fnp_crash_notify", rtrim (mpx_name), rtrim (fnpe.coreimage),
+		">dumps>" || rtrim (ename));
+	end;
+
+return_to_caller:
+	arg_code = code;
+	if sci_ptr ^= null then do;
+	     sc_stat_$admin_sci_ptr = saved_admin_sci_ptr;
+	     call sc_create_sci_$destroy (sci_ptr);
+	end;
+	return;
+     
+
+/* Wakeup handler for wakeups on the bootload event channel */
+
+fnp_wakeup_handler:
+     entry (arg_event_infop);
+
+	event_call_info_ptr = arg_event_infop;
+	cdtp = static_cdtp;
+	fnpep = event_call_info.data_ptr;
+	mpxep = addr (fnpe.mpxe);
+
+	if event_call_info.ring ^= 0
+	then					/* If not ring-0 */
+	     if event_call_info.sender ^= get_process_id_ ()
+	     then do;				/* Trust only myself */
+		string (ev_msg_array) = unspec (event_call_info.message);
+		call sys_log_ (SL_LOG, "^a: Unexpected wakeup (^w ^w) from process ^w.", name, ev_msg_array,
+		     event_call_info.sender);
+		return;
+	     end;
+
+	call compute_fnp_no;
+	if code ^= 0
+	then do;
+	     call sys_log_ (SL_LOG, "^a: Wakeup with bad data pointer ignored: ^p", name, fnpep);
+	     return;
+	end;
+
+	mpx_name = get_fnp_name_ (fnp_no);
+
+	unspec (ev_msg_char) = unspec (event_call_info.message);
+	if ev_msg_char = "alarm___"
+	then do;					/* Timeout */
+	     wakeup_found = 1;
+	     do while (bit (wakeup_found, 1));
+		call ipc_$read_ev_chn (fnpe.boot_ev_chan, wakeup_found, recursive_event_info_ptr, code);
+						/* check to see if something more useful has also happened */
+		if code ^= 0
+		then do;				/* a most unlikely result, but should be dealt with */
+		     call sys_log_$error_log (SL_LOG, code, name, "Reading event channel for FNP ^a.", mpx_name);
+		     return;
+		end;
+
+		else if bit (wakeup_found, 1)
+		then call fnp_wakeup_handler (recursive_event_info_ptr);
+						/* call ourselves to handle it */
+	     end;					/* end loop over wakeups */
+
+	     /*** here to examine a timeout */
+
+	     if mpxe.state = FNP_BOOT
+	     then do;
+		if (clock () - mpxe.time_load_start) < fnp_boot_timeout_secs * 1000000
+		then return;			/* Leftover from old bootload */
+
+		/*** here for legitimate time_out */
+
+		call free_boot_seg (fnp_no);
+		fnp_boot_timeout_mins = fnp_boot_timeout_secs / 60;
+		call sys_log_ (SL_LOG_BEEP, "^a: Load of FNP ^a did not complete within ^d minute^(s^).", name,
+		     mpx_name, fnp_boot_timeout_mins, (fnp_boot_timeout_mins ^= 1));
+		call multiplexer_mgr_$mpx_load_failed (mpx_name, code);
+		return;
+	     end;
+	     return;
+	end;					/* end of processing for alarm___ */
+
+	fnp_msg_ptr = addr (event_call_info.message);
+	if static_trace_switch
+	then call sys_log_ (SL_LOG, "^a (trace): FNP ^d, MPXE state ^a, FNP state ^a^[, deconfigured^].", name,
+		fnp_msg.fnp_no, MPXE_STATE (mpxe.state), MPXE_STATE ((fnp_msg.state)), fnp_msg.deconfigured);
+
+	if fnp_msg.fnp_no ^= fnp_no
+	then do;					/* Garbage msg */
+	     call sys_log_ (SL_LOG,
+		"^a: Invalid wakeup received for FNP ^a. Wakeup appears to be for FNP ^a (#^d).", name, mpx_name,
+		get_fnp_name_ ((fnp_msg.fnp_no)), fnp_msg.fnp_no);
+	     return;
+	end;
+
+	if fnp_msg.state < FNP_UNKNOWN | fnp_msg.state > FNP_UP
+	then do;
+	     call sys_log_ (SL_LOG, "^a: Wakeup for FNP ^a has invalid state code: ^d.", name, mpx_name, fnp_msg.state);
+	     return;
+	end;
+
+	if mpxe.state = FNP_BOOT
+	then do;					/* Now booting */
+	     call free_boot_seg (fnp_no);
+	     if fnp_msg.state = FNP_DOWN
+	     then do;				/* Boot failed */
+		call multiplexer_mgr_$mpx_load_failed (mpx_name, code);
+		call sys_log_ (SL_LOG, "^a: Load failed for FNP ^a.", name, mpx_name);
+	     end;
+	     else if fnp_msg.state = FNP_UP
+	     then do;				/* Boot succeeded */
+		call multiplexer_mgr_$mpx_loaded (mpx_name, code);
+		call sys_log_ (SL_LOG, "^a: Load signalled for FNP ^a.", name, mpx_name);
+	     end;
+	     else
+bad_wakeup:
+		call sys_log_ (SL_LOG,
+		     "^a: Inconsistent wakeup received from FNP ^a. FNP state = ^a, msg state = ^a.", name, mpx_name,
+		     MPXE_STATE ((mpxe.state)), MPXE_STATE ((fnp_msg.state)));
+	     return;
+	end;
+
+	else if mpxe.state = FNP_UP
+	then do;					/* Currently running ok */
+	     if fnp_msg.state = FNP_DOWN
+	     then do;				/* It crashed */
+		call multiplexer_mgr_$mpx_crashed (mpx_name, ^fnp_msg.deconfigured, code);
+						/* don't reload if deconfigured */
+		call sys_log_ (SL_LOG, "^a: Crash signalled for FNP ^a.", name, mpx_name);
+	     end;
+	     else go to bad_wakeup;
+	end;
+	else go to bad_wakeup;
+	return;
+
+/* Procedure to get fnp number given a fnp entry ptr in cdt */
+
+compute_fnp_no:
+     proc;
+
+dcl  i fixed bin;
+dcl  p ptr;
+
+	do i = 1 to hbound (cdt.fnp_entry, 1);
+	     p = addr (cdt.fnp_entry (i));
+	     if p = fnpep
+	     then do;				/* Got it */
+		fnp_no = i;
+		code = 0;
+		return;
+	     end;
+	end;
+	call sys_log_ (SL_LOG, "^a: Procedure called with bad fnpep into cdt: ^p", name, fnpep);
+	code = error_table_$action_not_performed;
+	return;
+
+     end compute_fnp_no;
+
+
+
+
+/* Procedure to free the boot segment */
+
+free_boot_seg:
+     procedure (fnp_no);
+
+declare  fnp_no fixed bin;
+
+	call load_fnp_$abort (fnp_no, cdtp, (0));
+	return;
+
+     end free_boot_seg;
+
+/* This entry is called at cv_cmf time to validate the CMF entries for an FNP */
+
+/* Summary of errors detected:
+   1  - Invalid memory size.
+   2  - Invalid LSLA count.
+   3  - Invalid HSLA count.
+   4  - DN6670 configured with LSLA's.
+   5  - Illegal channel name.
+   6  - No baud rate specified.
+   7  - Synchronous line type spcified on LSLA channel.
+   8  - Baud rate invalid on syncrhonous line.
+   9  - HSLA subchannel > 31 specified.
+   10 - LSLA subchannel > 51 specified.
+   11 - LSLA subchannel specified as autobaud.
+   12 - Baud rate invalid on LSLA channel.
+   13 - LSLA has too many time slots configured.
+   14 - Channels configured on more LSLA's than specified in lsla statement.
+   15 - Channels configured on more HSLA's than specified in hsla statement.
+   16 - Not configured as top-level multiplexer.
+   17 - FNP other than DN6670 configured for more than 32K of memory.
+   18 - Invalid line_type specified for an FNP channel.
+*/
+
+mcs_cv_cmf:
+     entry (arg_cdtp, arg_fnpep, arg_mpx_name, arg_chan_listp, arg_error_proc);
+
+	cdtp = arg_cdtp;
+	fnpep = arg_fnpep;
+	mpx_name = arg_mpx_name;
+	chan_listp = arg_chan_listp;
+	error_proc = arg_error_proc;
+
+	if index (mpx_name, ".") > 0
+	then do;
+	     call error_proc (16, 2, "An mcs multiplexer can only be configured for an FNP, not ^a", "^a", mpx_name, "")
+		;
+	     return;
+	end;
+
+/* Apply some defaults */
+
+	if fnpe.memory = 0
+	then fnpe.memory = 32;			/* The default */
+	if fnpe.type = 0
+	then fnpe.type = DN355;
+	if fnpe.coreimage = ""
+	then fnpe.coreimage = "mcs";
+
+/* Check memory size */
+
+	if fnpe.memory < 32 | fnpe.memory > 256 | mod (fnpe.memory, 32) ^= 0
+	then do;
+	     call ioa_$rsnnl ("^dk", ename, (0), fnpe.memory);
+	     call error_proc (1, 2, "Invalid memory size of ""^a"" on FNP ^a.", "^a on FNP ^a", ename, mpx_name);
+	end;
+
+	if fnpe.memory > 32 & fnpe.type ^= DN6670
+	then call error_proc (17, 2,
+		"The FNP type, ""^a"", for FNP ^a cannot be configured for more than 32K of memory.",
+		"type ^a for FNP ^a", fnp_types (fnpe.type), mpx_name);
+
+/* Check number of adapters */
+
+	if fnpe.nlslas < 0 | fnpe.nlslas > 6
+	then call error_proc (2, 2, "Invalid lsla count on FNP ""^a"".", "FNP ^a", mpx_name, "");
+	if fnpe.nhslas < 0 | fnpe.nhslas > 3
+	then call error_proc (3, 2, "Invalid hsla count on FNP ""^a"".", "FNP ^a", mpx_name, "");
+	if fnpe.type = DN6670 & fnpe.nlslas ^= 0
+	then do;
+	     fnpe.nlslas = 0;
+	     call error_proc (4, 2, "DN6670 (FNP ^a) configured with lsla's", "FNP ^a", mpx_name, "");
+	end;
+
+/* Now loop thru all the channels */
+
+	lsla_count (*) = 0;
+	hsla_configured (*) = "0"b;
+
+	do i = 1 to chan_list.count;
+	     cdtep = chan_list.cdte_ptr (i);
+	     call parse_tty_name_ ((cdte.name), fnp_no, adapt_type, adapt_no, chan_no);
+	     if fnp_no < 0
+	     then do;
+		call error_proc (5, 2, "Illegal channel name ""^a"".", "^a", (cdte.name), "");
+		go to next_channel;
+	     end;
+
+	     if cdte.baud_rate = 0 & ^cdte.autobaud
+	     then call error_proc (6, 2, "No baud rate specified for ""^a"".", "^a", (cdte.name), "");
+
+	     if cdte.line_type = LINE_HASP_OPR
+	     then call error_proc (18, 2, "Invalid line type ""^a"" specified for channel ""^a"".",
+		"^a for channel ^a", line_types (cdte.line_type), (cdte.name));
+
+	     sync_line = "0"b;
+	     do j = 1 to hbound (sync_line_type, 1) while (^sync_line);
+		if cdte.line_type = sync_line_type (j)
+		then sync_line = "1"b;
+	     end;
+	     if sync_line
+	     then do;
+		if ^adapt_type
+		then call error_proc (7, 2, "Synchronous line type specified on LSLA channel ""^a"".", "^a",
+			(cdte.name), "");
+		do j = 1 to hbound (sync_baud_rates, 1) while (cdte.baud_rate ^= sync_baud_rates (j));
+		end;
+		if j > hbound (sync_baud_rates, 1)
+		then call error_proc (8, 2, "Invalid synchronous baud rate specified for ""^a"".", "^a", (cdte.name),
+			"");
+	     end;
+
+	     if adapt_type				/* Hsla */
+	     then if adapt_no ^= 7			/* if not special channel */
+		then do;
+		     hsla_configured (adapt_no) = "1"b;
+		     if chan_no > 31
+		     then call error_proc (9, 2, "HSLA subchannel > 31 specified for ""^a"".", "^a", (cdte.name), "");
+		end;
+		else ;
+
+	     else do;
+		if chan_no > 51
+		then call error_proc (10, 2, "LSLA subchannel > 51 specified for ""^a"".", "^a", (cdte.name), "");
+		if cdte.autobaud
+		then call error_proc (11, 2, "LSLA subchannel ""^a"" specified as autobaud.", "^a", (cdte.name), "");
+		if cdte.baud_rate = 110
+		then lsla_count (adapt_no) = lsla_count (adapt_no) + 1;
+		else if cdte.baud_rate = 133 | cdte.baud_rate = 150
+		then lsla_count (adapt_no) = lsla_count (adapt_no) + 2;
+		else if cdte.baud_rate = 300
+		then lsla_count (adapt_no) = lsla_count (adapt_no) + 3;
+		else call error_proc (12, 2, "Invalid baud rate specified for LSLA channel ""^a"".", "^a",
+			(cdte.name), "");
+	     end;
+
+next_channel:
+	end;
+
+/* Some final consistency checks */
+
+	j = 0;
+	do i = lbound (lsla_count, 1) to hbound (lsla_count, 1);
+	     if lsla_count (i) > 0
+	     then do;
+		j = j + 1;
+		if lsla_count (i) > 52
+		then do;
+		     call ioa_$rsnnl ("LSLA ^d", ename, (0), i);
+		     call error_proc (13, 2, "^a on FNP ^a has too many time slots configured.", "^a on FNP ^a",
+			ename, mpx_name);
+		end;
+	     end;
+	end;
+	if j > fnpe.nlslas
+	then call error_proc (14, 2, "More LSLA's configured on FNP ^a than specified in lsla statement.", "FNP ^a",
+		mpx_name, "");
+
+	j = 0;
+	do i = lbound (hsla_configured, 1) to hbound (hsla_configured, 1);
+	     if hsla_configured (i)
+	     then j = j + 1;
+	end;
+	if j > fnpe.nhslas
+	then call error_proc (15, 2, "More HSLA's configured on FNP ^a than specified in hsla statement.", "FNP ^a",
+		mpx_name, "");
+
+	return;
+
+dcl  static_trace_switch bit (1) aligned int static init ("0"b);
+
+trace_on:
+     entry;
+	static_trace_switch = "1"b;
+	call sys_log_ (SL_LOG, "^a: Tracing on.", name);
+	return;
+trace_off:
+     entry;
+	static_trace_switch = "0"b;
+	call sys_log_ (SL_LOG, "^a: Tracing off.", name);
+	return;
+
+MPXE_STATE:
+     procedure (state) returns (char (32));
+
+declare  state fixed bin;
+
+	if state < lbound (MPXE_STATE_NAMES, 1) | state > hbound (MPXE_STATE_NAMES, 1)
+	then return (ltrim (char (state)));
+	else return (MPXE_STATE_NAMES (state));
+     end MPXE_STATE;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   as_mcs_mpx_: ERROR_CODE_MESSAGE Creating event channel for FNP TAG.
+
+   S:	$as1
+
+   T:	$run
+
+   M:	An error occured (ERROR_CODE_MESSAGE) when an attempt was made
+   to create an event channel for FNP TAG.  The load attempt has been aborted.
+   This message can also be logged if an error occured when changing the just
+   created event-wait channel into an event-call channel.
+
+   A:	$inform
+
+   Message:
+   as_mcs_mpx_: ERROR_CODE_MESSAGE Resetting event channel for FNP TAG.
+
+   S:	$as1
+
+   T:	$run
+
+   M:	An error occured (ERROR_CODE_MESSAGE) when an attempt was made to
+   drain all events from the FNP boot event channel.
+
+   A:	$inform
+
+   Message:
+   as_mcs_mpx_: ERROR_CODE_MESSAGE Taking dump of FNP TAG. FNP_DUMP_ENTRY_NAME
+
+   S:	$as1
+
+   T:	$run
+
+   M:	An error occured (ERROR_CODE_MESSAGE) when an attempt was made to
+   dump FNP TAG into the FNP_DUMP_ENTRY_NAME segment in >dumps.
+
+   A:	$inform
+
+   Message:
+   as_mcs_mpx_: FDUMP of FNP TAG created in >dumps>FNP_DUMP_ENTRY_NAME
+
+   S:	$as1
+
+   T:	$run
+
+   M:	FNP TAG has been dumped successfully into the
+   >dumps>FNP_DUMP_ENTRY_NAME segment after it crashed.
+
+   A:	$inform
+
+   Message:
+   as_mcs_mpx_: Unexpected wakeup (EV_MSG_WORD_1 EV_MSG_WORD_2) from process
+   PROC_ID.
+
+   S:	$as1
+
+   T:	$run
+
+   M:	An unexpected wakeup occured on an FNP bootload event channel from
+   process PROC_ID.  The event message data is in EV_MSG_WORD_1 and
+   EV_MSG_WORD_2.  Unable to determine FNP tag.
+
+   A:	$inform
+
+   Message:
+   as_mcs_mpx_: Wakeup with bad data pointer ignored: POINTER
+
+   S:	$as1
+
+   T:	$run
+
+   M:	A wakeup was received on an FNP bootload event channel with which a
+   bad data pointer was supplied.  Unable to determine FNP tag.
+
+   A:	$inform
+
+   Message:
+   as_mcs_mpx_: ERROR_CODE_MESSAGE Reading event channel for FNP TAG.
+
+   S:	$as1
+
+   T:	$run
+
+   M:	An error occured (ERROR_CODE_MESSAGE) when an attempt was made to
+   read the bootload event channel for FNP TAG.
+
+   A:	$inform
+
+   Message:
+   as_mcs_mpx_: Load of FNP TAG did not complete within X minutes.
+
+   S:	$as2
+
+   T:	$run
+
+   M:	FNP TAG did not signal that it had completed the load attempt within
+   the required X minutes from the time that the image was sent to the FNP.
+
+   A:	Try to load the FNP again.  If problem persists, contact system
+   programing staff.
+
+   Message:
+   as_mcs_mpx_ (trace): FNP FNP_NUMBER, MPXE state MPX_STATE, FNP state
+   FNP_STATE{, deconfigured}.
+
+   S:	$as1
+
+   T:	$run
+
+   M:	This is a tracing message which displays some values of variables
+   that describe the status of the FNP.
+
+   A:	$inform
+
+   Message:
+   as_mcs_mpx_: Invalid wakeup received for FNP TAG. Wakeup appears to be for
+   FNP OTHER_TAG (#FNP_NUMBER).
+
+   S:	$as1
+
+   T:	$run
+
+   M:	Invalid wakeup received on bootload event channel for FNP TAG.
+   Wakeup data indicates it is for FNP OTHER_TAG whose number is FNP_NUMBER.
+
+   A:	$inform
+
+   Message:
+   as_mcs_mpx_: Wakeup for FNP TAG has invalid state code: CODE.
+
+   S:	$as1
+
+   T:	$run
+
+   M:	Wakeup message data received on bootload event channel for FNP TAG
+   contains an invalid state code value of CODE.  Valid values for mpxe.state
+   are defined in the cdt.incl.pl1 include file by the FNP_* variables.
+
+   A:	$inform
+
+   Message:
+   as_mcs_mpx_: Load failed for FNP TAG.
+
+   S:	$as1
+
+   T:	$run
+
+   M:	The FNP TAG failed to load successfully.
+
+   A:	Try the bootload attempt again.  If problem persists, contact the
+   programing staff.
+
+   Message:
+   as_mcs_mpx_: Load signalled for FNP TAG.
+
+   S:	$as1
+
+   T:	$run
+
+   M:	FNP TAG bootloaded successfully.
+
+   A:	$ignore
+
+   Message:
+   as_mcs_mpx_: Inconsistent wakeup received from FNP TAG. FNP state =
+   FNP_STATE, msg state = MSG_STATE.
+
+   S:	$as1
+
+   T:	$run
+
+   M:	The data in the message from the bootload event channel for FNP TAG
+   indicates that the FNP was in an inconsistant state (MSG_STATE) with the
+   current state (FNP_STATE) of the FNP in the CDT.
+
+   A:	$inform
+
+   Message:
+   as_mcs_mpx_: Crash signalled for FNP TAG.
+
+   S:	$as1
+
+   T:	$run
+
+   M:	FNP TAG has crashed.  A reload of the FNP will be attempted if it is
+   not in a crash loop or not inactive.
+
+   A:	$inform
+
+   Message:
+   as_mcs_mpx_: Procedure called with bad fnpep into cdt: POINTER
+
+   S:	$as1
+
+   T:	$run
+
+   M:	The compute_fnp_no internal procedure detected that as_mcs_mpx_ was
+   supplied with a prointer value (POINTER) that should point to an FNP entry
+   in the CDT but doesn't.  Current operation has been aborted.
+
+   A:	$inform
+
+   Message:
+   as_mcs_mpx_: Tracing on.
+
+   S:	$as1
+
+   T:	$run
+
+   M:	The trace_on entry point has been called so that as_mcs_mpx_ trace
+   data will now be displayed.
+
+   A:	$inform
+
+   Message:
+   as_mcs_mpx_: Tracing off.
+
+   S:	$as1
+
+   T:	$run
+
+   M:	The trace_off entry point has been called and now tracing has been
+   disabled.
+
+   A:	$inform
+
+   Message:
+   as_mcs_mpx_: ERROR_CODE_MESSAGE >sc1>fnp_crash_notify.ec does not exist.
+
+   S:	$as1
+
+   T:	$run
+
+   M:	An error occured (ERROR_CODE_MESSAGE) when checking for the existence
+   of fnp_crash_notify.ec in the system_control_1 directory.
+
+   A:	$inform
+
+
+   Message:
+   as_mcs_mpx_: ERROR_CODE_MESSAGE Failed to establish an SCI environment.
+
+   S:	$as1
+
+   T:	$run
+
+   M:	An error occured (ERROR_CODE_MESSAGE) when trying to create an
+   system control subsystem environment pointer.
+
+   A:	$inform
+
+   END MESSAGE DOCUMENTATION */
+%page;
+%include cdt;
+%page;
+%include author_dcl;
+%page;
+%include as_mpx_state_names_;
+%page;
+%include line_types;
+%page;
+%include as_wakeup_priorities;
+%page;
+%include event_call_info;
+%page;
+%include fnp_mpx_msg_;
+%page;
+%include sc_subsystem_info_;
+%page;
+%include sc_stat_;
+%page;
+%include sys_log_constants;
+     end as_mcs_mpx_;
+   
+
+
+
+		    as_sty_mpx_.pl1                 11/15/82  1805.2rew 11/15/82  1458.0       26343
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+as_sty_mpx_:
+     procedure;
+
+/* AS interface for Pseudo-Terminal Multiplexer */
+/* Written By C. Hornig, July 1979 */
+
+declare (
+        (Cdtp, Cdtep, Cdt_listp) pointer,
+        Mpx_name character (*),
+        Mpx_error variable entry (fixed bin, fixed bin, character (*), character (*), character (*), character (*)),
+        Check_sw bit aligned,
+        Code fixed bin (35)
+        ) parameter;
+
+declare multiplexer_mgr_$mpx_loaded entry (character (*), fixed bin (35));
+
+dcl addr builtin;
+
+/* * * * * * * * * * STY_CV_CMF * * * * * * * * * */
+
+pty_cv_cmf:
+sty_cv_cmf:
+     entry (Cdtp, Cdtep, Mpx_name, Cdt_listp, Mpx_error);
+
+	return;
+
+/* * * * * * * * * * STY_LOAD  * * * * * * * * * */
+
+pty_load:
+sty_load:
+     entry (Mpx_name, Cdtp, Cdtep, Cdt_listp, Check_sw, Code);
+
+	Code = 0;
+	call multiplexer_mgr_$mpx_loaded (Mpx_name, Code);
+	return;
+
+/* * * * * * * * * * STY_DUMP * * * * * * * * * */
+
+pty_dump:
+sty_dump:
+     entry (Mpx_name, Cdtp, Cdtep, Code);
+
+	Code = 0;
+	return;
+
+/* * * * * * * * * * STY_DUMP_ * * * * * * * * * */
+
+pty_dump_:
+sty_dump_:
+     entry (Ttybp, Areap, Dp, Sc, Brief);
+
+declare (Ttybp, Areap, Dp) pointer parameter;
+declare Sc fixed bin parameter;
+declare Brief bit aligned parameter;
+
+declare (
+        ioa_,
+        ioa_$nnl
+        ) entry options (variable);
+declare tty_dump$print_chain entry (ptr, char (*), fixed bin, bit (1));
+
+declare 1 pd aligned based (pdp),
+	2 lctep pointer,
+	2 devx fixed bin,				/* my devx */
+	2 nchan fixed bin,
+	2 pdes (pd_nchan refer (pd.nchan)) like pde;
+
+declare 1 pde aligned based (pdep),			/* for each STY channel */
+	2 my,
+	  3 lctep pointer,				/* pointer to LCT entry */
+	  3 devx fixed bin,				/* this channel's devx */
+	  3 sc fixed bin,
+	2 her aligned like pde.my,			/* same stuff for spouse */
+	2 flags unaligned,
+	  3 listen bit,
+	2 words unsigned fixed bin (18),
+	2 (head, tail) unsigned fixed bin (18) unaligned;
+
+dcl (pdp, pdep) pointer;
+
+	pdp = Dp;
+	if Sc > 0
+	then call print_entry (Sc);
+	else do;
+	     call ioa_ ("STY MPX devx ^o, ^d channels.", pd.devx, pd.nchan);
+	     end;
+	call ioa_ ("");
+	return;
+
+print_entry:
+     proc (Sc);
+declare Sc fixed bin;
+
+	pdep = addr (pd.pdes (Sc));
+	call ioa_$nnl ("^/^d(^o) -> ^d(^o): ^d words^[ listening^].", pde.my.sc, pde.my.devx, pde.her.sc, pde.her.devx,
+	     pde.words, pde.flags.listen);
+	call tty_dump$print_chain (Ttybp, "", (pde.head), (Brief));
+     end;
+     end as_sty_mpx_;
+ 
+
+
+
+		    as_uncp_mpx_.pl1                07/20/88  1253.9rew 07/19/88  1525.6      171576
+
+
+
+/****^  ******************************************************
+        *                                                    *
+        * Copyright, (C) Honeywell Bull Inc., 1988           *
+        *                                                    *
+        * Copyright (c) 1972 by Massachusetts Institute of   *
+        * Technology and Honeywell Information Systems, Inc. *
+        *                                                    *
+        ****************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(88-06-13,Berno), approve(88-07-13,MCR7928),
+     audit(88-06-13,Parisek), install(88-07-19,MR12.2-1061):
+     Created to implement the uncp multiplexer interface for the DSA gateway.
+                                                   END HISTORY COMMENTS */
+
+/* AS_UNCP_MPX_ - Provides an interface for the answering service for fnp loading and dumping
+   that makes FNP's look like just another multiplexer */
+
+/* Written August 1978 by Larry Johnson */
+/* Changed April 1978 from as_fnp_mpx_ to as_mcss
+   s_mpx_ by Larry Johnson */
+/*	cv_cmf entry added at that time */
+/* changed July 1979 to implement fnp_crash_notify.ec */
+/* Modified 79 August 21 by Art Beattie to pass FNP type and memory size to fdump_fnp_ and add checks on FNP */
+/*	definition in mcs_cv_cmf entry. */
+/* Modified June 1981 by T. Casey for MR9.0 for new wakeup priorities. */
+/*     change le nom  en as_uncp_mpx_         */
+/*     modifications dans wakeup handler     */
+/* Modifie en Aout 1982 pour le load du DN 7100   */
+/* Modified April 1982 by Robert Coren to support baud rates up to 72000. */
+/* Modified June 1982 by Robert Coren to accept memory sizes up to 256K. */
+/* Modified August 1982 by Robert Coren for additional argument to multiplexer_mgr_$mpx_crashed. */
+
+/* THE FOLLOWING HISTORY COMMENTS REFER TO as_uncp_mpx_ VERSION NOT 
+   as_mcs_mpx_.  THIS CODE WAS EXTRACTED FROM as_mcs_mpx_.pl1. */
+
+/* Reported in June 1983 the modifications for the Datanet 7100.     */
+/* Reported in September 1985 the modifications for MR11   */
+/* Modified 25 Oct 85 by PL Schramm to set admin_sci_ptr if null to allow sc_commands in fnp_notify exec_com */
+/* Modified in December 1986 for MR12 & DSA-Compact f.d  */
+/* Modified in January 1987 for mise a niveau MR12.0 fd. */
+/* Modified by JL Berno for attendre 60 secondes apres le load avant de
+   dire qu'il y a probleme. */
+
+/* Date of the last modification 22/06/87    */
+
+
+/* format: style4,delnl,insnl,^ifthendo */
+
+as_uncp_mpx_ :
+     proc;
+
+/* Parameters */
+
+dcl  arg_mpx_name char (*);				/* Name of the multiplxer (fnp) */
+dcl  arg_cdtp ptr;					/* Address of the cdt */
+dcl  arg_fnpep ptr;					/* Pointer to cdte entry for this fnp */
+dcl  arg_chan_listp ptr;				/* Pointer to a structure of channels to init  */
+
+dcl  arg_check_sw bit (1) aligned;			/* Says whether or not to check configuration */
+dcl  arg_event_infop ptr;
+dcl  arg_code fixed bin (35);
+dcl  arg_error_proc entry variable;
+
+/* Automatic */
+
+dcl  up_time fixed bin;				/* pour le dn 7100    */
+dcl  code fixed bin (35);
+dcl  fnp_no fixed bin;
+dcl  mpx_name char (32);
+dcl  chan_listp ptr;
+dcl  event_infop ptr;
+dcl  ev_msg_array (2) bit (36);
+dcl  ev_msg_char char (8);
+dcl  ename char (32);
+dcl  (i, j) fixed bin;
+dcl  lsla_count (0:5) fixed bin;
+dcl  hsla_configured (0:2) bit (1);
+dcl  adapt_type bit (1);
+dcl  adapt_no fixed bin;
+dcl  chan_no fixed bin;
+dcl  sync_line bit (1);
+dcl  error_proc entry (fixed bin, fixed bin, char (*), char (*), char (*), char (*)) variable;
+
+/* Constants */
+
+dcl  TOO_MANY_BOOTLOADS fixed bin int static options (constant) init (2);
+dcl  DEFAULT_MEMORY fixed bin int static options (constant) init (192);
+dcl  MAX_MEMORY fixed bin int static options (constant) init (510);
+dcl  MOD_OF_MEMORY fixed bin int static options (constant) init (64);
+dcl  MAX_LSLAS fixed bin int static options (constant) init (6);
+dcl  MAX_HSLAS fixed bin int static options (constant) init (3);
+dcl  SPECIAL_CHN fixed bin int static options (constant) init (7);
+dcl  fnp_boot_timeout_secs fixed bin (71) init (120) int static options (constant);
+dcl  name char (12) int static options (constant) init ("as_uncp_mpx_");
+dcl  sync_baud_rates (10) fixed bin int static options (constant)
+	init (1200, 1800, 2400, 4800, 7200, 9600, 19200, 40800, 50000, 72000);
+
+
+/* Static */
+
+dcl  static_cdtp ptr int static init (null);		/* Remember where cdt is */
+
+/* Entrees ajoutees pour le Datanet 7100.      */
+dcl  multiplexer_mgr_$load_mpx entry (char (*), bit (1) aligned, bit (1) aligned, bit (1) aligned, fixed bin (35));
+dcl  multiplexer_mgr_$shutdown_mpx entry (char (*), bit (1) aligned, fixed bin (35));
+
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed bin (71), entry, ptr, fixed bin, fixed bin (35));
+dcl  sys_log_ entry options (variable);
+dcl  load_uncp_ entry (fixed bin, ptr, ptr, bit (1) aligned, fixed bin (35));
+dcl  sys_log_$error_log entry options (variable);
+dcl  timer_manager_$reset_alarm_wakeup entry (fixed bin (71));
+dcl  timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2), fixed bin (71));
+dcl  ipc_$drain_chn entry (fixed bin (71), fixed bin (35));
+dcl  get_process_id_ entry returns (bit (36) aligned);
+dcl  multiplexer_mgr_$mpx_load_failed entry (char (*), fixed bin (35));
+dcl  multiplexer_mgr_$mpx_loaded entry (char (*), fixed bin (35));
+dcl  multiplexer_mgr_$mpx_crashed entry (char (*), bit (1) aligned, fixed bin (35));
+
+dcl  ioa_$rsnnl entry options (variable);
+dcl  parse_tty_name_ entry (char (*), fixed bin, bit (1), fixed bin, fixed bin);
+dcl  error_table_$action_not_performed ext fixed bin (35);
+
+dcl  (addr, char, clock, divide, hbound, index, lbound, ltrim, mod, string,
+      unspec) builtin;
+dcl  get_fnp_name_ entry (fixed binary) returns (character (32));
+
+/* Based */
+
+dcl  1 chan_list aligned based (chan_listp),		/* List of cdte entries of channels to boot */
+       2 count fixed bin,
+       2 cdte_ptr (0 refer (chan_list.count)) ptr unal;
+
+dcl  1 event_info aligned based (event_infop),
+       2 channel_id fixed bin (71),
+       2 message fixed bin (71),
+       2 sender_procid bit (36),
+       2 origin,
+         3 dev_signal bit (18) unal,
+         3 ring bit (18) unal,
+       2 data_ptr ptr;
+
+dcl  1 fnp_msg aligned based (addr (event_info.message)),
+       2 fnp_no fixed bin (17) unal,
+       2 state fixed bin (17) unal,
+       2 pad fixed bin (35);
+
+
+/* Entry to load a fnp */
+
+
+uncp_load:
+     entry (arg_mpx_name, arg_cdtp, arg_fnpep, arg_chan_listp, arg_check_sw, arg_code);
+
+	mpx_name = arg_mpx_name;
+	cdtp, static_cdtp = arg_cdtp;
+	fnpep = arg_fnpep;
+	chan_listp = arg_chan_listp;
+	mpxep = addr (fnpe.mpxe);
+
+	call compute_fnp_no;
+	if code ^= 0 then do;
+	     arg_code = code;
+	     return;
+	end;
+
+	if fnpe.boot_ev_chan = 0
+	then do;
+	     call ipc_$create_ev_chn (fnpe.boot_ev_chan, code);
+	     if code ^= 0
+	     then do;
+ev_chan_err:
+		call sys_log_$error_log (SL_LOG, code, name, "Creating event channel for FNP ^a.", mpx_name);
+		arg_code = error_table_$action_not_performed;
+		return;
+	     end;
+	     call ipc_$decl_ev_call_chn (fnpe.boot_ev_chan, uncp_wakeup_handler, fnpep, MPX_LOAD_PRIO, code);
+	     if code ^= 0
+	     then go to ev_chan_err;
+	end;
+
+	call timer_manager_$reset_alarm_wakeup (fnpe.boot_ev_chan);
+	call ipc_$drain_chn (fnpe.boot_ev_chan, code);	/* Just in case */
+	if code ^= 0
+	then do;
+
+	     call sys_log_$error_log (SL_LOG, code, name, "Resetting event channel for FNP ^a.", mpx_name);
+	     arg_code = error_table_$action_not_performed;
+	     return;
+	end;
+
+	call load_uncp_ (fnp_no, cdtp, chan_listp, arg_check_sw, code);
+	if code ^= 0
+	then do;
+	     arg_code = code;
+	     mpxe.state = FNP_UNKNOWN;
+	     return;
+	end;
+
+	call timer_manager_$alarm_wakeup ((60), RELATIVE_SECONDS, fnpe.boot_ev_chan);
+
+	arg_code = 0;
+	return;
+
+/* Take a dump of an fnp */
+
+uncp_dump:
+     entry (arg_mpx_name, arg_cdtp, arg_fnpep, arg_code);
+	mpx_name = arg_mpx_name;
+	call sys_log_ (SL_LOG, "^a: FNP ^a stopped. All lines disconnected.", name, mpx_name);
+	arg_code = 0;
+	return;
+
+/* Wakeup handler for wakeups on the bootload event channel */
+
+uncp_wakeup_handler:
+     entry (arg_event_infop);
+
+	event_infop = arg_event_infop;
+	cdtp = static_cdtp;
+	fnpep = event_info.data_ptr;
+	mpxep = addr (fnpe.mpxe);
+
+
+	if event_info.ring ^= "0"b
+	then					/* If not ring-0 */
+	     if event_info.sender_procid ^= get_process_id_ ()
+	     then do;				/* Trust only myself */
+		string (ev_msg_array) = unspec (event_info.message);
+
+		call sys_log_ (SL_LOG, "^a: Unexpected wakeup (^w ^w) from process ^w.", name, ev_msg_array,
+		     event_info.sender_procid);
+		return;
+	     end;
+
+	call compute_fnp_no;
+	if code ^= 0
+	then do;
+	     call sys_log_ (SL_LOG, "^a: Wakeup with bad data pointer ignored: ^p", name, fnpep);
+	     return;
+	end;
+
+	mpx_name = get_fnp_name_ (fnp_no);
+
+	unspec (ev_msg_char) = unspec (event_info.message);
+
+	call timer_manager_$reset_alarm_wakeup (fnpe.boot_ev_chan);
+
+	if ev_msg_char = "alarm___"
+	then do;
+	     call sys_log_ (SL_LOG_BEEP, "^a: FNP ^a needs to be loaded.", name, mpx_name);
+
+	     return;
+	end;
+
+
+
+	if ev_msg_char = "inituncp"
+	then do;
+	     if mpxe.state = MPX_BOOT
+	     then do;
+		call multiplexer_mgr_$shutdown_mpx (mpx_name, "0"b, code);
+		if code ^= 0
+		then return;
+
+
+		call multiplexer_mgr_$load_mpx (mpx_name, "0"b, "1"b, "0"b, code);
+		return;
+	     end;
+	     if mpxe.state = MPX_UP
+	     then do;
+		call sys_log_ (SL_LOG, "^a: FNP ^a reinitialized (init received from DN7100).",
+		     name, mpx_name);
+		mpxe.time_last_crash = clock ();
+		call multiplexer_mgr_$shutdown_mpx (mpx_name, "0"b, code);
+		if code ^= 0
+		then return;
+
+		up_time = divide (mpxe.time_last_crash - mpxe.time_last_load, 60000000, 17, 0);
+						/* Time it stayed up */
+		code = 0;
+
+		if mpxe.current_service_type = INACTIVE
+		then				/* Stopped by operator */
+		     call sys_log_ (SL_LOG, "^a: FNP ^a is inactive and needs to be loaded.", name, mpx_name);
+
+		else if cdt.acceptable_fnp_tbf = 0
+		then				/* No auto reloading */
+		     call sys_log_ (SL_LOG, "^a: FNP ^a automatic reloading is disabled and will not be loaded.", name, mpx_name);
+
+		else if (mpxe.n_bootloads >= TOO_MANY_BOOTLOADS) & (up_time < cdt.acceptable_fnp_tbf)
+		     & (mpxe.last_tbf < cdt.acceptable_fnp_tbf)
+		then call sys_log_ (SL_LOG, "^a: FNP ^a is in apparent crash loop and will not be reloaded", name, mpx_name);
+
+		else call multiplexer_mgr_$load_mpx (mpx_name, "0"b, "1"b, "0"b, code);
+
+		mpxe.last_tbf = up_time;		/* Save for next crash */
+		return;				/* ignore other inituncp wakeup */
+	     end;
+	end;
+
+	if fnp_msg.fnp_no ^= fnp_no
+	then do;					/* Garbage msg */
+	     call sys_log_ (SL_LOG,
+		"^a: Invalid wakeup received for FNP ^a. Wakeup appears to be for GATEWAY #^d",
+		name, mpx_name, fnp_msg.fnp_no);
+	     return;
+	end;
+
+	if fnp_msg.state < FNP_UNKNOWN | fnp_msg.state > FNP_UP
+	then do;
+	     call sys_log_ (SL_LOG, "^a: Wakeup for FNP ^a has invalid state code: ^d.", name, fnp_msg.state);
+	     return;
+	end;
+
+	if mpxe.state = FNP_BOOT
+	then do;					/* Now booting */
+
+	     if fnp_msg.state = FNP_DOWN
+	     then do;				/* Boot failed */
+		mpxe.flags.retry_load = "0"b;		/* don't loop to boot the datanet */
+		call multiplexer_mgr_$mpx_load_failed (mpx_name, code);
+		call sys_log_ (SL_LOG, "^a: Load failed for FNP ^a.", name, mpx_name);
+	     end;
+	     else if fnp_msg.state = FNP_UP		/* Boot succeeded */
+	     then call multiplexer_mgr_$mpx_loaded (mpx_name, code);
+						/* don't report anything now, the gateway did it before */
+	     else
+bad_wakeup:
+		call sys_log_ (SL_LOG,
+		     "^a: Inconsistent wakeup received from FNP ^a. FNP state = ^a, msg state = ^a",
+		     name, mpx_name, MPXE_STATE ((mpxe.state)), MPXE_STATE ((fnp_msg.state)));
+
+	     return;
+	end;
+
+	else if mpxe.state = FNP_UP
+	then do;					/* Currently running ok */
+	     if fnp_msg.state = FNP_DOWN
+	     then do;				/* It crashed */
+		call multiplexer_mgr_$mpx_crashed (mpx_name, "1"b, code);
+						/* don't reload if deconfigured */
+		call sys_log_ (SL_LOG, "^a: Crash signalled for FNP ^a.", name, mpx_name);
+	     end;
+	     else go to bad_wakeup;
+	end;
+	else go to bad_wakeup;
+	return;
+
+/* Procedure to get fnp number given a fnp entry ptr in cdt */
+
+compute_fnp_no:
+     proc;
+
+dcl  i fixed bin;
+dcl  p ptr;
+
+	do i = 1 to hbound (cdt.fnp_entry, 1);
+	     p = addr (cdt.fnp_entry (i));
+	     if p = fnpep
+	     then do;				/* Got it */
+		fnp_no = i;
+		code = 0;
+		return;
+	     end;
+	end;
+	call sys_log_ (SL_LOG, "^a: Procedure called with bad fnpep into cdt: ^p", name, fnpep);
+	code = error_table_$action_not_performed;
+	return;
+
+     end compute_fnp_no;
+
+
+
+
+/* Procedure to free the boot segment */
+
+/* free_boot_seg: proc (abort_sw);
+
+   dcl  abort_sw bit (1);
+
+   if fnpe.boot_segp = null () then return;
+   if abort_sw then call hphcs_$abort_fnp_load (fnp_no);
+   else call hphcs_$release_fnp_seg (fnp_no);
+   call hcs_$delentry_seg (fnpe.boot_segp, code);
+   fnpe.boot_segp = null ();
+   return;
+
+   end free_boot_seg;
+*/
+
+/* This entry is called at cv_cmf time to validate the CMF entries for an FNP */
+
+/* Summary of errors detected:
+   1  - Invalid memory size.
+   2  - Invalid LSLA count.
+   3  - Invalid HSLA count.
+   4  - DN6670 configured with LSLA's.
+   5  - Illegal channel name.
+   6  - No baud rate specified.
+   7  - Synchronous line type spcified on LSLA channel.
+   8  - Baud rate invalid on syncrhonous line.
+   9  - HSLA subchannel > 31 specified.
+   10 - LSLA subchannel > 51 specified.
+   11 - LSLA subchannel specified as autobaud.
+   12 - Baud rate invalid on LSLA channel.
+   13 - LSLA has too many time slots configured.
+   14 - Channels configured on more LSLA's than specified in lsla statement.
+   15 - Channels configured on more HSLA's than specified in hsla statement.
+   16 - Not configured as top-level multiplexer.
+   17 - FNP other than DN6670 configured for more than 32K of memory.
+*/
+
+uncp_cv_cmf:
+     entry (arg_cdtp, arg_fnpep, arg_mpx_name, arg_chan_listp, arg_error_proc);
+
+	cdtp = arg_cdtp;
+	fnpep = arg_fnpep;
+	mpx_name = arg_mpx_name;
+	chan_listp = arg_chan_listp;
+	error_proc = arg_error_proc;
+
+	if index (mpx_name, ".") > 0
+	then do;
+	     call error_proc (16, 2, "uncp multiplexer can only be configured for an FNP, not ^a", "^a", mpx_name,
+		"");
+	     return;
+	end;
+
+/* Apply some defaults */
+
+	if fnpe.memory = 0
+	then fnpe.memory = DEFAULT_MEMORY;		/* The default */
+	if fnpe.type = 0
+	then fnpe.type = DN7100;
+	if fnpe.coreimage = ""
+	then fnpe.coreimage = "uncp";
+
+/* Check memory size */
+
+	if fnpe.memory < DEFAULT_MEMORY | fnpe.memory > MAX_MEMORY
+	then do;
+memory_error_size:
+	     call ioa_$rsnnl ("^dk", ename, (0), fnpe.memory);
+	     call error_proc (1, 2, "Invalid memory size of ""^a"" on FNP ^a.", "^a on FNP ^a", ename, mpx_name);
+	     return;
+	end;
+
+	if mod (fnpe.memory, MOD_OF_MEMORY) ^= 0
+	then do;
+	     if fnpe.memory ^= MAX_MEMORY
+	     then goto memory_error_size;
+	end;					/* Check number of adapters */
+
+	if fnpe.nlslas < 0 | fnpe.nlslas > MAX_LSLAS
+	then call error_proc (2, 2, "Invalid lsla count on FNP ""^a"".", "FNP ^a", mpx_name, "");
+	if fnpe.nhslas < 0 | fnpe.nhslas > MAX_HSLAS
+	then call error_proc (3, 2, "Invalid hsla count on FNP ""^a"".", "FNP ^a", mpx_name, "");
+	if fnpe.type = DN7100 & fnpe.nlslas ^= 0
+	then do;
+	     fnpe.nlslas = 0;
+	     call error_proc (4, 2, "DN7100 (FNP ^a) configured with lsla's", "FNP ^a", mpx_name, "");
+	end;
+
+/* Now loop thru all the channels */
+
+	lsla_count (*) = 0;
+	hsla_configured (*) = "0"b;
+
+	do i = 1 to chan_list.count;
+	     cdtep = chan_list.cdte_ptr (i);
+	     call parse_tty_name_ ((cdte.name), fnp_no, adapt_type, adapt_no, chan_no);
+	     if fnp_no < 0
+	     then do;
+		call error_proc (5, 2, "Illegal channel name ""^a"".", "^a", (cdte.name), "");
+		go to next_channel;
+	     end;
+
+	     if cdte.baud_rate = 0 & ^cdte.autobaud
+	     then call error_proc (6, 2, "No baud rate specified for ""^a"".", "^a", (cdte.name), "");
+
+	     sync_line = "0"b;
+	     do j = 1 to hbound (sync_line_type, 1) while (^sync_line);
+		if cdte.line_type = sync_line_type (j)
+		then sync_line = "1"b;
+	     end;
+	     if sync_line
+	     then do;
+		if ^adapt_type
+		then call error_proc (7, 2, "Synchronous line type specified on LSLA channel ""^a"".", "^a",
+			(cdte.name), "");
+		do j = 1 to hbound (sync_baud_rates, 1) while (cdte.baud_rate ^= sync_baud_rates (j));
+		end;
+		if j > hbound (sync_baud_rates, 1)
+		then call error_proc (8, 2, "Invalid synchronous baud rate specified for ""^a"".", "^a", (cdte.name),
+			"");
+	     end;
+
+	     if adapt_type				/* Hsla */
+	     then if adapt_no ^= SPECIAL_CHN		/* if not special channel */
+		then do;
+		     hsla_configured (adapt_no) = "1"b;
+		     if chan_no > 63
+		     then call error_proc (9, 2, "HSLA subchannel > 31 specified for ""^a"".", "^a", (cdte.name), "");
+		end;
+		else ;
+
+	     else do;
+		call error_proc (10, 2, "LSLA forbidden with uncp for ""^a"".", "^a", (cdte.name), "");
+						/* For the DN7100 */
+
+
+   if chan_no > 51 then call error_proc (10, 2, "LSLA subchannel > 51 specified for ""^a"".", "^a",
+   (cdte.name), "");
+   if cdte.autobaud then call error_proc (11, 2, "LSLA subchannel ""^a"" specified as autobaud.",
+   "^a", (cdte.name), "");
+   if cdte.baud_rate = 110 then lsla_count (adapt_no) = lsla_count (adapt_no) + 1;
+   else if cdte.baud_rate = 133 | cdte.baud_rate = 150 then
+   lsla_count (adapt_no) = lsla_count (adapt_no) + 2;
+   else if cdte.baud_rate = 300 then lsla_count (adapt_no) = lsla_count (adapt_no) + 3;
+   else call error_proc (12, 2, "Invalid baud rate specified for LSLA channel ""^a"".", "^a",
+   (cdte.name), "");
+
+	     end;
+
+next_channel:
+	end;
+
+/* Some final consistency checks */
+
+   j = 0;
+   do i = lbound (lsla_count, 1) to hbound (lsla_count, 1);
+   if lsla_count (i) > 0 then do;
+   j = j + 1;
+   if lsla_count (i) > 52 then do;
+   call ioa_$rsnnl ("LSLA ^d", ename, (0), i);
+   call error_proc (13, 2, "^a on FNP ^a has too many time slots configured.", "^a on FNP ^a",
+   ename, mpx_name);
+   end;
+   end;
+   end;
+   if j > fnpe.nlslas then
+   call error_proc (14, 2, "More LSLA's configured on FNP ^a than specified in lsla statement.",
+   "FNP ^a", mpx_name, "");
+
+
+	j = 0;
+	do i = lbound (hsla_configured, 1) to hbound (hsla_configured, 1);
+	     if hsla_configured (i)
+	     then j = j + 1;
+	end;
+	if j > fnpe.nhslas
+	then call error_proc (15, 2, "More HSLA's configured on FNP ^a than specified in hsla statement.", "FNP ^a",
+		mpx_name, "");
+
+	return;
+
+MPXE_STATE:
+     procedure (state) returns (char (32));
+
+declare  state fixed bin;
+
+	if state < lbound (MPXE_STATE_NAMES, 1) | state > hbound (MPXE_STATE_NAMES, 1)
+	then return (ltrim (char (state)));
+	else return (MPXE_STATE_NAMES (state));
+     end MPXE_STATE;
+
+%include cdt;
+
+%include author_dcl;
+%include as_mpx_state_names_;
+%include line_types;
+
+%include as_wakeup_priorities;
+%include event_call_info;
+/*  %include fnp_mpx_msg_;   */
+%include sc_stat_;
+%include sys_log_constants;
+%include timer_manager_constants;
+     end as_uncp_mpx_;
+
+
+
+
+		    as_vip7760_mpx_.pl1             07/20/88  1253.4r w 07/19/88  1536.9      128493
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+
+/* AS_VIP7760_MPX_ - Anserwing service piece of vip7760 multiplexer */
+
+/* Written October 1978 by Larry Johnson (as as_user1_mpx_) */
+/* Converted to as_vip7760_mpx_ 1/5/78 by J. Stern */
+/* Modified 5/1/79 by J. Stern to add vip7760_cv_cmf entry */
+/* Modified June 1981 by T. Casey for MR9.0 for new wakeup priorities. */
+/* Modified August 1982 by Robert Coren for additional argument to multiplexer_mgr_$mpx_crashed. */
+
+/* format: style4,delnl,insnl */
+
+as_vip7760_mpx_:
+     proc;
+
+/* Parameters */
+
+dcl  arg_mpx_chan char (*);				/* Name of the multiplexed channel */
+dcl  arg_cdtp ptr;					/* Address of the cdt */
+dcl  arg_cdtep ptr;
+dcl  arg_chan_listp ptr;				/* Pointer to a structure of channels to init  */
+dcl  arg_check_sw bit (1) aligned;			/* Says whether or not to check configuration */
+dcl  arg_event_infop ptr;
+dcl  arg_code fixed bin (35);
+dcl  arg_error_proc entry variable;
+
+/* Automatic */
+
+dcl  code fixed bin (35);
+dcl  mpx_chan char (32);
+dcl  chan_listp ptr;
+dcl  event_infop ptr;
+dcl  ev_msg_array (2) bit (36);
+dcl  load_parm char (32);
+dcl  1 boot_info aligned like pv_load_info;
+dcl  len fixed bin;
+dcl  p ptr;
+dcl  station_addr fixed bin;
+dcl  (i, j) fixed bin;
+dcl  error_proc entry (fixed bin, fixed bin, char (*), char (*), char (*), char (*)) variable;
+dcl  temp_value fixed bin;
+
+/* Constants */
+
+dcl  name char (15) int static options (constant) init ("as_vip7760_mpx_");
+
+/* Static */
+
+dcl  static_cdtp ptr int static init (null);		/* Remember where cdt is */
+
+/* External */
+
+dcl  hphcs_$tty_control entry (char (*), char (*), ptr, fixed bin (35));
+dcl  ipc_$delete_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed bin (71), entry, ptr, fixed bin, fixed bin (35));
+dcl  sys_log_ entry options (variable);
+dcl  convert_ipc_code_ entry (fixed bin (35));
+dcl  sys_log_$error_log entry options (variable);
+dcl  get_process_id_ entry returns (bit (36) aligned);
+dcl  ttt_info_$additional_info entry (char (*), char (512) varying, fixed bin (35));
+dcl  multiplexer_mgr_$mpx_load_failed entry (char (*), fixed bin (35));
+dcl  multiplexer_mgr_$mpx_loaded entry (char (*), fixed bin (35));
+dcl  multiplexer_mgr_$mpx_crashed entry (char (*), bit (1) aligned, fixed bin (35));
+
+dcl  error_table_$action_not_performed ext fixed bin (35);
+
+dcl  (addr, bin, low, rtrim, verify, null, string, substr, unspec, index, length) builtin;
+
+/* Based */
+
+dcl  1 chan_list aligned based (chan_listp),		/* List of cdte entries of channels to boot */
+       2 count fixed bin,
+       2 cdte_ptr (0 refer (chan_list.count)) ptr unal;
+
+dcl  1 event_info aligned based (event_infop),		/* Event call argument structure */
+       2 channel_id fixed bin (71),
+       2 message fixed bin (71),
+       2 sender_procid bit (36),
+       2 origin,
+         3 dev_signal bit (18) unal,
+         3 ring bit (18) unal,
+       2 data_ptr ptr;
+
+/* Entry to load a multiplexer */
+
+vip7760_load:
+     entry (arg_mpx_chan, arg_cdtp, arg_cdtep, arg_chan_listp, arg_check_sw, arg_code);
+
+	mpx_chan = arg_mpx_chan;
+	cdtp, static_cdtp = arg_cdtp;
+	cdtep = arg_cdtep;
+	chan_listp = arg_chan_listp;
+	mpxep = addr (cdte.initial_command);
+
+	if cdte.event ^= 0
+	then call ipc_$delete_ev_chn (cdte.event, code);
+	call ipc_$create_ev_chn (cdte.event, code);
+	if code ^= 0 then do;
+ev_chan_err:
+	     call convert_ipc_code_ (code);
+	     call sys_log_$error_log (1, code, name, "Creating event channel for multiplexer ^a", mpx_chan);
+	     arg_code = error_table_$action_not_performed;
+	     return;
+	end;
+	call ipc_$decl_ev_call_chn (cdte.event, vip7760_wakeup_handler, cdtep, MPX_LOAD_PRIO, code);
+	if code ^= 0
+	then go to ev_chan_err;
+
+	call get_boot_info;				/* get bootload parameters */
+
+	call hphcs_$tty_control (mpx_chan, "load_mpx", addr (boot_info), code);
+	if code ^= 0 then do;
+	     arg_code = code;
+	     return;
+	end;
+
+	arg_code = 0;
+	return;
+
+/* Wakeup handler for wakeups on the bootload event channel */
+
+vip7760_wakeup_handler:
+     entry (arg_event_infop);
+
+	event_infop = arg_event_infop;
+	cdtp = static_cdtp;
+	cdtep = event_info.data_ptr;
+	mpxep = addr (cdte.initial_command);
+
+	if event_info.ring ^= "0"b
+	then					/* If not ring-0 */
+	     if event_info.sender_procid ^= get_process_id_ () then do;
+						/* Trust only myself */
+		string (ev_msg_array) = unspec (event_info.message);
+		call sys_log_ (1, "^a: Unexpected wakeup (^w ^w) from process ^w.", name, ev_msg_array,
+		     event_info.sender_procid);
+		return;
+	     end;
+
+	mpx_chan = cdte.name;
+
+	if event_info.message ^= PV_MPX_UP & event_info.message ^= PV_MPX_DOWN & event_info.message ^= PV_MPX_MASKED then do;
+	     call sys_log_ (1, "^a: Wakeup for multiplexer ^a has invalid state code: ^d.", name, mpx_chan,
+		event_info.message);
+	     return;
+	end;
+	call sys_log_ (1, "^a: ^[Load^;Crash^] signaled for multiplexer ^a.", name, (event_info.message = PV_MPX_UP),
+	     mpx_chan);
+
+	if mpxe.state = MPX_BOOT then do;		/* Now booting */
+	     if event_info.message = PV_MPX_DOWN
+	     then					/* Boot failed */
+		call multiplexer_mgr_$mpx_load_failed (mpx_chan, code);
+	     else call multiplexer_mgr_$mpx_loaded (mpx_chan, code);
+	     return;
+	end;
+
+	else if mpxe.state = MPX_UP then do;		/* Currently running ok */
+	     if event_info.message ^= PV_MPX_UP
+	     then					/* it crashed */
+		call multiplexer_mgr_$mpx_crashed (mpx_chan, (event_info.message = PV_MPX_DOWN), code);
+	end;
+	return;
+
+/* Entry to dump a multiplexer. */
+
+vip7760_dump:
+     entry (arg_mpx_chan, arg_cdtp, arg_cdtep, arg_code);
+
+	arg_code = 0;				/* nothing to do really */
+	return;
+
+/* Entry called by cv_cmf to validate VIP7760 multiplexers */
+
+vip7760_cv_cmf:
+     entry (arg_cdtp, arg_cdtep, arg_mpx_chan, arg_chan_listp, arg_error_proc);
+
+	cdtp = arg_cdtp;
+	cdtep = arg_cdtep;
+	mpx_chan = arg_mpx_chan;
+	chan_listp = arg_chan_listp;
+	error_proc = arg_error_proc;
+
+/* Make sure this channel is not an FNP */
+
+	if index (mpx_chan, ".") = 0			/* single component name => FNP */
+	then call error_proc (1, 2, "A VIP7760 multiplexer cannot be configured as an FNP.  ^a", "^a", mpx_chan, "");
+
+/* Make sure line type is right */
+
+	if cdte.line_type ^= LINE_POLLED_VIP
+	then call error_proc (2, 2, "A VIP7760 multiplexer must have a line type of POLLED_VIP.  ^a", "^a", mpx_chan,
+		"");
+
+/* Validate subchannel names */
+
+	if chan_list.count > 32
+	then call error_proc (3, 2, "More than 32 subchannels specified for VIP7760 multiplexer ^a.", "^a", mpx_chan,
+		"");
+
+	j = length (rtrim (cdte.name)) + 1;		/* get length of major channel name */
+	do i = 1 to chan_list.count;			/* examine subchans */
+	     p = chan_list.cdte_ptr (i);
+	     len = length (rtrim (p -> cdte.name)) - j;
+	     if len < 3				/* name too short */
+	     then do;
+bad_name:
+		call error_proc (4, 2, "Invalid subchannel name ^a for VIP7760 multiplexer ^a.", "^a for ^a",
+		     substr (p -> cdte.name, j + 1), mpx_chan);
+		go to next_subchan;
+	     end;
+	     if len > 3				/* name too long, better be more components */
+	     then if substr (p -> cdte.name, j + 4, 1) ^= "."
+						/* nope, bad name */
+		then go to bad_name;
+
+	     if verify (substr (p -> cdte.name, j + 1, 1), "dpx") ^= 0
+	     then go to bad_name;
+
+	     station_addr = bin (substr (p -> cdte.name, j + 2, 2));
+	     if station_addr < 0 | station_addr > 31
+	     then go to bad_name;
+next_subchan:
+	end;
+
+	return;
+
+/* Subroutine to prepare info structure for "load_mpx" control order */
+
+get_boot_info:
+     proc;
+
+dcl  add_info char (512) varying;
+dcl  (i, j) fixed bin;
+dcl  p ptr;
+dcl  switch bit (1);
+
+
+	boot_info.ev_chan = cdte.event;
+	boot_info.pause_time = 1;			/* default value */
+	boot_info.max_text_len = 1024;		/* default value */
+	boot_info.max_message_len = 289;		/* default value */
+	string (boot_info.flags) = ""b;
+	boot_info.quit = "q";			/* default function code value recognized as a QUIT */
+	boot_info.formfeed = "l";			/* default function code value recognized as FF */
+	boot_info.pad1 (*) = 0;
+
+/* get baud rates for printer subchannels */
+
+	if chan_list.count > 32 then do;
+	     call sys_log_ (1, "^a: More than 32 subchannels specified for multiplexer ^a.  ^d", name, mpx_chan,
+		chan_list.count);
+	     go to error_exit;
+	end;
+
+	boot_info.nchan = chan_list.count;
+	j = length (rtrim (cdte.name)) + 2;		/* get index of subchan component name */
+	do i = 1 to chan_list.count;
+	     p = chan_list.cdte_ptr (i);
+	     boot_info.devx (i) = p -> cdte.twx;
+	     boot_info.slave (i) = (p -> cdte.service_type = SLAVE_SERVICE);
+	     if substr (p -> cdte.name, j, 1) = "p"	/* this is a printer subchan */
+	     then do;
+		if ^boot_info.slave (i) then do;
+		     call sys_log_ (1, "Printer subchannel ^a of multiplexer ^a does not have slave service type.",
+			substr (p -> cdte.name, j), mpx_chan);
+		     go to error_exit;
+		end;
+		if p -> cdte.baud_rate = 300
+		then boot_info.baud_rate (i) = 300;
+		else boot_info.baud_rate (i) = 1200;	/* this is our default */
+	     end;
+	     else boot_info.baud_rate (i) = 0;		/* not interesting for displays */
+	     boot_info.pad2 (i, *) = 0;
+	end;
+
+/* get bootload parameters kept in additional info field of terminal type */
+
+	if cdte.initial_terminal_type = "" | cdte.initial_terminal_type = low (length (cdte.initial_terminal_type))
+	then return;				/* no terminal type, use defaults */
+
+	call ttt_info_$additional_info (cdte.initial_terminal_type, add_info, code);
+	if code ^= 0 then do;
+	     call sys_log_$error_log (1, code, name,
+		"Cannot get additional info from terminal type ^a for multiplexer ^a", cdte.initial_terminal_type,
+		mpx_chan);
+	     go to error_exit;
+	end;
+	if length (add_info) = 0
+	then return;
+
+/* check for switch-type parameters */
+
+	if find_switch_parm ("controller_poll", switch)
+	then boot_info.controller_poll = switch;
+
+	if find_switch_parm ("crlf_echo", switch)
+	then boot_info.crlf_echo = switch;
+
+	if find_switch_parm ("omit_nl", switch)
+	then boot_info.omit_nl = switch;
+
+	if find_switch_parm ("omit_ff", switch)
+	then boot_info.omit_ff = switch;
+
+	if find_switch_parm ("gcos_break", switch)
+	then boot_info.gcos_break = switch;
+
+	if find_switch_parm ("etb_mode", switch)
+	then boot_info.etb_mode = switch;
+
+/* check for pause time */
+
+	if find_parm_value ("pause_time", temp_value)
+	then boot_info.pause_time = -temp_value;	/* negative value means milliseconds */
+
+/* check for max text length */
+
+	if find_parm_value ("max_text_len", temp_value) then do;
+	     boot_info.max_text_len = temp_value;
+	     if boot_info.max_text_len < 64 | boot_info.max_text_len > 1920 then do;
+		call sys_log_ (1,
+		     "^a: Specified value for max_text_len in terminal type ^a for multiplexer ^a is outside allowed range of 64 to 1920.  ^d"
+		     , name, cdte.initial_terminal_type, mpx_chan, boot_info.max_text_len);
+		go to error_exit;
+	     end;
+	end;
+
+/* check for max message length */
+
+	if find_parm_value ("max_message_len", temp_value) then do;
+	     boot_info.max_message_len = temp_value;
+	     if boot_info.max_message_len < 73 | boot_info.max_message_len > 1024 then do;
+		call sys_log_ (1,
+		     "^a: Specified value for max_message_len in terminal type ^a for multiplexer ^a is outside allowed range of 73 to 1024.  ^d"
+		     , name, cdte.initial_terminal_type, mpx_chan, boot_info.max_message_len);
+		go to error_exit;
+	     end;
+	end;
+
+/* check for quit function code */
+
+	i = index (add_info, "quit=");
+	if i > 0 then do;
+	     load_parm = "quit function code";
+	     i = i + length ("quit=");
+	     if i > length (add_info)
+	     then go to bad_load_parm;
+	     boot_info.quit = substr (add_info, i, 1);
+	end;
+
+/* check for formfeed function code */
+
+	i = index (add_info, "formfeed=");
+	if i > 0 then do;
+	     load_parm = "formfeed function code";
+	     i = i + length ("formfeed=");
+	     if i > length (add_info)
+	     then go to bad_load_parm;
+	     boot_info.formfeed = substr (add_info, i, 1);
+	end;
+
+/* Subroutine to find a yes/no type parameter in the add_info string. */
+
+find_switch_parm:
+	proc (name, switch) returns (bit (1));
+
+dcl  name char (*);					/* name of parameter */
+dcl  switch bit (1);				/* ON for "yes" value, OFF for "no" */
+
+dcl  i fixed bin;
+
+
+	     i = index (add_info, name || "=");
+	     if i = 0				/* no such parm */
+	     then return ("0"b);
+
+	     load_parm = name;
+	     i = i + length (name) + 1;
+	     if i + 1 > length (add_info)
+	     then go to bad_load_parm;
+	     if substr (add_info, i, 2) = "no"
+	     then switch = "0"b;
+	     else do;
+		if i + 2 > length (add_info)
+		then go to bad_load_parm;
+		if substr (add_info, i, 3) = "yes"
+		then switch = "1"b;
+		else go to bad_load_parm;
+	     end;
+
+	     return ("1"b);
+
+	end;					/* find_switch_parm */
+
+
+/* subroutine to find a parameter in the add_info string with a numeric value */
+
+find_parm_value:
+	procedure (name, value) returns (bit (1));
+
+dcl  name char (*);
+dcl  value fixed bin;
+
+	     i = index (add_info, name || "=");
+	     if i > 0 then do;
+		load_parm = name;
+		i = i + length (name) + 1;
+		if i > length (add_info)
+		then go to bad_load_parm;
+		j = verify (substr (add_info, i), "0123456789");
+		if j = 0
+		then j = length (add_info) + 1 - (i - 1);
+		if j <= 1
+		then go to bad_load_parm;
+		value = bin (substr (add_info, i, j - 1), 17);
+		return ("1"b);
+	     end;
+
+	     else return ("0"b);
+	end find_parm_value;
+
+
+     end;						/* get_boot_info */
+
+
+bad_load_parm:
+	call sys_log_ (1, "^a: Invalid ^a specification in terminal type ^a for multiplexer ^a.", name, load_parm,
+	     cdte.initial_terminal_type, mpx_chan);
+error_exit:
+	arg_code = error_table_$action_not_performed;
+	return;
+
+%include polled_vip_load_info;
+
+%include cdt;
+
+%include author_dcl;
+
+%include line_types;
+
+%include as_wakeup_priorities;
+
+     end;						/* as_vip7760_mpx_ */
+   
+
+
+
+		    as_x25_mpx_.pl1                 07/20/88  1253.4r w 07/19/88  1536.9      175671
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-05-13,GJohnson), approve(86-05-13,MCR7387),
+     audit(86-05-13,Martinson), install(86-05-14,MR12.0-1055):
+     Correct error message documentation.
+                                                   END HISTORY COMMENTS */
+
+
+/* AS_X25_MPX_ - Anserwing service piece of x25 multiplexer */
+
+/* Written October 1978 by Larry Johnson (as as_user1_mpx_) */
+/* Converted to as_vip7760_mpx_ 1/5/78 by J. Stern */
+/* Modified 7/31/79 by B.Westcott to support x25 instead */
+/* Modified November 1979 by C. Hornig for installation */
+/* Modified May 1982 by D. W. Cousins for direct interface to x25_tables in the fnp */
+/* Modified August 1982 by Robert Coren for additional argument to multiplexer_mgr_$mpx_crashed. */
+/* Modified July 1983 by Robert Coren to support "packet_threshold" parameter */
+/* Modified August 1983 by Jeff Schiller to implement the "reverse charging" facility. */
+/* Modified 1984-08-28 BIM for better error messages/tracing */
+/* Modified October 1984 by R.J.C. Kissel to set the error code for bad parameters, */
+/*     and to do some better error checking on parameters, and to not allow packet sizes */
+/*     of less than 55 (x25 error list #7). */
+/* Modified October 1984 by R.J.C. Kissel to support the "breakall_idle_timer" parameter. */
+
+/* format: style4,delnl,insnl,^ifthendo */
+as_x25_mpx_:
+     procedure;
+
+/* Parameters */
+
+dcl  arg_mpx_chan char (*);				/* Name of the multiplexed channel */
+dcl  arg_cdtp ptr;					/* Address of the cdt */
+dcl  arg_cdtep ptr;
+dcl  arg_chan_listp ptr;				/* Pointer to a structure of channels to init  */
+dcl  arg_check_sw bit (1) aligned;			/* Says whether or not to check configuration */
+dcl  arg_event_infop ptr;
+dcl  arg_code fixed bin (35);
+dcl  arg_error_proc entry variable;
+
+/* Automatic */
+
+dcl  code fixed bin (35);
+dcl  add_info varying char (512);
+dcl  parm char (32);
+dcl  msg char (64);
+dcl  mpx_chan char (32);
+dcl  chan_listp ptr;
+dcl  1 boot_info aligned like x25_load_info;
+dcl  error_proc entry (fixed bin, fixed bin, char (*), char (*), char (*), char (*)) variable;
+
+/* Constants */
+
+dcl  name char (15) int static options (constant) init ("as_x25_mpx_");
+
+/* External */
+
+dcl  hphcs_$tty_control entry (char (*), char (*), ptr, fixed bin (35));
+dcl  ioa_$rsnnl entry () options (variable);
+dcl  ipc_$delete_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed bin (71), entry, ptr, fixed bin, fixed bin (35));
+dcl  cv_dec_check_ entry (char (*), fixed bin (35)) returns (fixed bin (35));
+dcl  cv_float_ entry (char (*), fixed bin (35)) returns (float bin);
+dcl  sys_log_ entry options (variable);
+dcl  sys_log_$error_log entry options (variable);
+dcl  get_process_id_ entry returns (bit (36) aligned);
+dcl  multiplexer_mgr_$mpx_load_failed entry (char (*), fixed bin (35));
+dcl  multiplexer_mgr_$mpx_loaded entry (char (*), fixed bin (35));
+dcl  multiplexer_mgr_$mpx_crashed entry (char (*), bit (1) aligned, fixed bin (35));
+dcl  ttt_info_$additional_info entry (char (*), char (*) var, fixed bin (35));
+
+dcl  error_table_$action_not_performed ext fixed bin (35);
+dcl  error_table_$bad_conversion fixed bin (35) ext static;
+
+dcl  (addr, before, length, low, substr, unspec, index) builtin;
+
+/* Based */
+
+dcl  1 chan_list aligned based (chan_listp),		/* List of cdte entries of channels to boot */
+       2 count fixed bin,
+       2 cdte_ptr (0 refer (chan_list.count)) ptr unal;
+%page;
+/* Entry to load a multiplexer */
+
+x25_load:
+     entry (arg_mpx_chan, arg_cdtp, arg_cdtep, arg_chan_listp, arg_check_sw, arg_code);
+
+	mpx_chan = arg_mpx_chan;
+	cdtp = arg_cdtp;
+	cdtep = arg_cdtep;
+	chan_listp = arg_chan_listp;
+	mpxep = addr (cdte.initial_command);
+
+	arg_code = 0;				/* Start clean. */
+
+	if cdte.event ^= 0
+	then call ipc_$delete_ev_chn (cdte.event, code);
+	call ipc_$create_ev_chn (cdte.event, code);
+	if code ^= 0
+	then do;
+ev_chan_err:
+	     call sys_log_$error_log (1, code, name, "Creating event channel for multiplexer ^a", mpx_chan);
+	     arg_code = error_table_$action_not_performed;
+	     return;
+	end;
+	call ipc_$decl_ev_call_chn (cdte.event, x25_wakeup_handler, cdtep, (20), code);
+	if code ^= 0
+	then go to ev_chan_err;
+
+	boot_info.version = X25_LOAD_INFO_VERSION_1;
+	boot_info.ev_chan = cdte.event;
+	boot_info.pid = get_process_id_ ();
+	boot_info.max_packet_size = 128;
+	boot_info.window_size = 2;
+	boot_info.breakall_idle_timer = 2;		/* Default is 1/10 sec. */
+	boot_info.net_type = "";
+	boot_info.my_address = "";
+	string (boot_info.flags) = ""b;
+	string (boot_info.frame_level_data.flags) = ""b;
+	boot_info.frame_size = 1064;
+	boot_info.k = 7;
+	boot_info.n2 = 20;
+	boot_info.t1 = 3;
+	boot_info.t3 = 3;
+
+	add_info = "";
+	if (cdte.initial_terminal_type ^= low (length (cdte.initial_terminal_type)))
+	     & (cdte.initial_terminal_type ^= "")
+	then do;
+	     call ttt_info_$additional_info (cdte.initial_terminal_type, add_info, code);
+	     if code ^= 0
+	     then do;
+		call sys_log_$error_log (1, code, name,
+		     "Cannot get additional info for terminal type ^a for multiplexer ^a.",
+		     cdte.initial_terminal_type, mpx_chan);
+		add_info = "";
+	     end;
+	end;
+
+	if get_parm ("n_lc=", parm)
+	then do;
+	     boot_info.n_lc = cv_dec_check_ (parm, code);
+	     if (code ^= 0) | (boot_info.n_lc < 1)
+	     then call bad_conv ("n_lc");
+	end;
+	else do;
+	     call sys_log_$error_log (1, 0, name, "^a: n_lc must be specified", mpx_chan);
+	     arg_code = error_table_$action_not_performed;
+	     return;
+	end;
+
+	if get_parm ("window_size=", parm)
+	then do;
+	     boot_info.window_size = cv_dec_check_ (parm, code);
+	     if code ^= 0
+	     then call bad_conv ("window_size");
+
+	     if boot_info.window_size < 1 | boot_info.window_size > 7
+	     then call bad_range ("window_size", "1", "7", parm);
+	end;
+
+	if get_parm ("packet_size=", parm)
+	then do;
+	     boot_info.max_packet_size = cv_dec_check_ (parm, code);
+	     if code ^= 0
+	     then call bad_conv ("packet_size");
+
+	     if boot_info.max_packet_size < bsizec | boot_info.max_packet_size > 1024
+	     then call bad_range ("packet_size", "60", "1024", parm);
+						/* bsizec = #chars in smallest tty buffer (= 60). */
+	end;
+
+	if get_parm ("network=", parm)
+	then boot_info.net_type = substr (parm, 1, maxlength (boot_info.net_type));
+
+	if get_parm ("address=", parm)
+	then boot_info.my_address = rtrim (ltrim (parm));
+
+	if get_parm ("type=", parm)
+	then do;					/* DCE or DTE options */
+	     if parm = "DCE"
+	     then boot_info.flags.dce = "1"b;
+	     else if parm = "DTE"
+	     then boot_info.flags.dce = "0"b;
+	     else call bad_choice ("type", "DCE", "DTE", parm);
+	end;
+
+	if get_parm ("link_protocol=", parm)
+	then do;					/* LAP or LAPB options */
+	     if parm = "LAP"
+	     then boot_info.flags.abm = "0"b;
+	     else if parm = "LAPB"
+	     then boot_info.flags.abm = "1"b;
+	     else call bad_choice ("link_protocol", "LAP", "LAPB", parm);
+	end;
+
+	if get_parm ("frame_size=", parm)
+	then do;					/* Make sure this code stays after the packet_size code. */
+	     boot_info.frame_size = cv_dec_check_ (parm, code);
+	     if code ^= 0
+	     then call bad_conv ("frame_size");
+
+	     if (boot_info.frame_size < 8) | (boot_info.frame_size > 8232) | (mod (boot_info.frame_size, 8) ^= 0)
+		| ((boot_info.frame_size - 40) < (8 * boot_info.max_packet_size))
+	     then call bad_range ("frame_size", "(8 * packet_size + 40)", "8232", parm);
+	end;
+
+	if get_parm ("K=", parm)
+	then do;
+	     boot_info.k = cv_dec_check_ (parm, code);
+	     if code ^= 0
+	     then call bad_conv ("K");
+	     if (boot_info.k < 1) | (boot_info.k > 7)
+	     then call bad_range ("K", "1", "7", parm);
+	end;
+
+	if get_parm ("T1=", parm)
+	then do;
+	     boot_info.t1 = cv_float_ (parm, code);
+	     if code ^= 0
+	     then call bad_conv ("T1");
+	     if (boot_info.t1 < .1e0) | (boot_info.t1 > 50e0)
+	     then call bad_range ("T1", ".1e0", "50e0", parm);
+	end;
+
+	if get_parm ("T3=", parm)
+	then do;
+	     boot_info.t3 = cv_float_ (parm, code);
+	     if code ^= 0
+	     then call bad_conv ("T3");
+	     if (boot_info.t3 < .1e0) | (boot_info.t3 > 50e0)
+	     then call bad_range ("T3", ".1e0", "50e0", parm);
+	end;
+
+	if get_parm ("N2=", parm)
+	then do;
+	     boot_info.n2 = cv_dec_check_ (parm, code);
+	     if code ^= 0
+	     then call bad_conv ("N2");
+	     if (boot_info.n2 < 1) | (boot_info.n2 > 511)
+	     then call bad_range ("N2", "1", "511", parm);
+	end;
+
+	if get_parm ("disc_first=", parm)
+	then do;					/* disc_first yes or no */
+	     if parm = "yes"
+	     then boot_info.flags.disc_first = "1"b;
+	     else if parm = "no"
+	     then boot_info.flags.disc_first = "0"b;
+	     else call bad_choice ("disc_first", "yes", "no", parm);
+	end;
+
+	if get_parm ("bypass_restart=", parm)
+	then do;					/* bypass_restart yes or no */
+	     if parm = "yes"
+	     then boot_info.flags.bypass_restart = "1"b;
+	     else if parm = "no"
+	     then boot_info.flags.bypass_restart = "0"b;
+	     else call bad_choice ("bypass_restart", "yes", "no", parm);
+	end;
+
+	if get_parm ("d_bit=", parm)
+	then do;					/* d_bit yes or no */
+	     if parm = "yes"
+	     then boot_info.flags.no_d = "0"b;
+	     else if parm = "no"
+	     then boot_info.flags.no_d = "1"b;
+	     else call bad_choice ("d_bit", "yes", "no", parm);
+	end;
+
+	if get_parm ("trace_off=", parm)
+	then do;					/* trace_off yes or no */
+	     if parm = "yes"
+	     then boot_info.flags.trace_off = "1"b;
+	     else if parm = "no"
+	     then boot_info.flags.trace_off = "0"b;
+	     else call bad_choice ("trace_off", "yes", "no", parm);
+	end;
+
+	if get_parm ("packet_threshold=", parm)
+	then do;
+	     boot_info.long_packet_size = cv_dec_check_ (parm, code);
+	     if code ^= 0
+	     then call bad_conv ("packet_threshold");
+	     if boot_info.long_packet_size < 2
+	     then call bad_range ("packet_threshold", "2", "Infinity", parm);
+	end;
+
+	else boot_info.long_packet_size = boot_info.max_packet_size + 1;
+
+	if get_parm ("collect=", parm)
+	then do;					/* Whether outgoing calls are made collect */
+	     if parm = "yes"
+	     then boot_info.flags.out_calls_collect = "1"b;
+	     else if parm = "no"
+	     then boot_info.flags.out_calls_collect = "0"b;
+	     else call bad_choice ("collect", "yes", "no", parm);
+	end;
+
+	if get_parm ("breakall_idle_timer=", parm)
+	then do;					/* Timer is in 1/20 sec. */
+	     boot_info.breakall_idle_timer = cv_dec_check_ (parm, code);
+	     if code ^= 0
+	     then call bad_conv ("breakall_idle_timer");
+	     if boot_info.breakall_idle_timer < 1 | boot_info.breakall_idle_timer > 255
+	     then call bad_range ("breakall_idle_timer", "1", "255", parm);
+	end;
+
+	call hphcs_$tty_control (mpx_chan, "load_mpx", addr (boot_info), arg_code);
+return_to_caller:
+	return;
+
+bad_conv:
+     procedure (String);
+dcl  String char (*) parameter;
+
+	call sys_log_$error_log (1, error_table_$bad_conversion, name,
+	     "Converting ^a ^a to a number for multiplexer ^a.", String, parm, mpx_chan);
+	arg_code = error_table_$bad_conversion;
+	goto return_to_caller;
+     end bad_conv;
+
+get_parm:
+     procedure (Parm, Value) returns (bit (1) aligned);
+dcl  (Parm, Value) char (*);
+dcl  i fixed bin;
+
+	i = index (add_info, Parm);
+	if i = 0
+	then return ("0"b);
+	else do;
+	     Value = before (substr (add_info, i + length (Parm)), " ");
+	     return ("1"b);
+	end;
+     end get_parm;
+
+bad_choice:
+     proc (type, choice1, choice2, actual_choice);
+dcl  (type, choice1, choice2, actual_choice) char (*) parameter;
+
+	call sys_log_$error_log (1, 0, name,
+	     "Bad argument to parm ^a, should be ^a or ^a, but was ^a for multiplexer ^a.", type, choice1, choice2,
+	     actual_choice, mpx_chan);
+	arg_code = error_table_$action_not_performed;	/* Set the return code. */
+	goto return_to_caller;			/* it bad enought to go back */
+     end bad_choice;
+
+bad_range:
+     proc (type, lower_bound, upper_bound, actual_value);
+dcl  (type, lower_bound, upper_bound, actual_value) char (*) parameter;
+
+	call sys_log_$error_log (1, 0, name,
+	     "Bad argument to parm ^a.  Must have: ^a <= value <= ^a, but value = ^a, for multiplexer ^a.", type,
+	     lower_bound, upper_bound, actual_value, mpx_chan);
+	arg_code = error_table_$action_not_performed;
+	goto return_to_caller;
+     end bad_range;
+%page;
+/* Wakeup handler for wakeups on the bootload event channel */
+
+x25_wakeup_handler:
+     entry (arg_event_infop);
+
+	event_call_info_ptr = arg_event_infop;
+	cdtep = event_call_info.data_ptr;
+	mpxep = addr (cdte.initial_command);
+
+	if event_call_info.ring ^= 0			/* If not ring-0 */
+	then if event_call_info.sender ^= get_process_id_ ()
+	     then do;				/* Trust only myself */
+		call sys_log_ (1, "^a: Unexpected wakeup (^72.3b) from process ^w.", name,
+		     unspec (event_call_info.message), event_call_info.sender);
+		return;
+	     end;
+
+	mpx_chan = cdte.name;
+
+	if (event_call_info.message < 1) | (event_call_info.message > 3)
+	then do;
+	     call sys_log_ (1, "^a: Wakeup for multiplexer ^a has invalid state code: ^d.", name, mpx_chan,
+		event_call_info.message);
+	     return;
+	end;
+
+	msg = "";
+	call ioa_$rsnnl ("Unexpected signal ^d in state ^a", msg, (0), event_call_info.message,
+	     MPXE_STATE_NAMES (mpxe.state));
+	if mpxe.state = MPX_BOOT
+	then if event_call_info.message ^= 1
+	     then do;
+		msg = "Load failed";
+		call multiplexer_mgr_$mpx_load_failed (mpx_chan, code);
+	     end;
+	     else do;
+		msg = "Load signalled";
+		call multiplexer_mgr_$mpx_loaded (mpx_chan, code);
+	     end;
+	else if mpxe.state = MPX_UP
+	then if event_call_info.message ^= 1
+	     then do;
+		msg = "Crash signalled";
+		call multiplexer_mgr_$mpx_crashed (mpx_chan, (event_call_info.message = 2), code);
+	     end;
+	call sys_log_ (1, "^a: ^a for multiplexer ^a.", name, msg, mpx_chan);
+	return;
+%page;
+/* Entry to dump a multiplexer. */
+
+x25_dump:
+     entry (arg_mpx_chan, arg_cdtp, arg_cdtep, arg_code);
+
+	arg_code = 0;				/* nothing to do really */
+	return;
+%page;
+/* Entry called by cv_cmf to validate X25 multiplexers */
+
+x25_cv_cmf:
+     entry (arg_cdtp, arg_cdtep, arg_mpx_chan, arg_chan_listp, arg_error_proc);
+
+	cdtp = arg_cdtp;
+	cdtep = arg_cdtep;
+	mpx_chan = arg_mpx_chan;
+	chan_listp = arg_chan_listp;
+	error_proc = arg_error_proc;
+
+/* Make sure this channel is not an FNP */
+
+	if index (mpx_chan, ".") = 0			/* single component name => FNP */
+	then call error_proc (1, 2, "A X.25 multiplexer cannot be configured as an FNP.  ^a", "^a", mpx_chan, "");
+
+/* Validate subchannel names */
+
+	if chan_list.count > 512
+	then call error_proc (3, 2, "More than 512 subchannels specified for X25 multiplexer ^a.", "^a", mpx_chan, "");
+
+	return;
+%page;
+%include as_mpx_state_names_;
+%include x25_load_info;
+%include cdt;
+%include author_dcl;
+%include line_types;
+%include event_call_info;
+
+/* tty_buf is only included to use the value of bsizec, the size of the smallest tty buffer. */
+
+%include tty_buf;
+%page;
+/* BEGIN MESSAGE DOCUMENTATION
+
+   Message:
+   as_x25_mpx_: ERROR. Creating event channel for multiplexer MPX.
+
+   S: as (severity1)
+
+   T: In response to an operator load_mpx command or during system start up.
+
+   M: An ipc_ error occurred while trying to initialize the multiplexer.
+
+   A: $notify
+
+
+   Message:
+   as_x25_mpx_: ERROR. Cannot get additional info for terminal type TTP for multiplexer MPX.
+
+   S: as (severity1)
+
+   T: In response to an operator load_mpx command or during system start up.
+
+   M: An error occurred while retrieving the parameters of the multiplexer
+   from the TTT.
+   Either the terminal type specified in the CDT does not exist or it
+   does not contain the required additional_info field.
+
+   A: Check that the CMF and TTF contain the proper information.
+
+
+   Message:
+   as_x25_mpx_: MPX: n_lc must be specified.
+
+   S: as (severity1)
+
+   T: In response to an operator load_mpx command for during system startup.
+
+   M: The TTF entry for the X.25 multiplexer does not specify the number of logical channels.
+
+   A: Correct the TTF and reload the multiplexer.
+
+
+   Message:
+   as_x25_mpx_: Error in conversion. Converting FIELD VALUE to a number for multiplexer MPX.
+
+   S: as (severity1)
+
+   T: In response to an operator load_mpx command or during system start up.
+
+   M: It was impossible to convert a numeric parameter from the terminal_type
+   additional_info string to its internal form.
+   FIELD is the name of the parameter in error.
+   VALUE is the string which could not be converted.
+
+   A: Check the contents of the TTF entry for the terminal_type associated
+   with the multiplexer for errors.
+
+
+   Message:
+   as_x25_mpx_: Bad argument to parm PARM.  Must have: LOW <= value <= HIGH, but value = VALUE, for multiplexer MPX.
+
+   S: as (severity1)
+
+   T: In response to an operator load_mpx command or during system start up.
+
+   M: A bad value was specified for parameter PARM in the additional_info field
+   of the TTF entry for the multiplexer MPX.  The value must be between LOW and
+   HIGH, but VALUE was specified.
+
+   A: Check the contents of the TTF entry for the terminal_type associated
+   with the multiplexer for an improper parameter value. Correct and reload
+   mpx.
+
+
+   Message:
+   as_x25_mpx_: Bad argument to parm PARM, should be THIS or THAT, but was VALUE for multiplexer MPX.
+
+   S: as (severity1)
+
+   T: In response to an operator load_mpx command or during system start up.
+
+   M: A bad value was specified for parameter PARM in the additional_info field
+   of the TTF entry for the multiplexer MPX.  The choices are THIS or THAT, but
+   VALUE was specified.
+
+   A: Check the contents of the TTF entry for the terminal_type associated
+   with the multiplexer for an improper parameter value. Correct and reload
+   mpx.
+
+
+   Message:
+   as_x25_mpx_: Unexpected wakeup (DATA) from process PRCID.
+
+   S: as (severity1)
+
+   T: $run
+
+   M: The multiplexer manager received a wakeup from an unexpected source.
+   The wakeup is ignored.
+
+   A: $ignore
+
+
+   Message:
+   as_x25_mpx_: Wakeup for multiplexer MPX has invalid state code STATE.
+
+   S: as (severity1)
+
+   T: $run
+
+   M: A wakeup with invalid data was received by the multiplexer manager.
+   The wakeup is ignored.
+
+   A: $notify
+
+
+   Message:
+   as_x25_mpx_: Unexpected signal NUM in state STATE.
+
+   S: as (severity1)
+
+   T: $run
+
+   M: A signal, NUM, was received unexpectedly in state STATE.
+   The signal is ignored.
+
+   A: $notify
+
+
+   Message:
+   as_x25_mpx_: Load signalled for multiplexer MPX.
+
+   S: as (severity1)
+
+   T: In response to an operator load_mpx command or during system start up.
+
+   M: The multiplexer has been successfully loaded.
+   It will be started unless the -no_start control argument was given when
+   the load_mpx command was typed.
+
+   A: $ignore
+
+
+   Message:
+   as_x25_mpx_: Load failed for multiplexer MPX.
+
+   S: as (severity1)
+
+   T: In response to an operator load_mpx command or during system start up.
+
+   M: The attempt to load the multiplexer failed.
+   This should never happen.
+
+   A: $notify
+
+
+   Message:
+   as_x25_mpx_: Crash signalled for multiplexer MPX.
+
+   S: as (severity1)
+
+   T: $run
+
+   M: The multiplexer has crashed.
+   The LAP link has entered the disconnected state.
+
+   A: $notify
+
+
+   END MESSAGE DOCUMENTATION */
+
+     end as_x25_mpx_;
+
+
+
+
+		    bull_copyright_notice.txt       08/30/05  1008.4r   08/30/05  1007.3    00020025
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group Bull including Bull HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell Bull Inc., Groupe Bull
+and Bull HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato.Users consider that Multics provided the best software architecture for 
+managing computer hardware properly and for executing programs. Many subsequent operating systems
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, Bull or Bull HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by Bull HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

@@ -1,0 +1,910 @@
+	COMPILATION LISTING OF SEGMENT fm_sys_pn_tbl_insert
+	Compiled by: Multics PL/I Compiler, Release 33e, of October 6, 1992
+	Compiled at: CGI                             
+	Compiled on: 2000-04-17_1934.26_Mon_mdt
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        4*   *                                                         *
+        5*   *********************************************************** */
+        6 
+        7 
+        8 /* DESCRIPTION:
+        9*
+       10*         This routine inserts a pathname/uid pair into an entry of the System
+       11*     Pathname  Table  (sys_pn_tbl).   It is assumed that the sys_pn_tbl is not
+       12*     locked, and this routine will lock it while examining it.  In fact, an
+       13*     error is signalled if the lock is already locked.  It is assumed
+       14*     that the caller has set the validation level to the Data Management Ring.
+       15*
+       16*         Currently there is no mechanism for recovering from interuptions
+       17*     while inserting an entry.  Ideally there should be, but since an
+       18*     interuption immediately after this routine returns is really the same
+       19*     as one occurring during this routine, there is no pressing need.
+       20*     
+       21*         Error handling is managed by two routines: ERROR_RETURN and LOG,
+       22*     both of  which use the MAKE_MESSAGE function.  LOG simply logs an error
+       23*     and returns to the main procedure.  LOG is used when an inconsistency is
+       24*     found between the supplied and existing file_system_uid (a non-fatal 
+       25*     error) and when an error occurs in the FINISH procedure.  Both of these
+       26*     cases warrant reporting the unusual event while continuing to proceed.
+       27*     ERROR_RETURN is used in all other cases.  It logs a message then signals
+       28*     fm_sub_error_ via fm_error_util_$signal.  These errors are fatal errors.
+       29*     FINISH is not called by ERROR_RETURN as in many other modules.  It is
+       30*     invoked only by the cleanup handler when the stack is unwound.  
+       31*     A possible scenario in which FINISH is invoked is as follows:
+       32*       Invoke ERROR_RETURN, signal fm_sub_error_ via fm_error_util_signal,
+       33*       before signal escapes to outer ring stak is unwound, setting off
+       34*       cleanup on-unit, which calls FINISH.
+       35**/
+       36 
+       37 /* HISTORY:
+       38*
+       39*Written by Matthew, 06/26/84.
+       40*Modified:
+       41*10/29/84 by Matthew Pierret:  Cleaned up error messages. Answered audit 
+       42*            comments. Added use of SPT_ENTRY_*_IN_USE constants.
+       43*01/10/85 by Matthew C. Pierret:  Added ERROR_RETURN, LOG and MAKE_MESSAGE
+       44*            routines for error handling.  Changed algorithm to not blow up if
+       45*            an entry is found but the file system uid's do not match, rather
+       46*            to log the event and continue looking for a suitable entry.  Also
+       47*            changed to only check for file system uid mismatch if the entry is
+       48*            not a new entry.
+       49*03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+       50*03/14/85 by Matthew C. Pierret:  Changed to only flush once as the first flush
+       51*            does not really buy us anything.  Also changed to only unlock if
+       52*            the lock was obtained successfully and validly, where it is
+       53*            considered invalid to lock the table if the process already holds
+       54*            that lock.  More specifically, the codes
+       55*            dm_error_$invalid_lock_reset and 0 are valid codes returned from
+       56*            lock_manager_$lock_fast.
+       57*04/22/85 by Matthew C. Pierret:  Changed the loop which loops on sys_idx
+       58*            looking for a matching uid to start from sys_idx + 1 so that if
+       59*            the loop is executed again (happens if an entry has matching dm
+       60*            file uid but not file system uids) the same entry is not found a
+       61*            second time.
+       62*04/23/85 by Matthew C. Pierret:  Changed to attempt to find an orphan entry if
+       63*            the table is full.  An orphan entry is one which is in use but
+       64*            refers to a non-existent file.  Such entries are the result of a
+       65*            failure to run the post_transaction actions.  The sys_pn_tbl is
+       66*            locked and unlocked around each entry while looking for an ibly
+       67*            cause other transactions to timeout on the lock.
+       68*04/30/85 by Matthew C. Pierret:  Changed to salvage sys_pn_tbl if it is full,
+       69*            looking for an entry which describes a file which does not exist
+       70*            and is not in the process of being deleted.
+       71**/
+       72 
+       73 /* format: style2,ind3 */
+       74 
+       75 fm_sys_pn_tbl_insert:
+       76    proc (p_file_uid, p_file_path_name, p_component_0_seg_ptr, p_sys_pn_tbl_idx);
+       77 
+       78 /* START OF DECLARATIONS */
+       79 /* Parameter */
+       80 
+       81       dcl	    p_file_uid	       bit (36) aligned;	/*unique id of the file*/
+       82       dcl	    p_file_path_name       char (*);		/*full pathname of the file*/
+       83       dcl	    p_component_0_seg_ptr  ptr;		/*pointer to the first component of the file MSF*/
+       84       dcl	    p_sys_pn_tbl_idx       fixed bin;		/*new index into sys_pn_tbl, meant to be stored in file_access_info.pn_tbl_idx */
+       85 
+       86 /* Automatic */
+       87 
+       88       dcl	    code		       fixed bin (35) init (0);
+       89       dcl	    component_0_seg_ptr    ptr init (null);
+       90       dcl	    component_0_seg_uid    bit (36) aligned init (""b);
+       91       dcl	    file_path_name	       char (168);
+       92       dcl	    file_uid	       bit (36) aligned init (""b);
+       93       dcl	    lock_code	       fixed bin (35) init (LOCK_OP_NOT_COMPLETE);
+       94       dcl	    lock_state	       fixed bin init (LOCK_ATTEMPTED);
+       95       dcl	    sys_idx	       fixed bin init (-1);
+       96       dcl	    sys_pn_tbl_idx	       fixed bin init (-1);
+       97       dcl	    unlock_code	       fixed bin (35) init (LOCK_OP_NOT_COMPLETE);
+       98 
+       99 /* Based */
+      100 /* Builtin */
+      101 
+      102       dcl	    (addr, hbound, lbound, length, min, null, substr, unspec)
+      103 			       builtin;
+      104 
+      105 /* Condition */
+      106 
+      107       dcl	    cleanup	       condition;
+      108 
+      109 /* Constant */
+      110 
+      111       dcl	    MYNAME	       init ("fm_sys_pn_tbl_insert") char (32) varying internal static options (constant);
+      112       dcl	    (
+      113 	    LOCK_WAIT_TIME	       init (1e9),
+      114 	    LOCK_DONT_WAIT	       init (0)
+      115 	    )		       fixed bin (71) internal static options (constant);
+      116       dcl	    (
+      117 	    LOCK_ATTEMPTED	       init (1),
+      118 	    UNLOCK_ATTEMPTED       init (0)
+      119 	    )		       fixed bin internal static options (constant);
+      120       dcl	    LOCK_OP_NOT_COMPLETE   init (-1) fixed bin (35) internal static options (constant);
+      121 
+      122 /* Entry */
+      123 
+      124       dcl	    cu_$arg_list_ptr       entry (ptr);
+      125       dcl	    cu_$arg_ptr_rel	       entry (fixed bin, ptr, fixed bin (21), fixed bin (35), ptr);
+      126       dcl	    dm_misc_util_$log      entry options (variable);
+      127       dcl	    expand_pathname_       entry (char (*), char (*), char (*), fixed bin (35));
+      128       dcl	    fm_error_util_$signal  entry options (variable);
+      129       dcl	    fm_validate_$fm_validate_
+      130 			       entry (char (*), char (*), fixed bin (35));
+      131       dcl	    hcs_$force_write       entry (ptr, bit (36), fixed bin (35));
+      132       dcl	    hcs_$get_uid_seg       entry (ptr, bit (36) aligned, fixed bin (35));
+      133       dcl	    ioa_$general_rs	       entry (ptr, fixed bin, fixed bin, char (*), fixed bin (21), bit (1) aligned,
+      134 			       bit (1) aligned);
+      135       dcl	    lock_manager_$lock     entry (bit (36) aligned, fixed bin (27), fixed bin, fixed bin (71), fixed bin,
+      136 			       fixed bin (35));
+      137       dcl	    lock_manager_$lock_fast
+      138 			       entry (ptr, fixed bin (71), fixed bin (35));
+      139       dcl	    lock_manager_$unlock_fast
+      140 			       entry (ptr, fixed bin (35));
+      141 
+      142 /* External */
+      143 
+      144       dcl	    dm_error_$fast_lock_invalid_reset
+      145 			       fixed bin (35) ext;
+      146       dcl	    dm_error_$file_duplication
+      147 			       fixed bin (35) ext;
+      148       dcl	    dm_error_$fm_sys_pn_tbl_full
+      149 			       fixed bin (35) ext;
+      150       dcl	    error_table_$noentry   fixed bin (35) ext;
+      151 
+      152 /* END OF DECLARATIONS */
+      153 
+      154       p_sys_pn_tbl_idx = -1;
+      155 
+      156       code = 0;
+      157       component_0_seg_ptr = p_component_0_seg_ptr;
+      158       file_uid = p_file_uid;
+      159       file_path_name = p_file_path_name;
+      160 
+      161       call hcs_$get_uid_seg (component_0_seg_ptr, component_0_seg_uid, code);
+      162       if code ^= 0
+      163       then call ERROR_RETURN (code, "  Trying to get the Multics file system uid of ^a>0 (^p).", file_path_name,
+      164 	      component_0_seg_ptr);
+      165 
+      166       on cleanup call FINISH ();
+      167 
+      168       call LOCK (lock_state, lock_code);
+      169 
+      170       sys_pn_tbl_idx = -1;
+      171       sys_idx = lbound (sys_pn_tbl.e, 1) - 1;
+      172 
+      173 FIND_ENTRY_LOOP:
+      174       do while (sys_pn_tbl_idx = -1);
+      175 
+      176          do sys_idx = sys_idx + 1 to sys_pn_tbl.h.last_entry
+      177 	    while (sys_pn_tbl.e (sys_idx).file_uid ^= file_uid | sys_pn_tbl.e (sys_idx).in_use = SPT_ENTRY_NOT_IN_USE);
+      178 						/* This loop stops when it */
+      179 						/* finds matching uids in  */
+      180 						/* an entry currently used */
+      181          end;
+      182 
+      183          if sys_idx <= sys_pn_tbl.h.last_entry
+      184          then
+      185 VERIFY_EXISTING_ENTRY:
+      186 	  do;
+      187 	     if sys_pn_tbl.e (sys_idx).file_system_uid = component_0_seg_uid
+      188 	     then sys_pn_tbl_idx = sys_idx;
+      189 	     else call LOG (dm_error_$file_duplication,
+      190 		     "The new one is ^a.  The one already known in entry ^d is ^a.^/The new one will be put in another entry.",
+      191 		     file_path_name, sys_idx, sys_pn_tbl.paths (sys_idx));
+      192 	  end VERIFY_EXISTING_ENTRY;
+      193          else
+      194 INSERT_NEW_ENTRY:
+      195 	  do;
+      196 	     do sys_idx = lbound (sys_pn_tbl.e, 1) to sys_pn_tbl.h.last_entry
+      197 		while (sys_pn_tbl.e (sys_idx).in_use ^= SPT_ENTRY_NOT_IN_USE);
+      198 	     end;
+      199 
+      200 	     if sys_idx > sys_pn_tbl.h.last_entry & sys_pn_tbl.h.last_entry = hbound (sys_pn_tbl.e, 1)
+      201 	     then call SALVAGE_TABLE (sys_idx, lock_state, lock_code, unlock_code);
+      202 
+      203 	     if sys_idx > sys_pn_tbl.h.last_entry
+      204 	     then sys_pn_tbl.h.last_entry = sys_idx;
+      205 
+      206 	     unspec (sys_pn_tbl.e (sys_idx)) = ""b;
+      207 	     unspec (sys_pn_tbl.paths (sys_idx)) = ""b;
+      208 
+      209 	     sys_pn_tbl.paths (sys_idx) = file_path_name;
+      210 	     sys_pn_tbl.e (sys_idx).file_uid = file_uid;
+      211 	     sys_pn_tbl.e (sys_idx).file_system_uid = component_0_seg_uid;
+      212 	     sys_pn_tbl.e (sys_idx).in_use = SPT_ENTRY_IN_USE;
+      213 	     sys_pn_tbl_idx = sys_idx;
+      214 	  end INSERT_NEW_ENTRY;
+      215       end FIND_ENTRY_LOOP;
+      216 
+      217       sys_pn_tbl.e (sys_pn_tbl_idx).open_count = sys_pn_tbl.e (sys_pn_tbl_idx).open_count + 1;
+      218 
+      219       if sys_pn_tbl.e (sys_pn_tbl_idx).open_count = 1
+      220       then
+      221          do;
+      222 	  call hcs_$force_write (fm_data_$sys_pn_tbl_ptr, ""b, code);
+      223 	  if code ^= 0
+      224 	  then call ERROR_RETURN (code, "  Unable to force-write ^a (^p) after inserting file ^a in entry ^d.",
+      225 		  fm_data_$sys_pn_tbl_name, fm_data_$sys_pn_tbl_ptr, file_path_name, sys_pn_tbl_idx);
+      226          end;
+      227 
+      228       p_sys_pn_tbl_idx = sys_pn_tbl_idx;
+      229 
+      230       call UNLOCK (lock_state, unlock_code);
+      231 
+      232       return;
+      233 
+      234 ERROR_RETURN:
+      235    proc options (variable);
+      236 
+      237 
+      238       dcl	    er_arg_list_ptr	       ptr;
+      239       dcl	    er_code	       fixed bin (35) based (er_code_ptr);
+      240       dcl	    er_code_ptr	       ptr;
+      241       dcl	    er_code_len	       fixed bin (21);
+      242 
+      243       call cu_$arg_list_ptr (er_arg_list_ptr);
+      244       call cu_$arg_ptr_rel (1, er_code_ptr, er_code_len, (0), er_arg_list_ptr);
+      245       call fm_error_util_$signal (er_code, MYNAME, FM_ACTION_CANT_RESTART | FM_ACTION_LOG, LOG_SV,
+      246 	 MAKE_MESSAGE (er_arg_list_ptr));
+      247 
+      248 /* fm_error_util_$signal never returns, however FINISH will be invoked when
+      249*   the stack is unwound. */
+      250 
+      251    end ERROR_RETURN;
+      252 
+      253 LOG:
+      254    proc options (variable);
+      255 
+      256       dcl	    l_arg_list_ptr	       ptr;
+      257       dcl	    l_code	       fixed bin (35) based (l_code_ptr);
+      258       dcl	    l_code_ptr	       ptr;
+      259       dcl	    l_code_len	       fixed bin (21);
+      260 
+      261       call cu_$arg_list_ptr (l_arg_list_ptr);
+      262       call cu_$arg_ptr_rel (1, l_code_ptr, l_code_len, (0), l_arg_list_ptr);
+      263       call dm_misc_util_$log (LOG_SV, l_code, MYNAME, MAKE_MESSAGE (l_arg_list_ptr));
+      264 
+      265       return;
+      266 
+      267    end LOG;
+      268 
+      269 MAKE_MESSAGE:
+      270    proc (mm_p_arg_list_ptr) returns (char (*));
+      271 
+      272       dcl	    mm_p_arg_list_ptr      ptr;
+      273       dcl	    mm_message_len	       fixed bin (21);
+      274       dcl	    mm_message_buffer      char (1024);
+      275       dcl	    (DONT_PAD, NO_NEW_LINE)
+      276 			       init ("0"b) bit (1) aligned;
+      277 
+      278       call ioa_$general_rs (mm_p_arg_list_ptr, 2, 3, mm_message_buffer, mm_message_len, DONT_PAD, NO_NEW_LINE);
+      279 
+      280       return (substr (mm_message_buffer, 1, min (length (mm_message_buffer), mm_message_len)));
+      281 
+      282    end MAKE_MESSAGE;
+      283 
+      284 
+      285 FINISH:
+      286    proc ();
+      287 
+      288       if (lock_state = LOCK_ATTEMPTED & (lock_code = 0 | lock_code = dm_error_$fast_lock_invalid_reset))
+      289 	 | (lock_state = UNLOCK_ATTEMPTED & unlock_code = -1)
+      290       then call UNLOCK (lock_state, unlock_code);
+      291 
+      292    end FINISH;
+      293 
+      294 LOCK:
+      295    proc (lk_p_lock_state, lk_p_lock_code);
+      296 
+      297 /* This routine locks the SPT.  Following a protocol used to always be
+      298*   able to determine if the SPT is locked, it:
+      299*     1) sets lk_p_lock_code to LOCK_OP_NOT_COMPLETE (-1)
+      300*     2) sets lk_p_lock_state to LOCK_ATTEMPTED
+      301*     3) calls lock_manager_$lock_fast with lk_p_lock_code as
+      302*        the error code.
+      303*   The parameters correspond with the global variables lock_code and
+      304*   lock_state. This protocol (and a simlar one for unlocking) means 
+      305*   that if lock_state is equal to LOCK_ATTEMPTED and lock_code is equal
+      306*   to either 0 or dm_error_$fast_lock_invalid_reset, we have the lock. */
+      307 
+      308       dcl	    lk_p_lock_state	       fixed bin parameter;
+      309       dcl	    lk_p_lock_code	       fixed bin (35) parameter;
+      310 
+      311       lk_p_lock_code = LOCK_OP_NOT_COMPLETE;
+      312       lk_p_lock_state = LOCK_ATTEMPTED;
+      313       call lock_manager_$lock_fast (addr (sys_pn_tbl.h.lock), LOCK_WAIT_TIME, lk_p_lock_code);
+      314       if lk_p_lock_code ^= 0 & lk_p_lock_code ^= dm_error_$fast_lock_invalid_reset
+      315       then call ERROR_RETURN (lk_p_lock_code, " Unable to lock ^a.", fm_data_$sys_pn_tbl_name);
+      316       else return;
+      317 
+      318    end LOCK;
+
+
+
+
+      319 
+      320 UNLOCK:
+      321    proc (u_p_lock_state, u_p_unlock_code);
+      322 
+      323 /* This routine unlocks the SPT.  Following a protocol used to always be
+      324*   able to determine if the SPT is locked, it:
+      325*     1) sets u_p_unlock_code to LOCK_OP_NOT_COMPLETE (-1)
+      326*     2) sets u_p_lock_state to UNLOCK_ATTEMPTED
+      327*     3) calls lock_manager_$unlock_fast with u_p_unlock_code as
+      328*        the error code.
+      329*   The parameters correspond with the global variables unlock_code and
+      330*   lock_state. This protocol (and a simlar one for locking) means 
+      331*   that if lock_state is equal to UNLOCK_ATTEMPTED and unlock_code is equal
+      332*   to 0, we've unlocked the lock. */
+      333 
+      334       dcl	    u_p_lock_state	       fixed bin parameter;
+      335       dcl	    u_p_unlock_code	       fixed bin (35) parameter;
+      336 
+      337       u_p_unlock_code = LOCK_OP_NOT_COMPLETE;
+      338       u_p_lock_state = UNLOCK_ATTEMPTED;
+      339       call lock_manager_$unlock_fast (addr (sys_pn_tbl.h.lock), u_p_unlock_code);
+      340       if u_p_unlock_code ^= 0
+      341       then call ERROR_RETURN (u_p_unlock_code, " Unable to unlock ^a.", fm_data_$sys_pn_tbl_name);
+      342       else return;
+      343 
+      344    end UNLOCK;
+      345 
+      346 SALVAGE_TABLE:
+      347    proc (st_p_sys_idx, st_p_lock_state, st_p_lock_code, st_p_unlock_code);
+      348 
+      349 /* SALVAGE_TABLE walks through sys_pn_tbl verifying that each entry describes
+      350*   a file which exists or one which is in the process of being deleted.  If
+      351*   an entry fails verification, i.e., the file does not exist and no other
+      352*   transaction has the file locked, the entry is claimed for use by this
+      353*   transaction.  As SALVAGE_TABLE is called only when sys_pn_tbl is full,
+      354*   if no salvagable entry is found, the table is really full. 
+      355*
+      356*   So as not to hold the sys_pn_tbl lock for too long, after looking at each
+      357*   entry it is unlocked and locked again between entries. */
+      358 
+      359       dcl	    (
+      360 	    st_p_sys_idx	       fixed bin,
+      361 	    st_p_lock_state	       fixed bin,
+      362 	    st_p_lock_code	       fixed bin (35),
+      363 	    st_p_unlock_code       fixed bin (35)
+      364 	    )		       parameter;
+      365 
+      366       dcl	    st_sys_idx	       fixed bin;
+      367 
+      368       call LOG (dm_error_$fm_sys_pn_tbl_full, "Beginning salvage of ^a.", fm_data_$sys_pn_tbl_name);
+      369 
+      370       st_p_sys_idx = -1;
+      371       st_sys_idx = lbound (sys_pn_tbl.e, 1);
+      372 
+      373       call VALIDATE_ENTRY (st_sys_idx, st_p_lock_state, st_p_lock_code, st_p_unlock_code, st_p_sys_idx);
+      374 
+      375       do st_sys_idx = st_sys_idx + 1 to sys_pn_tbl.h.last_entry while (st_p_sys_idx = -1);
+      376          call UNLOCK (st_p_lock_state, st_p_unlock_code);
+      377          call LOCK (st_p_lock_state, st_p_lock_code);
+      378          call VALIDATE_ENTRY (st_sys_idx, st_p_lock_state, st_p_lock_code, st_p_unlock_code, st_p_sys_idx);
+      379       end;
+      380 
+      381       if st_p_sys_idx = -1
+      382       then
+      383          do;
+      384 	  call UNLOCK (st_p_lock_state, st_p_unlock_code);
+      385 	  call ERROR_RETURN (dm_error_$fm_sys_pn_tbl_full, "  No salvagable entries were found.");
+      386          end;
+      387       else return;
+      388 
+      389    end SALVAGE_TABLE;
+      390 
+      391 VALIDATE_ENTRY:
+      392    proc (ve_p_sys_idx, ve_p_lock_state, ve_p_lock_code, ve_p_unlock_code, ve_p_invalid_entry_idx);
+      393 
+      394 /* VALIDATE_ENTRY checks an entry in sys_pn_tbl to see if it contains an 
+      395*   active file, one that either exists or is in the process of being deleted.
+      396*   The validation is as follows:
+      397*     1) If the pathname is invalid, the entry is invalid.
+      398*     2) If the file exists, the entry is valid.
+      399*     3) If the file does not exist, attempt to lock the file.
+      400*        3.1) If the file is locked by another transaction, assume that
+      401*             that transaction is in the process of deleting it, so
+      402*             the entry is valid.
+      403*        3.2) If the file is not locked, then no transaction is in the
+      404*             process of deleting it, so the entry is invalid.  
+      405*   An entry is indicated as valid by setting ve_p_invalid_entry_idx to -1,
+      406*   as invalid by setting ve_p_invalid_entry_idx to ve_p_sys_idx.
+      407**/
+      408 
+      409       dcl	    (
+      410 	    ve_p_sys_idx	       fixed bin,
+      411 	    ve_p_lock_state	       fixed bin,
+      412 	    ve_p_lock_code	       fixed bin (35),
+      413 	    ve_p_unlock_code       fixed bin (35),
+      414 	    ve_p_invalid_entry_idx fixed bin
+      415 	    )		       parameter;
+      416       dcl	    ve_code	       fixed bin (35) init (0);
+      417       dcl	    ve_dir	       char (168);
+      418       dcl	    ve_file	       char (32);
+      419 
+      420       call expand_pathname_ ((sys_pn_tbl.paths (ve_p_sys_idx)), ve_dir, ve_file, ve_code);
+      421       if ve_code ^= 0
+      422       then
+      423          do;
+      424 	  ve_p_invalid_entry_idx = ve_p_sys_idx;
+      425 	  call LOG (0, "Salvaged ^a entry ^d with file ^a. The path is invalid.", fm_data_$sys_pn_tbl_name,
+      426 	       ve_p_invalid_entry_idx, sys_pn_tbl.paths (ve_p_invalid_entry_idx));
+      427          end;
+      428       else
+      429          do;
+      430 	  call fm_validate_$fm_validate_ (ve_dir, ve_file, ve_code);
+      431 	  if ve_code ^= error_table_$noentry
+      432 	  then ve_p_invalid_entry_idx = -1;
+      433 	  else
+      434 	     do;
+      435 	        call lock_manager_$lock (sys_pn_tbl.e (ve_p_sys_idx).file_uid, LOCK_ENTIRE_FILE, LOCK_MODE_X,
+      436 		   LOCK_DONT_WAIT, (0), ve_code);
+      437 	        if ve_code = 0
+      438 	        then
+      439 		 do;
+      440 		    ve_p_invalid_entry_idx = ve_p_sys_idx;
+      441 		    call LOG (0, "Salvaged ^a entry ^d with file ^a. The file does not exist.",
+      442 		         fm_data_$sys_pn_tbl_name, ve_p_invalid_entry_idx, sys_pn_tbl.paths (ve_p_invalid_entry_idx));
+      443 		 end;
+      444 	        else ve_p_invalid_entry_idx = -1;
+      445 	     end;
+      446          end;
+      447    end VALIDATE_ENTRY;
+      448 
+  1     1 /*  BEGIN INCLUDE FILE dm_fm_sys_pn_tbl.incl.pl1 */
+  1     2 
+  1     3 /* DESCRIPTION:
+  1     4*        This include file contains the sys_pn_tbl structure, the 
+  1     5*   file_manager_'s System Pathname Table.  Each file which can possibly
+  1     6*   have a before image current must have an entry in this table. Every
+  1     7*   time this table is modified it is force-written to disk, as its
+  1     8*   correct contents are necessary for rolling back transactions by a
+  1     9*   process other than the process which originally owned the transaction.
+  1    10*   When an entry is inserted, it is force-written twice: the first time with
+  1    11*   the entry filled in but with the "in_use" element set to indicate that the 
+  1    12*   entry is not yet in use; the second time with the "in_use" element set
+  1    13*   to indicate that the entry is in use.  This is done to avoid the possibility
+  1    14*   of a failure while the entry is being written which could successfully
+  1    15*   write the "in_use" but not all of the rest of the entry. "in_use" can have
+  1    16*   one of three values: 0 - not in use; -1 - in use ; +1 - in use but the
+  1    17*   file has been deleted. 
+  1    18**/
+  1    19 
+  1    20 /* HISTORY:
+  1    21*Written by Jeffrey D. Ives, 10/11/82.
+  1    22*  (Design by Andre Bensoussan and Jeffrey Ives.)
+  1    23*Modified:
+  1    24*10/30/84 by Matthew Pierret:  Added DESCRIPTION and HISTORY sections,
+  1    25*            *_IN_USE constants. Changed thread to in_use, pfuid to file_uid,
+  1    26*            fsuid to file_system_uid.
+  1    27**/
+  1    28 
+  1    29 /* format: style2,ind3 */
+  1    30 
+  1    31      dcl	   fm_data_$sys_pn_tbl_name
+  1    32 			      char (32) ext;
+  1    33      dcl	   fm_data_$sys_pn_tbl_ptr
+  1    34 			      ptr ext;
+  1    35 
+  1    36      dcl	   1 sys_pn_tbl	      aligned based (fm_data_$sys_pn_tbl_ptr),
+  1    37 	     2 h,
+  1    38 	       3 version	      bit (36),
+  1    39 	       3 last_entry	      fixed bin,
+  1    40 	       3 lock	      fixed bin (71),
+  1    41 	       3 mbz	      (30) fixed bin (71),
+  1    42 	     2 e		      (4096),
+  1    43 	       3 in_use	      fixed bin,
+  1    44 	       3 open_count	      fixed bin,
+  1    45 	       3 file_uid	      bit (36),
+  1    46 	       3 file_system_uid  bit (36),
+  1    47 	     2 paths	      (4096) char (168) unal;
+  1    48 
+  1    49      dcl	   SYS_PN_TBL_VERSION_1   bit (36) aligned static options (constant) init ("162363353101"b3);
+  1    50 
+  1    51      dcl	   (
+  1    52 	   SPT_ENTRY_IN_USE	      init (-1),
+  1    53 	   SPT_ENTRY_IN_USE_BUT_DELETED
+  1    54 			      init (1),
+  1    55 	   SPT_ENTRY_NOT_IN_USE   init (0)
+  1    56 	   )		      fixed bin internal static options (constant);
+  1    57 
+  1    58 /* END INCLUDE FILE dm_fm_sys_pn_tbl.incl.pl1 */
+      449 
+      450 
+  2     1 /* ******* BEGIN INCLUDE FILE dm_fm_sub_error_flags.incl.pl1 ******** */
+  2     2 
+  2     3 /* format: style2,ind3 */
+  2     4 
+  2     5 /* HISTORY:
+  2     6*Written by Matthew Pierret, 07/02/83.
+  2     7*Modified:
+  2     8**/
+  2     9 
+  2    10      dcl	   1 fm_error_flags	      aligned based,
+  2    11 	     2 action	      unal,
+  2    12 	       3 cant_restart     bit (1) unal,
+  2    13 	       3 default_restart  bit (1) unal,
+  2    14 	       3 quiet_restart    bit (1) unal,
+  2    15 	       3 support_signal   bit (1) unal,
+  2    16 	       3 mbz_1	      bit (14) unal,
+  2    17 	     2 log                unal,
+  2    18 	       3 system	      bit (1) unal,
+  2    19 	       3 mbz_2	      bit (1) unal,
+  2    20 	     2 mbz_3	      bit (16) unal;
+  2    21 
+  2    22      dcl	   (
+  2    23 	   FM_ACTION_CANT_RESTART init ("1000"b || (32)"0"b),
+  2    24 	   FM_ACTION_CAN_RESTART  init ("0000"b || (32)"0"b),
+  2    25 	   FM_ACTION_DEFAULT_RESTART
+  2    26 			      init ("0100"b || (32)"0"b),
+  2    27 	   FM_ACTION_QUIET_RESTART
+  2    28 			      init ("0010"b || (32)"0"b),
+  2    29 	   FM_ACTION_LOG	      init ((18)"0"b || "10"b || (16)"0"b)
+  2    30 	   )		      bit (36) aligned internal static options (constant);
+  2    31 
+  2    32 /* ********* END INCLUDE FILE dm_fm_sub_error_flags.incl.pl1 ******** */
+      451 
+      452 
+  3     1 /*  START OF:	dm_lock_modes.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+  3     2 
+  3     3 /* DESCRIPTION:
+  3     4*
+  3     5*     Hierarchical lock modes for Data Management control interval locking.  In
+  3     6*addition to conventional read and write locks, intention locks are provided
+  3     7*for finer locking granularity.
+  3     8**/
+  3     9 
+  3    10 /* HISTORY:
+  3    11*Written by Jeffrey D. Ives, 04/30/82.
+  3    12*Modified:
+  3    13*12/05/84 by Stanford S. Cox: Added Description.
+  3    14**/
+  3    15 /* format: style3,idind25 */
+  3    16 
+  3    17      dcl	   LOCK_MODE_S	      fixed bin static options (constant) init (2);
+  3    18      dcl	   LOCK_MODE_X	      fixed bin static options (constant) init (3);
+  3    19      dcl	   LOCK_MODE_IS	      fixed bin static options (constant) init (4);
+  3    20      dcl	   LOCK_MODE_IX	      fixed bin static options (constant) init (5);
+  3    21      dcl	   LOCK_MODE_SIX	      fixed bin static options (constant) init (6);
+  3    22 
+  3    23      dcl	   LOCK_ENTIRE_FILE	      fixed bin (27) static options (constant) init (-1);
+  3    24 
+  3    25      dcl	   LOCK_MODE_NAMES (2:6)  char (3) int static options (constant)
+  3    26 			      init ("  S", "  X", " IS", " IX", "SIX");
+  3    27 
+  3    28 /*
+  3    29*     S       Share                           Let others read it but not modify it.
+  3    30*     X	   Exclusive		     Let nobody else read or modify it.
+  3    31*     IS	   Intention Share		     I am only using S locks, because I am only reading CIs.
+  3    32*     IX	   Intention Exclusive	     I am using S and X locks, because I am reading and modifying CIs.
+  3    33*     SIX	   Share with Intention Exclusive  I am reading control intervals, but only locking the ones I modify.
+  3    34**/
+  3    35 
+  3    36 /*  END OF:	dm_lock_modes.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+      453 
+      454 
+  4     1 /* BEGIN INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+  4     2 
+  4     3 /* format: ^indcom */
+  4     4 
+  4     5 /* DESCRIPTION:
+  4     6*   These are the severity codes used by the dms daemon when calling its logger.
+  4     7*   The severity is ranked thusly:
+  4     8*
+  4     9*   severity log write situation
+  4    10*   -------- --- ----- ---------
+  4    11*          0 no  yes   standard output, query, etc.
+  4    12*          1 yes yes   fatal error, terminate dms daemon.
+  4    13*          2 yes yes   nonfatal error.
+  4    14*          3 yes yes   informative message.
+  4    15*          4 yes no    log information only.
+  4    16**/
+  4    17 
+  4    18 /* HISTORY:
+  4    19*
+  4    20*Written by M. Pandolf, 10/06/82.
+  4    21*Modified:
+  4    22*12/10/84 by R. Michael Tague: Rename and reformat description/history.
+  4    23*01/13/85 by Lee A. Newcomb:  Renamed to dm_log_sv_codes from
+  4    24*            dm_daemon_sv_codes as the severity codes for the DM log are not
+  4    25*            restrained to the DM Daemon's use.
+  4    26*01/24/85 by Lee A. Newcomb:  Fixed to say dm_log_sv_codes.incl.pl1 in the
+  4    27*            BEGIN and END INCLUDE comments, instead of dm_daemon_sv_codes.==.
+  4    28**/
+  4    29 
+  4    30 /* format: style5 */
+  4    31 
+  4    32      dcl	   (PRINT_SV, QUERY_SV)    fixed bin internal static
+  4    33 			       options (constant) init (0);
+  4    34      dcl	   (CRASH_SV, FATAL_SV)    fixed bin internal static
+  4    35 			       options (constant) init (1);
+  4    36      dcl	   ERROR_SV	       fixed bin internal static
+  4    37 			       options (constant) init (2);
+  4    38      dcl	   INFORM_SV	       fixed bin internal static
+  4    39 			       options (constant) init (3);
+  4    40      dcl	   LOG_SV		       fixed bin internal static
+  4    41 			       options (constant) init (4);
+  4    42 
+  4    43 /* END INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+      455 
+      456 
+      457    end fm_sys_pn_tbl_insert;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/17/00  1934.2  fm_sys_pn_tbl_insert.pl1          >udd>sm>ds>w>ml>fm_sys_pn_tbl_insert.pl1
+449          1    01/07/85  1000.8  dm_fm_sys_pn_tbl.incl.pl1         >ldd>incl>dm_fm_sys_pn_tbl.incl.pl1
+451          2    01/07/85  0958.8  dm_fm_sub_error_flags.incl.pl1    >ldd>incl>dm_fm_sub_error_flags.incl.pl1
+453          3    01/07/85  1001.4  dm_lock_modes.incl.pl1            >ldd>incl>dm_lock_modes.incl.pl1
+455          4    03/06/85  1131.1  dm_log_sv_codes.incl.pl1          >ldd>incl>dm_log_sv_codes.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+DONT_PAD                        000501 automatic       bit(1)                   initial dcl 275 set ref 275* 278*
+FM_ACTION_CANT_RESTART                 constant        bit(36)                  initial dcl 2-22 ref 245
+FM_ACTION_LOG                          constant        bit(36)                  initial dcl 2-22 ref 245
+LOCK_ATTEMPTED                         constant        fixed bin(17,0)          initial dcl 116 ref 94 288 312
+LOCK_DONT_WAIT                  000000 constant        fixed bin(71,0)          initial dcl 112 set ref 435*
+LOCK_ENTIRE_FILE                000040 constant        fixed bin(27,0)          initial dcl 3-23 set ref 435*
+LOCK_MODE_X                     000043 constant        fixed bin(17,0)          initial dcl 3-18 set ref 435*
+LOCK_OP_NOT_COMPLETE                   constant        fixed bin(35,0)          initial dcl 120 ref 93 97 311 337
+LOCK_WAIT_TIME                  000002 constant        fixed bin(71,0)          initial dcl 112 set ref 313*
+LOG_SV                          000041 constant        fixed bin(17,0)          initial dcl 4-40 set ref 245* 263*
+MYNAME                          000004 constant        varying char(32)         initial dcl 111 set ref 245* 263*
+NO_NEW_LINE                     000502 automatic       bit(1)                   initial dcl 275 set ref 275* 278*
+SPT_ENTRY_IN_USE                       constant        fixed bin(17,0)          initial dcl 1-51 ref 212
+SPT_ENTRY_NOT_IN_USE                   constant        fixed bin(17,0)          initial dcl 1-51 ref 176 196
+UNLOCK_ATTEMPTED                       constant        fixed bin(17,0)          initial dcl 116 ref 288 338
+addr                                                   builtin function         dcl 102 ref 313 313 339 339
+cleanup                         000166 stack reference condition                dcl 107 ref 166
+code                            000100 automatic       fixed bin(35,0)          initial dcl 88 set ref 88* 156* 161* 162 162* 222*
+                                                                                  223 223*
+component_0_seg_ptr             000102 automatic       pointer                  initial dcl 89 set ref 89* 157* 161* 162*
+component_0_seg_uid             000104 automatic       bit(36)                  initial dcl 90 set ref 90* 161* 187 211
+cu_$arg_list_ptr                000010 constant        entry                    external dcl 124 ref 243 261
+cu_$arg_ptr_rel                 000012 constant        entry                    external dcl 125 ref 244 262
+dm_error_$fast_lock_invalid_reset
+                                000040 external static fixed bin(35,0)          dcl 144 ref 288 314
+dm_error_$file_duplication      000042 external static fixed bin(35,0)          dcl 146 set ref 189*
+dm_error_$fm_sys_pn_tbl_full    000044 external static fixed bin(35,0)          dcl 148 set ref 368* 385*
+dm_misc_util_$log               000014 constant        entry                    external dcl 126 ref 263
+e                       100            based           structure                array level 2 dcl 1-36 set ref 171 196 200 206* 371
+er_arg_list_ptr                 000100 automatic       pointer                  dcl 238 set ref 243* 244* 245*
+er_code                                based           fixed bin(35,0)          dcl 239 set ref 245*
+er_code_len                     000104 automatic       fixed bin(21,0)          dcl 241 set ref 244*
+er_code_ptr                     000102 automatic       pointer                  dcl 240 set ref 244* 245
+error_table_$noentry            000046 external static fixed bin(35,0)          dcl 150 ref 431
+expand_pathname_                000016 constant        entry                    external dcl 127 ref 420
+file_path_name                  000105 automatic       char(168)                packed unaligned dcl 91 set ref 159* 162* 189* 209
+                                                                                  223*
+file_system_uid         103            based           bit(36)                  array level 3 dcl 1-36 set ref 187 211*
+file_uid                102            based           bit(36)                  array level 3 in structure "sys_pn_tbl" dcl 1-36
+                                                                                  in procedure "fm_sys_pn_tbl_insert" set ref 176
+                                                                                  210* 435*
+file_uid                        000157 automatic       bit(36)                  initial dcl 92 in procedure "fm_sys_pn_tbl_insert"
+                                                                                  set ref 92* 158* 176 210
+fm_data_$sys_pn_tbl_name        000050 external static char(32)                 packed unaligned dcl 1-31 set ref 223* 314* 340*
+                                                                                  368* 425* 441*
+fm_data_$sys_pn_tbl_ptr         000052 external static pointer                  dcl 1-33 set ref 171 176 176 176 183 187 189 196 196
+                                                                                  196 200 200 200 203 203 206 207 209 210 211 212
+                                                                                  217 217 219 222* 223* 313 313 339 339 371 375 420
+                                                                                  425 435 441
+fm_error_util_$signal           000020 constant        entry                    external dcl 128 ref 245
+fm_validate_$fm_validate_       000022 constant        entry                    external dcl 129 ref 430
+h                                      based           structure                level 2 dcl 1-36
+hbound                                                 builtin function         dcl 102 ref 200
+hcs_$force_write                000024 constant        entry                    external dcl 131 ref 222
+hcs_$get_uid_seg                000026 constant        entry                    external dcl 132 ref 161
+in_use                  100            based           fixed bin(17,0)          array level 3 dcl 1-36 set ref 176 196 212*
+ioa_$general_rs                 000030 constant        entry                    external dcl 133 ref 278
+l_arg_list_ptr                  000100 automatic       pointer                  dcl 256 set ref 261* 262* 263*
+l_code                                 based           fixed bin(35,0)          dcl 257 set ref 263*
+l_code_len                      000104 automatic       fixed bin(21,0)          dcl 259 set ref 262*
+l_code_ptr                      000102 automatic       pointer                  dcl 258 set ref 262* 263
+last_entry                1            based           fixed bin(17,0)          level 3 dcl 1-36 set ref 176 183 196 200 200 203
+                                                                                  203* 375
+lbound                                                 builtin function         dcl 102 ref 171 196 371
+length                                                 builtin function         dcl 102 ref 280
+lk_p_lock_code                         parameter       fixed bin(35,0)          dcl 309 set ref 294 311* 313* 314 314 314*
+lk_p_lock_state                        parameter       fixed bin(17,0)          dcl 308 set ref 294 312*
+lock                      2            based           fixed bin(71,0)          level 3 dcl 1-36 set ref 313 313 339 339
+lock_code                       000160 automatic       fixed bin(35,0)          initial dcl 93 set ref 93* 168* 200* 288 288
+lock_manager_$lock              000032 constant        entry                    external dcl 135 ref 435
+lock_manager_$lock_fast         000034 constant        entry                    external dcl 137 ref 313
+lock_manager_$unlock_fast       000036 constant        entry                    external dcl 139 ref 339
+lock_state                      000161 automatic       fixed bin(17,0)          initial dcl 94 set ref 94* 168* 200* 230* 288 288
+                                                                                  288*
+min                                                    builtin function         dcl 102 ref 280
+mm_message_buffer               000101 automatic       char(1024)               packed unaligned dcl 274 set ref 278* 280 280
+mm_message_len                  000100 automatic       fixed bin(21,0)          dcl 273 set ref 278* 280
+mm_p_arg_list_ptr                      parameter       pointer                  dcl 272 set ref 269 278*
+null                                                   builtin function         dcl 102 ref 89
+open_count              101            based           fixed bin(17,0)          array level 3 dcl 1-36 set ref 217* 217 219
+p_component_0_seg_ptr                  parameter       pointer                  dcl 83 ref 75 157
+p_file_path_name                       parameter       char                     packed unaligned dcl 82 ref 75 159
+p_file_uid                             parameter       bit(36)                  dcl 81 ref 75 158
+p_sys_pn_tbl_idx                       parameter       fixed bin(17,0)          dcl 84 set ref 75 154* 228*
+paths                 40100            based           char(168)                array level 2 packed packed unaligned dcl 1-36 set
+                                                                                  ref 189* 207* 209* 420 425* 441*
+st_p_lock_code                         parameter       fixed bin(35,0)          dcl 359 set ref 346 373* 377* 378*
+st_p_lock_state                        parameter       fixed bin(17,0)          dcl 359 set ref 346 373* 376* 377* 378* 384*
+st_p_sys_idx                           parameter       fixed bin(17,0)          dcl 359 set ref 346 370* 373* 375 378* 381
+st_p_unlock_code                       parameter       fixed bin(35,0)          dcl 359 set ref 346 373* 376* 378* 384*
+st_sys_idx                      000212 automatic       fixed bin(17,0)          dcl 366 set ref 371* 373* 375* 375* 378*
+substr                                                 builtin function         dcl 102 ref 280
+sys_idx                         000162 automatic       fixed bin(17,0)          initial dcl 95 set ref 95* 171* 176* 176 176 176*
+                                                                                  183 187 187 189* 189 196* 196* 200 200* 203 203
+                                                                                  206 207 209 210 211 212 213
+sys_pn_tbl                             based           structure                level 1 dcl 1-36
+sys_pn_tbl_idx                  000163 automatic       fixed bin(17,0)          initial dcl 96 set ref 96* 170* 173 187* 213* 217
+                                                                                  217 219 223* 228
+u_p_lock_state                         parameter       fixed bin(17,0)          dcl 334 set ref 320 338*
+u_p_unlock_code                        parameter       fixed bin(35,0)          dcl 335 set ref 320 337* 339* 340 340*
+unlock_code                     000164 automatic       fixed bin(35,0)          initial dcl 97 set ref 97* 200* 230* 288 288*
+unspec                                                 builtin function         dcl 102 set ref 206* 207*
+ve_code                         000222 automatic       fixed bin(35,0)          initial dcl 416 set ref 416* 420* 421 430* 431 435*
+                                                                                  437
+ve_dir                          000223 automatic       char(168)                packed unaligned dcl 417 set ref 420* 430*
+ve_file                         000275 automatic       char(32)                 packed unaligned dcl 418 set ref 420* 430*
+ve_p_invalid_entry_idx                 parameter       fixed bin(17,0)          dcl 409 set ref 391 424* 425* 425 431* 440* 441* 441
+                                                                                  444*
+ve_p_lock_code                         parameter       fixed bin(35,0)          dcl 409 ref 391
+ve_p_lock_state                        parameter       fixed bin(17,0)          dcl 409 ref 391
+ve_p_sys_idx                           parameter       fixed bin(17,0)          dcl 409 ref 391 420 424 435 440
+ve_p_unlock_code                       parameter       fixed bin(35,0)          dcl 409 ref 391
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+CRASH_SV                               internal static fixed bin(17,0)          initial dcl 4-34
+ERROR_SV                               internal static fixed bin(17,0)          initial dcl 4-36
+FATAL_SV                               internal static fixed bin(17,0)          initial dcl 4-34
+FM_ACTION_CAN_RESTART                  internal static bit(36)                  initial dcl 2-22
+FM_ACTION_DEFAULT_RESTART              internal static bit(36)                  initial dcl 2-22
+FM_ACTION_QUIET_RESTART                internal static bit(36)                  initial dcl 2-22
+INFORM_SV                              internal static fixed bin(17,0)          initial dcl 4-38
+LOCK_MODE_IS                           internal static fixed bin(17,0)          initial dcl 3-19
+LOCK_MODE_IX                           internal static fixed bin(17,0)          initial dcl 3-20
+LOCK_MODE_NAMES                        internal static char(3)                  initial array packed unaligned dcl 3-25
+LOCK_MODE_S                            internal static fixed bin(17,0)          initial dcl 3-17
+LOCK_MODE_SIX                          internal static fixed bin(17,0)          initial dcl 3-21
+PRINT_SV                               internal static fixed bin(17,0)          initial dcl 4-32
+QUERY_SV                               internal static fixed bin(17,0)          initial dcl 4-32
+SPT_ENTRY_IN_USE_BUT_DELETED           internal static fixed bin(17,0)          initial dcl 1-51
+SYS_PN_TBL_VERSION_1                   internal static bit(36)                  initial dcl 1-49
+fm_error_flags                         based           structure                level 1 dcl 2-10
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+ERROR_RETURN                    000704 constant        entry                    internal dcl 234 ref 162 223 314 340 385
+FIND_ENTRY_LOOP                 000400 constant        label                    dcl 173
+FINISH                          001205 constant        entry                    internal dcl 285 ref 166
+INSERT_NEW_ENTRY                000505 constant        label                    dcl 193
+LOCK                            001236 constant        entry                    internal dcl 294 ref 168 377
+LOG                             001015 constant        entry                    internal dcl 253 ref 189 368 425 441
+MAKE_MESSAGE                    001117 constant        entry                    internal dcl 269 ref 245 263
+SALVAGE_TABLE                   001405 constant        entry                    internal dcl 346 ref 200
+UNLOCK                          001324 constant        entry                    internal dcl 320 ref 230 288 376 384
+VALIDATE_ENTRY                  001574 constant        entry                    internal dcl 391 ref 373 378
+VERIFY_EXISTING_ENTRY           000437 constant        label                    dcl 183
+fm_sys_pn_tbl_insert            000242 constant        entry                    external dcl 75
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      2362        2436    2056        2372
+Length      2746    2056        54         274     303           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+fm_sys_pn_tbl_insert                441 external procedure  is an external procedure.  
+on unit on line 166                  78 on unit               
+ERROR_RETURN                        112 internal procedure  is declared options(variable).  
+LOG                                 108 internal procedure  is declared options(variable).  
+MAKE_MESSAGE                        356 internal procedure  uses returns(char(*)) or returns(bit(*)).  
+FINISH                                  internal procedure  shares stack frame of on unit on line 166.  
+LOCK                                    internal procedure  shares stack frame of external procedure fm_sys_pn_tbl_insert.  
+UNLOCK                               88 internal procedure  is called by several nonquick procedures.  
+SALVAGE_TABLE                           internal procedure  shares stack frame of external procedure fm_sys_pn_tbl_insert.  
+VALIDATE_ENTRY                          internal procedure  shares stack frame of external procedure fm_sys_pn_tbl_insert.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+ERROR_RETURN             000100 er_arg_list_ptr             ERROR_RETURN
+                         000102 er_code_ptr                 ERROR_RETURN
+                         000104 er_code_len                 ERROR_RETURN
+LOG                      000100 l_arg_list_ptr              LOG
+                         000102 l_code_ptr                  LOG
+                         000104 l_code_len                  LOG
+MAKE_MESSAGE             000100 mm_message_len              MAKE_MESSAGE
+                         000101 mm_message_buffer           MAKE_MESSAGE
+                         000501 DONT_PAD                    MAKE_MESSAGE
+                         000502 NO_NEW_LINE                 MAKE_MESSAGE
+fm_sys_pn_tbl_insert     000100 code                        fm_sys_pn_tbl_insert
+                         000102 component_0_seg_ptr         fm_sys_pn_tbl_insert
+                         000104 component_0_seg_uid         fm_sys_pn_tbl_insert
+                         000105 file_path_name              fm_sys_pn_tbl_insert
+                         000157 file_uid                    fm_sys_pn_tbl_insert
+                         000160 lock_code                   fm_sys_pn_tbl_insert
+                         000161 lock_state                  fm_sys_pn_tbl_insert
+                         000162 sys_idx                     fm_sys_pn_tbl_insert
+                         000163 sys_pn_tbl_idx              fm_sys_pn_tbl_insert
+                         000164 unlock_code                 fm_sys_pn_tbl_insert
+                         000212 st_sys_idx                  SALVAGE_TABLE
+                         000222 ve_code                     VALIDATE_ENTRY
+                         000223 ve_dir                      VALIDATE_ENTRY
+                         000275 ve_file                     VALIDATE_ENTRY
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+call_ext_out_desc   call_ext_out        call_int_this_desc  call_int_this       call_int_other_desc call_int_other
+return_mac          enable_op           shorten_stack       ext_entry_desc      int_entry           int_entry_desc
+return_chars_eis
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+cu_$arg_list_ptr              cu_$arg_ptr_rel               dm_misc_util_$log             expand_pathname_
+fm_error_util_$signal         fm_validate_$fm_validate_     hcs_$force_write              hcs_$get_uid_seg
+ioa_$general_rs               lock_manager_$lock            lock_manager_$lock_fast       lock_manager_$unlock_fast
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+dm_error_$fast_lock_invalid_reset                           dm_error_$file_duplication    dm_error_$fm_sys_pn_tbl_full
+error_table_$noentry          fm_data_$sys_pn_tbl_name      fm_data_$sys_pn_tbl_ptr
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     75 000235        88 000255        89 000256        90 000260        92 000261        93 000262        94 000264
+     95 000266        96 000270        97 000271       154 000273       156 000276       157 000277       158 000302
+    159 000304       161 000311       162 000323       166 000354       168 000372       170 000374       171 000376
+    173 000400       176 000403       181 000427       183 000431       187 000437       189 000447       192 000504
+    196 000505       198 000523       200 000525       203 000540       206 000547       207 000554       209 000564
+    210 000570       211 000572       212 000574       213 000576       215 000600       217 000601       219 000606
+    222 000611       223 000625       228 000667       230 000672       232 000702       234 000703       243 000711
+    244 000717       245 000741       251 001012       253 001014       261 001022       262 001030       263 001052
+    265 001114       269 001116       275 001124       278 001126       280 001171       285 001205       288 001206
+    292 001235       294 001236       311 001240       312 001242       313 001244       314 001264       316 001321
+    318 001322       320 001323       337 001331       338 001334       339 001336       340 001352       342 001403
+    344 001404       346 001405       368 001407       370 001433       371 001436       373 001440       375 001456
+    376 001473       377 001503       378 001514       379 001533       381 001535       384 001541       385 001551
+    386 001571       387 001572       389 001573       391 001574       416 001576       420 001577       421 001635
+    424 001637       425 001642       427 001703       430 001704       431 001725       435 001735       437 001763
+    440 001765       441 001770       443 002031       444 002032       447 002035
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

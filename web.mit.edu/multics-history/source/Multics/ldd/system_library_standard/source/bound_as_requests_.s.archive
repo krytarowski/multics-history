@@ -1,0 +1,1884 @@
+
+
+
+
+		    convert_dial_message_.pl1       08/05/87  0818.5r   08/04/87  1538.8       99585
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+
+/* CONVERT_DIAL_MESSAGE_ - Procedure to convert the event message
+   received on a dial control channel into a device name, default
+   IOSIM/DIM name, and standard status code.
+
+   Written 750310 by Paul Green
+   Modified 03/18/76 by David Jordan to add return_io_module entry.
+   Modified 07/05/76 by D. M. Wells to understand about FTP channels
+   and to use as_data_ names for IOSIMs
+   Modified 04/23/79 by C. Hornig to know that AS uses iox_.
+   Modified 80-11-11 by E.N. Kittlitz for full error code, line type.
+   Modified May 1982 by E. N. Kittlitz for silly error_table_ typo.
+*/
+
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-06-30,Coren), approve(86-06-30,MCR7415),
+     audit(86-07-02,Margolin), install(86-07-11,MR12.0-1092):
+     Use dial_event_message.incl.pl1 to interpret the format of the message.
+     Call as_user_message_$read_message to get the information defining the
+     connection if the ls_message flag is set in the event message.
+                                                   END HISTORY COMMENTS */
+
+
+/* format: style4 */
+convert_dial_message_:
+     procedure (bv_dial_message_fb, bv_device, bv_io_module, bv_n_dialed, bv_status, bv_code);
+
+/* parameters */
+
+dcl  (bv_dial_message_fb fixed bin (71),		/* Input */
+     bv_device char (*),				/* Output */
+     bv_io_module char (*),				/* Output */
+     bv_n_dialed fixed bin,				/* Output */
+     bv_code fixed bin (35)				/* Output */
+     ) parameter;
+
+dcl  1 bv_status aligned parameter,			/* Output */
+       2 dialed_up bit (1) unaligned,
+       2 hung_up bit (1) unaligned,
+       2 control bit (1) unaligned,
+       2 pad bit (33) unaligned;
+
+dcl  bv_dial_message bit (72) aligned based (addr (bv_dial_message_fb));
+
+/* automatic */
+
+dcl  make_iox_name bit (1) aligned;			/* which flavor of io module, "1"b-> iox */
+dcl  chan_name char (32);
+dcl  code fixed bin (35);
+dcl  system_areap pointer;
+
+dcl  1 auto_user_message_info aligned like as_user_message_info;
+
+/* based */
+
+dcl  user_message (as_user_message_info.message_length) bit (36) aligned based (ls_connection_message_ptr);
+
+dcl  1 message_device unal based (dial_event_message_ptr),	/* for messages that contain devxs */
+       2 devx fixed bin (17) unal,
+       2 line_type bin (17) unal,
+       2 pad fixed bin (35) unal;
+
+dcl  1 message_error aligned based (dial_event_message_ptr),/* for messages that contain full error codes */
+       2 error_code fixed bin (35) aligned,
+       2 pad fixed bin (35) aligned;
+
+dcl  1 devx_tab_entry aligned based,			/* format of internal dexv tab entry */
+       2 channel char (32),
+       2 devx fixed bin;
+
+dcl  1 devx_tab aligned based (devx_tabp),
+       2 devx_entries (n_devx_entries) like devx_tab_entry;
+
+/* builtins and conditions */
+
+dcl  (addr, fixed, hbound, length, null, rtrim, string) builtin;
+
+dcl  cleanup condition;
+
+/* entries */
+
+dcl  hcs_$tty_get_name entry (fixed bin, char (*), fixed bin, fixed bin (35));
+dcl  get_temp_segment_ entry (char (*), pointer, fixed bin (35));
+dcl  get_system_free_area_ entry () returns (ptr);
+dcl  user_message_$read_message entry (pointer, pointer, fixed bin (35));
+
+/* external static */
+
+dcl  (as_data_$g115_dim, as_data_$mrd_dim, as_data_$ntty_dim, as_data_$tty_dim)
+	character (32) external static;
+
+dcl  (error_table_$action_not_performed,
+     error_table_$unimplemented_version,
+     error_table_$smallarg,
+     error_table_$badcall)
+	fixed bin (35) external static;
+
+/* internal static variables */
+
+dcl  n_devx_entries fixed bin int static;		/* size of current devx_tab */
+dcl  devx_tabp ptr int static init (null);
+dcl  1 static_devx_tab aligned int static,		/* use this little table until it overflows */
+       2 entries (8) like devx_tab_entry;
+
+/* program */
+
+	make_iox_name = ""b;			/* return ios DIM name */
+	goto cv_go;
+
+return_io_module: entry (bv_dial_message_fb, bv_device, bv_io_module,
+	bv_n_dialed, bv_status, bv_code);
+
+	make_iox_name = "1"b;			/* caller wants to use iox */
+	goto cv_go;
+
+cv_go:
+	dial_event_message_ptr = addr (bv_dial_message);	/* get set to overlay on message */
+	bv_n_dialed = -1;				/* not all messages set this...initialize it */
+	string (bv_status) = ""b;			/* .. */
+
+/* check for message of all 1s (-1) which dial_manager_ may return */
+
+	if bv_dial_message = (72)"1"b then do;
+	     bv_code = error_table_$badcall;
+	     bv_status.control = "1"b;
+	     return;
+	end;
+
+/* See if this is a control message or a terminal status message */
+
+	if dial_event_message.description = "contrl"	/* it's a control message */
+	then do;
+	     bv_status.control = "1"b;		/* mark as a control message */
+
+	     if dial_event_message.control = DIALS_ALLOWED
+	     then bv_code = 0;
+	     else if dial_event_message.control = DIALS_DENIED
+	     then bv_code = error_table_$action_not_performed;
+	     else do;
+		bv_n_dialed = fixed (dial_event_message.control, 18);
+		bv_code = 0;
+	     end;
+	     return;
+	end;
+
+/* See if this is an error message */
+
+	if dial_event_message.error_msg then do;	/* it's an error return */
+	     bv_status.control = "1"b;
+	     bv_code = message_error.error_code;
+	     return;
+	end;
+
+
+/* It is a terminal status message ... return device name from message */
+
+	bv_status.control = "0"b;			/* mark as a terminal info message */
+	if dial_event_message.devx_msg then do;
+	     call hcs_$tty_get_name ((message_device.devx), chan_name, (0), code);
+	     if code ^= 0 then do;
+		if dial_event_message.control = JUST_HUNGUP then do; /* I may have name internally */
+		     call lookup_chan_name ((message_device.devx), chan_name);
+		     if chan_name = "" then do;
+			bv_code = code;
+			return;
+		     end;
+		end;
+		else do;
+		     bv_code = code;
+		     return;
+		end;
+	     end;
+	     else if dial_event_message.control = JUST_DIALED then
+		call store_chan_name ((message_device.devx), chan_name);
+
+	     if length (bv_device) < length (rtrim (chan_name)) then do;
+		bv_code = error_table_$smallarg;
+		return;
+	     end;
+	     bv_device = chan_name;
+
+/* try to deduce I/O module name from line type */
+
+	     bv_io_module = as_data_$tty_dim;		/* default assumed */
+	     if message_device.line_type = LINE_MC then bv_io_module = as_data_$mrd_dim;
+	     else if message_device.line_type = LINE_TELNET then bv_io_module = as_data_$ntty_dim;
+	     else if message_device.line_type = LINE_G115 then bv_io_module = as_data_$g115_dim;
+	     else if message_device.line_type = LINE_BSC then bv_io_module = "bisync_";
+	end;
+
+	else if dial_event_message.ls_msg
+	then do;					/* message is from login server; the "device" name and I/O module are in a user_message sent by the login server */
+	     as_user_message_info_ptr = addr (auto_user_message_info);
+	     as_user_message_info.version = AS_USER_MESSAGE_INFO_VERSION_1;
+	     string (as_user_message_info.flags) = ""b;
+	     as_user_message_info.message_handle = dial_event_message_handle || USER_MESSAGE_LS_CONNECTION_INFO_HANDLE_LOWER_18;
+	     system_areap = get_system_free_area_ ();
+	     ls_connection_message_ptr = null ();
+
+	     on cleanup
+		begin;
+		if ls_connection_message_ptr ^= null ()
+		then free user_message;
+	     end;
+
+	     call user_message_$read_message (system_areap, as_user_message_info_ptr, code);
+	     if code ^= 0
+	     then do;
+		bv_code = code;
+		return;
+	     end;
+
+	     ls_connection_message_ptr = as_user_message_info.message_ptr;
+	     if ls_connection_message_common.version ^= LS_CONNECTION_MESSAGE_V1
+	     then do;
+		free user_message;
+		bv_code = error_table_$unimplemented_version;
+		return;
+	     end;
+
+	     bv_device = ls_connection_message_common.connection_name;
+	     bv_io_module = ls_connection_message_common.io_module_name;
+	     free user_message;
+	end;
+
+	else bv_device = dial_event_message.description;	/* this should never happen, but it's all we've got */
+
+	if ^make_iox_name then			/* user really wanted an iox io module name */
+	     if bv_io_module = as_data_$tty_dim then bv_io_module = "tw_"; /* map the names */
+	     else if bv_io_module = as_data_$ntty_dim then bv_io_module = "ntw_";
+	     else if bv_io_module = as_data_$mrd_dim then bv_io_module = "mrd_";
+	     else ;				/* don't know how to map name, leave asis */
+
+/* Convert control bits into standard status code. */
+
+	if dial_event_message.control = JUST_DIALED
+	then bv_status.dialed_up = "1"b;
+	else if dial_event_message.control = JUST_HUNGUP
+	then bv_status.hung_up = "1"b;
+
+/* That's it. */
+
+	bv_code = 0;
+	return;
+
+/* procedure to manage an internal data-base of channel names and devx's */
+/* this is because if we are told by the answering service that one of our
+   channels hung up, we are only told the devx. There is no sure way of finding
+   the channel name unless we remember it ourselves from the time the channel
+   hung up. */
+
+store_chan_name: proc (devx, name);
+
+dcl  devx fixed bin;
+dcl  name char (*);
+
+dcl  i fixed bin;
+dcl  code fixed (35);
+dcl  p ptr;
+
+	if devx_tabp = null () then do;		/* once per process */
+	     devx_tabp = addr (static_devx_tab);
+	     n_devx_entries = hbound (static_devx_tab.entries, 1);
+	     do i = 1 to n_devx_entries;
+		devx_tab.devx (i) = -1;
+		devx_tab.channel (i) = "";
+	     end;
+	end;
+
+	do i = 1 to n_devx_entries;			/* look for entry for given devx */
+	     if devx_tab.devx (i) = devx then do;
+		devx_tab.channel (i) = name;		/* remember name */
+		return;
+	     end;
+	end;
+
+	do i = 1 to n_devx_entries;			/* look for free entry */
+	     if devx_tab.devx (i) = -1 then do;
+		devx_tab.devx (i) = devx;
+		devx_tab.channel (i) = name;
+		return;
+	     end;
+	end;
+
+	if devx_tabp = addr (static_devx_tab) then do;	/* our internal static table is full */
+	     call get_temp_segment_ ("convert_dial_message_", p, code);
+	     if code ^= 0 then return;		/* punt */
+	     do i = 1 to n_devx_entries;
+		p -> devx_tab.devx (i) = devx_tab.devx (i);
+		p -> devx_tab.channel (i) = devx_tab.channel (i);
+	     end;
+	     devx_tabp = p;				/* abandon internal static table */
+	end;
+
+	n_devx_entries = n_devx_entries + 1;		/* can grow without bound now */
+	devx_tab.devx (n_devx_entries) = devx;
+	devx_tab.channel (n_devx_entries) = name;
+	return;
+
+lookup_chan_name: entry (devx, name);
+
+	name = "";
+	if devx_tabp = null () then return;
+	do i = 1 to n_devx_entries;
+	     if devx_tab.devx (i) = devx then do;
+		name = devx_tab.channel (i);
+		return;
+	     end;
+	end;
+
+     end store_chan_name;
+
+%include line_types;
+%page;
+%include as_user_message_info;
+%page;
+%include user_message_handles;
+%page;
+%include ls_connection_message;
+%page;
+%include dial_event_message;
+
+     end convert_dial_message_;
+   
+
+
+
+		    dial_manager_.pl1               08/05/87  0818.5r   08/04/87  1538.8      113274
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+/* format: style4 */
+
+/* DIAL_MANAGER_ - This subroutine is the user interface to the answering service
+   dial facility.
+
+   Written 750324 by Paul Green
+   Modified 03/18/76 by David Jordan for Auto Call.
+   Modified 11/9/76 by S.T. Kent to allow selective release of  dialed channels.
+   and to accept request to become a registered dial server.
+   Modified April 1979 by Larry Johnson for release_channel_no_hangup
+   Modified November 1980 by E.N.Kittlitz for version_2 requests,
+   release_dial_id.
+   Modified March 1981 by Robert Coren to add tandd_attach and release_channel_no_listen entry points
+   Modified May 1983 by E. N. Kittlitz for version_3: access_class.
+   Modified 84-04-04 by BIM for version_4: privileged_server.
+   Modified 84-11-06 by E. Swenson to recompile after include file changes.
+*/
+
+allow_dials:
+     procedure (bv_request_ptr, bv_code);
+
+/* parameters */
+
+dcl  (bv_request_ptr ptr,
+     bv_code fixed bin (35)
+     ) parameter;
+
+/* automatic */
+
+dcl  dial_control_process bit (36) aligned,
+     ldx fixed bin,
+     i fixed bin,
+     dial_control_channel fixed bin (71),
+     request_mseg_dir char (168),
+     request_mseg char (32),
+     code fixed bin (35),
+     hangup_channel bit (1),
+     dont_listen bit (1),
+     tandd bit (1),
+     sub_string char (168),
+     reservation_string char (168),
+     release_dial_id_sw bit (1) aligned,
+     request_uid bit (72) aligned;
+
+dcl  1 dial_rq aligned like dial_server_request;
+
+dcl  1 wait_list aligned,				/* channels to block on */
+       2 n_channels fixed bin,
+       2 pad bit (36),
+       2 channel_id (1) fixed bin (71);
+
+dcl  1 reply aligned,				/* filled in by ipc_$block */
+       2 channel_id fixed bin (71),
+       2 message fixed bin (71),
+       2 sending_process bit (36) aligned,
+       2 origin bit (36) aligned,
+       2 channel_index fixed bin;
+
+/* conditions */
+
+dcl  conversion condition;
+
+/* external static */
+
+dcl  (error_table_$action_not_performed,
+     error_table_$bad_conversion,
+     error_table_$invalid_line_type,
+     error_table_$bad_arg,
+     error_table_$unimplemented_version) fixed bin (35) external static;
+
+/* entries */
+
+dcl  system_info_$request_chn entry (bit (36) aligned, fixed bin (71), char (*), char (*)),
+     hcs_$wakeup entry (bit (36) aligned, fixed bin (71), bit (72) aligned, fixed bin (35)),
+     message_segment_$add_file entry (char (*), char (*), ptr, fixed bin (18), bit (72) aligned, fixed bin (35)),
+     ipc_$block entry (ptr, ptr, fixed bin (35)),
+     convert_ipc_code_ entry (fixed bin (35)),
+     convert_dial_message_ entry (fixed bin (71), char (*), char (*), fixed bin, bit (36) aligned, fixed bin (35));
+
+/* builtins */
+
+dcl  (addr, after, before, convert, hbound, lbound, ltrim, size, string, substr) builtin;
+%page;
+/* include files */
+
+%include dial_manager_arg;
+%include as_request_header;
+%include dial_server_request;
+%include line_types;
+%page;
+
+/* entry to request to become a non-registered dial server */
+
+	bv_code = 0;
+
+	request_ptr = bv_request_ptr;
+	call fill_request;				/* fill out red tape */
+	dial_rq.header.type = ASR_DIAL_SERVER;
+	dial_rq.flags.start = "1"b;			/* this is a request to allow dials */
+
+	call send_request;				/* communicate with boss */
+	return;
+
+
+/* Entry for a dial server process to release a selected channel dialed to him */
+
+release_channel:
+     entry (bv_request_ptr, bv_code);
+
+	hangup_channel = "1"b;
+	dont_listen = "0"b;
+	go to release_channel_join;
+
+release_channel_no_hangup:
+     entry (bv_request_ptr, bv_code);
+
+	hangup_channel = "0"b;
+	dont_listen = "0"b;
+	go to release_channel_join;
+release_channel_no_listen:
+     entry (bv_request_ptr, bv_code);
+
+	dont_listen = "1"b;
+	hangup_channel = "1"b;
+
+release_channel_join:
+	bv_code = 0;
+
+	request_ptr = bv_request_ptr;			/* copy ptr */
+	call fill_request;
+	dial_rq.header.type = ASR_DIAL_SERVER;
+	dial_rq.flags.release_channel = "1"b;		/* this is a channel release request */
+	dial_rq.channel_name = request_ptr -> dial_manager_arg.channel_name; /* this is the channel to hangup */
+	dial_rq.flags.no_hangup = ^hangup_channel;
+	dial_rq.flags.no_listen = dont_listen;
+
+	call send_request;
+	return;
+
+/* Entry to request to allow dials on a registered dial qualifier */
+
+registered_server: entry (bv_request_ptr, bv_code);
+
+	bv_code = 0;
+
+	request_ptr = bv_request_ptr;
+
+	call fill_request;
+
+	dial_rq.header.type = ASR_DIAL_SERVER;
+	dial_rq.flags.registered_server = "1"b;
+	dial_rq.flags.start = "1"b;			/* this is in for test purposes only */
+
+	call send_request;
+	return;
+
+/* Entries to stop being a dial server */
+
+release_dial_id:					/* stop as server, but keep current calls */
+     entry (bv_request_ptr, bv_code);
+
+	release_dial_id_sw = "1"b;
+	go to shutoff_dials_common;
+
+
+shutoff_dials:					/* stop as server and hangup all calls */
+     entry (bv_request_ptr, bv_code);
+	release_dial_id_sw = "0"b;
+
+shutoff_dials_common:
+	bv_code = 0;
+
+	request_ptr = bv_request_ptr;			/* copy ptr for efficiency */
+	call fill_request;
+	dial_rq.header.type = ASR_DIAL_SERVER;
+	if release_dial_id_sw then dial_rq.flags.release_dial_id = "1"b; /* keep current lines */
+	else dial_rq.flags.stop = "1"b;		/* hang 'em up */
+
+	call send_request;
+	return;
+
+/* Entry for a privileged process (daemons) to call to attach any
+   channel in the lines file as if it had dialed to the process itself. */
+
+privileged_attach:
+     entry (bv_request_ptr, bv_code);
+
+	tandd = "0"b;
+	go to priv_attach_join;
+
+tandd_attach:
+     entry (bv_request_ptr, bv_code);
+
+	tandd = "1"b;
+
+priv_attach_join:
+	bv_code = 0;
+
+	request_ptr = bv_request_ptr;			/* copy ptr for efficiency */
+	call fill_request;
+	dial_rq.header.type = ASR_DIAL_SERVER;
+	dial_rq.channel_name = request_ptr -> dial_manager_arg.channel_name;
+	dial_rq.flags.privileged_attach = "1"b;		/* ask for the channel */
+	dial_rq.flags.tandd_attach = tandd;
+
+	call send_request;
+	return;
+
+/* Entry for a user to attach and dial an auto call line. */
+
+dial_out:
+     entry (bv_request_ptr, bv_code);
+
+	bv_code = 0;
+
+	request_ptr = bv_request_ptr;
+
+	call fill_request;
+
+	dial_rq.channel_name = request_ptr -> dial_manager_arg.channel_name; /* remember requested line */
+	dial_rq.header.type = ASR_DIAL_OUT;		/* we're dialing out */
+
+	if request_ptr -> dial_manager_arg.version >= dial_manager_arg_version_2 then do; /* look at new fields */
+	     dial_rq.dial_out_destination = request_ptr -> dial_manager_arg.dial_out_destination;
+	     if request_ptr -> dial_manager_arg.reservation_string ^= "" then do; /* RCP-like description */
+		reservation_string = request_ptr -> dial_manager_arg.reservation_string; /* efficiency, svp. */
+		sub_string = ltrim (before (reservation_string, ",")); /* get a device requirement */
+		do while (sub_string ^= "");
+		     if index (sub_string, "baud_rate=") = 1 then do;
+			on conversion begin;	/* prevent the outrageous */
+				code = error_table_$bad_conversion;
+				goto return_code;
+			     end;
+			sub_string = after (sub_string, "=");
+			if sub_string = "" then go to bad_arg_found;
+			dial_rq.baud_rate = convert (dial_rq.baud_rate, sub_string);
+			revert conversion;
+		     end;
+		     else if index (sub_string, "line_type=") = 1 then do;
+			sub_string = ltrim (after (sub_string, "=")); /* just the LINE_TYPE */
+			ldx = lbound (line_types, 1) - 1; /* flag nothing found yet */
+			do i = lbound (line_types, 1) to hbound (line_types, 1) /* is there any such animal? */
+			     while (ldx < lbound (line_types, 1));
+			     if sub_string = line_types (i) then
+				ldx = i;
+			end;
+			if ldx < lbound (line_types, 1) then do;
+			     code = error_table_$invalid_line_type;
+			     goto return_code;
+			end;
+			else dial_rq.line_type = ldx; /* make specification to dial_ctl_ */
+		     end;
+		     else if index (sub_string, "server_type=") = 1 then do;
+			dial_rq.server_type = substr (sub_string, 13);
+		     end;
+		     else do;
+bad_arg_found:		code = error_table_$bad_arg;
+			goto return_code;
+		     end;
+		     reservation_string = after (reservation_string, ","); /* eliminate portion just considered */
+		     sub_string = ltrim (before (reservation_string, ",")); /* and set up for next portion */
+		end;
+	     end;
+	end;
+	else do;					/* version 1 dial_manager_arg structure */
+	     dial_rq.dial_out_destination = request_ptr -> dial_manager_arg.dial_qualifier;
+	end;
+	call send_request;
+
+	return;
+
+/* Entry to release  a dial out line. */
+
+terminate_dial_out:
+     entry (bv_request_ptr, bv_code);
+
+	bv_code = 0;
+
+
+	request_ptr = bv_request_ptr;
+
+	call fill_request;
+
+	dial_rq.channel_name = request_ptr -> dial_manager_arg.channel_name;
+	dial_rq.header.type = ASR_DIAL_OUT;
+	dial_rq.flags.release_channel = "1"b;		/* Hang up the line */
+
+	call send_request;
+
+	return;
+
+
+dial_failed:
+	code = error_table_$action_not_performed;
+
+return_code:
+	bv_code = code;
+	return;
+%page;
+fill_request:
+     procedure;
+
+	if request_ptr -> dial_manager_arg.version < /* dial_manager_arg_version_1 */ 1
+	     | request_ptr -> dial_manager_arg.version > dial_manager_arg_version_4
+	then do;
+	     code = error_table_$unimplemented_version;
+	     go to return_code;
+	end;
+
+	if request_ptr -> dial_manager_arg.version >= dial_manager_arg_version_2 then
+	     request_ptr -> dial_manager_arg.dial_message = -1; /* initialize OUTPUT field */
+	call system_info_$request_chn (dial_control_process, dial_control_channel,
+	     request_mseg_dir, request_mseg);
+
+	dial_rq.header.version = as_request_version_1;
+	dial_rq.header.reply_channel = request_ptr -> dial_manager_arg.dial_channel;
+
+	dial_rq.version = dial_server_request_version_4;
+	dial_rq.dial_control_channel = request_ptr -> dial_manager_arg.dial_channel;
+	dial_rq.dial_qualifier = request_ptr -> dial_manager_arg.dial_qualifier;
+	string (dial_rq.flags) = ""b;
+	dial_rq.channel_name = "";
+	dial_rq.baud_rate = -1;
+	dial_rq.line_type = lbound (line_types, 1) - 1;
+	dial_rq.server_type = "";
+	dial_rq.dial_out_destination = "";
+	dial_rq.access_class = ""b;
+	dial_rq.privileged_server = "0"b;
+
+	if (request_ptr -> dial_manager_arg.version >= dial_manager_arg_version_3) then do;
+	     if request_ptr -> dial_manager_arg.access_class_required then do;
+		dial_rq.access_class = request_ptr -> dial_manager_arg.access_class;
+		dial_rq.flags.access_class_specified = "1"b;
+	     end;
+	     if request_ptr -> dial_manager_arg.version >= dial_manager_arg_version_4 then do;
+		if request_ptr -> dial_manager_arg.privileged_operation /* only meaningful for accept dials */
+		then dial_rq.privileged_server = "1"b;
+	     end;
+	     else dial_rq.privileged_server = comm_privilege ();
+	end;
+	else dial_rq.privileged_server = comm_privilege ();
+	return;
+
+     end fill_request;
+
+%page;
+send_request:
+     procedure;
+
+dcl  cdm_device char (32);				/* these variables are used to avoid */
+dcl  cdm_iom char (32);				/* errors from convert_dial_message */
+dcl  cdm_ndialed fixed bin;				/* which gets upset if string parameters are too short. */
+dcl  cdm_status bit (36) aligned;			/* We just throw the results away */
+
+	call message_segment_$add_file (request_mseg_dir, request_mseg, addr (dial_rq), 36 * size (dial_rq),
+	     request_uid, code);
+	if code ^= 0 then go to return_code;
+
+	call hcs_$wakeup (dial_control_process, dial_control_channel, request_uid, code);
+	if code ^= 0 then go to dial_failed;
+
+
+	wait_list.n_channels = 1;
+	wait_list.channel_id (1) = dial_rq.header.reply_channel;
+
+	call ipc_$block (addr (wait_list), addr (reply), code);
+	if code ^= 0 then do;
+	     call convert_ipc_code_ (code);
+	     go to return_code;
+	end;
+
+	if request_ptr -> dial_manager_arg.version >= dial_manager_arg_version_2 then
+	     request_ptr -> dial_manager_arg.dial_message = reply.message; /* OUTPUT field */
+
+	call convert_dial_message_ (reply.message, cdm_device, cdm_iom, cdm_ndialed, cdm_status, code);
+	if code ^= 0
+	then go to return_code;
+
+     end send_request;
+
+comm_privilege:
+     procedure returns (bit (1) aligned);
+
+declare get_privileges_ entry() returns(bit (36) aligned);
+%include aim_privileges;
+
+     return ((get_privileges_ () & COMM_PRIVILEGE) = COMM_PRIVILEGE);
+     end comm_privilege;
+
+     end allow_dials;
+  
+
+
+
+		    dial_manager_call.pl1           01/16/85  1237.8rew 01/16/85  1237.0       83574
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   * Copyright (c) 1972 by Massachusetts Institute of        *
+   * Technology and Honeywell Information Systems, Inc.      *
+   *                                                         *
+   *********************************************************** */
+
+/* format: style4 */
+
+/* DIAL_MANAGER_CALL - Command interface to dial_manager_ */
+
+/* Written February 1979 by Larry Johnson */
+/* Modified December 1980 by E. N. Kittlitz for V2 dial_manager_arg, new dial_manager functions */
+/* Modified 84-04-12 BIM for access_class */
+
+dial_manager_call: procedure options (variable);
+
+/* Automatic */
+
+dcl  code fixed bin (35);
+dcl  save_code fixed bin (35);
+dcl  arg_ptr ptr;
+dcl  arg_len fixed bin;
+dcl  entry entry (ptr, fixed bin (35)) variable;
+dcl  next_arg fixed bin;
+dcl  arg_count fixed bin;
+
+dcl  io_module char (32);
+dcl  n_dialed fixed bin;
+dcl  channel_name char (32);
+dcl  1 status_flags aligned,
+       2 dialed_up bit (1) unal,
+       2 hung_up bit (1) unal,
+       2 control bit (1) unal,
+       2 pad bit (33) unal;
+
+dcl  1 auto_dial_manager_arg like dial_manager_arg aligned automatic;
+dcl  dmap ptr;
+
+/* Based */
+
+dcl  arg char (arg_len) based (arg_ptr);
+
+/* Internal static */
+
+dcl  static_channel fixed (71) int static init (0);
+dcl  static_channel_is_wait bit (1) int static;		/* Current state of chanel - wait/call */
+dcl  reporting_enabled bit (1) init ("1"b) int static;
+
+/* Constants */
+
+dcl  name char (17) int static options (constant) init ("dial_manager_call");
+
+/* External */
+
+dcl  iox_$user_output ptr ext static;
+
+dcl  convert_authorization_$from_string entry (bit (72) aligned, char (*), fixed bin (35));
+dcl  ioa_ entry options (variable);
+dcl  com_err_ entry options (variable);
+dcl  cu_$arg_count entry (fixed bin, fixed bin (35));
+dcl  cu_$arg_ptr entry (fixed bin, ptr, fixed bin, fixed bin (35));
+dcl  iox_$control entry (ptr, char (*), ptr, fixed bin (35));
+dcl  ipc_$create_ev_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$decl_ev_wait_chn entry (fixed bin (71), fixed bin (35));
+dcl  ipc_$decl_ev_call_chn entry (fixed bin (71), entry, ptr, fixed bin, fixed bin (35));
+dcl  timer_manager_$sleep entry (fixed bin (71), bit (2));
+dcl  convert_ipc_code_ entry (fixed bin (35));
+dcl  convert_dial_message_$return_io_module entry (fixed bin (71), char (*), char (*), fixed bin,
+	1 aligned like status_flags, fixed bin (35));
+
+dcl  (dial_manager_$allow_dials,
+     dial_manager_$registered_server,
+     dial_manager_$dial_out,
+     dial_manager_$release_channel,
+     dial_manager_$release_channel_no_hangup,
+     dial_manager_$release_channel_no_listen,
+     dial_manager_$release_dial_id,
+     dial_manager_$shutoff_dials,
+     dial_manager_$privileged_attach,
+     dial_manager_$tandd_attach,
+     dial_manager_$terminate_dial_out) entry (ptr, fixed bin (35));
+
+dcl  (addr, null) builtin;
+
+/* Setup event channel for this program */
+
+	if static_channel = 0 then do;
+	     call ipc_$create_ev_chn (static_channel, code);
+	     if code ^= 0 then do;
+		call convert_ipc_code_ (code);
+		call com_err_ (code, name, "Unable to create event channel.");
+		static_channel = 0;
+		return;
+	     end;
+	     else static_channel_is_wait = "1"b;
+	end;
+
+/* Initialize dial_manager_args */
+
+	dmap = addr (auto_dial_manager_arg);
+	dmap -> dial_manager_arg.version = dial_manager_arg_version_4;
+	dmap -> dial_manager_arg.dial_qualifier = "";
+	dmap -> dial_manager_arg.dial_channel = static_channel;
+	dmap -> dial_manager_arg.channel_name = "";
+	dmap -> dial_manager_arg.reservation_string = "";
+	dmap -> dial_manager_arg.dial_out_destination = "";
+	dmap -> dial_manager_arg.access_class = ""b;
+	dmap -> dial_manager_arg.flags = "0"b;
+
+/* Process arguments */
+
+	call cu_$arg_count (arg_count, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, "dial_manager_call");
+	     return;
+	end;
+
+	next_arg = 1;
+	call get_arg ("Usage: dial_manager_call request qualifier/channel");
+
+	if arg = "allow_dials" | arg = "ad" then do;
+	     call get_qualifier;
+	     entry = dial_manager_$allow_dials;
+	end;
+	else if arg = "registered_server" | arg = "rs" then do;
+	     call get_qualifier;
+	     entry = dial_manager_$registered_server;
+	end;
+	else if arg = "dial_out" | arg = "do" then do;
+	     call get_channel;
+	     call get_dial_out_destination;
+	     if next_arg <= arg_count then call get_reservation_string;
+	     if next_arg <= arg_count then call get_access_class;
+	     entry = dial_manager_$dial_out;
+	end;
+	else if arg = "release_channel" | arg = "rc" then do;
+	     call get_channel;
+	     entry = dial_manager_$release_channel;
+	end;
+	else if arg = "release_channel_no_hangup" | arg = "rcnh" then do;
+	     call get_channel;
+	     entry = dial_manager_$release_channel_no_hangup;
+	end;
+	else if arg = "release_channel_no_listen" | arg = "rcnl" then do;
+	     call get_channel;
+	     entry = dial_manager_$release_channel_no_listen;
+	end;
+	else if arg = "shutoff_dials" | arg = "sd" then do;
+	     call get_qualifier;
+	     entry = dial_manager_$shutoff_dials;
+	end;
+	else if arg = "privileged_attach" | arg = "pa" then do;
+	     call get_channel;
+	     entry = dial_manager_$privileged_attach;
+	end;
+	else if arg = "tandd_attach" | arg = "tda" then do;
+	     call get_channel;
+	     entry = dial_manager_$tandd_attach;
+	end;
+	else if arg = "terminate_dial_out" | arg = "tdo" then do;
+	     call get_channel;
+	     entry = dial_manager_$terminate_dial_out;
+	end;
+	else if arg = "release_dial_id" | arg = "rdi" then do;
+	     call get_qualifier;
+	     entry = dial_manager_$release_dial_id;
+	end;
+	else if arg = "start_report" | arg = "start" then do;
+	     reporting_enabled = "1"b;
+	     go to done;
+	end;
+	else if arg = "stop_report" | arg = "stop" then do;
+	     reporting_enabled = "0"b;
+	     go to done;
+	end;
+	else do;
+bad_arg:	     call com_err_ (0, name, "Unrecognized arg: ^a", arg);
+	     return;
+	end;
+
+/* Make the dial manager call */
+
+	if ^static_channel_is_wait then do;
+	     call ipc_$decl_ev_wait_chn (static_channel, code);
+	     if code ^= 0 then do;
+		call convert_ipc_code_ (code);
+		call com_err_ (code, name, "Unable to setup event wait channel.");
+		return;
+	     end;
+	     static_channel_is_wait = "1"b;
+	end;
+
+	call entry (dmap, save_code);			/* make the call */
+
+	call ipc_$decl_ev_call_chn (static_channel, handler, null (), 10, code);
+	if code ^= 0 then do;
+	     call convert_ipc_code_ (code);
+	     call com_err_ (code, name, "Unable to setup event call channel.");
+	end;
+	else static_channel_is_wait = "0"b;
+	if save_code ^= 0 then call com_err_ (save_code, name, "dial_manager_ error.");
+
+/* Allow event calls to go off in case channel is already dialed.  This is done
+   because of the way dial_manager_ uses the event channel.  A subsequent
+   invocation of dial_manager_ without an intervening block will cause
+   dial_manager_ to get out of step with the event messages. */
+
+	call timer_manager_$sleep (250000, "10"b);
+
+done:	return;
+
+/* Handler for event call wakeups, utility procedures */
+
+handler: entry (arg_event_call_infop);
+
+dcl  arg_event_call_infop ptr;
+
+	if ^reporting_enabled then return;
+	event_call_info_ptr = arg_event_call_infop;
+
+	call convert_dial_message_$return_io_module (event_call_info.message, channel_name, io_module, n_dialed,
+	     status_flags, code);
+	if code ^= 0 then call com_err_ (code, name, "dial_manager_ error.");
+	else do;
+	     if status_flags.control then call ioa_ ("^a: Channels dialed=^d", name, n_dialed);
+	     else call ioa_ ("^a: Channel ^a (^a) ^[dialed^]^[hungup^].", name, channel_name, io_module,
+		     status_flags.dialed_up, status_flags.hung_up);
+	     call iox_$control (iox_$user_output, "start", null (), code);
+	end;
+	return;
+
+get_arg: proc (msg);
+
+dcl  msg char (*);
+
+	call cu_$arg_ptr (next_arg, arg_ptr, arg_len, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, name, "^a", msg);
+	     go to done;
+	end;
+	next_arg = next_arg + 1;
+	return;
+
+     end get_arg;
+
+get_qualifier: proc;
+
+	call get_arg ("qualifier");
+	dmap -> dial_manager_arg.dial_qualifier = arg;
+	if next_arg <= arg_count then do;
+	     call get_access_class;
+	     dmap -> dial_manager_arg.privileged_operation = "1"b;
+	end;
+	return;
+
+     end get_qualifier;
+
+get_access_class:
+     procedure;
+	call get_arg ("access class");
+	call convert_authorization_$from_string (dmap -> dial_manager_arg.access_class, arg, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, name, "^a", arg);
+	     go to done;
+	end;
+	dmap -> dial_manager_arg.access_class_required = "1"b;
+     end get_access_class;
+
+get_channel: proc;
+
+	call get_arg ("channel");
+	dmap -> dial_manager_arg.channel_name = arg;
+	return;
+
+     end get_channel;
+
+get_dial_out_destination: proc;
+
+	call get_arg ("destination");
+	dmap -> dial_manager_arg.dial_out_destination = arg;
+	return;
+
+     end get_dial_out_destination;
+
+get_reservation_string: proc;
+
+	call get_arg ("reservation");
+	dmap -> dial_manager_arg.reservation_string = arg;
+	return;
+
+     end get_reservation_string;
+
+%include dial_manager_arg;
+
+%include event_call_info;
+
+     end dial_manager_call;
+
+  
+
+
+
+		    logout.pl1                      08/04/87  1445.5rew 08/04/87  1221.3       92313
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* format: style4 */
+
+/* LOGOUT - Command to destroy a process and log the user off the system.
+
+   logout -hold			don't hangup the line...let another user login on this terminal
+   logout -brief			don't print logout message
+
+
+   NEW_PROC - Command to destroy a process and create a new one for the same user.
+
+   new_proc			create a new process with same attributes as this one
+   new_proc -auth new_authorization	create a new process whose authorization is new_authorization
+
+
+   Written 750406 by PG (split off from terminate_process_)
+   Modified Aug 25, 1977 by S. Webber to add term_signal_handler_
+   Modified April 1979 by T. Casey for MR7.0a to make process type determination work right for foreground absentee jobs.
+   Modified December 1980 by E. N. Kittlitz for absentee cancellation message
+   Modified 3/82 BIM for new print_abs_msg_, finish_info.incl.pl1
+   Modified 84-06-24 BIM to check strict trusted path.
+*/
+
+
+/****^  HISTORY COMMENTS:
+  1) change(86-05-19,GDixon), approve(86-09-26,MCR7499),
+     audit(86-10-08,Beattie), install(86-10-13,MR12.0-1183):
+     Resolve uninitialized variable (logout_string) in new_proc command by
+     moving no_more_arguments label so variable doesn't get referenced by the
+     new_proc control path. (phx20351)
+  2) change(87-04-08,Parisek), approve(87-07-14,MCR7644),
+     audit(87-07-24,GDixon), install(87-08-04,MR12.1-1055):
+     Added the "disconnect" entry point.
+                                                   END HISTORY COMMENTS */
+
+
+logout:
+     procedure options (variable);
+
+/* automatic */
+
+dcl  process_type fixed bin;				/* = 2 if this is an absentee process */
+dcl  argno fixed bin;
+dcl  arg_length fixed bin (21);
+dcl  arg_ptr ptr;
+dcl  attr char (128) varying;
+dcl  authorization bit (72) aligned;
+dcl  code fixed bin (35);
+dcl  my_name char (12);
+dcl  term_structure_ptr ptr;
+
+
+dcl  1 logout_string aligned,				/* information about logouts */
+       2 version fixed bin,				/* this is version 0 */
+       2 hold bit (1) unaligned,			/* don't hangup line */
+       2 brief bit (1) unaligned,			/* don't print logout message */
+       2 pad bit (34) unaligned;			/* must be zero */
+
+dcl  1 new_proc_string aligned,			/* information about new_procs */
+       2 version fixed bin,				/* this is version 1 */
+       2 authorization_option bit (1) unaligned,		/* use value of new_authorization, below */
+       2 pad bit (35) unaligned,			/* must be zero */
+       2 new_authorization bit (72) aligned;		/* authorization of new process */
+
+dcl  1 disc_string aligned,				/* info about user invoked disconnect */
+       2 version fixed bin,				/* this is version 0 */
+       2 pad bit(36) aligned;				/* init "0"b */
+
+dcl  1 local_finish_info aligned like finish_info;
+
+%include finish_info;
+%include condition_info_header;
+%include trusted_path_flags;
+
+/* based */
+
+dcl  argument char (arg_length) based (arg_ptr);
+
+/* builtins */
+
+dcl  (addr, index, null, size, string, unspec) builtin;
+
+/* external static */
+
+dcl  error_table_$badopt fixed bin (35) external static;
+
+/* entries */
+
+dcl  aim_check_$equal entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+dcl  aim_check_$greater_or_equal entry (bit (72) aligned, bit (72) aligned) returns (bit (1) aligned);
+dcl  com_err_ entry options (variable);
+dcl  convert_access_class_$from_string entry (bit (72) aligned, char (*), fixed bin (35));
+dcl  cu_$arg_ptr entry (fixed bin, ptr, fixed bin (21), fixed bin (35));
+dcl  execute_epilogue_ entry (bit (1) aligned);
+dcl  get_process_authorization_ entry () returns (bit (72) aligned);
+dcl  get_process_max_authorization_ entry returns (bit (72) aligned);
+dcl  ioa_ entry options (variable);
+dcl  print_abs_msg_$logout entry ();
+dcl  save_on_disconnect entry;
+dcl  signal_ entry (char (*), ptr, ptr);
+dcl  system_info_$trusted_path_flags entry returns (bit (36) aligned);
+dcl  terminate_process_ entry (char (*), ptr);
+dcl  user_info_$attributes entry (char(*) varying);
+dcl  user_info_$process_type entry (fixed bin);
+
+
+/* program */
+
+	my_name = "logout";
+	finish_info_ptr = addr (local_finish_info);
+	finish_info.type = "logout";
+
+	call user_info_$process_type (process_type);	/* we will need to know if this is absentee later */
+
+	logout_string.version = 0;
+	logout_string.hold = "0"b;			/* set default values for arguments */
+	logout_string.brief = "0"b;			/* .. */
+	logout_string.pad = ""b;
+	term_structure_ptr = addr (logout_string);
+
+	do argno = 1 by 1;				/* read all arguments */
+	     call cu_$arg_ptr (argno, arg_ptr, arg_length, code);
+	     if code ^= 0 then go to no_more_logout_arguments;
+
+	     if argument = "-hold" | argument = "-hd"
+	     then logout_string.hold = "1"b;		/* user doesn't want line hung up */
+
+	     else if argument = "-brief" | argument = "-bf"
+	     then logout_string.brief = "1"b;		/* user doesn't want logout message printed */
+
+	     else go to bad_argument;
+	end;
+
+no_more_logout_arguments:
+	if ^logout_string.brief then do;		/* print absentee logout message */
+	     if process_type = 2 then call print_abs_msg_$logout;
+	end;
+
+	if logout_string.hold
+	then do;
+	     string (trusted_path_flags) = system_info_$trusted_path_flags ();
+	     if trusted_path_flags.login then do;
+		if logout_string.hold & my_name = "logout" then do;
+		     call com_err_ (0, my_name, "logout -hold is not permitted at this site to ensure secure logins.");
+		     return;
+		end;
+	     end;
+	end;
+
+no_more_arguments:
+	if my_name = "disconnect" then do;
+	     call user_info_$attributes (attr);		/* check for disconnect_ok */
+	     if index (attr, "disconnect_ok") = 0 then do;
+		call com_err_ (0, my_name, "You lack permission to disconnect your process.
+Check with your project administrator for more information.");
+		return;
+	     end;
+	     call save_on_disconnect;			/* Ensure process will be saved. */
+	     call terminate_process_ (my_name, term_structure_ptr);
+	     return;
+	end;
+						/* assume that's what we want */
+	else do;
+	     finish_info.length = size (finish_info);
+	     finish_info.version = 1;
+	     finish_info.info_string = "";
+	     unspec (finish_info.action_flags) = ""b;
+	     finish_info.status_code = 0;
+	     call signal_ ("finish", null (), addr (finish_info));
+	     call execute_epilogue_ ("0"b);		/* The "0"b says not just a run unit */
+	     call terminate_process_ (my_name, term_structure_ptr);
+	     go to no_more_arguments;			/* and don't come back */
+	end;
+
+new_proc:
+     entry;					/* entry to create a new process */
+
+	my_name = "new_proc";
+	finish_info_ptr = addr (local_finish_info);
+	finish_info.type = "new_proc";
+
+	call user_info_$process_type (process_type);	/* is this an process_type process? */
+
+	if process_type = 2 then do;			/* yes! */
+	     call com_err_ (0, my_name, "Invalid command for absentee process.");
+	     return;
+	end;
+
+	new_proc_string.version = 1;
+	new_proc_string.authorization_option = "0"b;	/* initialize options */
+	new_proc_string.new_authorization = ""b;	/* .. */
+	new_proc_string.pad = ""b;
+	term_structure_ptr = addr (new_proc_string);	/* set ptr to argument */
+
+	do argno = 1 by 1;				/* read all arguments */
+	     call cu_$arg_ptr (argno, arg_ptr, arg_length, code);
+	     if code ^= 0 then go to no_more_arguments;	/* go do it */
+
+	     if argument = "-authorization" | argument = "-auth"
+	     then do;
+		new_proc_string.authorization_option = "1"b;
+		argno = argno + 1;
+		call cu_$arg_ptr (argno, arg_ptr, arg_length, code);
+		if code ^= 0 then do;
+		     call com_err_ (code, my_name, "-authorization must be followed by an authorization.");
+		     return;
+		end;
+
+		call convert_access_class_$from_string (authorization, argument, code);
+		if code ^= 0 then do;
+		     call com_err_ (code, my_name, "^a", argument);
+		     return;
+		end;
+
+/* get the max authorization of this process */
+
+		if ^aim_check_$greater_or_equal (get_process_max_authorization_ (), authorization) then do;
+		     call com_err_ (0, my_name, "You cannot new_proc to the requested authorization.");
+		     return;
+		end;
+
+		string (trusted_path_flags) = system_info_$trusted_path_flags ();
+		if trusted_path_flags.login then if
+			^aim_check_$equal (get_process_authorization_ (), authorization)
+		     then do;
+			call com_err_ (0, my_name, "new_proc -authorization is not permitted at this site to ensure secure logins.");
+			return;
+		     end;
+
+		new_proc_string.new_authorization = authorization; /* pass to terminate_process_ */
+	     end;
+	     else go to bad_argument;
+	end;
+
+bad_argument:
+	call com_err_ (error_table_$badopt, my_name, argument);
+	return;
+
+term_signal_handler_: entry;
+
+	my_name = "term_signal";
+	finish_info_ptr = addr (local_finish_info);
+	finish_info.type = "termsgnl";
+
+	call user_info_$process_type (process_type);
+
+	if process_type = 2 then			/* absentee cancellation */
+	     call ioa_ ("^2/Process terminated by the system.  The reason will be sent by Multics mail.");
+
+	logout_string.version = 0;
+	logout_string.hold = "0"b;
+	logout_string.brief = "0"b;
+	logout_string.pad = "0"b;
+	term_structure_ptr = addr (logout_string);
+
+	goto no_more_logout_arguments;
+
+disconnect:
+	entry;
+	
+	my_name = "disconnect";
+
+	call user_info_$process_type (process_type);
+	
+	if process_type ^= 1 then do;
+	     call com_err_ (0, my_name, "Command valid for interactive processes only.");
+	     return;
+	end;
+	
+	disc_string.version = 0;
+	disc_string.pad = ""b;
+	term_structure_ptr = addr (disc_string);
+	
+	do argno = 1 by 1;
+	     call cu_$arg_ptr (argno, arg_ptr, arg_length, code);
+	     if code ^= 0 then go to no_more_arguments;
+	     else go to bad_argument;
+	end;
+
+     end logout;
+   
+
+
+
+		    send_as_request_.pl1            10/28/86  1549.7r w 10/28/86  1024.7       46485
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+   *                                                         *
+   *********************************************************** */
+/* send_as_request_ -- common subroutine interface. */
+/* format: style2 */
+
+/**** Created 1984-12 */
+/**** Modified 1985-02-21, BIM -- initialize code, create ev chan. */
+/**** Modified 1985-03-18, E. Swenson to return error code if executed
+      in the Initializer process. */
+
+send_as_request_$block:
+     procedure (Info_ptr, Info_length, Message_id, Reply, Code);
+
+	declare Info_ptr		 pointer;
+	declare Info_length		 fixed bin;
+	declare Message_id		 bit (72) aligned;
+	declare Reply		 bit (72) aligned;
+	declare Code		 fixed bin (35);
+
+	dcl     system_info_$request_chn
+				 entry (bit (36) aligned, fixed bin (71), char (*), char (*));
+	dcl     get_group_id_	 entry () returns (char (32));
+	dcl     hcs_$wakeup		 entry (bit (36) aligned, fixed bin (71), bit (72) aligned, fixed bin (35));
+	dcl     message_segment_$add_file
+				 entry (char (*), char (*), ptr, fixed bin (18), bit (72) aligned, fixed bin (35))
+				 ;
+	dcl     ipc_$create_ev_chn	 entry (fixed bin (71), fixed bin (35));
+	dcl     ipc_$delete_ev_chn	 entry (fixed bin (71), fixed bin (35));
+	dcl     ipc_$block		 entry (ptr, ptr, fixed bin (35));
+
+	dcl     block_flag		 bit (1) aligned;
+	dcl     code		 fixed bin (35);
+	dcl     request_process_id	 bit (36) aligned;
+	dcl     request_channel	 fixed bin (71);
+	dcl     request_uid		 bit (72) aligned;
+	dcl     ms_dir_name		 char (168);
+	dcl     ms_entryname	 char (32);
+	dcl     msg_ptr		 pointer;
+	dcl     msg_length		 fixed bin (18);
+	dcl     created_ev_chn	 bit (1) aligned;
+%include event_wait_channel;
+%include event_wait_info;
+	dcl     1 EWI		 aligned like event_wait_info;
+
+	dcl     error_table_$action_not_performed
+				 fixed bin (35) external;
+	dcl     error_table_$unimplemented_version
+				 fixed bin (35) ext static;
+
+	dcl     cleanup		 condition;
+
+
+	block_flag = "1"b;
+	goto COMMON;
+
+send_as_request_$no_block:
+     entry (Info_ptr, Info_length, Message_id, Code);
+
+	block_flag = "0"b;
+COMMON:
+	Code = 0;
+
+/**** The following code prevents this call from being made in the
+      Initializer process.  We do not want to invoke the AS request
+      mechanism from within the Initializer process, because it would
+      be possible to get into the AS request server recursively which
+      doesn't work.  (The event call channel is inhibited while executing
+      the handler (as_request_server_) and therefore the server will not
+      function recursively). */
+
+	if get_group_id_ () = "Initializer.SysDaemon.z"
+	then do;
+		Code = error_table_$action_not_performed;
+		return;
+	     end;
+
+	msg_ptr = Info_ptr;
+	msg_length = Info_length * 36;
+	if msg_ptr -> as_request_header.version ^= as_request_version_1
+	then do;
+		Code = error_table_$unimplemented_version;
+		return;
+	     end;
+	created_ev_chn = "0"b;
+	on cleanup
+	     begin;
+		if created_ev_chn
+		then call ipc_$delete_ev_chn (msg_ptr -> as_request_header.reply_channel, (0));
+	     end;
+	if block_flag & (msg_ptr -> as_request_header.reply_channel = 0)
+	then do;
+		created_ev_chn = "1"b;
+		call ipc_$create_ev_chn (msg_ptr -> as_request_header.reply_channel, (0));
+	     end;
+	if test_flag
+	then do;
+		request_process_id = static_process_id;
+		request_channel = static_channel;
+		ms_dir_name = static_dir_name;
+		ms_entryname = static_entryname;
+	     end;
+	else call system_info_$request_chn (request_process_id, request_channel, ms_dir_name, ms_entryname);
+	call message_segment_$add_file (ms_dir_name, ms_entryname, msg_ptr, msg_length, request_uid, code);
+	if code ^= 0
+	then do;
+		Code = code;
+		go to RETURN;
+	     end;
+	Message_id = request_uid;
+	call hcs_$wakeup (request_process_id, request_channel, request_uid, code);
+	if code ^= 0
+	then do;
+		Code = code;
+		go to RETURN;
+	     end;
+
+	if msg_ptr -> as_request_header.reply_channel = 0 | ^block_flag
+	then return;
+
+	event_wait_channel.pad = ""b;
+	event_wait_channel.channel_id (1) = msg_ptr -> as_request_header.reply_channel;
+	call ipc_$block (addr (event_wait_channel), addr (EWI), code);
+	if code ^= 0
+	then do;
+		Code = code;
+		go to RETURN;
+	     end;
+	Reply = unspec (EWI.message);
+RETURN:
+	if created_ev_chn
+	then call ipc_$delete_ev_chn (msg_ptr -> as_request_header.reply_channel, (0));
+	return;
+
+test:
+     entry (a_pid, a_event, a_dir, a_entryname);
+
+	declare (a_dir, a_entryname)	 char (*);
+	declare a_pid		 bit (36) aligned;
+	declare a_event		 fixed bin (71);
+
+	declare test_flag		 bit (1) aligned internal static init ("0"b);
+	declare (
+	        static_process_id	 bit (36) aligned,
+	        static_channel	 fixed bin (71),
+	        static_dir_name	 char (168),
+	        static_entryname	 char (32)
+	        )			 int static;
+
+	test_flag = "1"b;
+	static_process_id = a_pid;
+	static_channel = a_event;
+	static_dir_name = a_dir;
+	static_entryname = a_entryname;
+	return;
+
+no_test:
+     entry;
+	test_flag = "0"b;
+	return;
+
+%include as_request_header;
+     end send_as_request_$block;
+
+
+   
+
+
+
+		    terminate_process_.pl1          08/04/87  1445.5rew 08/04/87  1221.3      105489
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        * Copyright (c) 1972 by Massachusetts Institute of        *
+        * Technology and Honeywell Information Systems, Inc.      *
+        *                                                         *
+        *********************************************************** */
+
+/* TERMINATE_PROCESS_ - This procedure terminates the process in which it is called.
+   The arguments determine the exact nature of the termination.
+
+   declare terminate_process_ entry (char (*), ptr);
+   call terminate_process_ (action, info_ptr);
+
+   1. action	indicates the type of termination and must be on of those
+   .		listed below. (Input)
+
+   2. info_ptr	points to additional information about the termination and
+   .		its structure is dependent upon the action. (Input)
+
+   Possible actions:
+
+   1. logout	the process is simply to be logged out.
+
+   dcl 1 info aligned based(info_ptr),
+   2 version fixed bin,				/* must be 0
+   2 hold bit(1) unaligned,				/* 1 if the console is to be held
+   2 brief bit(1) unaligned,				/* 1 if no logout message is to be printed
+   2 pad bit(34) unaligned;				/* must be 0
+
+   2. new_proc	a new process is to be created for the user after this one is terminated.
+
+   dcl 1 info aligned based(info_ptr),
+   2 version fixed bin,				/* must be 1
+   2 authorization_option bit (1) unaligned,		/* 1 if new_authorization is to be used.
+   2 pad bit (35) unaligned,				/* must be 0
+   2 new_authorization bit (72) aligned;		/* authorization of new process
+
+   3. fatal_error	the process is doomed due to an unrecoverable error.
+
+   dcl 1 info aligned based(info_ptr),
+   2 version fixed bin,				/* must be 0
+   2 status_code fixed bin(35);			/* status code describing error
+
+   4. init_error	this process encountered an error during initialization.
+
+   dcl 1 info aligned based(info_ptr),
+   2 version fixed bin,				/* must be 0
+   2 status_code fixed bin(35);			 /* status code describing error
+
+   5. disconnect     this process is to be disconnected.
+
+   dcl 1 info aligned based(info_ptr),
+   2 version fixed bin,				/* must be 0
+   2 pad bit(36) aligned;
+
+   Originally coded by R. J. Feiertag on April 29, 1972
+   Modified 750406 by PG to remove logout & new_proc code, and handle 
+     version 1 new_proc structures
+   */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-04-08,Parisek), approve(87-07-14,MCR7644),
+     audit(87-07-24,GDixon), install(87-08-04,MR12.1-1055):
+     Send AS the "disconn" user signal based on the invocation of the
+     "disconnect" command.
+                                                   END HISTORY COMMENTS */
+
+
+terminate_process_:
+     procedure (action, info_ptr);
+
+/* parameters */
+
+dcl (action char (*),				/* indicates general nature of termination */
+     info_ptr ptr) parameter;				/* points to additional information about termination */
+
+/* automatic */
+
+dcl  1 auto_ev_info aligned like event_wait_info;		/* Automatic event info structure */
+dcl  1 auto_ev_chn aligned like event_wait_channel;	/* Automatic event channel structure */
+dcl  event_message fixed bin (71),			/* message to answering service */
+     em_ptr ptr,					/* points to message */
+     code fixed bin (35),				/* status code */
+     logout_channel fixed bin (71),			/* channel on which to signal logout */
+     logout_pid bit (36) aligned;			/* process to which to signal logout */
+dcl  old_mask bit (36) aligned;
+dcl  sig_mask bit (36) aligned;
+dcl  sig_names (2) char (32) int static options (constant) init ("sus_", "trm_");
+
+
+/* based */
+
+dcl  logout_message char (8) aligned based (em_ptr);	/* character string version of message */
+
+dcl 1 new_proc_auth aligned based (em_ptr),		/* structure to overlay message */
+    2 message char (2) unaligned,			/* "np" */
+    2 authorization bit (54) unaligned;			/* an authorization */
+
+dcl  based_version fixed bin based (info_ptr);		/* version number of all structures */
+
+dcl 1 based_logout aligned based (info_ptr),
+    2 version fixed bin,
+    2 hold bit (1) unaligned,
+    2 brief bit (1) unaligned,
+    2 pad bit (34) unaligned;
+
+dcl 1 based_new_proc aligned based (info_ptr),
+    2 version fixed bin,				/* must be 1 */
+    2 authorization_option bit (1) unaligned,		/* 1 if new_authorization is to be used */
+    2 pad bit (35) unaligned,				/* must be zero */
+    2 new_authorization bit (72) aligned;		/* authorization of new process */
+
+dcl 1 based_disc aligned based (info_ptr),
+    2 version fixed bin,				/* must be 0 */
+    2 pad bit (36) unaligned;
+
+dcl 1 based_fatal_error aligned based (info_ptr),
+    2 version fixed bin,
+    2 fatal_code fixed bin (35);			/* status code */
+
+dcl 1 based_init_error aligned based (info_ptr),		/* informations about initialization errors */
+    2 version fixed bin,
+    2 init_code fixed bin (35);			/* status code */
+
+dcl 1 fatal_term aligned based (em_ptr),		/* message to answering service */
+    2 name char (4),				/* "term" */
+    2 status_code fixed bin (35);			/* status code to answering service */
+
+/* external static */
+
+dcl  error_table_$improper_termination ext fixed bin (35),
+     error_table_$unimplemented_version ext fixed bin (35);
+
+/* conditions */
+
+dcl  (cleanup, quit) condition;
+
+/* builtins */
+
+dcl (addr, null, substr) builtin;
+
+/* entries */
+
+dcl  
+     continue_to_signal_ entry (fixed bin(35)),
+     create_ips_mask_ entry (ptr, fixed bin, bit (36) aligned),
+     get_process_id_ entry returns (bit (36) aligned),
+     hcs_$block entry,
+     hcs_$reset_ips_mask entry (bit (36) aligned, bit (36) aligned),
+     hcs_$get_ips_mask entry (bit (36) aligned),
+     hcs_$set_ips_mask entry (bit (36) aligned, bit (36) aligned),
+     hcs_$stop_process entry (bit (36) aligned),
+     hcs_$wakeup entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35)),
+     ipc_$block entry (ptr, ptr, fixed bin(35)),
+     ipc_$create_ev_chn entry (fixed bin(71), fixed bin(35)),
+     ipc_$delete_ev_chn entry (fixed bin(71), fixed bin(35)),
+     sub_err_ entry options (variable),
+     user_info_$logout_data entry options (variable);
+     
+	
+%include event_wait_info;
+%page;
+%include event_wait_channel;
+%page;
+%include sub_err_flags;
+%page;
+/* program */
+
+	em_ptr = addr (event_message);
+	if action = "logout" then do;			/* this is a simple logout */
+	     if (based_logout.version ^= 0) | (based_logout.pad ^= ""b)
+	     then go to illegal_termination;		/* invalid structure */
+
+	     if based_logout.brief then do;		/* don't print logout message */
+		if based_logout.hold then logout_message = "lhbrief"; /* hold and brief */
+		else logout_message = "lobrief";	/* breif only */
+	     end;
+	     else do;				/* print logout message */
+		if based_logout.hold then logout_message = "login"; /* hold only */
+		else logout_message = "logout";	/* no hold or brief */
+	     end;
+	end;
+	else if action = "new_proc" then do;		/* this is a new_proc */
+	     if (based_new_proc.version ^= 1) | (based_new_proc.pad ^= ""b)
+	     then go to illegal_termination;		/* naughty, naughty */
+
+	     if based_new_proc.authorization_option
+	     then do;				/* special handling here */
+		new_proc_auth.message = "np";		/* set identifying string */
+		new_proc_auth.authorization = substr (based_new_proc.new_authorization, 1, 54); /* ugh */
+	     end;
+	     else logout_message = "new_proc";		/* map new_proc into proper key word */
+	end;
+	else if action = "fatal_error" then do;		/* this is a fatal error */
+	     if based_fatal_error.version ^= 0
+	     then go to illegal_termination;
+
+	     fatal_term.name = "term";		/* include proper key word */
+	     fatal_term.status_code = based_fatal_error.fatal_code; /* pass on status code */
+	end;
+	else if action = "init_error" then do;		/* this is an initialization error */
+	     if based_init_error.version ^= 0
+	     then go to illegal_termination;
+
+	     logout_message = "init_err";		/* map into proper key word */
+	end;
+	else if action = "io_attach" then do;		/* cannot do initial ios_$attach */
+	     if based_version ^= 0
+	     then go to illegal_termination;
+
+	     logout_message = "no_ioatt";
+	end;
+	else if action = "abs_order" then do;		/* Cannot issue absentee  outseg order */
+	     if based_version ^= 0
+	     then go to illegal_termination;
+
+	     logout_message = "abs_ordr";
+	end;
+	else if action = "no_initproc" then do;		/* Cannot find initial procedure */
+	     if based_version ^= 0
+	     then go to illegal_termination;
+
+	     logout_message = "no_initp";
+	end;
+	else if action = "term_signal" then do;
+	     if based_version ^= 0
+	     then goto illegal_termination;
+
+	     logout_message = "termsgnl";
+	end;
+	else if action = "disconnect" then do;
+	     if (based_disc.version ^= 0) | (based_disc.pad ^= ""b)
+	     then do;
+		call sub_err_ (error_table_$unimplemented_version, "disconnect", ACTION_CANT_RESTART, null (), (0), "");
+		return;
+	     end;
+	     logout_message = "disconn";
+	end;
+	else do;					/* illegal action */
+illegal_termination:
+	     fatal_term.name = "term";		/* use proper key word */
+	     fatal_term.status_code = error_table_$improper_termination;
+						/* return proper status code */
+	end;
+
+	call user_info_$logout_data (logout_channel, logout_pid);
+						/* get logout information */
+
+	if action = "disconnect" then do;
+	     call create_ips_mask_ (addr (sig_names), (2), sig_mask);
+						/* Create a mask of trm_ & sus_ signals */
+	     sig_mask = ^sig_mask;			/* Allow only trm_ & sus_ to wakeup our process */
+	     call hcs_$get_ips_mask (old_mask);
+	     event_wait_channel.channel_id (1) = 0;
+	     event_wait_channel.pad = ""b;
+	     
+	     on cleanup begin;			/* If we typed "release" in response to the QUIT condition */
+		if event_wait_channel.channel_id (1) ^= 0 then
+		     call ipc_$delete_ev_chn (event_wait_channel.channel_id (1), code);
+		call hcs_$reset_ips_mask (old_mask, (""b));
+						/* Delete our event chn & reset the signal mask */
+	     end;
+	     call ipc_$create_ev_chn (event_wait_channel.channel_id (1), code);
+	     call hcs_$set_ips_mask (sig_mask, old_mask);
+						/* Create an event chn to send ourselves a wakeup on */
+	     on quit begin;
+		call hcs_$wakeup ((get_process_id_ ()), event_wait_channel.channel_id (1), 0, code);
+						/* Send a wakeup to ourselves */
+		call continue_to_signal_ (code);	/* Look for another "quit" handler and return */
+	     end;
+
+	     call hcs_$wakeup (logout_pid, logout_channel, event_message, code);
+						/* send message to answering service */
+
+	     call ipc_$block (addr (event_wait_channel), addr (auto_ev_info), code);
+						/* Have our process go blocked */
+						/*  until a "quit" condition is signalled */
+
+						/* If we get here then we must have typed "start" */
+						/* in response to the QUIT condition */
+
+	     revert quit;				/* If we get the "quit" condition signalled, then revert it */
+	     call ipc_$delete_ev_chn (event_wait_channel.channel_id (1), code);
+						/* Delete our event chn after "start" on the quit condition */
+	     call hcs_$reset_ips_mask (old_mask, (""b));	/* Reset IPS masks */
+	     return;				/* Return to caller */
+	end;
+
+	else do;
+	     call hcs_$wakeup (logout_pid, logout_channel, event_message, code);
+						/* send message to answering service */
+
+	     call hcs_$stop_process ((get_process_id_ ()));
+						/* stop the process */
+	     do while ("1"b);			/* wait for destruction */
+		call hcs_$block;
+	     end;
+	end;
+
+     end terminate_process_;
+
+
+
+
+
+
+
+
+		    bull_copyright_notice.txt       08/30/05  1008.4r   08/30/05  1007.3    00020025
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group Bull including Bull HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell Bull Inc., Groupe Bull
+and Bull HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato.Users consider that Multics provided the best software architecture for 
+managing computer hardware properly and for executing programs. Many subsequent operating systems
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, Bull or Bull HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by Bull HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

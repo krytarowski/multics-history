@@ -1,0 +1,1842 @@
+	COMPILATION LISTING OF SEGMENT open_seq_file
+	Compiled by: Multics PL/I Compiler, Release 27d, of October 11, 1982
+	Compiled at: Honeywell LISD Phoenix, System M
+	Compiled on: 11/04/82  1735.6 mst Thu
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        4*   *                                                         *
+        5*   * Copyright (c) 1972 by Massachusetts Institute of        *
+        6*   * Technology and Honeywell Information Systems, Inc.      *
+        7*   *                                                         *
+        8*   *********************************************************** */
+        9 
+       10 
+       11 /* Modified 8/8/74 to correct bug. Declared header size increased by four words
+       12*   to retroactively justify declaration of first_record_pos as having vale 61.
+       13*   New file version number is 1.1. Only difference is that initial_descriptor
+       14*   now is (correctly) immediately before the first records descriptor. Version 1.0 files are ok except for
+       15*   backspacing past beginning of segment, which was the bug */
+       16 
+       17 open_seq_file:
+       18      proc (iocb_ptr, fcb_ptr_arg, first_seg_ptr, is_new_file, mode, close_x, first_seg_bitcount, max_component_size, code);
+       19 	call validate_initialize_file;
+       20 	if code = 0
+       21 	then do;					/* initialize cb, set iocb items */
+       22 		call create_initialize_cb;
+       23 		if first_seg_ptr -> header.version < current_version
+       24 		then if mode > 4			/* OK to update file version */
+       25 		     then if (first_seg_ptr -> header.version = 12)
+       26 			     & ^iocb_ptr -> iocb.attach_data_ptr -> atb.inv_lock_reset
+       27 			then call adjust_file_v12;	/* needs end_desc */
+       28 			else do;			/* needs both end_pos and end_desc */
+       29 				call adjust_file;	/* sets end_pos */
+       30 				if code = 0
+       31 				then first_seg_ptr -> header.version = current_version;
+       32 						/* makes change */
+       33 			     end;
+       34 		     else end_not_valid =
+       35 			     (iocb_ptr -> iocb.attach_data_ptr -> atb.inv_lock_reset
+       36 			     | first_seg_ptr -> header.version ^= 12);
+       37 		else do;				/* new version file */
+       38 			end_not_valid = "0"b;	/* end_pos is valid */
+       39 			if first_seg_ptr -> header.file_action ^= 0
+       40 						/* not consistent */
+       41 			then if first_seg_ptr -> header.file_action = must_rollback
+       42 			     then if mode > 4
+       43 				then do;
+       44 					call save_position;
+       45 					call rollback;
+       46 					call restore_position;
+       47 				     end;
+       48 				else ;
+       49 			     else if first_seg_ptr -> header.file_action = must_adjust
+       50 			     then if mode > 4
+       51 				then call adjust_file;
+       52 						/* skips forward */
+       53 				else seq_cb.end_not_valid = "1"b;
+       54 			     else code = error_table_$bad_file;
+       55 		     end;
+       56 		if code = 0
+       57 		then do;
+       58 			call set_entries_and_positions;
+       59 			if mode > 4		/* opening for modification */
+       60 			then if seq_cb.checkpoint
+       61 			     then first_seg_ptr -> header.file_action = must_rollback;
+       62 			     else first_seg_ptr -> header.file_action = must_adjust;
+       63 		     end;
+       64 		else call free_cb_file (size (seq_cb), open_data_ptr);
+       65 	     end;
+       66 	return;					/* end of opening routine */
+       67 
+       68 control_seq_file:
+       69      entry (iocb_ptr, order, info_ptr, code);
+       70 	code = 0;
+       71 
+       72 	if order = "read_position"
+       73 	then do;
+       74 		if end_not_valid			/* old version file -- must compute positions */
+       75 		then call get_positions;
+       76 		info.end_position = seq_cb.end_pos;
+       77 		info.next_position = next_pos;
+       78 		return;
+       79 	     end;
+       80 
+       81 	if order = "record_status"
+       82 	then do;
+       83 		rs_info_ptr = info_ptr;
+       84 		if (rs_info.version < rs_info_version_1) | (rs_info.version > rs_info_version_2)
+       85 		then code = error_table_$unimplemented_version;
+       86 		else if substr (string (rs_info.flags), 1, 6) ^= "0"b
+       87 		then code = error_table_$bad_arg;	/* flags not supported for seq files */
+       88 		else do;
+       89 			if rs_info.locate_pos_sw
+       90 			then if (rs_info.descriptor = 0) | (rs_info.record_length < 0)
+       91 				| (^seq_cb.end_not_valid & (rs_info.record_length > seq_cb.end_pos))
+       92 			     then do;
+       93 				     code = error_table_$bad_arg;
+       94 				     return;	/* abort */
+       95 				end;
+       96 			     else if seq_cb.opening_mode = 5
+       97 						/* output */
+       98 			     then do;
+       99 				     code = error_table_$no_operation;
+      100 				     return;
+      101 				end;
+      102 			     else do;		/* set position as indicated */
+      103 				     if seq_cb.write_pos ^= beyond_limits
+      104 						/* in write state */
+      105 				     then call switch_to_read_state;
+      106 				     call set_position (rs_info.descriptor);
+      107 				     seq_cb.next_is_current = "1"b;
+      108 				     seq_cb.next_pos = rs_info.record_length;
+      109 				     seq_cb.current_record_ptr = null;
+      110 				end;
+      111 			call check_current;		/* current record position required */
+      112 			if code = 0
+      113 			then do;			/* fill in info structure */
+      114 				dbytes = current_record_ptr -> descrip;
+      115 				rs_info.record_length = d;
+      116 				rs_info.record_ptr = addr (current_record_ptr -> record);
+      117 						/* get pointer to record contents */
+      118 				packed_curp = current_record_ptr;
+      119 						/* get into packed format */
+      120 				unspec (rs_info.descriptor) = unspec (packed_curp);
+      121 				seq_desc.comp_num = component;
+      122 				rs_info.max_rec_len = d;
+      123 			     end;
+      124 		     end;
+      125 		return;				/* finished with record_status control order */
+      126 	     end;
+      127 
+      128 	if (order = "checkpoint") & seq_cb.checkpoint & ^seq_cb.input_only
+      129 	then do;					/* make note of present end of file position */
+      130 		call checkpoint;
+      131 		return;				/* end of file position now saved in file header */
+      132 	     end;					/* end of checkpoint order */
+      133 
+      134 	if (order = "truncate") & ^input_only
+      135 	then do;					/* truncate unless already at eof */
+      136 		if read_pos ^= minus_one_pos		/* not in write state */
+      137 		then if seq_cb.checkpoint & (seq_cb.next_pos < seq_cb.header_end_pos /* below checkpoint */)
+      138 		     then do;			/* purely logical truncation */
+      139 			     pos = seq_cb.read_pos;
+      140 			     call set_end_desc;	/* note new eof location */
+      141 			     seq_cb.end_pos = seq_cb.next_pos;
+      142 			end;			/* logically current eof precedes rollback eof */
+      143 		     else do;
+      144 			     call truncate_file;
+      145 			     return;
+      146 			end;
+      147 		seq_cb.current_record_ptr = null;
+      148 		seq_cb.next_is_current = "1"b;
+      149 		return;
+      150 	     end;
+      151 
+      152 	if (order = "rollback") & ^input_only & seq_cb.checkpoint
+      153 	then do;
+      154 		call rollback;
+      155 		return;
+      156 	     end;
+      157 
+      158 	else if order = "error_status"
+      159 	then do;
+      160 		if error_info.version ^= 1
+      161 		then code = error_table_$bad_arg;
+      162 		else do;
+      163 			error_info.type = error.type;
+      164 			error_info.requested = error.requested;
+      165 			error_info.received = error.received;
+      166 		     end;
+      167 		return;
+      168 	     end;
+      169 
+      170 	else if order = "file_status"
+      171 	then do;
+      172 		call vfile_status_$seg (iocb_ptr, file_base_ptr, info_ptr, code);
+      173 		return;
+      174 	     end;
+      175 
+      176 	else if order = "io_call"
+      177 	then call vfile_io_control (iocb_ptr, file_base_ptr, info_ptr, code);
+      178 	else code = error_table_$no_operation;
+      179 	return;					/* end of control routine */
+      180 
+      181 read_length_seq_file:
+      182      entry (iocb_ptr, rec_len, code);
+      183 	call find_next_record;
+      184 	if code = 0
+      185 	then do;					/* record found */
+      186 		rec_len = d;
+      187 		current_record_ptr = addr (descrip);	/* becomes current record */
+      188 		next_is_current = "1"b;		/* unstaggerred */
+      189 	     end;
+      190 	return;					/* end of read length routine */
+      191 
+      192 read_seq_file:
+      193      entry (iocb_ptr, buff_ptr, buff_len, rec_len, code);
+      194 	call find_next_record;
+      195 	if code = 0
+      196 	then do;
+      197 		rec_len = d;
+      198 		if d > buff_len
+      199 		then do;
+      200 			code = error_table_$long_record;
+      201 			d = buff_len;
+      202 		     end;
+      203 		if d > 0
+      204 		then buffer = record;
+      205 		current_record_ptr = addr (descrip);
+      206 		next_pos = next_pos + 1;
+      207 		next_is_current = "0"b;		/* staggerred */
+      208 		read_pos = read_pos + 8 + rec_len;
+      209 	     end;
+      210 	return;					/* end read routine */
+      211 
+      212 position_seq_file:
+      213      entry (iocb_ptr, pos_type, skip, code);
+      214 	code = 0;
+      215 	pos = read_pos;
+      216 	dbytes = descrip;
+      217 	if pos_type = 0
+      218 	then call position_skip;
+      219 	else if pos_type = 1
+      220 	then do;					/* position to eof */
+      221 		if d ^= -1			/* not already at eof, therefore in read state */
+      222 		then if seq_cb.write_pos = beyond_limits/* else must be checkpoint truncation case */
+      223 		     then call position_eof;
+      224 		read_pos = pos;
+      225 	     end;
+      226 	else if pos_type = -1
+      227 	then do;					/* position to beginning */
+      228 		call position_bof;
+      229 		code = er_code;
+      230 	     end;
+      231 	else code = error_table_$bad_arg;
+      232 	return;					/* end position routine */
+      233 
+      234 write_seq_file:
+      235      entry (iocb_ptr, buff_ptr, buff_len, code);
+      236 	if buff_len < 0
+      237 	then do;
+      238 		code = error_table_$negative_nelem;
+      239 		return;
+      240 	     end;
+      241 write:
+      242 	pos = write_pos;
+      243 	write_pos = write_pos + 8 + buff_len;
+      244 	if write_pos > write_limit
+      245 	then call write_exception;
+      246 	else do;
+      247 		code = 0;
+      248 		d = buff_len;
+      249 		addr (seg (write_pos)) -> descrip = minus_one_descrip;
+      250 		trailer_descrip = dbytes;
+      251 		record = buffer;
+      252 		descrip = dbytes;
+      253 		next_is_current = "0"b;		/* positions staggerred after write */
+      254 		current_record_ptr = addr (descrip);
+      255 		seq_cb.end_pos = seq_cb.end_pos + 1;
+      256 		next_pos = seq_cb.end_pos;
+      257 	     end;
+      258 	return;					/* end write routine */
+      259 
+      260 rewrite_seq_file:
+      261      entry (iocb_ptr, buff_ptr, buff_len, code);
+      262 	call check_current;				/* sets code */
+      263 	if buff_len < 0
+      264 	then code = error_table_$negative_nelem;
+      265 	if code = 0				/* current record is defined */
+      266 	then if seq_cb.checkpoint
+      267 	     then do;
+      268 		     if seq_cb.next_is_current
+      269 		     then cur_pos = seq_cb.next_pos;
+      270 		     else cur_pos = seq_cb.next_pos - 1;
+      271 		     if cur_pos < seq_cb.header_end_pos
+      272 		     then code = error_table_$no_operation;
+      273 		     else call replace_record;
+      274 		end;
+      275 	     else call replace_record;
+      276 	return;					/* end rewrite routine */
+      277 
+      278 delete_seq_file:
+      279      entry (iocb_ptr, code);
+      280 	call check_current;
+      281 	if code = 0				/* current record is defined */
+      282 	then if seq_cb.checkpoint			/* may be a purely logical deletion or disallowed */
+      283 	     then do;
+      284 		     if seq_cb.next_is_current
+      285 		     then cur_pos = seq_cb.next_pos;
+      286 		     else cur_pos = seq_cb.next_pos - 1;
+      287 		     if cur_pos < seq_cb.header_end_pos
+      288 		     then if cur_pos < seq_cb.end_pos - 1
+      289 						/* not supported */
+      290 			then code = error_table_$no_operation;
+      291 			else if cur_pos = seq_cb.end_pos - 1
+      292 						/* new low pos */
+      293 			then do;			/* adjust low end */
+      294 				last_desc_ptr = current_record_ptr;
+      295 				last_desc.compno = seq_cb.component;
+      296 				go to set_positions;/* don't actually delete now */
+      297 			     end;
+      298 		end;
+      299 	if code = 0
+      300 	then do;
+      301 		dbytes = current_record_ptr -> descrip;
+      302 		d = -(deleted_size_bias + d);
+      303 		current_record_ptr -> descrip = dbytes;
+      304 set_positions:
+      305 		current_record_ptr = null;
+      306 		seq_cb.end_pos = seq_cb.end_pos - 1;	/* decrement count of records in file */
+      307 		if ^next_is_current			/* next position moves back */
+      308 		then do;
+      309 			next_pos = next_pos - 1;	/* predecessor is deleted */
+      310 			next_is_current = "1"b;	/* current becomes next */
+      311 		     end;
+      312 	     end;
+      313 	return;					/* end delete routine */
+      314 
+      315 close_seq_file:
+      316      entry (iocb_ptr);
+      317 	pos = write_pos;
+      318 	if pos ^= beyond_limits
+      319 	then call switch_to_read_state;
+      320 	if ^seq_cb.input_only
+      321 	then if (unspec (seq_cb.header_end_info) = unspec (seq_cb.checkpoint_data))
+      322 	     then file_base_ptr -> header.file_action = 0;
+      323 	     else if ^seq_cb.checkpoint
+      324 	     then do;
+      325 		     file_base_ptr -> header.checkpoint_data = seq_cb.checkpoint_data;
+      326 		     file_base_ptr -> header.file_action = 0;
+      327 		end;
+      328 	call free_cb_file (size (seq_cb), open_data_ptr);
+      329 	return;					/* end close routine */
+      330 
+      331 find_next_record:
+      332      proc;
+      333 						/* If read pos designates a record, this procedure sets
+      334*						   pos and d and returns with code = 0.  If read_pos
+      335*						   designates eof, it sets current_record_ptr and code
+      336*						   accordingly and returns.  In other cases it advances read_pos
+      337*						   to the first undeleted record or eof, setting pos, d,
+      338*						   and code accordingly. */
+      339 
+      340 	code = 0;
+      341 	do while ("1"b);				/* may cross msf component boundaries */
+      342 	     pos = read_pos;
+      343 	     dbytes = descrip;
+      344 	     if seq_cb.next_pos >= seq_cb.end_pos
+      345 	     then d = -1;				/* as if eof marker encountered */
+      346 	     if d >= 0
+      347 	     then return;
+      348 	     do while (d < -2);			/* skip deleted record */
+      349 		pos = pos + 8 - d - deleted_size_bias;
+      350 		dbytes = descrip;
+      351 	     end;
+      352 	     read_pos = pos;
+      353 	     if d = -1				/* end of file, applies in read or write state */
+      354 	     then do;
+      355 		     if seq_cb.end_not_valid
+      356 		     then do;			/* note that we have found eof */
+      357 			     seq_cb.end_pos = seq_cb.next_pos;
+      358 			     call set_end_desc;
+      359 			end;
+      360 		     code = error_table_$end_of_info;
+      361 		end;
+      362 	     else if d = -2
+      363 	     then call next_seg_read;
+      364 	     if code ^= 0
+      365 	     then do;
+      366 		     current_record_ptr = null;	/* current position is undefined */
+      367 		     return;
+      368 		end;
+      369 	end;
+      370      end;						/* end find_next_record */
+      371 
+      372 position_skip:
+      373      proc;
+      374 	next_is_current = "1"b;			/* positions always the same after a skip */
+      375 	if skip > 0
+      376 	then do;					/* forward skip */
+      377 		count = skip;
+      378 		do while (count > 0);
+      379 		     seq_cb.current_record_ptr = null;
+      380 		     call find_next_record;
+      381 		     if code = 0
+      382 		     then do;
+      383 			     read_pos = read_pos + 8 + d;
+      384 			     next_pos = next_pos + 1; /* bump next record position */
+      385 			     count = count - 1;
+      386 			end;
+      387 		     else count = -count;
+      388 		end;
+      389 		if code ^= 0
+      390 		then do;
+      391 			error.type = skip_error;	/* for "error_status" control order */
+      392 			error.requested = skip;
+      393 			error.received = skip + count;
+      394 		     end;
+      395 	     end;
+      396 	else if skip < 0
+      397 	then do;					/* backwards skip */
+      398 		if write_pos ^= beyond_limits
+      399 		then call switch_to_read_state;
+      400 		count = -skip;
+      401 		call backspace;
+      402 		read_pos = pos;
+      403 		current_record_ptr = addr (descrip);
+      404 		if code ^= 0			/* attempt to pass end of info */
+      405 		then do;				/* save error info */
+      406 			error.type = skip_error;
+      407 			error.requested = skip;
+      408 			error.received = skip - count;
+      409 		     end;
+      410 	     end;
+      411 	else do;					/* don't move next position, just set current */
+      412 		call find_next_record;
+      413 		if code = 0			/* record found */
+      414 		then current_record_ptr = addr (descrip);
+      415 		else code = 0;			/* not error if at end of file */
+      416 	     end;
+      417 
+      418 backspace:
+      419      proc;
+      420 						/* This position backspaces over count records
+      421*						   setting pos.  If there are less than count records
+      422*						   code is set to end_of_info. */
+      423 
+      424 	do while (count > 0);
+      425 	     pos = pos - 4;				/* locate trailer descrip, prev record */
+      426 	     dbytes = descrip;
+      427 	     if d >= 0				/* not beginning of segment */
+      428 	     then do;
+      429 		     pos = pos - 4 - d;		/* descrip for record */
+      430 		     dbytes = descrip;
+      431 		     if d >= 0			/* not deleted record */
+      432 		     then do;			/* decrement count and next_pos */
+      433 			     count = count - 1;
+      434 			     next_pos = next_pos - 1;
+      435 			end;
+      436 		end;
+      437 	     else if component = 0			/* beginning of file */
+      438 	     then do;
+      439 		     code = error_table_$end_of_info;
+      440 		     pos = pos + 4;			/* reset to record descrip */
+      441 		     dbytes = descrip;
+      442 		     count = -count;
+      443 		end;
+      444 	     else do;				/* get preceding segment */
+      445 		     next_comp = component - 1;
+      446 		     call msf_manager_$get_ptr (fcb_ptr, next_comp, "0"b, next_seg_ptr, foo24, foo);
+      447 		     if next_seg_ptr = null
+      448 		     then do;
+      449 			     code = error_table_$bad_file;
+      450 			     pos = pos + 4;		/* reset to record descrip */
+      451 			     dbytes = descrip;
+      452 			     count = 0;
+      453 			end;
+      454 		     else do;
+      455 			     pos = end_prev_seg;
+      456 			     component = next_comp;
+      457 			     seg_ptr = next_seg_ptr;
+      458 			     dbytes = descrip;
+      459 						/* Note count is not decremented.  All
+      460*						   that has happened is to position to the
+      461*						   final descriptor of the preceding segment.
+      462*						   A record must still be backspaced over. */
+      463 			end;
+      464 		end;
+      465 	end;
+      466      end;						/* end backspace */
+      467 
+      468 	dcl     count		 fixed bin;
+      469      end;						/* end position_skip */
+      470 
+      471 check_current:
+      472      proc;					/* routines sets code to indicate whether current rec found */
+      473 	if current_record_ptr = null			/* may be valid if current is next */
+      474 	then do;					/* set current to next */
+      475 		call find_next_record;		/* sets code */
+      476 		if code = 0			/* record found */
+      477 		then current_record_ptr = addr (descrip);
+      478 		else code = error_table_$no_record;
+      479 	     end;
+      480 	else code = 0;				/* current defined since non-null */
+      481      end check_current;
+      482 
+      483 position_eof:
+      484      proc;					/* called in read state */
+      485 	if seq_cb.end_not_valid			/* must scan to find true eof */
+      486 	then call set_end_pos;
+      487 	current_record_ptr = null;
+      488 	seq_cb.next_is_current = "1"b;
+      489 	next_pos = seq_cb.end_pos;
+      490 	if seq_cb.end_desc = 0			/* must be an old version file */
+      491 	then do;					/* handle first positioning to eof as special case */
+      492 		call find_eof_v12;			/* will set end_desc */
+      493 		return;
+      494 	     end;
+      495 	call set_position (seq_cb.end_desc);
+      496 	pos = seq_cb.read_pos;
+      497      end position_eof;
+      498 
+      499 set_position:
+      500      proc (descriptor);				/* sets position to location specified by descriptor */
+      501 	seq_cb.read_pos = 4 * fixed (ds.wordno) + divide (fixed (ds.bitno, 6, 0), 9, 17, 0) + 1;
+      502 						/* byte offset of descriptor */
+      503 	if seq_cb.component ^= ds.compno
+      504 	then do;					/* get another component */
+      505 		seq_cb.component = ds.compno;
+      506 		call msf_manager_$get_ptr (fcb_ptr, seq_cb.component, "0"b, seq_cb.seg_ptr, foo24, foo);
+      507 	     end;
+      508 	dcl     descriptor		 fixed (35);
+      509 	dcl     1 ds		 based (addr (descriptor)),
+      510 		2 bitno		 fixed (5) unal,
+      511 		2 compno		 fixed (11) unal,
+      512 		2 wordno		 bit (18) unal;
+      513      end set_position;
+      514 
+      515 position_bof:
+      516      proc;					/* sets position to beginning of file */
+      517 	er_code = 0;
+      518 	if component ^= 0
+      519 	then call msf_manager_$get_ptr (fcb_ptr, 0, "0"b, next_seg_ptr, foo24, foo);
+      520 	else next_seg_ptr = seg_ptr;
+      521 	if next_seg_ptr = null
+      522 	then er_code = error_table_$bad_file;
+      523 	else do;
+      524 		if write_pos ^= beyond_limits
+      525 		then call switch_to_read_state;
+      526 		seg_ptr = next_seg_ptr;
+      527 		component = 0;
+      528 		read_pos = first_record_pos;
+      529 		next_is_current = "1"b;
+      530 		next_pos = 0;			/* beginning of file */
+      531 		pos = read_pos;			/* offset of first descriptor */
+      532 		current_record_ptr = addr (descrip);
+      533 	     end;
+      534      end position_bof;
+      535 
+      536 replace_record:
+      537      proc;					/* tries to insert new rec at current position */
+      538 	dbytes = current_record_ptr -> descrip;
+      539 	if buff_len = d
+      540 	then do;
+      541 		code = 0;
+      542 		if d ^= 0
+      543 		then current_record_ptr -> record = buffer;
+      544 		if next_is_current			/* positions not staggerred */
+      545 		then do;				/* advance next record position */
+      546 			next_pos = next_pos + 1;
+      547 			next_is_current = "0"b;
+      548 			read_pos = read_pos + 8 + buff_len;
+      549 						/* skip over the current record */
+      550 		     end;
+      551 	     end;
+      552 	else if buff_len < d
+      553 	then code = error_table_$short_record;
+      554 	else code = error_table_$long_record;
+      555      end replace_record;
+      556 
+      557 checkpoint:
+      558      proc;					/* saves eof position in checkpoint data in file header */
+      559 	if seq_cb.write_pos ^= beyond_limits		/* write state */
+      560 	then do;					/* note eof position */
+      561 		pos = seq_cb.write_pos;
+      562 		call set_seg_end;
+      563 	     end;					/* this already done if in read state */
+      564 	file_base_ptr -> header.checkpoint_data = seq_cb.checkpoint_data;
+      565 						/* atomically
+      566*						   changes eof setting */
+      567 	if seq_cb.header_end_pos >= seq_cb.end_pos	/* dispose of tail garbage */
+      568 	then do;
+      569 		call save_position;			/* must be able to leave user's pos unchanged */
+      570 		call position_eof;			/* locate last descriptor */
+      571 		call truncate_file;			/* zero tail contents */
+      572 		call restore_position;		/* like when we started */
+      573 	     end;
+      574 	seq_cb.header_end_info = seq_cb.checkpoint_data;	/* if file is closed now
+      575*						   the file_action can be cleared, since trunc is done and
+      576*						   header end info is correct checkpoint value */
+      577      end checkpoint;
+      578 
+      579 save_position:
+      580      proc;					/* keeps track of file positions so they can be reset */
+      581 	saved_seg_ptr = seg_ptr;
+      582 	saved_comp = component;
+      583 	saved_write_pos = write_pos;
+      584 	saved_read_pos = read_pos;
+      585 	saved_curr_ptr = current_record_ptr;
+      586 	saved_next_curr = next_is_current;
+      587 	saved_next_pos = seq_cb.next_pos;
+      588      end save_position;
+      589 
+      590 restore_position:
+      591      proc;
+      592 	seg_ptr = saved_seg_ptr;
+      593 	component = saved_comp;
+      594 	write_pos = saved_write_pos;
+      595 	read_pos = saved_read_pos;
+      596 	current_record_ptr = saved_curr_ptr;
+      597 	next_is_current = saved_next_curr;
+      598 	seq_cb.next_pos = saved_next_pos;
+      599      end restore_position;
+      600 
+      601 switch_to_read_state:
+      602      proc;
+      603 	pos = seq_cb.write_pos;
+      604 	if seq_cb.checkpoint
+      605 	then if seq_cb.end_pos <= seq_cb.header_end_pos	/* don't alter file yet */
+      606 	     then call set_end_desc;			/* note eof location */
+      607 	     else call set_seg_end;			/* mark the file as well */
+      608 	else call set_seg_end;			/* change is immediate */
+      609 	seq_cb.write_pos = beyond_limits;		/* read state */
+      610      end switch_to_read_state;
+      611 
+      612 set_seg_end:
+      613      proc;
+      614 						/* This procedure sets the current segment's bit count and the
+      615*						   end_seg field in the header.  It expects pos to be at the final
+      616*						   descriptor. */
+      617 
+      618 	end_seg = pos;
+      619 	call hcs_$set_bc_seg (seg_ptr, 9 * (pos + 3), foo);
+      620 
+      621 set_end_desc:
+      622      entry;					/* notes eof location */
+      623 	last_desc_ptr = addr (descrip);		/* get packed ptr */
+      624 	last_desc.compno = seq_cb.component;
+      625      end set_seg_end;
+      626 
+      627 write_exception:
+      628      proc;
+      629 	if pos = beyond_limits			/* read state */
+      630 	then do;
+      631 		if append_sw
+      632 		then if seq_cb.checkpoint		/* may not append if already has truncated */
+      633 		     then if seq_cb.end_pos < seq_cb.header_end_pos
+      634 			then go to no_op;		/* not supported at this time */
+      635 			else call position_eof;
+      636 		     else call position_eof;
+      637 		else if updating
+      638 		then do;				/* replace or insert next record */
+      639 			if seq_cb.checkpoint
+      640 			then if seq_cb.next_pos < seq_cb.header_end_pos
+      641 			     then do;		/* dissallow this case, because it can't be rolled back */
+      642 no_op:
+      643 				     seq_cb.write_pos = pos;
+      644 						/* initial state */
+      645 				     code = error_table_$no_operation;
+      646 				     return;	/* abort */
+      647 				end;
+      648 			call find_next_record;
+      649 			if code = 0		/* not at end of file */
+      650 			then do;			/* replace */
+      651 				write_pos = beyond_limits;
+      652 						/* leave file in read state */
+      653 				current_record_ptr = addr (descrip);
+      654 				next_is_current = "1"b;
+      655 						/* will be changed by replacement */
+      656 				call replace_record;/* lengths must match */
+      657 				return;
+      658 			     end;
+      659 		     end;
+      660 		else if seq_cb.checkpoint & (seq_cb.next_pos < seq_cb.header_end_pos)
+      661 		then go to no_op;
+      662 		else do;
+      663 			call truncate_file;
+      664 			go to write;
+      665 		     end;
+      666 		pos = seq_cb.read_pos;
+      667 		seq_cb.read_pos = minus_one_pos;	/* switch to write state */
+      668 		seq_cb.write_pos = pos;
+      669 		go to write;			/* appends to eof */
+      670 	     end;
+      671 	else if buff_len > max_record_size
+      672 	then do;
+      673 		write_pos = pos;
+      674 		code = error_table_$long_record;
+      675 	     end;
+      676 	else do;					/* end of segment case */
+      677 		write_pos = pos;
+      678 		if ssf_sw				/* no msf's allowed */
+      679 		then do;				/* flag the error */
+      680 			code = error_table_$file_is_full;
+      681 			call set_seg_end;
+      682 			return;
+      683 		     end;
+      684 		next_comp = component + 1;
+      685 		if ^is_msf			/* first open msf */
+      686 		then do;
+      687 			call msf_manager_$open (substr (attach_descrip_string, 8, dname_len),
+      688 			     substr (attach_descrip_string, 9 + dname_len, ename_len), fcb_ptr, code);
+      689 			is_msf = "1"b;
+      690 			atb.fcbp = fcb_ptr;
+      691 		     end;
+      692 		call msf_manager_$get_ptr (fcb_ptr, next_comp, "1"b, next_seg_ptr, foo24, code);
+      693 		if next_seg_ptr ^= null
+      694 		then do;
+      695 			prev_seg_ptr = seg_ptr;	/* save ptr to base of seg */
+      696 			code = 0;
+      697 			call set_seg_end;
+      698 			seg_ptr = next_seg_ptr;
+      699 			component = next_comp;
+      700 			header.version = 1;
+      701 			end_prev_seg = pos;
+      702 			minus_one = -1;
+      703 			addr (seg (header_size + 1)) -> descrip = minus_one_descrip;
+      704 						/* sets initial descriptor */
+      705 			pos = first_record_pos;
+      706 			call set_seg_end;
+      707 			write_pos = first_record_pos;
+      708 			descrip = minus_one_descrip;	/* first record descrip */
+      709 			d = -2;
+      710 			addr (prev_seg_ptr -> seg (end_prev_seg)) -> descrip = dbytes;
+      711 			go to write;		/* add record to end of file */
+      712 		     end;
+      713 	     end;
+      714 	dcl     prev_seg_ptr	 ptr;
+      715      end;						/* end write exception */
+      716 
+      717 next_seg_read:
+      718      proc;					/* called in read state when another seg exists */
+      719 	next_comp = component + 1;
+      720 	call msf_manager_$get_ptr (fcb_ptr, next_comp, "0"b, next_seg_ptr, foo24, foo);
+      721 	if next_seg_ptr = null
+      722 	then code = error_table_$bad_file;
+      723 	else do;
+      724 		component = next_comp;
+      725 		seg_ptr = next_seg_ptr;
+      726 		read_pos = first_record_pos;
+      727 	     end;
+      728      end;						/* end next_seg_read */
+      729 
+      730 truncate_file:
+      731      proc;					/* sets end of file to next record position */
+      732 	pos = read_pos;
+      733 	read_pos = minus_one_pos;			/* first change to write state */
+      734 	write_pos = pos;
+      735 	seq_cb.current_record_ptr = null;
+      736 	seq_cb.next_is_current = "1"b;
+      737 	descrip = minus_one_descrip;
+      738 	call set_seg_end;
+      739 	seq_cb.end_pos = next_pos;
+      740 	if ^is_msf				/* single segment */
+      741 	then call hcs_$truncate_seg (seg_ptr, divide (pos + 6, 4, 18, 0), foo);
+      742 	else call msf_manager_$adjust (fcb_ptr, component, 9 * (pos + 3), "010"b, foo);
+      743 						/* truncate file */
+      744      end truncate_file;
+      745 
+      746 create_initialize_cb:
+      747      proc;
+      748 	call alloc_cb_file (size (seq_cb), open_data_ptr);
+      749 	fcb_ptr = fcb_ptr_arg;
+      750 	seg_ptr = first_seg_ptr;
+      751 	component = 0;
+      752 	write_limit = 4 * max_component_size - 3;
+      753 	max_record_size = 4 * max_component_size - header_size - 12;
+      754 	beyond_limits = write_limit + 4;
+      755 	write_pos = beyond_limits;			/* initialize to read state */
+      756 	read_pos = first_record_pos;
+      757 	next_is_current = "1"b;			/* positions initially not staggerred */
+      758 	pos = read_pos;
+      759 	current_record_ptr = null;
+      760 	next_pos = 0;
+      761 	file_base_ptr = seg_ptr;
+      762 	seq_cb.checkpoint_data, seq_cb.header_end_info = file_base_ptr -> header.checkpoint_data;
+      763 	append_sw = (iocb_ptr -> iocb.attach_data_ptr -> atb.appending) & (mode = 6 /* input_output */);
+      764 	updating = (mode = 7 /* sequential_update */);
+      765 	input_only = (mode = 4);
+      766 	seq_cb.opening_mode = mode;
+      767 	is_msf = atb.msf;				/* set if file is already an msf */
+      768 	ssf_sw = atb.ssf;				/* -ssf option indicates no msf's allowed */
+      769 	minus_one_word = -1;
+      770 	seq_cb.checkpoint = atb.checkpoint_sw;
+      771      end;						/* end create_initialize_cb */
+      772 
+      773 set_entries_and_positions:
+      774      proc;					/* sets iocb entries for valid operations
+      775*						   and positions to end of file in some output modes */
+      776 	close_x = close_seq_file;
+      777 	control = control_seq_file;			/* supported in all modes */
+      778 
+      779 	if mode = 4				/* input */
+      780 	then do;
+      781 		read_record = read_seq_file;
+      782 		read_length = read_length_seq_file;
+      783 		position = position_seq_file;
+      784 	     end;
+      785 
+      786 	else if mode = 5				/* output */
+      787 	then write_record = write_seq_file;
+      788 
+      789 	else if mode = 6				/* input_output */
+      790 	then do;
+      791 		read_record = read_seq_file;
+      792 		read_length = read_length_seq_file;
+      793 		position = position_seq_file;
+      794 		write_record = write_seq_file;
+      795 	     end;
+      796 
+      797 	else do;					/* update */
+      798 		read_record = read_seq_file;
+      799 		read_length = read_length_seq_file;
+      800 		position = position_seq_file;
+      801 		write_record = write_seq_file;
+      802 		rewrite_record = rewrite_seq_file;
+      803 		delete_record = delete_seq_file;
+      804 	     end;
+      805 
+      806 	if (mode = 5) | ((mode = 6) & ^append_sw)	/* output or input-output */
+      807 	then do;					/* change to write state */
+      808 		call position_eof;
+      809 		write_pos = pos;
+      810 		read_pos = minus_one_pos;
+      811 	     end;
+      812 
+      813      end set_entries_and_positions;
+      814 
+      815 validate_initialize_file:
+      816      proc;
+      817 	code = 0;
+      818 	if is_new_file
+      819 	then do;					/* initialize file */
+      820 		first_seg_ptr -> end_prev_seg = 0;
+      821 		first_seg_ptr -> minus_one = -1;
+      822 		first_seg_ptr -> end_seg = first_record_pos;
+      823 		first_seg_ptr -> header.checkpoint_data.end_desc = initial_end_desc;
+      824 		addr (first_seg_ptr -> seg (header_size + 1)) -> descrip = addr (first_seg_ptr -> minus_one) -> descrip;
+      825 
+      826 /* this sets the initial descriptor */
+      827 		addr (first_seg_ptr -> seg (first_record_pos)) -> descrip = addr (first_seg_ptr -> minus_one) -> descrip;
+      828 						/* this set the eof descriptor */
+      829 		call hcs_$set_bc_seg (first_seg_ptr, 9 * (header_size + 8), foo);
+      830 		first_seg_ptr -> header.version = current_version;
+      831 	     end;
+      832 	else do;					/* validate header, init descriptor */
+      833 		dbytes = addr (first_seg_ptr -> seg (header_size + 1)) -> descrip;
+      834 		if ((first_seg_ptr -> header.version < 10) | (first_seg_ptr -> header.version > current_version))
+      835 		     | (first_seg_ptr -> end_prev_seg ^= 0) | (first_seg_ptr -> minus_one ^= -1)
+      836 		     | ((d ^= -1) & (first_seg_ptr -> header.version = 11))
+      837 		then code = error_table_$bad_file;
+      838 	     end;
+      839      end;						/* end validate_initialize_file */
+      840 
+      841 rollback:
+      842      proc;					/* restores eof according to checkpoint data */
+      843 	if seq_cb.write_pos ^= beyond_limits
+      844 	then call switch_to_read_state;
+      845 	if seq_cb.end_pos >= seq_cb.header_end_pos	/* file was extended */
+      846 	then do;					/* rollback requires truncation */
+      847 		seq_cb.next_pos = seq_cb.header_end_pos;
+      848 		call set_position (seq_cb.header_end_desc);
+      849 		call truncate_file;			/* dispose of new stuff */
+      850 		seq_cb.checkpoint_data = seq_cb.header_end_info;
+      851 	     end;
+      852 	else do;					/* un-truncate file */
+      853 		seq_cb.checkpoint_data = seq_cb.header_end_info;
+      854 		call position_eof;
+      855 	     end;
+      856      end rollback;
+      857 
+      858 adjust_file:
+      859      proc;					/* truncates file after setting eof properly */
+      860 	call save_position;
+      861 	seq_cb.end_pos = infinity;			/* let find_next_rec scan for marker */
+      862 	call set_end_pos;
+      863 	call set_seg_end;
+      864 	file_base_ptr -> header.checkpoint_data = seq_cb.checkpoint_data;
+      865 	if ^is_msf				/* single segment */
+      866 	then call hcs_$truncate_seg (seg_ptr, divide (pos + 6, 4, 18, 0), code);
+      867 	else call msf_manager_$adjust (fcb_ptr, component, 9 * (pos + 3), "010"b, code);
+      868 						/* truncate any garbage */
+      869 	seq_cb.header_end_info = seq_cb.checkpoint_data;
+      870 	call restore_position;
+      871      end adjust_file;				/* file properly adjusted to last rec */
+      872 
+      873 set_end_pos:
+      874      proc;					/* determines true record count */
+      875 
+      876 	do while (code = 0);			/* advance position to true eof */
+      877 	     call find_next_record;			/* may advance file position */
+      878 	     next_pos = next_pos + 1;
+      879 	     read_pos = read_pos + 8 + d;		/* skips the record */
+      880 	end;
+      881 
+      882 	seq_cb.end_pos = next_pos - 1;		/* true end of file position */
+      883 	call set_end_desc;
+      884 	end_not_valid = "0"b;			/* remember end pos is now correct */
+      885 	code = 0;
+      886      end set_end_pos;
+      887 
+      888 find_eof_v12:
+      889      proc;					/* positions to end of file in version 12 or older files */
+      890 	flag = "1"b;
+      891 
+      892 	do while (flag);
+      893 	     pos = end_seg;
+      894 	     dbytes = descrip;
+      895 	     read_pos = pos;
+      896 	     if d = -2				/* another segment exists */
+      897 	     then do;
+      898 		     call next_seg_read;
+      899 		     if code ^= 0
+      900 		     then flag = "0"b;		/* found file bad */
+      901 		end;
+      902 	     else flag = "0"b;			/* this is the last seg */
+      903 	end;
+      904 
+      905 	call set_end_desc;
+      906 	dcl     flag		 bit (1) aligned;
+      907      end find_eof_v12;
+      908 
+      909 adjust_file_v12:
+      910      proc;					/* converts version 12 to current */
+      911 	call save_position;
+      912 	call find_eof_v12;
+      913 	first_seg_ptr -> header.checkpoint_data.end_desc = seq_cb.end_desc;
+      914 	first_seg_ptr -> header.version = current_version;
+      915 	call restore_position;
+      916      end adjust_file_v12;
+      917 
+      918 get_positions:
+      919      proc;					/* used on initial attempt to read positions in old version files */
+      920 	call save_position;
+      921 
+      922 /* now find next and end positions */
+      923 	ei_ptr = addr (ei_block);
+      924 	ei_ptr -> error_info.version = 1;
+      925 	call position_seq_file (iocb_ptr, 0, -infinity, foo);
+      926 						/* will produce error */
+      927 	call control_seq_file (iocb_ptr, "error_status", ei_ptr, foo);
+      928 	next_pos = 0;
+      929 	call set_end_pos;
+      930 	next_pos = -ei_ptr -> error_info.received;
+      931 
+      932 	call restore_position;
+      933 	dcl     ei_ptr		 ptr;
+      934 	dcl     1 ei_block,
+      935 		2 words		 (4) fixed;
+      936      end get_positions;
+      937 
+      938 	dcl     (addr, divide)	 builtin;
+      939 	dcl     infinity		 static options (constant) internal fixed (34) init (17179870);
+      940 	dcl     (vfile_io_control, vfile_status_$seg)
+      941 				 entry (ptr, ptr, ptr, fixed (35));
+      942 	dcl     order		 char (*);
+      943 	dcl     info_ptr		 ptr;
+      944 	dcl     alloc_cb_file	 entry (fixed bin, ptr);
+      945 	dcl     buffer		 char (d) based (buff_ptr);
+      946 	dcl     buff_ptr		 ptr;
+      947 	dcl     buff_len		 fixed bin (21);
+      948 	dcl     close_x		 entry;
+      949 	dcl     code		 fixed bin (35);
+      950 	dcl     1 error_info	 based (info_ptr),	/* used with "error_status" control order */
+      951 		2 version		 fixed,		/* must =1 (Input) */
+      952 		2 type		 fixed,		/* identifies type of error--only one currently exists */
+      953 		2 requested	 fixed,		/* skip arg passed to vfile_ for positioning */
+      954 		2 received	 fixed;		/* skips completed successfully */
+      955 	dcl     skip_error		 fixed static options (constant) internal init (1);
+      956 	dcl     1 complete_record	 based (addr (seg (pos))),
+      957 		2 descrip		 char (4),	/* descriptor for record, actually
+      958*						   an integer, = length of record normally, = -(header_size + length)
+      959*						   for deleted record */
+      960 		2 record		 char (d),
+      961 		2 trailer_descrip	 char (4);	/* always = record length */
+      962 	dcl     d			 fixed bin (21);	/* value of descriptor, length of record */
+      963 	dcl     dbytes		 char (4) based (addr (d));
+      964 						/* alias for assignment between d and descrip */
+      965 	dcl     deleted_size_bias	 static options (constant) internal fixed bin (21) init (40);
+      966 						/* this is added to the record size
+      967*						   before commplementing it to get the descriptor for a deleted record. 40 is an arbitrary value >0. */
+      968 	dcl     error_table_$bad_file	 external fixed bin (35);
+      969 	dcl     error_table_$negative_nelem
+      970 				 external fixed (35);
+      971 	dcl     error_table_$file_busy external fixed (35);
+      972 	dcl     error_table_$unimplemented_version
+      973 				 external fixed (35);
+      974 	dcl     error_table_$file_is_full
+      975 				 static external fixed (35);
+      976 	dcl     error_table_$no_operation
+      977 				 external fixed (35);
+      978 	dcl     error_table_$no_record external fixed bin (35);
+      979 	dcl     error_table_$long_record
+      980 				 external fixed bin (35);
+      981 	dcl     error_table_$short_record
+      982 				 external fixed bin (35);
+      983 	dcl     error_table_$end_of_info
+      984 				 external fixed bin (35);
+      985 	dcl     error_table_$bad_arg	 external fixed bin (35);
+      986 	dcl     free_cb_file	 entry (fixed bin, ptr);
+      987 	dcl     fcb_ptr_arg		 ptr;
+      988 	dcl     first_record_pos	 static options (constant) internal fixed bin init (61);
+      989 						/* =header_size+4+1, 4 for initial descriptor */
+      990 	dcl     first_seg_ptr	 ptr;
+      991 	dcl     first_seg_bitcount	 fixed bin (24);
+      992 	dcl     foo		 fixed bin (35);	/* used when status code is to
+      993*						   be ignored */
+      994 	dcl     foo24		 fixed bin (24);	/* used when bit count is to
+      995*						   be ignored */
+      996 	dcl     1 header		 based (seg_ptr),
+      997 		2 common_header_words
+      998 				 (4) fixed bin,
+      999 		2 version_word	 aligned,
+     1000 		  3 file_action	 fixed (17) unal,
+     1001 		  3 version	 fixed (17) unal,
+     1002 		2 end_prev_seg	 fixed bin (21),	/* = 0 in first seg,
+     1003*						   otherwise = pos of final descrip in preceding
+     1004*						   segment */
+     1005 		2 end_seg		 fixed bin (21),	/* = pos of final
+     1006*						   descriptor in this segment except while
+     1007*						   in write state.  In write state indicates
+     1008*						   end of seg when write state entered */
+     1009 		2 minus_one	 fixed bin (21),	/* always -1 */
+     1010 		2 checkpoint_data,
+     1011 		  3 end_pos	 fixed (34),
+     1012 		  3 end_desc	 fixed (35),
+     1013 		2 reserved	 (4) fixed;
+     1014 	dcl     cur_pos		 fixed (34);
+     1015 	dcl     low_end_ptr		 ptr unal based (addr (seq_cb.low_end_desc));
+     1016 	dcl     1 low_ds_struct	 based (addr (seq_cb.low_end_desc)),
+     1017 		2 bitno		 bit (6) unal,
+     1018 		2 low_end_comp	 fixed (11) unal,
+     1019 		2 wordno		 bit (18) unal;
+     1020 	dcl     must_rollback	 static internal fixed options (constant) init (3);
+     1021 	dcl     must_adjust		 static internal fixed options (constant) init (2);
+     1022 	dcl     header_size		 static options (constant) internal fixed bin init (56);
+     1023 	dcl     checkpoint_info_words	 fixed (71);
+     1024 	dcl     1 checkpoint_info	 based (addr (checkpoint_info_words)) aligned,
+     1025 		2 end_pos		 fixed (34),
+     1026 		2 end_desc	 fixed (35);
+     1027 	dcl     hcs_$truncate_seg	 entry (ptr, fixed (18), fixed (35));
+     1028 	dcl     hcs_$terminate_noname	 entry (ptr, fixed (35));
+     1029 	dcl     msf_manager_$open	 entry (char (*), char (*), ptr, fixed (35));
+     1030 	dcl     hcs_$set_bc_seg	 entry (ptr,	/* pointer to seg, input */
+     1031 				 fixed bin (24),	/* bit count to be set */
+     1032 				 fixed bin (35));	/* status code */
+     1033 	dcl     iocb_ptr		 ptr;		/* for open and close entries this points to the actual iocb.
+     1034*						   For other entries the iocb may be attached as a syn */
+     1035 	dcl     is_new_file		 bit (1) aligned;
+     1036 	dcl     max_component_size	 fixed bin (19);
+     1037 	dcl     mode		 fixed bin;	/* 4, 5, 6, or 7 */
+     1038 	dcl     minus_one_pos	 static options (constant) internal fixed bin (21) init (29);
+     1039 						/* 4*common_header_size+13 = position of header.minus_one */
+     1040 	dcl     msf_manager_$adjust	 entry (ptr,	/* fcb_ptr */
+     1041 				 fixed bin,	/* component number of segment to be
+     1042*						   made last segment */
+     1043 				 fixed bin (24),	/* bit count for that seg */
+     1044 				 bit (3),		/* "010" = dont set bit counts, truncate
+     1045*						   segment, dont terminate components */
+     1046 				 fixed bin (35));	/* status code */
+     1047 	dcl     msf_manager_$get_ptr	 entry (ptr,	/* fcb_ptr */
+     1048 				 fixed bin,	/* component number of desired segment */
+     1049 				 bit (1),		/* create switch */
+     1050 				 ptr,		/* ptr to seg or null if error, output */
+     1051 				 fixed bin (24),	/* bitcount of segment, output */
+     1052 				 fixed bin (35));	/* status code */
+     1053 	dcl     next_comp		 fixed bin;
+     1054 	dcl     next_seg_ptr	 ptr;
+     1055 	dcl     null		 builtin;
+     1056 	dcl     rec_len		 fixed bin (21);
+     1057 	dcl     pos		 fixed bin (21);	/* position of next descriptor */
+     1058 	dcl     pos_type		 fixed bin;
+     1059 	dcl     seg		 (1048576) char (1) based (seg_ptr);
+     1060 	dcl     1 info		 based (info_ptr),	/* used for "read_position" order call */
+     1061 		2 next_position	 fixed (34),
+     1062 		2 end_position	 fixed (34);
+     1063 	dcl     1 seq_cb		 based (open_data_ptr),
+     1064 		2 seg_ptr		 ptr,		/* ptr to current seg */
+     1065 		2 fcb_ptr		 ptr,		/* ptr to msf control block */
+     1066 		2 component	 fixed bin,	/* component number of
+     1067*						   current seg */
+     1068 		2 write_limit	 fixed bin (21),	/* set at open to max seg size + 1 */
+     1069 		2 beyond_limits	 fixed bin (21),	/* set at open to write_limit + 4 */
+     1070 		2 max_record_size	 fixed bin (21),	/* set at open to 4*max_component_size-
+     1071*						   header_size-12(i.e. 3 desciptor words */
+     1072 		2 write_pos	 fixed bin (21),	/* in write state =
+     1073*						   pos of final descriptor, in read state =
+     1074*						   beyond limits */
+     1075 		2 read_pos	 fixed bin (21),	/* in read state =
+     1076*						   pos of next descriptor, in write state
+     1077*						   = minus_one_pos */
+     1078 		2 current_record_ptr ptr,
+     1079 		2 checkpoint_data,
+     1080 		  3 end_pos	 fixed (34),
+     1081 		  3 end_desc	 fixed (35),
+     1082 		2 next_pos	 fixed (34),	/* next record number */
+     1083 		2 next_is_current	 bit (1) aligned,	/* "0"b if positions staggerred */
+     1084 		2 updating	 bit (1) aligned,	/* set if mode=7 (sequential_update) */
+     1085 		2 append_sw	 bit (1) aligned,	/* set if mode=6 (seq in out) and -append attachment */
+     1086 		2 input_only	 bit (1) aligned,
+     1087 		2 ssf_sw		 bit (1) aligned,	/* -ssf option indicator */
+     1088 		2 is_msf		 bit (1) aligned,	/* set when msf is opened */
+     1089 		2 end_not_valid	 bit (1) aligned,	/* used with old version files */
+     1090 		2 error,				/* used by "error_status" control order */
+     1091 		  3 type		 fixed,
+     1092 		  3 requested	 fixed (34),
+     1093 		  3 received	 fixed (34),
+     1094 		2 minus_one_word	 fixed,
+     1095 		2 file_base_ptr	 ptr,
+     1096 		2 header_end_info,
+     1097 		  3 header_end_pos	 fixed (34),
+     1098 		  3 header_end_desc	 fixed (35),
+     1099 		2 checkpoint	 bit (1) aligned,	/* set if -checkpoint attachment */
+     1100 		2 opening_mode	 fixed;
+     1101 	dcl     packed_curp		 ptr unal;
+     1102 	dcl     minus_one_descrip	 char (4) based (addr (minus_one_word));
+     1103 	dcl     size		 builtin;
+     1104 	dcl     er_code		 fixed (35);
+     1105 	dcl     current_version	 fixed static options (constant) internal init (13);
+     1106 	dcl     initial_end_desc	 static fixed (35) internal options (constant) init (15);
+     1107 	dcl     1 last_desc		 based (addr (seq_cb.end_desc)),
+     1108 		2 bitno		 fixed (5) unal,
+     1109 		2 compno		 fixed (11) unal,
+     1110 		2 wordno		 bit (18) unal;
+     1111 	dcl     last_desc_ptr	 ptr unal based (addr (seq_cb.end_desc));
+     1112 	dcl     1 eof_data		 based (addr (eof_data_word)),
+     1113 		2 end_pos		 fixed (34),
+     1114 		2 end_desc	 fixed (35);
+     1115 	dcl     eof_data_word	 fixed (71) aligned;
+  1     1 /* include file for common portions of vfile_'s attach block used in
+  1     2*   several modules--created by M. Asherman 1/9/76
+  1     3*   Modified 8/28/76 to add last_comp */
+  1     4 
+  1     5      dcl	   1 atb		      based (iocb_ptr -> iocb.actual_iocb_ptr -> iocb.attach_data_ptr),
+  1     6 						/* attach block */
+  1     7 	     2 flags	      aligned,
+  1     8 	       3 (pad1, appending, no_trunc, pad2, ssf, header_present, blocked, shared, pad3, msf, inv_lock_reset,
+  1     9 		  dup_ok_sw, trans_sw, noend_sw, exclu_sw, stat_sw, checkpoint_sw)
+  1    10 			      bit (1) unal,
+  1    11 	       3 pad5	      bit (19) unal,
+  1    12 	     2 wait_time	      fixed (35),
+  1    13 	     2 word	      fixed,
+  1    14 	     2 max_rec_len	      fixed (35),
+  1    15 	     2 header_id	      fixed (35),
+  1    16 	     2 word2	      fixed,
+  1    17 	     2 attach_descrip_string
+  1    18 			      char (256),
+  1    19 	     2 dname_len,
+  1    20 	     2 ename_len	      fixed,
+  1    21 	     2 words3	      (9) fixed,
+  1    22 	     2 opening_mode	      fixed,
+  1    23 	     2 word4	      fixed,
+  1    24 	     2 fcbp	      ptr,
+  1    25 	     2 fsp	      ptr,		/* first seg ptr */
+  1    26 	     2 close_x	      entry,		/* set to close routine */
+  1    27 	     2 last_comp	      fixed,		/* msf component number */
+  1    28 	     2 tcf_iocbp	      ptr;		/* iocb ptr for transaction control switch */
+     1116 
+  2     1 /* include file for info structure used with record_status control order
+  2     2*   created by M. Asherman 1/6/76 */
+  2     3 /* modified 6/15/77 to support stationary type records */
+  2     4 
+  2     5      dcl	   rs_info_ptr	      ptr;
+  2     6      dcl	   1 rs_info	      based (rs_info_ptr) aligned,
+  2     7 	     2 version	      fixed,		/* must be set to 1 or 2 (Input) */
+  2     8 	     2 flags	      aligned,
+  2     9 	       3 lock_sw	      bit (1) unal,		/* Input -- if ="1"b  try to lock record */
+  2    10 	       3 unlock_sw	      bit (1) unal,		/* Input -- if ="1"b try to unlock record */
+  2    11 	       3 create_sw	      bit (1) unal,		/* Input--if set creat new record */
+  2    12 	       3 locate_sw	      bit (1) unal,		/* Input--if set causes current rec to be
+  2    13*						   located outside the index by descrip, or created without key */
+  2    14 	       3 inc_ref_count    bit (1) unal,		/* Input--bump reference count of record, if stationary */
+  2    15 	       3 dec_ref_count    bit (1) unal,		/* Input--decrement ref count if this flag set and record stationary */
+  2    16 	       3 locate_pos_sw    bit (1) unal,		/* Input--if set the record_length is taken
+  2    17*						   as an input argument specifying the absolute logical record positioni	  to which both the current and next positions will be set */
+  2    18 	       3 mbz1	      bit (29) unal,	/* must be set to "0"b, reserved for future use */
+  2    19 	     2 record_length      fixed (21),		/* length in bytes, Input if create_sw set */
+  2    20 	     2 max_rec_len	      fixed (21),		/* max length of contained record
+  2    21*						   Input if create_sw is set--overrides min_block_size in effect */
+  2    22 	     2 record_ptr	      ptr,		/* points to first byte of record--will be word aligned */
+  2    23 	     2 descriptor	      fixed (35),		/* Input if locate_sw set and create_sw="0"b */
+  2    24 	     2 ref_count	      fixed (34),		/* Output--should match number of keys on this record-- = -1 if non-stationary record */
+  2    25 	     2 time_last_modified fixed (71),		/* Output */
+  2    26 	     2 modifier	      fixed (35),		/* Output--also Input when locking */
+  2    27 	     2 block_ptr	      ptr unal,		/* Output */
+  2    28 	     2 last_image_modifier
+  2    29 			      fixed (35),
+  2    30 	     2 mbz2	      fixed;
+  2    31 
+  2    32      dcl	   1 rs_desc	      based (addr (rs_info.descriptor)),
+  2    33 						/* record block descriptor structure */
+  2    34 	     2 comp_num	      fixed (17) unal,	/* msf component number */
+  2    35 	     2 offset	      bit (18) unal;	/* word offset of record block */
+  2    36 
+  2    37      dcl	   1 seq_desc	      based (addr (rs_info.descriptor)),
+  2    38 						/* for sequential files */
+  2    39 	     2 bitno	      bit (6) unal,
+  2    40 	     2 comp_num	      fixed (11) unal,	/* msf component number */
+  2    41 	     2 wordno	      bit (18) unal;	/* word offset */
+  2    42 
+  2    43      dcl	   rs_info_version_1      static internal fixed init (1);
+  2    44      dcl	   rs_info_version_2      static internal fixed init (2);
+  2    45 
+     1117 
+     1118 	dcl     skip		 fixed (34);
+     1119 	dcl     (saved_seg_ptr, saved_curr_ptr)
+     1120 				 ptr;
+     1121 	dcl     saved_comp		 fixed;
+     1122 	dcl     saved_next_pos	 fixed (34);
+     1123 	dcl     (saved_read_pos, saved_write_pos)
+     1124 				 fixed (21);
+     1125 	dcl     saved_next_curr	 bit (1) aligned;
+  3     1 
+  3     2      dcl	   1 iocb		      aligned based (iocb_ptr),
+  3     3 						/* I/O control block. */
+  3     4 	     2 iocb_version	      fixed init (1),	/* Version number of structure. */
+  3     5 	     2 name	      char (32),		/* I/O name of this block. */
+  3     6 	     2 actual_iocb_ptr    ptr,		/* IOCB ultimately SYNed to. */
+  3     7 	     2 attach_descrip_ptr ptr,		/* Ptr to printable attach description. */
+  3     8 	     2 attach_data_ptr    ptr,		/* Ptr to attach data structure. */
+  3     9 	     2 open_descrip_ptr   ptr,		/* Ptr to printable open description. */
+  3    10 	     2 open_data_ptr      ptr,		/* Ptr to open data structure (old SDB). */
+  3    11 	     2 reserved	      bit (72),		/* Reserved for future use. */
+  3    12 	     2 detach_iocb	      entry (ptr, fixed (35)),/* detach_iocb(p,s) */
+  3    13 	     2 open	      entry (ptr, fixed, bit (1) aligned, fixed (35)),
+  3    14 						/* open(p,mode,not_used,s) */
+  3    15 	     2 close	      entry (ptr, fixed (35)),/* close(p,s) */
+  3    16 	     2 get_line	      entry (ptr, ptr, fixed (21), fixed (21), fixed (35)),
+  3    17 						/* get_line(p,bufptr,buflen,actlen,s) */
+  3    18 	     2 get_chars	      entry (ptr, ptr, fixed (21), fixed (21), fixed (35)),
+  3    19 						/* get_chars(p,bufptr,buflen,actlen,s) */
+  3    20 	     2 put_chars	      entry (ptr, ptr, fixed (21), fixed (35)),
+  3    21 						/* put_chars(p,bufptr,buflen,s) */
+  3    22 	     2 modes	      entry (ptr, char (*), char (*), fixed (35)),
+  3    23 						/* modes(p,newmode,oldmode,s) */
+  3    24 	     2 position	      entry (ptr, fixed, fixed (21), fixed (35)),
+  3    25 						/* position(p,u1,u2,s) */
+  3    26 	     2 control	      entry (ptr, char (*), ptr, fixed (35)),
+  3    27 						/* control(p,order,infptr,s) */
+  3    28 	     2 read_record	      entry (ptr, ptr, fixed (21), fixed (21), fixed (35)),
+  3    29 						/* read_record(p,bufptr,buflen,actlen,s) */
+  3    30 	     2 write_record	      entry (ptr, ptr, fixed (21), fixed (35)),
+  3    31 						/* write_record(p,bufptr,buflen,s) */
+  3    32 	     2 rewrite_record     entry (ptr, ptr, fixed (21), fixed (35)),
+  3    33 						/* rewrite_record(p,bufptr,buflen,s) */
+  3    34 	     2 delete_record      entry (ptr, fixed (35)),/* delete_record(p,s) */
+  3    35 	     2 seek_key	      entry (ptr, char (256) varying, fixed (21), fixed (35)),
+  3    36 						/* seek_key(p,key,len,s) */
+  3    37 	     2 read_key	      entry (ptr, char (256) varying, fixed (21), fixed (35)),
+  3    38 						/* read_key(p,key,len,s) */
+  3    39 	     2 read_length	      entry (ptr, fixed (21), fixed (35));
+  3    40 						/* read_length(p,len,s) */
+  3    41 
+     1126 
+     1127      end /* end of sequential file i-o program */;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    11/04/82  1620.8  open_seq_file.pl1                 >dumps>old>recomp>open_seq_file.pl1
+1116         1    07/19/79  1547.0  vf_attach_block.incl.pl1          >ldd>include>vf_attach_block.incl.pl1
+1117         2    07/19/79  1547.0  rs_info.incl.pl1                  >ldd>include>rs_info.incl.pl1
+1126         3    07/02/81  1905.0  iocbv.incl.pl1                    >ldd>include>iocbv.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+actual_iocb_ptr          12            based           pointer                  level 2 dcl 3-2 ref 687 687 687 687 687 687 687 687
+                                                                                  687 687 690 767 768 770
+addr                                                   builtin function         dcl 938 ref 114 116 121 187 187 203 205 205 216 216
+                                                                                  249 249 250 250 251 252 252 254 254 294 295 301
+                                                                                  303 343 343 350 350 403 403 413 413 426 426 430
+                                                                                  430 441 441 451 451 458 458 476 476 501 501 503
+                                                                                  505 532 532 538 623 623 623 624 653 653 703 703
+                                                                                  708 708 710 710 737 737 824 824 827 827 833 833
+                                                                                  894 894 923
+alloc_cb_file                   000014 constant        entry                    external dcl 944 ref 748
+append_sw                21            based           bit(1)                   level 2 dcl 1063 set ref 631 763* 806
+appending                 0(01)        based           bit(1)                   level 3 packed unaligned dcl 1-5 ref 763
+atb                                    based           structure                level 1 unaligned dcl 1-5
+attach_data_ptr          16            based           pointer                  level 2 dcl 3-2 ref 23 34 687 687 687 687 687 687
+                                                                                  687 687 687 687 690 763 767 768 770
+attach_descrip_string
+                          6            based           char(256)                level 2 packed unaligned dcl 1-5 ref 687 687 687 687
+beyond_limits             6            based           fixed bin(21,0)          level 2 dcl 1063 set ref 103 221 318 398 524 559 609
+                                                                                  629 651 754* 755 843
+bitno                                  based           fixed bin(5,0)           level 2 packed unaligned dcl 509 ref 501
+buff_len                               parameter       fixed bin(21,0)          dcl 947 ref 192 198 201 234 236 243 248 260 263 539
+                                                                                  548 552 671
+buff_ptr                               parameter       pointer                  dcl 946 ref 192 203 234 251 260 542
+buffer                                 based           char                     unaligned dcl 945 set ref 203* 251 542
+checkpoint               36            based           bit(1)                   level 2 dcl 1063 set ref 59 128 136 152 265 281 323
+                                                                                  604 631 639 660 770*
+checkpoint_data          10            based           structure                level 2 in structure "header" unaligned dcl 996
+                                                                                  in procedure "open_seq_file" set ref 325* 564* 762
+                                                                                  864*
+checkpoint_data          14            based           structure                level 2 in structure "seq_cb" unaligned dcl 1063
+                                                                                  in procedure "open_seq_file" set ref 320 325 564
+                                                                                  574 762* 850* 853* 864 869
+checkpoint_sw             0(16)        based           bit(1)                   level 3 packed unaligned dcl 1-5 ref 770
+close_x                                parameter       entry variable           dcl 948 set ref 17 776*
+code                                   parameter       fixed bin(35,0)          dcl 949 set ref 17 20 30 54* 56 68 70* 84* 86* 93*
+                                                                                  99* 112 160* 172* 176* 178* 181 184 192 195 200*
+                                                                                  212 214* 229* 231* 234 238* 247* 260 263* 265 271*
+                                                                                  278 281 287* 299 340* 360* 364 381 389 404 413
+                                                                                  415* 439* 449* 476 478* 480* 541* 552* 554* 645*
+                                                                                  649 674* 680* 687* 692* 696* 721* 817* 834* 865*
+                                                                                  867* 876 885* 899
+comp_num                  0(06)        based           fixed bin(11,0)          level 2 packed unaligned dcl 2-37 set ref 121*
+complete_record                        based           structure                level 1 packed unaligned dcl 956
+compno                    0(06)        based           fixed bin(11,0)          level 2 in structure "ds" packed unaligned dcl 509
+                                                                                  in procedure "set_position" ref 503 505
+compno                    0(06)        based           fixed bin(11,0)          level 2 in structure "last_desc" packed unaligned
+                                                                                  dcl 1107 in procedure "open_seq_file" set ref 295*
+                                                                                  624*
+component                 4            based           fixed bin(17,0)          level 2 dcl 1063 set ref 121 295 437 445 456* 503
+                                                                                  505* 506* 518 527* 582 593* 624 684 699* 719 724*
+                                                                                  742* 751* 867*
+control                  66            based           entry variable           level 2 dcl 3-2 set ref 777*
+count                           000150 automatic       fixed bin(17,0)          dcl 468 set ref 377* 378 385* 385 387* 387 393 400*
+                                                                                  408 424 433* 433 442* 442 452*
+cur_pos                         000103 automatic       fixed bin(34,0)          dcl 1014 set ref 268* 270* 271 284* 286* 287 287 291
+current_record_ptr       12            based           pointer                  level 2 dcl 1063 set ref 109* 114 116 118 147* 187*
+                                                                                  205* 254* 294 301 303 304* 366* 379* 403* 413* 473
+                                                                                  476* 487* 532* 538 542 585 596* 653* 735* 759*
+current_version                        constant        fixed bin(17,0)          initial dcl 1105 ref 23 30 830 834 914
+d                               000100 automatic       fixed bin(21,0)          dcl 962 set ref 114 115 116 122 186 197 198 201* 203
+                                                                                  203 203 216 221 248* 250 250 251 251 252 301 302*
+                                                                                  302 303 343 344* 346 348 349 350 353 362 383 426
+                                                                                  427 429 430 431 441 451 458 538 539 542 542 542
+                                                                                  552 709* 710 833 834 879 894 896
+dbytes                                 based           char(4)                  unaligned dcl 963 set ref 114* 216* 250 252 301* 303
+                                                                                  343* 350* 426* 430* 441* 451* 458* 538* 710 833*
+                                                                                  894*
+delete_record           106            based           entry variable           level 2 dcl 3-2 set ref 803*
+deleted_size_bias                      constant        fixed bin(21,0)          initial dcl 965 ref 302 349
+descrip                                based           char(4)                  level 2 packed unaligned dcl 956 set ref 114 187 205
+                                                                                  216 249* 252* 254 301 303* 343 350 403 413 426 430
+                                                                                  441 451 458 476 532 538 623 653 703* 708* 710*
+                                                                                  737* 824* 824 827* 827 833 894
+descriptor                             parameter       fixed bin(35,0)          dcl 508 in procedure "set_position" set ref 499 501
+                                                                                  501 503 505
+descriptor                6            based           fixed bin(35,0)          level 2 in structure "rs_info" dcl 2-6 in procedure
+                                                                                  "open_seq_file" set ref 89 106* 120* 121
+divide                                                 builtin function         dcl 938 ref 501 740 740 865 865
+dname_len               106            based           fixed bin(17,0)          level 2 dcl 1-5 ref 687 687 687 687
+ds                                     based           structure                level 1 packed unaligned dcl 509
+ei_block                        000372 automatic       structure                level 1 unaligned dcl 934 set ref 923
+ei_ptr                          000370 automatic       pointer                  dcl 933 set ref 923* 924 927* 930
+ename_len               107            based           fixed bin(17,0)          level 2 dcl 1-5 ref 687 687
+end_desc                 11            based           fixed bin(35,0)          level 3 in structure "header" dcl 996 in procedure
+                                                                                  "open_seq_file" set ref 823* 913*
+end_desc                 15            based           fixed bin(35,0)          level 3 in structure "seq_cb" dcl 1063 in procedure
+                                                                                  "open_seq_file" set ref 294 295 490 495* 623 624
+                                                                                  913
+end_not_valid            25            based           bit(1)                   level 2 dcl 1063 set ref 34* 38* 53* 74 89 355 485
+                                                                                  884*
+end_pos                  14            based           fixed bin(34,0)          level 3 dcl 1063 set ref 76 89 141* 255* 255 256 287
+                                                                                  291 306* 306 344 357* 489 567 604 631 739* 845
+                                                                                  861* 882*
+end_position              1            based           fixed bin(34,0)          level 2 dcl 1060 set ref 76*
+end_prev_seg              5            based           fixed bin(21,0)          level 2 dcl 996 set ref 455 701* 710 820* 834
+end_seg                   6            based           fixed bin(21,0)          level 2 dcl 996 set ref 618* 822* 893
+er_code                         000112 automatic       fixed bin(35,0)          dcl 1104 set ref 229 517* 521*
+error                    26            based           structure                level 2 unaligned dcl 1063
+error_info                             based           structure                level 1 unaligned dcl 950
+error_table_$bad_arg            000040 external static fixed bin(35,0)          dcl 985 ref 86 93 160 231
+error_table_$bad_file           000016 external static fixed bin(35,0)          dcl 968 ref 54 449 521 721 834
+error_table_$end_of_info        000036 external static fixed bin(35,0)          dcl 983 ref 360 439
+error_table_$file_is_full       000024 external static fixed bin(35,0)          dcl 974 ref 680
+error_table_$long_record        000032 external static fixed bin(35,0)          dcl 979 ref 200 554 674
+error_table_$negative_nelem     000020 external static fixed bin(35,0)          dcl 969 ref 238 263
+error_table_$no_operation       000026 external static fixed bin(35,0)          dcl 976 ref 99 178 271 287 645
+error_table_$no_record          000030 external static fixed bin(35,0)          dcl 978 ref 478
+error_table_$short_record       000034 external static fixed bin(35,0)          dcl 981 ref 552
+error_table_$unimplemented_version
+                                000022 external static fixed bin(35,0)          dcl 972 ref 84
+fcb_ptr                   2            based           pointer                  level 2 dcl 1063 set ref 446* 506* 518* 687* 690
+                                                                                  692* 720* 742* 749* 867*
+fcb_ptr_arg                            parameter       pointer                  dcl 987 ref 17 749
+fcbp                    124            based           pointer                  level 2 dcl 1-5 set ref 690*
+file_action               4            based           fixed bin(17,0)          level 3 packed unaligned dcl 996 set ref 39 39 49
+                                                                                  59* 62* 320* 326*
+file_base_ptr            32            based           pointer                  level 2 dcl 1063 set ref 172* 176* 320 325 326 564
+                                                                                  761* 762 864
+first_record_pos                       constant        fixed bin(17,0)          initial dcl 988 ref 528 705 707 726 756 822 827
+first_seg_bitcount                     parameter       fixed bin(24,0)          dcl 991 ref 17
+first_seg_ptr                          parameter       pointer                  dcl 990 set ref 17 23 23 30 34 39 39 49 59 62 750
+                                                                                  820 821 822 823 824 824 827 827 829* 830 833 834
+                                                                                  834 834 834 834 913 914
+flag                            000352 automatic       bit(1)                   dcl 906 set ref 890* 892 899* 902*
+flags                                  based           structure                level 2 in structure "atb" dcl 1-5 in procedure
+                                                                                  "open_seq_file"
+flags                     1            based           structure                level 2 in structure "rs_info" dcl 2-6 in procedure
+                                                                                  "open_seq_file" ref 86
+foo                             000101 automatic       fixed bin(35,0)          dcl 992 set ref 446* 506* 518* 619* 720* 740* 742*
+                                                                                  829* 925* 927*
+foo24                           000102 automatic       fixed bin(24,0)          dcl 994 set ref 446* 506* 518* 692* 720*
+free_cb_file                    000042 constant        entry                    external dcl 986 ref 64 328
+hcs_$set_bc_seg                 000050 constant        entry                    external dcl 1030 ref 619 829
+hcs_$truncate_seg               000044 constant        entry                    external dcl 1027 ref 740 865
+header                                 based           structure                level 1 unaligned dcl 996
+header_end_desc          35            based           fixed bin(35,0)          level 3 dcl 1063 set ref 848*
+header_end_info          34            based           structure                level 2 unaligned dcl 1063 set ref 320 574* 762* 850
+                                                                                  853 869*
+header_end_pos           34            based           fixed bin(34,0)          level 3 dcl 1063 set ref 136 271 287 567 604 631 639
+                                                                                  660 845 847
+header_size                            constant        fixed bin(17,0)          initial dcl 1022 ref 703 753 824 829 833
+infinity                        000000 constant        fixed bin(34,0)          initial dcl 939 ref 861 925
+info                                   based           structure                level 1 unaligned dcl 1060
+info_ptr                               parameter       pointer                  dcl 943 set ref 68 76 77 83 160 163 164 165 172*
+                                                                                  176*
+initial_end_desc                       constant        fixed bin(35,0)          initial dcl 1106 ref 823
+input_only               22            based           bit(1)                   level 2 dcl 1063 set ref 128 134 152 320 765*
+inv_lock_reset            0(10)        based           bit(1)                   level 3 packed unaligned dcl 1-5 ref 23 34
+iocb                                   based           structure                level 1 dcl 3-2
+iocb_ptr                               parameter       pointer                  dcl 1033 set ref 17 23 34 34 38 53 59 64 64 64 68 74
+                                                                                  76 77 89 89 96 103 103 107 108 109 114 116 118 121
+                                                                                  128 128 134 136 136 136 136 139 141 141 147 148
+                                                                                  152 152 163 164 165 172* 172 176* 176 181 187 187
+                                                                                  188 192 203 205 205 206 206 207 208 208 212 215
+                                                                                  216 221 221 224 234 241 243 243 244 244 249 249
+                                                                                  249 250 251 252 253 254 254 255 255 256 256 260
+                                                                                  265 268 268 270 271 278 281 284 284 286 287 287
+                                                                                  291 294 294 295 295 301 303 304 306 306 307 309
+                                                                                  309 310 315 317 318 320 320 320 320 323 325 325
+                                                                                  326 328 328 328 342 343 344 344 350 352 355 357
+                                                                                  357 366 374 379 383 383 384 384 391 392 393 398
+                                                                                  398 402 403 403 406 407 408 413 413 426 430 434
+                                                                                  434 437 441 445 446 451 455 456 457 458 473 476
+                                                                                  476 485 487 488 489 489 490 495 496 501 503 505
+                                                                                  506 506 506 518 518 520 524 524 526 527 528 529
+                                                                                  530 531 532 532 538 542 544 546 546 547 548 548
+                                                                                  559 559 561 564 564 567 567 574 574 581 582 583
+                                                                                  584 585 586 587 592 593 594 595 596 597 598 603
+                                                                                  604 604 604 609 609 618 619 623 623 624 624 629
+                                                                                  631 631 631 631 637 639 639 639 642 651 651 653
+                                                                                  653 654 660 660 660 666 667 668 671 673 677 678
+                                                                                  684 685 687 687 687 687 687 687 687 687 687 687
+                                                                                  687 689 690 690 692 695 698 699 700 701 702 703
+                                                                                  703 707 708 708 710 719 720 724 725 726 732 733
+                                                                                  734 735 736 737 737 739 739 740 740 742 742 748
+                                                                                  748 748 749 750 751 752 753 754 754 755 755 756
+                                                                                  757 758 759 760 761 761 762 762 762 763 763 764
+                                                                                  765 766 767 767 768 768 769 770 770 777 781 782
+                                                                                  783 786 791 792 793 794 798 799 800 801 802 803
+                                                                                  806 809 810 843 843 845 845 847 847 848 850 850
+                                                                                  853 853 861 864 864 865 865 867 867 869 869 878
+                                                                                  878 879 879 882 882 884 893 894 895 913 925* 927*
+                                                                                  928 930
+is_msf                   24            based           bit(1)                   level 2 dcl 1063 set ref 685 689* 740 767* 865
+is_new_file                            parameter       bit(1)                   dcl 1035 ref 17 818
+last_desc                              based           structure                level 1 packed unaligned dcl 1107
+last_desc_ptr                          based           pointer                  unaligned dcl 1111 set ref 294* 623*
+locate_pos_sw             1(06)        based           bit(1)                   level 3 packed unaligned dcl 2-6 ref 89
+max_component_size                     parameter       fixed bin(19,0)          dcl 1036 ref 17 752 753
+max_rec_len               3            based           fixed bin(21,0)          level 2 dcl 2-6 set ref 122*
+max_record_size           7            based           fixed bin(21,0)          level 2 dcl 1063 set ref 671 753*
+minus_one                 7            based           fixed bin(21,0)          level 2 dcl 996 set ref 702* 821* 824 827 834
+minus_one_descrip                      based           char(4)                  unaligned dcl 1102 ref 249 703 708 737
+minus_one_pos                          constant        fixed bin(21,0)          initial dcl 1038 ref 136 667 733 810
+minus_one_word           31            based           fixed bin(17,0)          level 2 dcl 1063 set ref 249 703 708 737 769*
+mode                                   parameter       fixed bin(17,0)          dcl 1037 ref 17 23 39 49 59 763 764 765 766 779 786
+                                                                                  789 806 806
+msf                       0(09)        based           bit(1)                   level 3 packed unaligned dcl 1-5 ref 767
+msf_manager_$adjust             000052 constant        entry                    external dcl 1040 ref 742 867
+msf_manager_$get_ptr            000054 constant        entry                    external dcl 1047 ref 446 506 518 692 720
+msf_manager_$open               000046 constant        entry                    external dcl 1029 ref 687
+must_adjust                            constant        fixed bin(17,0)          initial dcl 1021 ref 49 62
+must_rollback                          constant        fixed bin(17,0)          initial dcl 1020 ref 39 59
+next_comp                       000104 automatic       fixed bin(17,0)          dcl 1053 set ref 445* 446* 456 684* 692* 699 719*
+                                                                                  720* 724
+next_is_current          17            based           bit(1)                   level 2 dcl 1063 set ref 107* 148* 188* 207* 253*
+                                                                                  268 284 307 310* 374* 488* 529* 544 547* 586 597*
+                                                                                  654* 736* 757*
+next_pos                 16            based           fixed bin(34,0)          level 2 dcl 1063 set ref 77 108* 136 141 206* 206
+                                                                                  256* 268 270 284 286 309* 309 344 357 384* 384
+                                                                                  434* 434 489* 530* 546* 546 587 598* 639 660 739
+                                                                                  760* 847* 878* 878 882 928* 930*
+next_position                          based           fixed bin(34,0)          level 2 dcl 1060 set ref 77*
+next_seg_ptr                    000106 automatic       pointer                  dcl 1054 set ref 446* 447 457 518* 520* 521 526 692*
+                                                                                  693 698 720* 721 725
+null                                                   builtin function         dcl 1055 ref 109 147 304 366 379 447 473 487 521 693
+                                                                                  721 735 759
+open_data_ptr            22            based           pointer                  level 2 dcl 3-2 set ref 34 38 53 59 64 64 64* 74 76
+                                                                                  77 89 89 96 103 103 107 108 109 114 116 118 121
+                                                                                  128 128 134 136 136 136 136 139 141 141 147 148
+                                                                                  152 152 163 164 165 172 176 187 187 188 203 205
+                                                                                  205 206 206 207 208 208 215 216 221 221 224 241
+                                                                                  243 243 244 244 249 249 249 250 251 252 253 254
+                                                                                  254 255 255 256 256 265 268 268 270 271 281 284
+                                                                                  284 286 287 287 291 294 294 295 295 301 303 304
+                                                                                  306 306 307 309 309 310 317 318 320 320 320 320
+                                                                                  323 325 325 326 328 328 328* 342 343 344 344 350
+                                                                                  352 355 357 357 366 374 379 383 383 384 384 391
+                                                                                  392 393 398 398 402 403 403 406 407 408 413 413
+                                                                                  426 430 434 434 437 441 445 446 451 455 456 457
+                                                                                  458 473 476 476 485 487 488 489 489 490 495 496
+                                                                                  501 503 505 506 506 506 518 518 520 524 524 526
+                                                                                  527 528 529 530 531 532 532 538 542 544 546 546
+                                                                                  547 548 548 559 559 561 564 564 567 567 574 574
+                                                                                  581 582 583 584 585 586 587 592 593 594 595 596
+                                                                                  597 598 603 604 604 604 609 609 618 619 623 623
+                                                                                  624 624 629 631 631 631 631 637 639 639 639 642
+                                                                                  651 651 653 653 654 660 660 660 666 667 668 671
+                                                                                  673 677 678 684 685 687 689 690 692 695 698 699
+                                                                                  700 701 702 703 703 707 708 708 710 719 720 724
+                                                                                  725 726 732 733 734 735 736 737 737 739 739 740
+                                                                                  740 742 742 748 748 748* 749 750 751 752 753 754
+                                                                                  754 755 755 756 757 758 759 760 761 761 762 762
+                                                                                  762 763 764 765 766 767 768 769 770 806 809 810
+                                                                                  843 843 845 845 847 847 848 850 850 853 853 861
+                                                                                  864 864 865 865 867 867 869 869 878 878 879 879
+                                                                                  882 882 884 893 894 895 913 928 930
+opening_mode             37            based           fixed bin(17,0)          level 2 dcl 1063 set ref 96 766*
+order                                  parameter       char                     unaligned dcl 942 ref 68 72 81 128 134 152 158 170
+                                                                                  176
+packed_curp                     000111 automatic       pointer                  unaligned dcl 1101 set ref 118* 120
+pos                             000110 automatic       fixed bin(21,0)          dcl 1057 set ref 139* 187 203 205 215* 216 224 241*
+                                                                                  250 251 252 254 317* 318 342* 343 349* 349 350 352
+                                                                                  402 403 413 425* 425 426 429* 429 430 440* 440 441
+                                                                                  450* 450 451 455* 458 476 496* 531* 532 561* 603*
+                                                                                  618 619 623 629 642 653 666* 668 673 677 701 705*
+                                                                                  708 732* 734 737 740 740 742 758* 809 865 865 867
+                                                                                  893* 894 895
+pos_type                               parameter       fixed bin(17,0)          dcl 1058 ref 212 217 219 226
+position                 62            based           entry variable           level 2 dcl 3-2 set ref 783* 793* 800*
+prev_seg_ptr                    000262 automatic       pointer                  dcl 714 set ref 695* 710
+read_length             122            based           entry variable           level 2 dcl 3-2 set ref 782* 792* 799*
+read_pos                 11            based           fixed bin(21,0)          level 2 dcl 1063 set ref 136 139 208* 208 215 224*
+                                                                                  342 352* 383* 383 402* 496 501* 528* 531 548* 548
+                                                                                  584 595* 666 667* 726* 732 733* 756* 758 810* 879*
+                                                                                  879 895*
+read_record              72            based           entry variable           level 2 dcl 3-2 set ref 781* 791* 798*
+rec_len                                parameter       fixed bin(21,0)          dcl 1056 set ref 181 186* 192 197* 208
+received                  3            based           fixed bin(17,0)          level 2 in structure "error_info" dcl 950
+                                                                                  in procedure "open_seq_file" set ref 165* 930
+received                 30            based           fixed bin(34,0)          level 3 in structure "seq_cb" dcl 1063 in procedure
+                                                                                  "open_seq_file" set ref 165 393* 408*
+record                    1            based           char                     level 2 packed unaligned dcl 956 set ref 116 203
+                                                                                  251* 542*
+record_length             2            based           fixed bin(21,0)          level 2 dcl 2-6 set ref 89 89 108 115*
+record_ptr                4            based           pointer                  level 2 dcl 2-6 set ref 116*
+requested                27            based           fixed bin(34,0)          level 3 in structure "seq_cb" dcl 1063 in procedure
+                                                                                  "open_seq_file" set ref 164 392* 407*
+requested                 2            based           fixed bin(17,0)          level 2 in structure "error_info" dcl 950
+                                                                                  in procedure "open_seq_file" set ref 164*
+rewrite_record          102            based           entry variable           level 2 dcl 3-2 set ref 802*
+rs_info                                based           structure                level 1 dcl 2-6
+rs_info_ptr                     000114 automatic       pointer                  dcl 2-5 set ref 83* 84 84 86 89 89 89 89 106 108 115
+                                                                                  116 120 121 122
+rs_info_version_1                      constant        fixed bin(17,0)          initial dcl 2-43 ref 84
+rs_info_version_2                      constant        fixed bin(17,0)          initial dcl 2-44 ref 84
+saved_comp                      000122 automatic       fixed bin(17,0)          dcl 1121 set ref 582* 593
+saved_curr_ptr                  000120 automatic       pointer                  dcl 1119 set ref 585* 596
+saved_next_curr                 000126 automatic       bit(1)                   dcl 1125 set ref 586* 597
+saved_next_pos                  000123 automatic       fixed bin(34,0)          dcl 1122 set ref 587* 598
+saved_read_pos                  000124 automatic       fixed bin(21,0)          dcl 1123 set ref 584* 595
+saved_seg_ptr                   000116 automatic       pointer                  dcl 1119 set ref 581* 592
+saved_write_pos                 000125 automatic       fixed bin(21,0)          dcl 1123 set ref 583* 594
+seg                                    based           char(1)                  array unaligned dcl 1059 set ref 187 203 205 216 249
+                                                                                  250 251 252 254 343 350 403 413 426 430 441 451
+                                                                                  458 476 532 623 653 703 708 710 737 824 827 833
+                                                                                  894
+seg_ptr                                based           pointer                  level 2 dcl 1063 set ref 187 203 205 216 249 250 251
+                                                                                  252 254 343 350 403 413 426 430 441 451 455 457*
+                                                                                  458 476 506* 520 526* 532 581 592* 618 619* 623
+                                                                                  653 695 698* 700 701 702 703 708 710 725* 737 740*
+                                                                                  750* 761 865* 893 894
+seq_cb                                 based           structure                level 1 unaligned dcl 1063 set ref 64 64 328 328 748
+                                                                                  748
+seq_desc                               based           structure                level 1 packed unaligned dcl 2-37
+size                                                   builtin function         dcl 1103 ref 64 64 328 328 748 748
+skip                                   parameter       fixed bin(34,0)          dcl 1118 ref 212 375 377 392 393 396 400 407 408
+skip_error                             constant        fixed bin(17,0)          initial dcl 955 ref 391 406
+ssf                       0(04)        based           bit(1)                   level 3 packed unaligned dcl 1-5 ref 768
+ssf_sw                   23            based           bit(1)                   level 2 dcl 1063 set ref 678 768*
+trailer_descrip                        based           char(4)                  level 2 packed unaligned dcl 956 set ref 250*
+type                      1            based           fixed bin(17,0)          level 2 in structure "error_info" dcl 950
+                                                                                  in procedure "open_seq_file" set ref 163*
+type                     26            based           fixed bin(17,0)          level 3 in structure "seq_cb" dcl 1063 in procedure
+                                                                                  "open_seq_file" set ref 163 391* 406*
+updating                 20            based           bit(1)                   level 2 dcl 1063 set ref 637 764*
+version                   4(18)        based           fixed bin(17,0)          level 3 in structure "header" packed unaligned
+                                                                                  dcl 996 in procedure "open_seq_file" set ref 23 23
+                                                                                  30* 34 700* 830* 834 834 834 914*
+version                                based           fixed bin(17,0)          level 2 in structure "error_info" dcl 950
+                                                                                  in procedure "open_seq_file" set ref 160 924*
+version                                based           fixed bin(17,0)          level 2 in structure "rs_info" dcl 2-6 in procedure
+                                                                                  "open_seq_file" ref 84 84
+version_word              4            based           structure                level 2 dcl 996
+vfile_io_control                000010 constant        entry                    external dcl 940 ref 176
+vfile_status_$seg               000012 constant        entry                    external dcl 940 ref 172
+wordno                    0(18)        based           bit(18)                  level 2 packed unaligned dcl 509 ref 501
+write_limit               5            based           fixed bin(21,0)          level 2 dcl 1063 set ref 244 752* 754
+write_pos                10            based           fixed bin(21,0)          level 2 dcl 1063 set ref 103 221 241 243* 243 244
+                                                                                  249 317 398 524 559 561 583 594* 603 609* 642*
+                                                                                  651* 668* 673* 677* 707* 734* 755* 809* 843
+write_record             76            based           entry variable           level 2 dcl 3-2 set ref 786* 794* 801*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+checkpoint_info                        based           structure                level 1 dcl 1024
+checkpoint_info_words                  automatic       fixed bin(71,0)          dcl 1023
+eof_data                               based           structure                level 1 unaligned dcl 1112
+eof_data_word                          automatic       fixed bin(71,0)          dcl 1115
+error_table_$file_busy                 external static fixed bin(35,0)          dcl 971
+hcs_$terminate_noname           000000 constant        entry                    external dcl 1028
+low_ds_struct                          based           structure                level 1 packed unaligned dcl 1016
+low_end_ptr                            based           pointer                  unaligned dcl 1015
+rs_desc                                based           structure                level 1 packed unaligned dcl 2-32
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+adjust_file                     004123 constant        entry                    internal dcl 858 ref 29 49
+adjust_file_v12                 004316 constant        entry                    internal dcl 909 ref 23
+backspace                       001771 constant        entry                    internal dcl 418 ref 401
+check_current                   002150 constant        entry                    internal dcl 471 ref 111 262 280
+checkpoint                      002505 constant        entry                    internal dcl 557 ref 130
+close_seq_file                  001435 constant        entry                    external dcl 315 ref 776
+control_seq_file                000256 constant        entry                    external dcl 68 ref 777 927
+create_initialize_cb            003456 constant        entry                    internal dcl 746 ref 22
+delete_seq_file                 001314 constant        entry                    external dcl 278 ref 803
+find_eof_v12                    004261 constant        entry                    internal dcl 888 ref 492 912
+find_next_record                001517 constant        entry                    internal dcl 331 ref 183 194 380 412 475 648 877
+get_positions                   004335 constant        entry                    internal dcl 918 ref 74
+next_seg_read                   003267 constant        entry                    internal dcl 717 ref 362 898
+no_op                           002755 constant        label                    dcl 642 ref 631 660
+open_seq_file                   000056 constant        entry                    external dcl 17
+position_bof                    002332 constant        entry                    internal dcl 515 ref 228
+position_eof                    002206 constant        entry                    internal dcl 483 ref 221 570 635 636 808 854
+position_seq_file               001042 constant        entry                    external dcl 212 ref 783 793 800 925
+position_skip                   001624 constant        entry                    internal dcl 372 ref 217
+read_length_seq_file            000674 constant        entry                    external dcl 181 ref 782 792 799
+read_seq_file                   000741 constant        entry                    external dcl 192 ref 781 791 798
+replace_record                  002436 constant        entry                    internal dcl 536 ref 273 275 656
+restore_position                002572 constant        entry                    internal dcl 590 ref 46 572 870 915 932
+rewrite_seq_file                001240 constant        entry                    external dcl 260 ref 802
+rollback                        004057 constant        entry                    internal dcl 841 ref 45 154
+save_position                   002545 constant        entry                    internal dcl 579 ref 44 569 860 911 920
+set_end_desc                    002702 constant        entry                    internal dcl 621 ref 140 358 604 883 905
+set_end_pos                     004224 constant        entry                    internal dcl 873 ref 485 862 929
+set_entries_and_positions       003622 constant        entry                    internal dcl 773 ref 58
+set_position                    002254 constant        entry                    internal dcl 499 ref 106 495 848
+set_positions                   001411 constant        label                    dcl 304 ref 296
+set_seg_end                     002653 constant        entry                    internal dcl 612 ref 562 607 608 681 697 706 738 863
+switch_to_read_state            002623 constant        entry                    internal dcl 601 ref 103 318 398 524 843
+truncate_file                   003350 constant        entry                    internal dcl 730 ref 144 571 663 849
+validate_initialize_file        003750 constant        entry                    internal dcl 815 ref 19
+write                           001147 constant        label                    dcl 241 ref 664 669 711
+write_exception                 002723 constant        entry                    internal dcl 627 ref 244
+write_seq_file                  001130 constant        entry                    external dcl 234 ref 786 794 801
+
+NAMES DECLARED BY CONTEXT OR IMPLICATION.
+fixed                                                  builtin function         ref 501 501
+string                                                 builtin function         ref 86
+substr                                                 builtin function         ref 86 687 687 687 687
+unspec                                                 builtin function         ref 120 120 320 320
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      4770        5046    4440        5000
+Length      5350    4440        56         265     330           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+open_seq_file                       486 external procedure  is an external procedure.  
+find_next_record                        internal procedure  shares stack frame of external procedure open_seq_file.  
+position_skip                           internal procedure  shares stack frame of external procedure open_seq_file.  
+backspace                               internal procedure  shares stack frame of external procedure open_seq_file.  
+check_current                           internal procedure  shares stack frame of external procedure open_seq_file.  
+position_eof                            internal procedure  shares stack frame of external procedure open_seq_file.  
+set_position                            internal procedure  shares stack frame of external procedure open_seq_file.  
+position_bof                            internal procedure  shares stack frame of external procedure open_seq_file.  
+replace_record                          internal procedure  shares stack frame of external procedure open_seq_file.  
+checkpoint                              internal procedure  shares stack frame of external procedure open_seq_file.  
+save_position                           internal procedure  shares stack frame of external procedure open_seq_file.  
+restore_position                        internal procedure  shares stack frame of external procedure open_seq_file.  
+switch_to_read_state                    internal procedure  shares stack frame of external procedure open_seq_file.  
+set_seg_end                             internal procedure  shares stack frame of external procedure open_seq_file.  
+write_exception                         internal procedure  shares stack frame of external procedure open_seq_file.  
+next_seg_read                           internal procedure  shares stack frame of external procedure open_seq_file.  
+truncate_file                           internal procedure  shares stack frame of external procedure open_seq_file.  
+create_initialize_cb                    internal procedure  shares stack frame of external procedure open_seq_file.  
+set_entries_and_positions               internal procedure  shares stack frame of external procedure open_seq_file.  
+validate_initialize_file                internal procedure  shares stack frame of external procedure open_seq_file.  
+rollback                                internal procedure  shares stack frame of external procedure open_seq_file.  
+adjust_file                             internal procedure  shares stack frame of external procedure open_seq_file.  
+set_end_pos                             internal procedure  shares stack frame of external procedure open_seq_file.  
+find_eof_v12                            internal procedure  shares stack frame of external procedure open_seq_file.  
+adjust_file_v12                         internal procedure  shares stack frame of external procedure open_seq_file.  
+get_positions                           internal procedure  shares stack frame of external procedure open_seq_file.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+open_seq_file            000100 d                           open_seq_file
+                         000101 foo                         open_seq_file
+                         000102 foo24                       open_seq_file
+                         000103 cur_pos                     open_seq_file
+                         000104 next_comp                   open_seq_file
+                         000106 next_seg_ptr                open_seq_file
+                         000110 pos                         open_seq_file
+                         000111 packed_curp                 open_seq_file
+                         000112 er_code                     open_seq_file
+                         000114 rs_info_ptr                 open_seq_file
+                         000116 saved_seg_ptr               open_seq_file
+                         000120 saved_curr_ptr              open_seq_file
+                         000122 saved_comp                  open_seq_file
+                         000123 saved_next_pos              open_seq_file
+                         000124 saved_read_pos              open_seq_file
+                         000125 saved_write_pos             open_seq_file
+                         000126 saved_next_curr             open_seq_file
+                         000150 count                       position_skip
+                         000262 prev_seg_ptr                write_exception
+                         000352 flag                        find_eof_v12
+                         000370 ei_ptr                      get_positions
+                         000372 ei_block                    get_positions
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+r_e_as              r_ne_as             alloc_cs            call_ext_in_desc    call_ext_in         call_ext_out_desc
+call_ext_out        return              mpfx2               shorten_stack       ext_entry           ext_entry_desc
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+alloc_cb_file                 free_cb_file                  hcs_$set_bc_seg               hcs_$truncate_seg
+msf_manager_$adjust           msf_manager_$get_ptr          msf_manager_$open             vfile_io_control
+vfile_status_$seg
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$bad_arg          error_table_$bad_file         error_table_$end_of_info      error_table_$file_is_full
+error_table_$long_record      error_table_$negative_nelem   error_table_$no_operation     error_table_$no_record
+error_table_$short_record     error_table_$unimplemented_version
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     17 000047        19 000066        20 000067        22 000071        23 000072        29 000120        30 000121
+     33 000130        34 000131        38 000146        39 000152        44 000163        45 000164        46 000165
+     48 000166        49 000167        53 000176        54 000201        56 000204        58 000206        59 000207
+     62 000225        63 000231        64 000232        66 000250        68 000251        70 000274        72 000275
+     74 000304        76 000312        77 000322        78 000324        81 000325        83 000331        84 000334
+     86 000345        89 000354        93 000372        94 000375        96 000376        99 000401       100 000404
+    103 000405       106 000411       107 000420       108 000426       109 000431       111 000433       112 000434
+    114 000436       115 000446       116 000451       118 000453       120 000461       121 000464       122 000467
+    125 000471       128 000472       130 000510       131 000511       134 000512       136 000521       139 000531
+    140 000533       141 000534       142 000542       144 000543       145 000544       147 000545       148 000552
+    149 000557       152 000560       154 000571       155 000572       158 000573       160 000600       163 000610
+    164 000613       165 000615       167 000617       170 000620       172 000624       173 000641       176 000642
+    178 000664       179 000667       181 000670       183 000706       184 000707       186 000711       187 000713
+    188 000726       190 000733       192 000734       194 000753       195 000754       197 000756       198 000760
+    200 000764       201 000767       203 000771       205 001011       206 001023       207 001027       208 001030
+    210 001034       212 001035       214 001052       215 001053       216 001061       217 001065       219 001071
+    221 001073       224 001102       225 001110       226 001111       228 001113       229 001114       230 001116
+    231 001117       232 001122       234 001123       236 001140       238 001143       239 001146       241 001147
+    243 001155       244 001160       247 001164       248 001165       249 001167       250 001174       251 001205
+    252 001215       253 001221       254 001222       255 001226       256 001233       258 001235       260 001236
+    262 001250       263 001251       265 001257       268 001266       270 001273       271 001276       273 001304
+    274 001305       275 001306       276 001307       278 001310       280 001324       281 001325       284 001335
+    286 001342       287 001345       291 001360       294 001361       295 001363       296 001366       299 001367
+    301 001371       302 001401       303 001406       304 001411       306 001416       307 001423       309 001425
+    310 001427       313 001431       315 001432       317 001442       318 001450       320 001453       323 001473
+    325 001475       326 001501       328 001503       329 001516       331 001517       340 001520       342 001521
+    343 001527       344 001533       346 001540       348 001543       349 001546       350 001553       351 001563
+    352 001564       353 001572       355 001575       357 001577       358 001601       360 001602       361 001605
+    362 001606       364 001611       366 001613       367 001621       369 001622       370 001623       372 001624
+    374 001625       375 001633       377 001635       378 001636       379 001640       380 001646       381 001647
+    383 001651       384 001661       385 001662       386 001664       387 001665       388 001667       389 001670
+    391 001672       392 001700       393 001702       395 001705       396 001706       398 001707       400 001713
+    401 001716       402 001717       403 001725       404 001732       406 001734       407 001741       408 001744
+    410 001747       412 001750       413 001751       415 001767       469 001770       418 001771       424 001772
+    425 001774       426 001776       427 002007       429 002013       430 002017       431 002022       433 002024
+    434 002026       436 002031       437 002032       439 002035       440 002040       441 002042       442 002046
+    443 002050       445 002051       446 002053       447 002076       449 002102       450 002105       451 002107
+    452 002120       453 002121       455 002122       456 002131       457 002134       458 002136       465 002146
+    466 002147       471 002150       473 002151       475 002161       476 002162       478 002200       479 002203
+    480 002204       481 002205       483 002206       485 002207       487 002216       488 002224       489 002231
+    490 002233       492 002235       493 002236       495 002237       496 002245       497 002253       499 002254
+    501 002256       503 002277       505 002305       506 002306       513 002331       515 002332       517 002333
+    518 002334       520 002367       521 002371       524 002401       526 002411       527 002416       528 002422
+    529 002424       530 002426       531 002427       532 002430       534 002435       536 002436       538 002437
+    539 002447       541 002452       542 002453       544 002462       546 002464       547 002465       548 002466
+    551 002473       552 002474       554 002501       555 002504       557 002505       559 002506       561 002515
+    562 002516       564 002517       567 002527       569 002532       570 002533       571 002534       572 002535
+    574 002536       577 002544       579 002545       581 002546       582 002554       583 002557       584 002561
+    585 002563       586 002565       587 002567       588 002571       590 002572       592 002573       593 002600
+    594 002605       595 002607       596 002611       597 002613       598 002620       599 002622       601 002623
+    603 002624       604 002632       607 002641       608 002643       609 002644       610 002652       612 002653
+    618 002654       619 002663       621 002701       623 002703       624 002717       625 002722       627 002723
+    629 002724       631 002733       635 002742       636 002744       637 002746       639 002750       642 002755
+    645 002763       646 002766       648 002767       649 002770       651 002772       653 003000       654 003006
+    656 003013       657 003014       659 003015       660 003016       663 003023       664 003024       666 003025
+    667 003033       668 003035       669 003037       671 003040       673 003043       674 003045       675 003050
+    677 003051       678 003053       680 003055       681 003060       682 003061       684 003062       685 003065
+    687 003067       689 003135       690 003144       692 003150       693 003177       695 003203       696 003211
+    697 003212       698 003213       699 003220       700 003225       701 003230       702 003232       703 003234
+    705 003240       706 003242       707 003243       708 003251       709 003256       710 003260       711 003265
+    715 003266       717 003267       719 003270       720 003277       721 003322       724 003332       725 003340
+    726 003342       728 003347       730 003350       732 003351       733 003357       734 003361       735 003363
+    736 003365       737 003372       738 003377       739 003400       740 003406       742 003430       744 003455
+    746 003456       748 003457       749 003475       750 003504       751 003511       752 003515       753 003522
+    754 003525       755 003530       756 003531       757 003533       758 003535       759 003536       760 003540
+    761 003544       762 003546       763 003561       764 003572       765 003576       766 003601       767 003602
+    768 003607       769 003613       770 003615       771 003621       773 003622       776 003623       777 003631
+    779 003636       781 003641       782 003645       783 003650       784 003653       786 003654       789 003663
+    791 003665       792 003671       793 003674       794 003677       795 003702       798 003703       799 003707
+    800 003712       801 003715       802 003720       803 003723       806 003726       808 003736       809 003737
+    810 003745       813 003747       815 003750       817 003751       818 003752       820 003756       821 003761
+    822 003763       823 003765       824 003767       827 003773       829 003777       830 004014       831 004021
+    833 004022       834 004030       839 004056       841 004057       843 004060       845 004070       847 004077
+    848 004101       849 004107       850 004110       851 004116       853 004117       854 004121       856 004122
+    858 004123       860 004124       861 004125       862 004133       863 004134       864 004135       865 004145
+    867 004167       869 004214       870 004222       871 004223       873 004224       876 004225       877 004227
+    878 004230       879 004235       880 004241       882 004242       883 004251       884 004252       885 004257
+    886 004260       888 004261       890 004262       892 004264       893 004266       894 004275       895 004300
+    896 004302       898 004305       899 004306       901 004311       902 004312       903 004313       905 004314
+    907 004315       909 004316       911 004317       912 004320       913 004321       914 004331       915 004333
+    916 004334       918 004335       920 004336       923 004337       924 004341       925 004343       927 004363
+    928 004414       929 004421       930 004422       932 004431       936 004432
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

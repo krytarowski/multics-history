@@ -1,0 +1,1342 @@
+	COMPILATION LISTING OF SEGMENT dm_log_
+	Compiled by: Multics PL/I Compiler, Release 31a, of October 12, 1988
+	Compiled at: Bull HN, Phoenix AZ, System-M   
+	Compiled on: 03/15/89  0830.2 mst Wed
+	    Options: optimize map
+
+        1 /****^  ***********************************************************
+        2*        *                                                         *
+        3*        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        4*        *                                                         *
+        5*        *********************************************************** */
+        6 
+        7 
+        8 
+        9 
+       10 /****^  HISTORY COMMENTS:
+       11*  1) change(86-10-17,Dupuis), approve(86-11-06,MCR7566), audit(86-11-07,Blair),
+       12*     install(86-11-10,MR12.0-1207):
+       13*     Initialized the parent_ac_sw in auto_create_branch_info to "1"b so that it
+       14*     would create the "logs" directory at the same AIM level as its containing
+       15*     directory (phx20619).
+       16*                                                   END HISTORY COMMENTS */
+       17 
+       18 
+       19 /* DESCRIPTION:
+       20*
+       21*     Primitive interface to the data management log, to be used by all
+       22*processes that need to leave a message in an accessable place for future
+       23*use.  This procedure contains a locking protocol for the data management
+       24*system log.
+       25*
+       26*     There are two entries to this program.  The first is dm_log_, which
+       27*uses a "long" calling sequence.  That is, the user provides all
+       28*information for logging in the dm_log_ call.  The other is
+       29*dm_log_$from_arg_ptr, a pass through method.  The caller must provide an
+       30*argument list pointer a the only argument.  Any error taken while trying
+       31*to log will be swallowed by the any_other handler and not reported to the
+       32*user.  Record quota overflows and segment faults are tried to be reported
+       33*in the log, but these may be lost.  Normally, this should not be a
+       34*problem.
+       35*
+       36*     The "find" entrypoint has been added to initiate the log during boot
+       37*time, following a requirement that the log must be able to be referenced
+       38*before data management commences.
+       39*
+       40*     Two calling sequences are recognized by dm_log_, one for error
+       41*reporting and one for simple reporting.  Error reports will generate two
+       42*entries in the log, simple reports will generate one entry.  The calling
+       43*sequences are:
+       44*
+       45*	call dm_log_ (severity, code, caller, ioa_ctl_string,
+       46*					ioa_arg1, ..., ioa_argN);
+       47*	call dm_log_ (severity, ioa_ctl_string, ioa_arg1, ..., ioa_argN);
+       48*
+       49*   the fundamental flow of this program is:
+       50*
+       51*	DM_LOG_
+       52*
+       53*	     MAKE_MESSAGE
+       54*
+       55*	     LOCK_LOG
+       56*	     if   CANNOT_LOCK_LOG then
+       57*	     else do
+       58*		WRITE_INTO_LOG (time, severity, id || message)
+       59*		UNLOCK_LOG
+       60*		end
+       61*
+       62*        end DM_LOG_
+       63**/
+       64 
+       65 /* HISTORY:
+       66*
+       67*Written by M. Pandolf, 01/11/83.
+       68*Modified:
+       69*02/01/83 by M. Pandolf: to accept pointer to arg list in addition
+       70*	  to accepting an arglist directly.
+       71*05/05/83 by B. Margulies: to stop using write_log_, stop truncating messages.
+       72*06/27/83 by L. A. Newcomb:  Fixed minor problem with long continuation msgs
+       73*            wrapping because of tab at start of extra lines, multiple names
+       74*            on old log segments; deleted obs. entry set_dir.
+       75*08/08/83 by L. A. Newcomb:  checked to call term_$refname if we are using the
+       76*            installed dm_system_data_.  If we don't, the Daemon may use the
+       77*            wrong sys data in the takeover checking.
+       78*08/14/83 by L. A. Newcomb:  fixed to use decode_descriptor_ instead of looking
+       79*            at the argument list directly; now handles a varying string for
+       80*            the caller as well as non-varying.
+       81*09/19/83 by L. A. Newcomb:  moved dm_data_$sys_log_ptr to int. static and 
+       82*	  changed any_other handler to cleanup handler only.
+       83*10/13/83 by M. Pandolf:  added "find" entrypoint.
+       84*03/05/84 by L. A. Newcomb:  changed to use the include file dm_system_states
+       85*            (renamed from dm_statuses), and to use the new names therein.
+       86*08/20/84 by Matthew Pierret:  Changed processing of varying character strings 
+       87*            the argument list to take into account the fact that 
+       88*            arg_list.arg_ptrs points at the string, not the length word.
+       89*11/22/84 by Lee A. Newcomb:  Changed to use dm_misc_util_$get_aim_dir.
+       90*12/05/84 by R. Michael Tague:  Since above $get_aim_dir doesn't return a code,
+       91*            I took out the code check in open_log.
+       92*01/08/85 by Steve Herbst: Converted to call log_write_ and not reference dm_system_data_.
+       93*02/07/85 by Steve Herbst: Changed to call dm_misc_util_$get_log_path instead of $get_aim_dir.
+       94*02/19/85 by Steve Herbst: Changed to create the directory AIM_DIR>logs.
+       95**/
+       96 /* format: style4,indattr,ifthenstmt,ifthen,idind33,^indcomtxt */
+       97 
+       98 dm_log_:
+       99      procedure () options (variable);
+      100 
+      101 
+      102 /* DECLARATIONS */
+      103 
+      104 /* Parameters */
+      105 
+      106 dcl A_arglist_ptr ptr;
+      107 
+      108 /* Constants */
+      109 
+      110 dcl CREATE_IF_NONE bit (1) aligned int static options (constant) init ("1"b);
+      111 dcl FIFTEEN_SECOND_WAIT fixed bin int static options (constant) init (15);
+      112 
+      113 /* Static */
+      114 
+      115 dcl static_log_write_data_ptr ptr int static init (null);
+      116 
+      117 /* Automatic */
+      118 
+      119 dcl 1 auto_create_branch_info aligned like create_branch_info;
+      120 
+      121 dcl 1 log_acl aligned like segment_acl_entry;
+      122 dcl log_ring_brackets (3) fixed bin (3);
+      123 
+      124 dcl (message, message1, message2) char (1024);
+      125 dcl (dm_system_log_path, log_dir_dname, log_dname) char (168);
+      126 dcl long_report char (100) aligned;
+      127 dcl (acct, log_dir_ename, log_ename, my_name) char (32);
+      128 dcl person_id char (22);
+      129 dcl project_id char (9);
+      130 dcl short_report char (8) aligned;
+      131 dcl arg_packed bit (1) aligned;
+      132 dcl arglist_ptr ptr;
+      133 dcl type fixed bin (2);
+      134 dcl (arg_ndims, arg_scale, arg_type, message_severity) fixed bin;
+      135 dcl message_len fixed bin (21);
+      136 dcl (arg_size, bit_count) fixed bin (24);
+      137 dcl (code, error_code) fixed bin (35);
+      138 
+      139 /* External */
+      140 
+      141 dcl error_table_$no_s_permission fixed bin (35) ext;
+      142 dcl error_table_$noentry fixed bin (35) ext;
+      143 
+      144 /* Entries */
+      145 
+      146 dcl convert_status_code_ entry (fixed bin(35), char(8) aligned, char(100) aligned);
+      147 dcl cu_$arg_list_ptr entry (ptr);
+      148 dcl cu_$level_get entry (fixed bin);
+      149 dcl cu_$level_set entry (fixed bin);
+      150 dcl decode_descriptor_ entry (ptr, fixed bin, fixed bin, bit(1) aligned, fixed bin, fixed bin(24), fixed bin);
+      151 dcl dm_misc_util_$get_log_path entry (char (*));
+      152 dcl expand_pathname_ entry (char(*), char(*), char(*), fixed bin(35));
+      153 dcl get_ring_ entry() returns(fixed bin(3));
+      154 dcl hcs_$add_acl_entries entry (char(*), char(*), ptr, fixed bin, fixed bin(35));
+      155 dcl hcs_$create_branch_ entry (char(*), char(*), ptr, fixed bin(35));
+      156 dcl hcs_$set_ring_brackets entry (char(*), char(*), (3)fixed bin(3), fixed bin(35));
+      157 dcl hcs_$status_minf entry (char(*), char(*), fixed bin(1), fixed bin(2), fixed bin(24), fixed bin(35));
+      158 dcl ioa_$general_rs entry (ptr, fixed bin, fixed bin, char(*), fixed bin(21), bit(1) aligned, bit(1) aligned);
+      159 dcl ioa_$rsnnl entry() options(variable);
+      160 dcl log_write_$message entry (ptr, fixed bin, char(*), ptr, fixed bin(35));
+      161 dcl log_write_$open entry (char(*), char(*), bit(1) aligned, ptr, fixed bin(35));
+      162 dcl pathname_ entry (char (*), char (*)) returns (char (168));
+      163 dcl user_info_$whoami entry (char(*), char(*), char(*));
+      164 
+      165 /* Builtins */
+      166 
+      167 dcl (addr, addwordno, null, substr, unspec) builtin;
+      168 
+      169 /* Conditions */
+      170 
+      171 dcl (cleanup, record_quota_overflow, seg_fault_error) condition;
+      172 
+      173 /* dm_log_:  proc () options (variable) */
+      174 
+      175 	my_name = "dm_log_";
+      176 	call cu_$arg_list_ptr (arglist_ptr);
+      177 	go to COMMON;
+      178 
+      179 
+      180 from_arg_ptr:					/* entrypoint to accept arglist_ptr as an argument */
+      181      entry (A_arglist_ptr);
+      182 
+      183 	my_name = "dm_log_$from_arg_ptr";
+      184 	arglist_ptr = A_arglist_ptr;
+      185 	go to COMMON;
+      186 
+      187 COMMON:
+      188 	if arglist_ptr -> arg_list.arg_count < 2 then return;
+      189 
+      190 /* Open/create the log if necessary */
+      191 
+      192 	if static_log_write_data_ptr = null then do;
+      193 	     call dm_misc_util_$get_log_path (dm_system_log_path);
+      194 	     call expand_pathname_ (dm_system_log_path, log_dname, log_ename, 0);
+      195 	     call hcs_$status_minf (log_dname, "", 0, type, bit_count, code);  /* make sure log dir exists */
+      196 	     if code = 0 | code = error_table_$no_s_permission then do;  /* something by that name exists */
+      197 		if type ^= 2 /* directory */ | bit_count ^= 0 then
+      198 		     call ERROR_RETURN (0, "Not a directory: " || log_dname);
+      199 	     end;
+      200 	     else if code = error_table_$noentry then do;	/* create it */
+      201 		unspec (auto_create_branch_info) = "0"b;
+      202 		auto_create_branch_info.version = create_branch_version_2;
+      203 		auto_create_branch_info.dir_sw = "1"b;
+      204 		auto_create_branch_info.parent_ac_sw = "1"b;
+      205 		auto_create_branch_info.mode = SMA_ACCESS;
+      206 		auto_create_branch_info.rings (*) = get_ring_ ();
+      207 		auto_create_branch_info.userid = "*.*.*";  /* all users need access to this dir in ring 2 */
+      208 		call expand_pathname_ (log_dname, log_dir_dname, log_dir_ename, code);
+      209 		if code ^= 0 then call ERROR_RETURN (code, "Unable to create log directory " || log_dname);
+      210 		call hcs_$create_branch_ (log_dir_dname, log_dir_ename, addr (auto_create_branch_info), code);
+      211 		if code ^= 0 then call ERROR_RETURN (code, "Unable to create log directory " || log_dname);
+      212 	     end;
+      213 	     else call ERROR_RETURN (code, "Log directory " || log_dname);
+      214 
+      215 	     call log_write_$open (log_dname, log_ename, CREATE_IF_NONE, static_log_write_data_ptr, code);
+      216 	     if code ^= 0 then call ERROR_RETURN (code, "Cannot open log " || pathname_ (log_dname, log_ename));
+      217 
+      218 /* If had to open, add ACL entry "rw *.*.*" */
+      219 
+      220 	     unspec (log_acl) = "0"b;
+      221 	     log_acl.access_name = "*.*.*";
+      222 	     log_acl.mode = RW_ACCESS;
+      223 	     call hcs_$add_acl_entries (log_dname, log_ename, addr (log_acl), 1, 0);
+      224 
+      225 	     log_ring_brackets (*) = get_ring_ ();
+      226 	     call hcs_$set_ring_brackets (log_dname, log_ename, log_ring_brackets, 0);
+      227 	end;
+      228 
+      229 /* Get some values needed for the message */
+      230 
+      231 	call user_info_$whoami (person_id, project_id, acct);
+      232 	message_severity = FIXED_BIN_17 (1);
+      233 	message1, message2 = "";
+      234 
+      235 /* Decide what type of call this is. Error call if parameter 2 is fixed bin(35) */
+      236 
+      237 	call decode_descriptor_ (arglist_ptr, 2, arg_type, arg_packed, arg_ndims, arg_size, arg_scale);
+      238 	if arg_type = real_fix_bin_1_dtype & arg_packed = "0"b & arg_ndims = 0 & arg_scale = 0 then do;
+      239 
+      240 /* Error call */
+      241 
+      242 	     error_code = FIXED_BIN_35 (2);		/* from parm 2 */
+      243 	     if error_code = 0 then short_report, long_report = "";
+      244 	     else call convert_status_code_ (error_code, short_report, long_report);
+      245 	     call ioa_$rsnnl ("(^a.^a) ^a: ^a", message1, message_len, person_id, project_id, CHAR_N (3), long_report);
+      246 
+      247 	     if arglist_ptr -> arg_list.arg_count > 3 then do;
+      248 		call ioa_$general_rs (arglist_ptr, 4, 5, message2, message_len, "0"b, "0"b);
+      249 		call ioa_$rsnnl ("^a^/^a", message, message_len, message1, message2);
+      250 	     end;
+      251 	     else message = message1;
+      252 	end;
+      253 
+      254 	else do;
+      255 
+      256 /* Not error call */
+      257 
+      258 	     call ioa_$general_rs (arglist_ptr, 2, 3, message1, 0, "0"b, "0"b);
+      259 	     call ioa_$rsnnl ("(^a.^a) ^a", message, message_len, person_id, project_id, message1);
+      260 	end;
+      261 
+      262 	call WRITE_MESSAGE (substr (message, 1, message_len), message_severity);
+      263 
+      264 RETURN:
+      265 	return;
+      266 
+      267 ERROR_RETURN:
+      268      procedure (P_code, P_str);
+      269 
+      270 dcl P_code fixed bin (35);
+      271 dcl P_str char (*);
+      272 
+      273 	/* Code and message are temporarily thrown away until a good way is
+      274*	   found to report them. */
+      275 
+      276 	go to RETURN;
+      277 
+      278 end ERROR_RETURN;
+      279 
+      280 FIXED_BIN_17:
+      281      procedure (P_arg_number) returns (fixed bin (17));
+      282 
+      283 dcl P_arg_number fixed bin;
+      284 dcl fb17 fixed bin based;
+      285 
+      286 	if arglist_ptr -> arg_list.arg_count >= P_arg_number then
+      287 	     return (arglist_ptr -> arg_list.arg_ptrs (P_arg_number) -> fb17);
+      288 	else return (0);
+      289 
+      290 end FIXED_BIN_17;
+      291 
+      292 FIXED_BIN_35:
+      293      procedure (P_arg_number) returns (fixed bin (35));
+      294 
+      295 dcl P_arg_number fixed bin;
+      296 dcl fb35 fixed bin (35) based;
+      297 
+      298 	if arglist_ptr -> arg_list.arg_count >= P_arg_number then
+      299 	     return (arglist_ptr -> arg_list.arg_ptrs (P_arg_number) -> fb35);
+      300 	else return (0);
+      301 
+      302 end FIXED_BIN_35;
+      303 
+      304 CHAR_N:
+      305      procedure (P_arg_number) returns (char (*));
+      306 
+      307 dcl P_arg_number fixed bin;
+      308 dcl char_non_varying char (1000000) based;
+      309 dcl char_varying char (1000000) varying based;
+      310 dcl char_varying_ptr ptr;
+      311 
+      312 	call decode_descriptor_ (arglist_ptr, P_arg_number, arg_type, arg_packed, arg_ndims, arg_size, arg_scale);
+      313 	if arg_type < 1 then return ("");		/* no desc. or no arg. in the given position */
+      314 	if arg_packed = "1"b | arg_ndims ^= 0 | arg_scale ^= 0 | arg_size < 1 then return ("");
+      315 
+      316 	if arg_type = char_dtype then			/* non-varying, assumed most common case */
+      317 	     return (substr (arglist_ptr -> arg_list.arg_ptrs (P_arg_number) -> char_non_varying, 1, arg_size));
+      318 	if arg_type = varying_char_dtype then do;	/* can still do it */
+      319 						/* PL/1 kludge has arg_list pointer point at data, */
+      320 						/* not length word, so back it up. */
+      321 	     char_varying_ptr = addwordno (arglist_ptr -> arg_list.arg_ptrs (P_arg_number), -1);
+      322 	     return (char_varying_ptr -> char_varying);	/* do not need substr */
+      323 	end;
+      324 	else return ("");				/* if we got here, we had a non-char type */
+      325 
+      326 end CHAR_N;
+      327 
+      328 WRITE_MESSAGE:
+      329      procedure (P_message, P_message_severity);		/*  Writes a message to the log */
+      330 
+      331 dcl P_message char (*);
+      332 dcl P_message_severity fixed bin;
+      333 dcl saved_validation fixed bin;
+      334 
+      335 	call cu_$level_get (saved_validation);
+      336 	on cleanup begin;
+      337 	     call cu_$level_set (saved_validation);
+      338 	end;
+      339 	call cu_$level_set (get_ring_ ());
+      340 
+      341 	on record_quota_overflow, seg_fault_error begin;
+      342 	     on record_quota_overflow, seg_fault_error goto PUNT_WARNING;
+      343 	     call log_write_$message (static_log_write_data_ptr, 2,
+      344 		"*** MESSAGES HAVE BEEN LOST ***", null, 0);
+      345 PUNT_WARNING:
+      346 	     call cu_$level_set (saved_validation);
+      347 	     go to RETURN;
+      348 	end;
+      349 
+      350 	call log_write_$message (static_log_write_data_ptr, P_message_severity, P_message, null, code);
+      351 	if code ^= 0 then call ERROR_RETURN (code, "");
+      352 
+      353 	revert record_quota_overflow, seg_fault_error;
+      354 
+      355 	call cu_$level_set (saved_validation);
+      356 
+      357 end WRITE_MESSAGE;
+      358  /* BEGIN INCLUDE FILE ... access_mode_values.incl.pl1
+  1     2*
+  1     3*   Values for the "access mode" argument so often used in hardcore
+  1     4*   James R. Davis 26 Jan 81  MCR 4844
+  1     5*   Added constants for SM access 4/28/82 Jay Pattin
+  1     6*   Added text strings 03/19/85 Chris Jones
+  1     7**/
+  1     8 
+  1     9 
+  1    10 /* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+  1    11 dcl	(
+  1    12 	N_ACCESS		   init ("000"b),
+  1    13 	R_ACCESS		   init ("100"b),
+  1    14 	E_ACCESS		   init ("010"b),
+  1    15 	W_ACCESS		   init ("001"b),
+  1    16 	RE_ACCESS		   init ("110"b),
+  1    17 	REW_ACCESS	   init ("111"b),
+  1    18 	RW_ACCESS		   init ("101"b),
+  1    19 	S_ACCESS		   init ("100"b),
+  1    20 	M_ACCESS		   init ("010"b),
+  1    21 	A_ACCESS		   init ("001"b),
+  1    22 	SA_ACCESS		   init ("101"b),
+  1    23 	SM_ACCESS		   init ("110"b),
+  1    24 	SMA_ACCESS	   init ("111"b)
+  1    25 	)		   bit (3) internal static options (constant);
+  1    26 
+  1    27 /* The following arrays are meant to be accessed by doing either 1) bin (bit_value) or
+  1    28*   2) divide (bin_value, 2) to come up with an index into the array. */
+  1    29 
+  1    30 dcl	SEG_ACCESS_MODE_NAMES  (0:7) init ("null", "W", "E", "EW", "R", "RW", "RE", "REW") char (4) internal
+  1    31 			   static options (constant);
+  1    32 
+  1    33 dcl	DIR_ACCESS_MODE_NAMES  (0:7) init ("null", "A", "M", "MA", "S", "SA", "SM", "SMA") char (4) internal
+  1    34 			   static options (constant);
+  1    35 
+  1    36 dcl	(
+  1    37 	N_ACCESS_BIN	   init (00000b),
+  1    38 	R_ACCESS_BIN	   init (01000b),
+  1    39 	E_ACCESS_BIN	   init (00100b),
+  1    40 	W_ACCESS_BIN	   init (00010b),
+  1    41 	RW_ACCESS_BIN	   init (01010b),
+  1    42 	RE_ACCESS_BIN	   init (01100b),
+  1    43 	REW_ACCESS_BIN	   init (01110b),
+  1    44 	S_ACCESS_BIN	   init (01000b),
+  1    45 	M_ACCESS_BIN	   init (00010b),
+  1    46 	A_ACCESS_BIN	   init (00001b),
+  1    47 	SA_ACCESS_BIN	   init (01001b),
+  1    48 	SM_ACCESS_BIN	   init (01010b),
+  1    49 	SMA_ACCESS_BIN	   init (01011b)
+  1    50 	)		   fixed bin (5) internal static options (constant);
+  1    51 
+  1    52 /* END INCLUDE FILE ... access_mode_values.incl.pl1 */
+      358 
+      359  /* Begin include file -- acl_structures.incl.pl1 BIM 3/82 */
+  2     2 /* format: style3,indcomtxt,idind30 */
+  2     3 
+  2     4 declare   acl_ptr                       pointer;
+  2     5 declare   acl_count                     fixed bin;
+  2     6 
+  2     7 declare 1 general_acl                   aligned based (acl_ptr), /* for fs_util_ */
+  2     8           2 version                     char (8) aligned,
+  2     9           2 count                       fixed bin,
+  2    10           2 entries                     (acl_count refer (general_acl.count)) aligned like general_acl_entry;
+  2    11 
+  2    12 declare 1 general_acl_entry             based,
+  2    13           2 access_name                 character (32) unaligned,
+  2    14           2 mode                        bit (36) aligned,
+  2    15           2 status_code                 fixed bin (35);
+  2    16 
+  2    17 
+  2    18 declare 1 general_extended_acl          aligned based (acl_ptr), /* for fs_util_ */
+  2    19           2 version                     char (8) aligned,
+  2    20           2 count                       fixed bin,
+  2    21           2 entries                     (acl_count refer (general_extended_acl.count)) aligned like general_extended_acl_entry;
+  2    22 
+  2    23 declare 1 general_extended_acl_entry    aligned based,
+  2    24           2 access_name                 character (32) unaligned,
+  2    25           2 mode                        bit (36) aligned,
+  2    26           2 extended_mode               bit (36) aligned,
+  2    27           2 status_code                 fixed bin (35);
+  2    28 
+  2    29 
+  2    30 declare 1 general_delete_acl            aligned based (acl_ptr), /* for file_system_ */
+  2    31           2 version                     char (8) aligned,
+  2    32           2 count                       fixed bin,
+  2    33           2 entries                     (acl_count refer (general_delete_acl.count)) aligned like delete_acl_entry;
+  2    34 
+  2    35 declare 1 general_delete_acl_entry      aligned based,
+  2    36           2 access_name                 character (32) unaligned,
+  2    37           2 status_code                 fixed bin (35);
+  2    38 
+  2    39 
+  2    40 declare 1 segment_acl                   aligned based (acl_ptr),
+  2    41           2 version                     fixed bin,
+  2    42           2 count                       fixed bin,
+  2    43           2 entries                     (acl_count refer (segment_acl.count)) aligned like segment_acl_entry;
+  2    44 
+  2    45 declare 1 segment_acl_entry             like general_extended_acl_entry aligned based;
+  2    46 declare 1 segment_acl_array             (acl_count) aligned like segment_acl_entry based (acl_ptr);
+  2    47 
+  2    48 
+  2    49 declare 1 directory_acl                 aligned based (acl_ptr),
+  2    50           2 version                     fixed bin,
+  2    51           2 count                       fixed bin,
+  2    52           2 entries                     (acl_count refer (directory_acl.count)) aligned like directory_acl_entry;
+  2    53 
+  2    54 declare 1 directory_acl_entry           like general_acl_entry aligned based;
+  2    55 declare 1 directory_acl_array           (acl_count) aligned like directory_acl_entry based (acl_ptr);
+  2    56 
+  2    57 
+  2    58 declare 1 delete_acl                    based (acl_ptr) aligned,
+  2    59           2 version                     fixed bin,
+  2    60           2 count                       fixed bin,
+  2    61           2 entries                     (acl_count refer (delete_acl.count)) aligned like delete_acl_entry;
+  2    62 
+  2    63 declare 1 delete_acl_entry              like general_delete_acl_entry aligned based;
+  2    64 declare 1 delete_acl_array              (acl_count) aligned like delete_acl_entry based (acl_ptr);
+  2    65 
+  2    66 
+  2    67 declare  (SEG_ACL_VERSION_1             init ("sga1"),
+  2    68           DIR_ACL_VERSION_1             init ("dra1"),
+  2    69           DELETE_ACL_VERSION_1          init ("dla1"))
+  2    70                                         char (4) int static options (constant);
+  2    71 
+  2    72 declare  (GENERAL_ACL_VERSION_1         init ("gacl001"),
+  2    73           GENERAL_EXTENDED_ACL_VERSION_1 init ("gxacl001"),
+  2    74           GENERAL_DELETE_ACL_VERSION_1  init ("gdacl001"))
+  2    75                                         char (8) internal static options (constant);
+  2    76 
+  2    77 declare   ACL_VERSION_1                 fixed bin init (1) int static options (constant);
+  2    78 
+  2    79 /* End include file acl_structures.incl.pl1 */
+      359 
+      360  /* BEGIN INCLUDE FILE ... arg_list.incl.pl1
+  3     2*
+  3     3*   James R. Davis 10 May 79 */
+  3     4 
+  3     5 
+  3     6      
+  3     7 /****^  HISTORY COMMENTS:
+  3     8*  1) change(86-05-15,DGHowe), approve(86-05-15,MCR7375),
+  3     9*     audit(86-07-15,Schroth):
+  3    10*     added command_name_arglist declaration to allow the storage of the
+  3    11*     command name given to the command processor
+  3    12*                                                   END HISTORY COMMENTS */
+  3    13 
+  3    14      dcl	   1 arg_list	      aligned based,
+  3    15 	     2 header,
+  3    16 	       3 arg_count	      fixed bin (17) unsigned unal,
+  3    17 	       3 pad1	      bit (1) unal,
+  3    18 	       3 call_type	      fixed bin (18) unsigned unal,
+  3    19 	       3 desc_count	      fixed bin (17) unsigned unal,
+  3    20 	       3 pad2	      bit (19) unal,
+  3    21 	     2 arg_ptrs	      (arg_list_arg_count refer (arg_list.arg_count)) ptr,
+  3    22 	     2 desc_ptrs	      (arg_list_arg_count refer (arg_list.arg_count)) ptr;
+  3    23 
+  3    24 
+  3    25      dcl	   1 command_name_arglist	      aligned based,
+  3    26 	     2 header,
+  3    27 	       3 arg_count	      fixed bin (17) unsigned unal,
+  3    28 	       3 pad1	      bit (1) unal,
+  3    29 	       3 call_type	      fixed bin (18) unsigned unal,
+  3    30 	       3 desc_count	      fixed bin (17) unsigned unal,
+  3    31 	       3 mbz              bit(1) unal,
+  3    32                  3 has_command_name bit(1) unal,
+  3    33 	       3 pad2	      bit (17) unal,
+  3    34 	     2 arg_ptrs	      (arg_list_arg_count refer (command_name_arglist.arg_count)) ptr,
+  3    35 	     2 desc_ptrs	      (arg_list_arg_count refer (command_name_arglist.arg_count)) ptr,
+  3    36 	     2 name,
+  3    37                  3 command_name_ptr         pointer,
+  3    38                  3 command_name_length      fixed bin (21);
+  3    39 	
+  3    40 
+  3    41 
+  3    42      dcl	   1 arg_list_with_envptr aligned based,	/* used with non-quick int and entry-var calls */
+  3    43 	     2 header,
+  3    44 	       3 arg_count	      fixed bin (17) unsigned unal,
+  3    45 	       3 pad1	      bit (1) unal,
+  3    46 	       3 call_type	      fixed bin (18) unsigned unal,
+  3    47 	       3 desc_count	      fixed bin (17) unsigned unal,
+  3    48 	       3 pad2	      bit (19) unal,
+  3    49 	     2 arg_ptrs	      (arg_list_arg_count refer (arg_list_with_envptr.arg_count)) ptr,
+  3    50 	     2 envptr	      ptr,
+  3    51 	     2 desc_ptrs	      (arg_list_arg_count refer (arg_list_with_envptr.arg_count)) ptr;
+  3    52 
+  3    53 
+  3    54      dcl	   (
+  3    55 	   Quick_call_type	      init (0),
+  3    56 	   Interseg_call_type     init (4),
+  3    57 	   Envptr_supplied_call_type
+  3    58 			      init (8)
+  3    59 	   )		      fixed bin (18) unsigned unal int static options (constant);
+  3    60 
+  3    61 /* The user must declare arg_list_arg_count - if an adjustable automatic structure
+  3    62*   is being "liked" then arg_list_arg_count may be a parameter, in order to allocate
+  3    63*   an argument list of the proper size in the user's stack
+  3    64*
+  3    65**/
+  3    66 /* END INCLUDE FILE ... arg_list.incl.pl1 */
+      360 
+      361  /* BEGIN INCLUDE FILE ... arg_descriptor.incl.pl1
+  4     2*
+  4     3*   James R. Davis 1 Mar 79 */
+  4     4 /* Modified June 83 JMAthane for extended arg descriptor format */
+  4     5 
+  4     6      dcl	   1 arg_descriptor	      based (arg_descriptor_ptr) aligned,
+  4     7 	     2 flag	      bit (1) unal,
+  4     8 	     2 type	      fixed bin (6) unsigned unal,
+  4     9 	     2 packed	      bit (1) unal,
+  4    10 	     2 number_dims	      fixed bin (4) unsigned unal,
+  4    11 	     2 size	      fixed bin (24) unsigned unal;
+  4    12 
+  4    13      dcl	   1 fixed_arg_descriptor based (arg_descriptor_ptr) aligned,
+  4    14 	     2 flag	      bit (1) unal,
+  4    15 	     2 type	      fixed bin (6) unsigned unal,
+  4    16 	     2 packed	      bit (1) unal,
+  4    17 	     2 number_dims	      fixed bin (4) unsigned unal,
+  4    18 	     2 scale	      fixed bin (11) unal,
+  4    19 	     2 precision	      fixed bin (12) unsigned unal;
+  4    20 
+  4    21      dcl	   1 extended_arg_descriptor based (arg_descriptor_ptr) aligned,
+  4    22 	     2 flag	      bit (1) unal,		/* = "1"b */
+  4    23 	     2 type	      fixed bin (6) unsigned unal, /* = 58 */
+  4    24 	     2 packed	      bit (1) unal,		/* significant if number_dims ^= 0 */
+  4    25 	     2 number_dims	      fixed (4) unsigned unal,/* number of variable dimensions */
+  4    26 	     2 size	      bit (24) unal,
+  4    27 	     2 dims	      (0 refer (extended_arg_descriptor.number_dims)), /* part referenced by called generated code */
+  4    28 	       3 low	      fixed bin (35),
+  4    29 	       3 high	      fixed bin (35),
+  4    30 	       3 multiplier	      fixed bin (35),	/* in bits if packed, in words if not */
+  4    31 	     2 real_type	      fixed bin (18) unsigned unal,
+  4    32 	     2 type_offset	      fixed bin (18) unsigned unal; /* offset rel to symbol tree to symbol node for type, if any */
+  4    33 
+  4    34      dcl	   arg_descriptor_ptr     ptr;
+  4    35 
+  4    36      dcl	   extended_arg_type      fixed bin init (58);
+  4    37 
+  4    38 /* END INCLUDE file .... arg_descriptor.incl.pl1  */
+      361 
+      362  /*  BEGIN INCLUDE FILE - - - create_branch_info.incl.pl1 - - - created January 1975 */
+  5     2 
+  5     3 
+  5     4 /****^  HISTORY COMMENTS:
+  5     5*  1) change(89-01-16,TLNguyen), approve(89-01-16,MCR8049),
+  5     6*     audit(89-02-03,Parisek), install(89-03-15,MR12.3-1025):
+  5     7*       1. Declare version constant properly.
+  5     8*       2. Remove version 1 since it was never referenced and to force
+  5     9*          callers to upgrade their programs.
+  5    10*                                                   END HISTORY COMMENTS */
+  5    11 
+  5    12 
+  5    13 /* Modified December 1984 for dir_quota, Keith Loepere. */
+  5    14 
+  5    15 /* this include files gives the argument structure for create_branch_ */
+  5    16 
+  5    17 dcl 1 create_branch_info aligned based,
+  5    18     2 version fixed bin,				/* set this to the largest value given below */
+  5    19     2 switches unaligned,
+  5    20       3 dir_sw bit (1) unaligned,			/* if on, a directory branch is wanted */
+  5    21       3 copy_sw bit (1) unaligned,			/* if on, initiating segment will be done by copying */
+  5    22       3 chase_sw bit (1) unaligned,			/* if on, if pathname is a link, it will be chased */
+  5    23       3 priv_upgrade_sw bit (1) unaligned,		/* privileged creation (ring 1) of upgraded object */
+  5    24       3 parent_ac_sw bit (1) unaligned,			/* if on, use parent's access class for seg or dir created */
+  5    25       3 mbz1 bit (31) unaligned,			/* pad to full word */
+  5    26     2 mode bit (3) unaligned,				/* segment or directory for acl for userid */
+  5    27     2 mbz2 bit (33) unaligned,			/* pad to full word */
+  5    28     2 rings (3) fixed bin (3),			/* branch's ring brackets */
+  5    29     2 userid char (32),				/* user's access control name */
+  5    30     2 bitcnt fixed bin (24),				/* bit count of the segment */
+  5    31     2 quota fixed bin (18),				/* for directories, this am't of quota will be moved to it */
+  5    32     2 access_class bit (72),				/* is the access class of the body of the branch */
+  5    33     2 dir_quota fixed bin (18);			/* for directories, this am't of dir quota will be moved to it */
+  5    34 
+  5    35 dcl  create_branch_version_2 fixed bin int static options (constant) init (2);
+  5    36 
+  5    37 /* END INCLUDE FILE - - - create_branch_info.incl.pl1 - - - */
+  5    38 
+      362 
+      363  /* BEGIN INCLUDE FILE - dm_system_states.incl.pl1 */
+  6     2 
+  6     3 /* DESCRIPTION:
+  6     4*
+  6     5*	This include file gives all defined values that
+  6     6*     dm_system_data_$current_dm_state may have.
+  6     7**/
+  6     8 
+  6     9 /* HISTORY:
+  6    10*Written by Lee A. Newcomb, CISL, 11/04/82
+  6    11*Modified:
+  6    12*03/02/84 by Lee A. Newcomb:  added DM_SYSTEM_STATE_SHUTDOWN_WARNING and
+  6    13*	  DM_SYSTEM_STATE_USER_SHUTDOWN; also renamed from dm_statuses to
+  6    14*	  dm_system_states.incl.pl1.
+  6    15*04/06/84 by Lindsey Spratt:  Added DM_SYSTEM_STATE_SYSTEM_SHUTDOWN.
+  6    16*09/05/84 by Lee A. Newcomb:  renamed DM_SYSTEM_STATE_SHUTDOWN_WARNING do
+  6    17*            ...SHUTDOWN_BEGUN and ...SYSTEM_SHUTDOWN to
+  6    18*            ...SHUTDOWN_BUMP_USERS; deleted ...USER_SHUTDOWN.
+  6    19**/
+  6    20 /* format:  style2,^inddcls,linecom,ifthendo,ifthen,^indnoniterdo,dclind5,idind35 */
+  6    21 
+  6    22 dcl  (						/* valid statuses of data management */
+  6    23 						/* ordered to expected sequence of use */
+  6    24      DM_SYSTEM_STATE_UNDEFINED	init ("undf"),	/* found in a template dm_system_data_ */
+  6    25      DM_SYSTEM_STATE_INITIALIZING	init ("init"),
+  6    26      DM_SYSTEM_STATE_RECOVERING	init ("rcov"),
+  6    27      DM_SYSTEM_STATE_RUNNING		init ("run "),
+  6    28      DM_SYSTEM_STATE_SHUTDOWN_BEGUN	init ("sbgn"),
+  6    29      DM_SYSTEM_STATE_SHUTDOWN_BUMP_USERS
+  6    30 				init ("sbmp"),
+  6    31      DM_SYSTEM_STATE_NORMAL_SHUTDOWN	init ("shut")
+  6    32      )				char (4) aligned int static options (constant);
+  6    33 
+  6    34 /* END INCLUDE FILE - dm_system_states.incl.pl1 */
+      363 
+      364  /* BEGIN INCLUDE FILE ... std_descriptor_types.incl.pl1 */
+  7     2 
+  7     3 
+  7     4 /****^  HISTORY COMMENTS:
+  7     5*  1) change(86-09-05,JMAthane), approve(86-09-05,MCR7525),
+  7     6*     audit(86-09-11,Martinson), install(86-11-12,MR12.0-1208):
+  7     7*     Added pascal_string_type_dtype descriptor type.  Its number is 87.
+  7     8*     Objects of this type are PASCAL string types.
+  7     9*  2) change(88-09-20,WAAnderson), approve(88-09-20,MCR7952),
+  7    10*     audit(88-09-30,JRGray), install(88-10-24,MR12.2-1184):
+  7    11*     Added the new C types.
+  7    12*                                                   END HISTORY COMMENTS */
+  7    13 
+  7    14 /* This include file defines mnemonic names for the Multics
+  7    15*   standard descriptor types, using both pl1 and cobol terminology.
+  7    16*   PG 780613
+  7    17*   JRD 790530
+  7    18*   JRD 791016
+  7    19*   MBW 810731
+  7    20*   TGO 830614 Add hex types.
+  7    21*   Modified June 83 JMAthane to add PASCAL data types
+  7    22*   TGO 840120 Add float dec extended and generic, float binary generic
+  7    23**/
+  7    24 
+  7    25      dcl	   (real_fix_bin_1_dtype  init (1),
+  7    26 	   real_fix_bin_2_dtype   init (2),
+  7    27 	   real_flt_bin_1_dtype   init (3),
+  7    28 	   real_flt_bin_2_dtype   init (4),
+  7    29 	   cplx_fix_bin_1_dtype   init (5),
+  7    30 	   cplx_fix_bin_2_dtype   init (6),
+  7    31 	   cplx_flt_bin_1_dtype   init (7),
+  7    32 	   cplx_flt_bin_2_dtype   init (8),
+  7    33 	   real_fix_dec_9bit_ls_dtype init (9),
+  7    34 	   real_flt_dec_9bit_dtype init (10),
+  7    35 	   cplx_fix_dec_9bit_ls_dtype init (11),
+  7    36 	   cplx_flt_dec_9bit_dtype init (12),
+  7    37 	   pointer_dtype	      init (13),
+  7    38 	   offset_dtype	      init (14),
+  7    39 	   label_dtype	      init (15),
+  7    40 	   entry_dtype	      init (16),
+  7    41 	   structure_dtype	      init (17),
+  7    42 	   area_dtype	      init (18),
+  7    43 	   bit_dtype	      init (19),
+  7    44 	   varying_bit_dtype      init (20),
+  7    45 	   char_dtype	      init (21),
+  7    46 	   varying_char_dtype     init (22),
+  7    47 	   file_dtype	      init (23),
+  7    48 	   real_fix_dec_9bit_ls_overp_dtype init (29),
+  7    49 	   real_fix_dec_9bit_ts_overp_dtype init (30),
+  7    50 	   real_fix_bin_1_uns_dtype init (33),
+  7    51 	   real_fix_bin_2_uns_dtype init (34),
+  7    52 	   real_fix_dec_9bit_uns_dtype init (35),
+  7    53 	   real_fix_dec_9bit_ts_dtype init (36),
+  7    54 	   real_fix_dec_4bit_uns_dtype init (38),	/* digit-aligned */
+  7    55 	   real_fix_dec_4bit_ts_dtype init (39),	/* byte-aligned */
+  7    56 	   real_fix_dec_4bit_bytealigned_uns_dtype init (40), /* COBOL */
+  7    57 	   real_fix_dec_4bit_ls_dtype init (41),	/* digit-aligned */
+  7    58 	   real_flt_dec_4bit_dtype init (42),		/* digit-aligned */
+  7    59 	   real_fix_dec_4bit_bytealigned_ls_dtype init (43),
+  7    60 	   real_flt_dec_4bit_bytealigned_dtype init (44),
+  7    61 	   cplx_fix_dec_4bit_bytealigned_ls_dtype init (45),
+  7    62 	   cplx_flt_dec_4bit_bytealigned_dtype init (46),
+  7    63 	   real_flt_hex_1_dtype   init (47),
+  7    64 	   real_flt_hex_2_dtype   init (48),
+  7    65 	   cplx_flt_hex_1_dtype   init (49),
+  7    66 	   cplx_flt_hex_2_dtype   init (50),
+  7    67 	   c_typeref_dtype        init (54),
+  7    68 	   c_enum_dtype           init (55),
+  7    69              c_enum_const_dtype     init (56),
+  7    70 	   c_union_dtype          init (57),
+  7    71 	   algol68_straight_dtype init (59),
+  7    72 	   algol68_format_dtype   init (60),
+  7    73 	   algol68_array_descriptor_dtype init (61),
+  7    74 	   algol68_union_dtype    init (62),
+  7    75 
+  7    76 	   cobol_comp_6_dtype     init (1),
+  7    77 	   cobol_comp_7_dtype     init (1),
+  7    78 	   cobol_display_ls_dtype init (9),
+  7    79 	   cobol_structure_dtype  init (17),
+  7    80 	   cobol_char_string_dtype init (21),
+  7    81 	   cobol_display_ls_overp_dtype init (29),
+  7    82 	   cobol_display_ts_overp_dtype init (30),
+  7    83 	   cobol_display_uns_dtype init (35),
+  7    84 	   cobol_display_ts_dtype init (36),
+  7    85 	   cobol_comp_8_uns_dtype init (38),		/* digit aligned */
+  7    86 	   cobol_comp_5_ts_dtype  init (39),		/* byte aligned */
+  7    87 	   cobol_comp_5_uns_dtype init (40),
+  7    88 	   cobol_comp_8_ls_dtype  init (41),		/* digit aligned */
+  7    89 	   real_flt_dec_extended_dtype init (81),	/* 9-bit exponent */
+  7    90 	   cplx_flt_dec_extended_dtype init (82),	/* 9-bit exponent */
+  7    91 	   real_flt_dec_generic_dtype init (83),	/* generic float decimal */
+  7    92 	   cplx_flt_dec_generic_dtype init (84),
+  7    93 	   real_flt_bin_generic_dtype init (85),	/* generic float binary */
+  7    94 	   cplx_flt_bin_generic_dtype init (86)) fixed bin internal static options (constant);
+  7    95 
+  7    96      dcl	   (ft_integer_dtype      init (1),
+  7    97 	   ft_real_dtype	      init (3),
+  7    98 	   ft_double_dtype	      init (4),
+  7    99 	   ft_complex_dtype	      init (7),
+  7   100 	   ft_complex_double_dtype init (8),
+  7   101 	   ft_external_dtype      init (16),
+  7   102 	   ft_logical_dtype	      init (19),
+  7   103 	   ft_char_dtype	      init (21),
+  7   104 	   ft_hex_real_dtype      init (47),
+  7   105 	   ft_hex_double_dtype    init (48),
+  7   106 	   ft_hex_complex_dtype   init (49),
+  7   107 	   ft_hex_complex_double_dtype init (50)
+  7   108 	   )		      fixed bin internal static options (constant);
+  7   109 
+  7   110      dcl	   (algol68_short_int_dtype init (1),
+  7   111 	   algol68_int_dtype      init (1),
+  7   112 	   algol68_long_int_dtype init (2),
+  7   113 	   algol68_real_dtype     init (3),
+  7   114 	   algol68_long_real_dtype init (4),
+  7   115 	   algol68_compl_dtype    init (7),
+  7   116 	   algol68_long_compl_dtype init (8),
+  7   117 	   algol68_bits_dtype     init (19),
+  7   118 	   algol68_bool_dtype     init (19),
+  7   119 	   algol68_char_dtype     init (21),
+  7   120 	   algol68_byte_dtype     init (21),
+  7   121 	   algol68_struct_struct_char_dtype init (22),
+  7   122 	   algol68_struct_struct_bool_dtype init (20)
+  7   123 	   )		      fixed bin internal static options (constant);
+  7   124 
+  7   125      dcl	   (label_constant_runtime_dtype init (24),
+  7   126 	   int_entry_runtime_dtype init (25),
+  7   127 	   ext_entry_runtime_dtype init (26),
+  7   128 	   ext_procedure_runtime_dtype init (27),
+  7   129 	   picture_runtime_dtype  init (63)
+  7   130 	   )		      fixed bin internal static options (constant);
+  7   131 
+  7   132      dcl	   (pascal_integer_dtype  init (1),
+  7   133 	   pascal_real_dtype      init (4),
+  7   134 	   pascal_label_dtype     init (24),
+  7   135 	   pascal_internal_procedure_dtype init (25),
+  7   136 	   pascal_exportable_procedure_dtype init (26),
+  7   137 	   pascal_imported_procedure_dtype init (27),
+  7   138 	   pascal_typed_pointer_type_dtype init (64),
+  7   139 	   pascal_char_dtype      init (65),
+  7   140 	   pascal_boolean_dtype   init (66),
+  7   141 	   pascal_record_file_type_dtype init (67),
+  7   142 	   pascal_record_type_dtype init (68),
+  7   143 	   pascal_set_dtype	      init (69),
+  7   144 	   pascal_enumerated_type_dtype init (70),
+  7   145 	   pascal_enumerated_type_element_dtype init (71),
+  7   146 	   pascal_enumerated_type_instance_dtype init (72),
+  7   147 	   pascal_user_defined_type_dtype init (73),
+  7   148 	   pascal_user_defined_type_instance_dtype init (74),
+  7   149 	   pascal_text_file_dtype init (75),
+  7   150 	   pascal_procedure_type_dtype init (76),
+  7   151 	   pascal_variable_formal_parameter_dtype init (77),
+  7   152 	   pascal_value_formal_parameter_dtype init (78),
+  7   153 	   pascal_entry_formal_parameter_dtype init (79),
+  7   154 	   pascal_parameter_procedure_dtype init (80),
+  7   155 	   pascal_string_type_dtype init (87)) fixed bin int static options (constant);
+  7   156 
+  7   157 
+  7   158 /* END INCLUDE FILE ... std_descriptor_types.incl.pl1 */
+      364 
+      365  /* BEGIN INCLUDE FILE sub_err_flags.incl.pl1 BIM 11/81 */
+  8     2 /* format: style3 */
+  8     3 
+  8     4 /* These constants are to be used for the flags argument of sub_err_ */
+  8     5 /* They are just "string (condition_info_header.action_flags)" */
+  8     6 
+  8     7 declare	(
+  8     8 	ACTION_CAN_RESTART	init (""b),
+  8     9 	ACTION_CANT_RESTART init ("1"b),
+  8    10 	ACTION_DEFAULT_RESTART
+  8    11 			init ("01"b),
+  8    12 	ACTION_QUIET_RESTART
+  8    13 			init ("001"b),
+  8    14 	ACTION_SUPPORT_SIGNAL
+  8    15 			init ("0001"b)
+  8    16 	)		bit (36) aligned internal static options (constant);
+  8    17 
+  8    18 /* End include file */
+      365 
+      366  /* BEGIN INCLUDE FILE ... terminate_file.incl.pl1 */
+  9     2 /* format: style2,^inddcls,idind32 */
+  9     3 
+  9     4 declare 1 terminate_file_switches	based,
+  9     5 	2 truncate		bit (1) unaligned,
+  9     6 	2 set_bc			bit (1) unaligned,
+  9     7 	2 terminate		bit (1) unaligned,
+  9     8 	2 force_write		bit (1) unaligned,
+  9     9 	2 delete			bit (1) unaligned;
+  9    10 
+  9    11 declare TERM_FILE_TRUNC		bit (1) internal static options (constant) initial ("1"b);
+  9    12 declare TERM_FILE_BC		bit (2) internal static options (constant) initial ("01"b);
+  9    13 declare TERM_FILE_TRUNC_BC		bit (2) internal static options (constant) initial ("11"b);
+  9    14 declare TERM_FILE_TERM		bit (3) internal static options (constant) initial ("001"b);
+  9    15 declare TERM_FILE_TRUNC_BC_TERM	bit (3) internal static options (constant) initial ("111"b);
+  9    16 declare TERM_FILE_FORCE_WRITE		bit (4) internal static options (constant) initial ("0001"b);
+  9    17 declare TERM_FILE_DELETE		bit (5) internal static options (constant) initial ("00001"b);
+  9    18 
+  9    19 /* END INCLUDE FILE ... terminate_file.incl.pl1 */
+      366 
+      367 
+      368 end dm_log_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    03/15/89  0800.6  dm_log_.pl1                       >special_ldd>install>MR12.3-1025>dm_log_.pl1
+358          1    04/11/85  1452.6  access_mode_values.incl.pl1       >ldd>include>access_mode_values.incl.pl1
+359          2    10/14/83  1606.6  acl_structures.incl.pl1           >ldd>include>acl_structures.incl.pl1
+360          3    08/05/86  0856.8  arg_list.incl.pl1                 >ldd>include>arg_list.incl.pl1
+361          4    11/02/83  1845.0  arg_descriptor.incl.pl1           >ldd>include>arg_descriptor.incl.pl1
+362          5    03/15/89  0759.4  create_branch_info.incl.pl1       >special_ldd>install>MR12.3-1025>create_branch_info.incl.pl1
+363          6    01/07/85  0900.0  dm_system_states.incl.pl1         >ldd>include>dm_system_states.incl.pl1
+364          7    10/26/88  1255.5  std_descriptor_types.incl.pl1     >ldd>include>std_descriptor_types.incl.pl1
+365          8    04/16/82  0958.1  sub_err_flags.incl.pl1            >ldd>include>sub_err_flags.incl.pl1
+366          9    04/06/83  1239.4  terminate_file.incl.pl1           >ldd>include>terminate_file.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+A_arglist_ptr                          parameter       pointer                  dcl 106 ref 180 184
+CREATE_IF_NONE                  000017 constant        bit(1)                   initial dcl 110 set ref 215*
+P_arg_number                           parameter       fixed bin(17,0)          dcl 283 in procedure "FIXED_BIN_17" ref 280 286 286
+P_arg_number                           parameter       fixed bin(17,0)          dcl 307 in procedure "CHAR_N" set ref 304 312* 316
+                                                                                  321
+P_arg_number                           parameter       fixed bin(17,0)          dcl 295 in procedure "FIXED_BIN_35" ref 292 298 298
+P_code                                 parameter       fixed bin(35,0)          dcl 270 ref 267
+P_message                              parameter       char                     packed unaligned dcl 331 set ref 328 350*
+P_message_severity                     parameter       fixed bin(17,0)          dcl 332 set ref 328 350*
+P_str                                  parameter       char                     packed unaligned dcl 271 ref 267
+RW_ACCESS                              constant        bit(3)                   initial packed unaligned dcl 1-11 ref 222
+SMA_ACCESS                             constant        bit(3)                   initial packed unaligned dcl 1-11 ref 205
+access_name                     000123 automatic       char(32)                 level 2 packed packed unaligned dcl 121 set ref 221*
+acct                            001770 automatic       char(32)                 packed unaligned dcl 127 set ref 231*
+addr                                                   builtin function         dcl 167 ref 210 210 223 223
+addwordno                                              builtin function         dcl 167 ref 321
+arg_count                              based           fixed bin(17,0)          level 3 packed packed unsigned unaligned dcl 3-14
+                                                                                  ref 187 247 286 298
+arg_list                               based           structure                level 1 dcl 3-14
+arg_ndims                       002051 automatic       fixed bin(17,0)          dcl 134 set ref 237* 238 312* 314
+arg_packed                      002044 automatic       bit(1)                   dcl 131 set ref 237* 238 312* 314
+arg_ptrs                  2            based           pointer                  array level 2 dcl 3-14 ref 286 298 316 321
+arg_scale                       002052 automatic       fixed bin(17,0)          dcl 134 set ref 237* 238 312* 314
+arg_size                        002056 automatic       fixed bin(24,0)          dcl 136 set ref 237* 312* 314 316
+arg_type                        002053 automatic       fixed bin(17,0)          dcl 134 set ref 237* 238 312* 313 316 318
+arglist_ptr                     002046 automatic       pointer                  dcl 132 set ref 176* 184* 187 237* 247 248* 258* 286
+                                                                                  286 298 298 312* 316 321
+auto_create_branch_info         000100 automatic       structure                level 1 dcl 119 set ref 201* 210 210
+bit_count                       002057 automatic       fixed bin(24,0)          dcl 136 set ref 195* 197
+char_dtype                             constant        fixed bin(17,0)          initial dcl 7-25 ref 316
+char_non_varying                       based           char(1000000)            packed unaligned dcl 308 ref 316
+char_varying                           based           varying char(1000000)    dcl 309 ref 322
+char_varying_ptr                000100 automatic       pointer                  dcl 310 set ref 321* 322
+cleanup                         000000 stack reference condition                dcl 171 ref 336
+code                            002060 automatic       fixed bin(35,0)          dcl 137 set ref 195* 196 196 200 208* 209 209* 210*
+                                                                                  211 211* 213* 215* 216 216* 350* 351 351*
+convert_status_code_            000016 constant        entry                    external dcl 146 ref 244
+create_branch_info                     based           structure                level 1 dcl 5-17
+create_branch_version_2                constant        fixed bin(17,0)          initial dcl 5-35 ref 202
+cu_$arg_list_ptr                000020 constant        entry                    external dcl 147 ref 176
+cu_$level_get                   000022 constant        entry                    external dcl 148 ref 335
+cu_$level_set                   000024 constant        entry                    external dcl 149 ref 337 339 345 355
+decode_descriptor_              000026 constant        entry                    external dcl 150 ref 237 312
+delete_acl_entry                       based           structure                level 1 dcl 2-63
+dir_sw                    1     000100 automatic       bit(1)                   level 3 packed packed unaligned dcl 119 set ref 203*
+directory_acl_entry                    based           structure                level 1 dcl 2-54
+dm_misc_util_$get_log_path      000030 constant        entry                    external dcl 151 ref 193
+dm_system_log_path              001541 automatic       char(168)                packed unaligned dcl 125 set ref 193* 194*
+error_code                      002061 automatic       fixed bin(35,0)          dcl 137 set ref 242* 243 244*
+error_table_$no_s_permission    000012 external static fixed bin(35,0)          dcl 141 ref 196
+error_table_$noentry            000014 external static fixed bin(35,0)          dcl 142 ref 200
+expand_pathname_                000032 constant        entry                    external dcl 152 ref 194 208
+extended_arg_type               002062 automatic       fixed bin(17,0)          initial dcl 4-36 set ref 4-36*
+fb17                                   based           fixed bin(17,0)          dcl 284 ref 286
+fb35                                   based           fixed bin(35,0)          dcl 296 ref 298
+general_acl_entry                      based           structure                level 1 unaligned dcl 2-12
+general_delete_acl_entry               based           structure                level 1 dcl 2-35
+general_extended_acl_entry             based           structure                level 1 dcl 2-23
+get_ring_                       000034 constant        entry                    external dcl 153 ref 206 225 339 339
+hcs_$add_acl_entries            000036 constant        entry                    external dcl 154 ref 223
+hcs_$create_branch_             000040 constant        entry                    external dcl 155 ref 210
+hcs_$set_ring_brackets          000042 constant        entry                    external dcl 156 ref 226
+hcs_$status_minf                000044 constant        entry                    external dcl 157 ref 195
+header                                 based           structure                level 2 dcl 3-14
+ioa_$general_rs                 000046 constant        entry                    external dcl 158 ref 248 258
+ioa_$rsnnl                      000050 constant        entry                    external dcl 159 ref 245 249 259
+log_acl                         000123 automatic       structure                level 1 dcl 121 set ref 220* 223 223
+log_dir_dname                   001613 automatic       char(168)                packed unaligned dcl 125 set ref 208* 210*
+log_dir_ename                   002000 automatic       char(32)                 packed unaligned dcl 127 set ref 208* 210*
+log_dname                       001665 automatic       char(168)                packed unaligned dcl 125 set ref 194* 195* 197 208*
+                                                                                  209 211 213 215* 216* 223* 226*
+log_ename                       002010 automatic       char(32)                 packed unaligned dcl 127 set ref 194* 215* 216* 223*
+                                                                                  226*
+log_ring_brackets               000136 automatic       fixed bin(3,0)           array dcl 122 set ref 225* 226*
+log_write_$message              000052 constant        entry                    external dcl 160 ref 343 350
+log_write_$open                 000054 constant        entry                    external dcl 161 ref 215
+long_report                     001737 automatic       char(100)                dcl 126 set ref 243* 244* 245*
+message                         000141 automatic       char(1024)               packed unaligned dcl 124 set ref 249* 251* 259* 262
+                                                                                  262
+message1                        000541 automatic       char(1024)               packed unaligned dcl 124 set ref 233* 245* 249* 251
+                                                                                  258* 259*
+message2                        001141 automatic       char(1024)               packed unaligned dcl 124 set ref 233* 248* 249*
+message_len                     002055 automatic       fixed bin(21,0)          dcl 135 set ref 245* 248* 249* 259* 262 262
+message_severity                002054 automatic       fixed bin(17,0)          dcl 134 set ref 232* 262*
+mode                     10     000123 automatic       bit(36)                  level 2 in structure "log_acl" dcl 121 in procedure
+                                                                                  "dm_log_" set ref 222*
+mode                      2     000100 automatic       bit(3)                   level 2 in structure "auto_create_branch_info"
+                                                                                  packed packed unaligned dcl 119 in procedure
+                                                                                  "dm_log_" set ref 205*
+my_name                         002020 automatic       char(32)                 packed unaligned dcl 127 set ref 175* 183*
+null                                                   builtin function         dcl 167 ref 192 343 343 350 350
+parent_ac_sw              1(04) 000100 automatic       bit(1)                   level 3 packed packed unaligned dcl 119 set ref 204*
+pathname_                       000056 constant        entry                    external dcl 162 ref 216
+person_id                       002030 automatic       char(22)                 packed unaligned dcl 128 set ref 231* 245* 259*
+project_id                      002036 automatic       char(9)                  packed unaligned dcl 129 set ref 231* 245* 259*
+real_fix_bin_1_dtype                   constant        fixed bin(17,0)          initial dcl 7-25 ref 238
+record_quota_overflow           000000 stack reference condition                dcl 171 ref 341 342 353
+rings                     3     000100 automatic       fixed bin(3,0)           array level 2 dcl 119 set ref 206*
+saved_validation                000100 automatic       fixed bin(17,0)          dcl 333 set ref 335* 337* 345* 355*
+seg_fault_error                 000000 stack reference condition                dcl 171 ref 341 342 353
+segment_acl_entry                      based           structure                level 1 dcl 2-45
+short_report                    002042 automatic       char(8)                  dcl 130 set ref 243* 244*
+static_log_write_data_ptr       000010 internal static pointer                  initial dcl 115 set ref 192 215* 343* 350*
+substr                                                 builtin function         dcl 167 ref 262 262 316
+switches                  1     000100 automatic       structure                level 2 packed packed unaligned dcl 119
+type                            002050 automatic       fixed bin(2,0)           dcl 133 set ref 195* 197
+unspec                                                 builtin function         dcl 167 set ref 201* 220*
+user_info_$whoami               000060 constant        entry                    external dcl 163 ref 231
+userid                    6     000100 automatic       char(32)                 level 2 dcl 119 set ref 207*
+varying_char_dtype                     constant        fixed bin(17,0)          initial dcl 7-25 ref 318
+version                         000100 automatic       fixed bin(17,0)          level 2 dcl 119 set ref 202*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+ACL_VERSION_1                          internal static fixed bin(17,0)          initial dcl 2-77
+ACTION_CANT_RESTART                    internal static bit(36)                  initial dcl 8-7
+ACTION_CAN_RESTART                     internal static bit(36)                  initial dcl 8-7
+ACTION_DEFAULT_RESTART                 internal static bit(36)                  initial dcl 8-7
+ACTION_QUIET_RESTART                   internal static bit(36)                  initial dcl 8-7
+ACTION_SUPPORT_SIGNAL                  internal static bit(36)                  initial dcl 8-7
+A_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 1-11
+A_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+DELETE_ACL_VERSION_1                   internal static char(4)                  initial packed unaligned dcl 2-67
+DIR_ACCESS_MODE_NAMES                  internal static char(4)                  initial array packed unaligned dcl 1-33
+DIR_ACL_VERSION_1                      internal static char(4)                  initial packed unaligned dcl 2-67
+DM_SYSTEM_STATE_INITIALIZING           internal static char(4)                  initial dcl 6-22
+DM_SYSTEM_STATE_NORMAL_SHUTDOWN        internal static char(4)                  initial dcl 6-22
+DM_SYSTEM_STATE_RECOVERING             internal static char(4)                  initial dcl 6-22
+DM_SYSTEM_STATE_RUNNING                internal static char(4)                  initial dcl 6-22
+DM_SYSTEM_STATE_SHUTDOWN_BEGUN         internal static char(4)                  initial dcl 6-22
+DM_SYSTEM_STATE_SHUTDOWN_BUMP_USERS    internal static char(4)                  initial dcl 6-22
+DM_SYSTEM_STATE_UNDEFINED              internal static char(4)                  initial dcl 6-22
+E_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 1-11
+E_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+Envptr_supplied_call_type              internal static fixed bin(18,0)          initial packed unsigned unaligned dcl 3-54
+FIFTEEN_SECOND_WAIT                    internal static fixed bin(17,0)          initial dcl 111
+GENERAL_ACL_VERSION_1                  internal static char(8)                  initial packed unaligned dcl 2-72
+GENERAL_DELETE_ACL_VERSION_1           internal static char(8)                  initial packed unaligned dcl 2-72
+GENERAL_EXTENDED_ACL_VERSION_1         internal static char(8)                  initial packed unaligned dcl 2-72
+Interseg_call_type                     internal static fixed bin(18,0)          initial packed unsigned unaligned dcl 3-54
+M_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 1-11
+M_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+N_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 1-11
+N_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+Quick_call_type                        internal static fixed bin(18,0)          initial packed unsigned unaligned dcl 3-54
+REW_ACCESS                             internal static bit(3)                   initial packed unaligned dcl 1-11
+REW_ACCESS_BIN                         internal static fixed bin(5,0)           initial dcl 1-36
+RE_ACCESS                              internal static bit(3)                   initial packed unaligned dcl 1-11
+RE_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 1-36
+RW_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 1-36
+R_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 1-11
+R_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+SA_ACCESS                              internal static bit(3)                   initial packed unaligned dcl 1-11
+SA_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 1-36
+SEG_ACCESS_MODE_NAMES                  internal static char(4)                  initial array packed unaligned dcl 1-30
+SEG_ACL_VERSION_1                      internal static char(4)                  initial packed unaligned dcl 2-67
+SMA_ACCESS_BIN                         internal static fixed bin(5,0)           initial dcl 1-36
+SM_ACCESS                              internal static bit(3)                   initial packed unaligned dcl 1-11
+SM_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 1-36
+S_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 1-11
+S_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+TERM_FILE_BC                           internal static bit(2)                   initial packed unaligned dcl 9-12
+TERM_FILE_DELETE                       internal static bit(5)                   initial packed unaligned dcl 9-17
+TERM_FILE_FORCE_WRITE                  internal static bit(4)                   initial packed unaligned dcl 9-16
+TERM_FILE_TERM                         internal static bit(3)                   initial packed unaligned dcl 9-14
+TERM_FILE_TRUNC                        internal static bit(1)                   initial packed unaligned dcl 9-11
+TERM_FILE_TRUNC_BC                     internal static bit(2)                   initial packed unaligned dcl 9-13
+TERM_FILE_TRUNC_BC_TERM                internal static bit(3)                   initial packed unaligned dcl 9-15
+W_ACCESS                               internal static bit(3)                   initial packed unaligned dcl 1-11
+W_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+acl_count                              automatic       fixed bin(17,0)          dcl 2-5
+acl_ptr                                automatic       pointer                  dcl 2-4
+algol68_array_descriptor_dtype         internal static fixed bin(17,0)          initial dcl 7-25
+algol68_bits_dtype                     internal static fixed bin(17,0)          initial dcl 7-110
+algol68_bool_dtype                     internal static fixed bin(17,0)          initial dcl 7-110
+algol68_byte_dtype                     internal static fixed bin(17,0)          initial dcl 7-110
+algol68_char_dtype                     internal static fixed bin(17,0)          initial dcl 7-110
+algol68_compl_dtype                    internal static fixed bin(17,0)          initial dcl 7-110
+algol68_format_dtype                   internal static fixed bin(17,0)          initial dcl 7-25
+algol68_int_dtype                      internal static fixed bin(17,0)          initial dcl 7-110
+algol68_long_compl_dtype               internal static fixed bin(17,0)          initial dcl 7-110
+algol68_long_int_dtype                 internal static fixed bin(17,0)          initial dcl 7-110
+algol68_long_real_dtype                internal static fixed bin(17,0)          initial dcl 7-110
+algol68_real_dtype                     internal static fixed bin(17,0)          initial dcl 7-110
+algol68_short_int_dtype                internal static fixed bin(17,0)          initial dcl 7-110
+algol68_straight_dtype                 internal static fixed bin(17,0)          initial dcl 7-25
+algol68_struct_struct_bool_dtype       internal static fixed bin(17,0)          initial dcl 7-110
+algol68_struct_struct_char_dtype       internal static fixed bin(17,0)          initial dcl 7-110
+algol68_union_dtype                    internal static fixed bin(17,0)          initial dcl 7-25
+area_dtype                             internal static fixed bin(17,0)          initial dcl 7-25
+arg_descriptor                         based           structure                level 1 dcl 4-6
+arg_descriptor_ptr                     automatic       pointer                  dcl 4-34
+arg_list_with_envptr                   based           structure                level 1 dcl 3-42
+bit_dtype                              internal static fixed bin(17,0)          initial dcl 7-25
+c_enum_const_dtype                     internal static fixed bin(17,0)          initial dcl 7-25
+c_enum_dtype                           internal static fixed bin(17,0)          initial dcl 7-25
+c_typeref_dtype                        internal static fixed bin(17,0)          initial dcl 7-25
+c_union_dtype                          internal static fixed bin(17,0)          initial dcl 7-25
+cobol_char_string_dtype                internal static fixed bin(17,0)          initial dcl 7-25
+cobol_comp_5_ts_dtype                  internal static fixed bin(17,0)          initial dcl 7-25
+cobol_comp_5_uns_dtype                 internal static fixed bin(17,0)          initial dcl 7-25
+cobol_comp_6_dtype                     internal static fixed bin(17,0)          initial dcl 7-25
+cobol_comp_7_dtype                     internal static fixed bin(17,0)          initial dcl 7-25
+cobol_comp_8_ls_dtype                  internal static fixed bin(17,0)          initial dcl 7-25
+cobol_comp_8_uns_dtype                 internal static fixed bin(17,0)          initial dcl 7-25
+cobol_display_ls_dtype                 internal static fixed bin(17,0)          initial dcl 7-25
+cobol_display_ls_overp_dtype           internal static fixed bin(17,0)          initial dcl 7-25
+cobol_display_ts_dtype                 internal static fixed bin(17,0)          initial dcl 7-25
+cobol_display_ts_overp_dtype           internal static fixed bin(17,0)          initial dcl 7-25
+cobol_display_uns_dtype                internal static fixed bin(17,0)          initial dcl 7-25
+cobol_structure_dtype                  internal static fixed bin(17,0)          initial dcl 7-25
+command_name_arglist                   based           structure                level 1 dcl 3-25
+cplx_fix_bin_1_dtype                   internal static fixed bin(17,0)          initial dcl 7-25
+cplx_fix_bin_2_dtype                   internal static fixed bin(17,0)          initial dcl 7-25
+cplx_fix_dec_4bit_bytealigned_ls_dtype internal static fixed bin(17,0)          initial dcl 7-25
+cplx_fix_dec_9bit_ls_dtype             internal static fixed bin(17,0)          initial dcl 7-25
+cplx_flt_bin_1_dtype                   internal static fixed bin(17,0)          initial dcl 7-25
+cplx_flt_bin_2_dtype                   internal static fixed bin(17,0)          initial dcl 7-25
+cplx_flt_bin_generic_dtype             internal static fixed bin(17,0)          initial dcl 7-25
+cplx_flt_dec_4bit_bytealigned_dtype    internal static fixed bin(17,0)          initial dcl 7-25
+cplx_flt_dec_9bit_dtype                internal static fixed bin(17,0)          initial dcl 7-25
+cplx_flt_dec_extended_dtype            internal static fixed bin(17,0)          initial dcl 7-25
+cplx_flt_dec_generic_dtype             internal static fixed bin(17,0)          initial dcl 7-25
+cplx_flt_hex_1_dtype                   internal static fixed bin(17,0)          initial dcl 7-25
+cplx_flt_hex_2_dtype                   internal static fixed bin(17,0)          initial dcl 7-25
+delete_acl                             based           structure                level 1 dcl 2-58
+delete_acl_array                       based           structure                array level 1 dcl 2-64
+directory_acl                          based           structure                level 1 dcl 2-49
+directory_acl_array                    based           structure                array level 1 dcl 2-55
+entry_dtype                            internal static fixed bin(17,0)          initial dcl 7-25
+ext_entry_runtime_dtype                internal static fixed bin(17,0)          initial dcl 7-125
+ext_procedure_runtime_dtype            internal static fixed bin(17,0)          initial dcl 7-125
+extended_arg_descriptor                based           structure                level 1 dcl 4-21
+file_dtype                             internal static fixed bin(17,0)          initial dcl 7-25
+fixed_arg_descriptor                   based           structure                level 1 dcl 4-13
+ft_char_dtype                          internal static fixed bin(17,0)          initial dcl 7-96
+ft_complex_double_dtype                internal static fixed bin(17,0)          initial dcl 7-96
+ft_complex_dtype                       internal static fixed bin(17,0)          initial dcl 7-96
+ft_double_dtype                        internal static fixed bin(17,0)          initial dcl 7-96
+ft_external_dtype                      internal static fixed bin(17,0)          initial dcl 7-96
+ft_hex_complex_double_dtype            internal static fixed bin(17,0)          initial dcl 7-96
+ft_hex_complex_dtype                   internal static fixed bin(17,0)          initial dcl 7-96
+ft_hex_double_dtype                    internal static fixed bin(17,0)          initial dcl 7-96
+ft_hex_real_dtype                      internal static fixed bin(17,0)          initial dcl 7-96
+ft_integer_dtype                       internal static fixed bin(17,0)          initial dcl 7-96
+ft_logical_dtype                       internal static fixed bin(17,0)          initial dcl 7-96
+ft_real_dtype                          internal static fixed bin(17,0)          initial dcl 7-96
+general_acl                            based           structure                level 1 dcl 2-7
+general_delete_acl                     based           structure                level 1 dcl 2-30
+general_extended_acl                   based           structure                level 1 dcl 2-18
+int_entry_runtime_dtype                internal static fixed bin(17,0)          initial dcl 7-125
+label_constant_runtime_dtype           internal static fixed bin(17,0)          initial dcl 7-125
+label_dtype                            internal static fixed bin(17,0)          initial dcl 7-25
+offset_dtype                           internal static fixed bin(17,0)          initial dcl 7-25
+pascal_boolean_dtype                   internal static fixed bin(17,0)          initial dcl 7-132
+pascal_char_dtype                      internal static fixed bin(17,0)          initial dcl 7-132
+pascal_entry_formal_parameter_dtype    internal static fixed bin(17,0)          initial dcl 7-132
+pascal_enumerated_type_dtype           internal static fixed bin(17,0)          initial dcl 7-132
+pascal_enumerated_type_element_dtype   internal static fixed bin(17,0)          initial dcl 7-132
+pascal_enumerated_type_instance_dtype  internal static fixed bin(17,0)          initial dcl 7-132
+pascal_exportable_procedure_dtype      internal static fixed bin(17,0)          initial dcl 7-132
+pascal_imported_procedure_dtype        internal static fixed bin(17,0)          initial dcl 7-132
+pascal_integer_dtype                   internal static fixed bin(17,0)          initial dcl 7-132
+pascal_internal_procedure_dtype        internal static fixed bin(17,0)          initial dcl 7-132
+pascal_label_dtype                     internal static fixed bin(17,0)          initial dcl 7-132
+pascal_parameter_procedure_dtype       internal static fixed bin(17,0)          initial dcl 7-132
+pascal_procedure_type_dtype            internal static fixed bin(17,0)          initial dcl 7-132
+pascal_real_dtype                      internal static fixed bin(17,0)          initial dcl 7-132
+pascal_record_file_type_dtype          internal static fixed bin(17,0)          initial dcl 7-132
+pascal_record_type_dtype               internal static fixed bin(17,0)          initial dcl 7-132
+pascal_set_dtype                       internal static fixed bin(17,0)          initial dcl 7-132
+pascal_string_type_dtype               internal static fixed bin(17,0)          initial dcl 7-132
+pascal_text_file_dtype                 internal static fixed bin(17,0)          initial dcl 7-132
+pascal_typed_pointer_type_dtype        internal static fixed bin(17,0)          initial dcl 7-132
+pascal_user_defined_type_dtype         internal static fixed bin(17,0)          initial dcl 7-132
+pascal_user_defined_type_instance_dtype
+                                       internal static fixed bin(17,0)          initial dcl 7-132
+pascal_value_formal_parameter_dtype    internal static fixed bin(17,0)          initial dcl 7-132
+pascal_variable_formal_parameter_dtype internal static fixed bin(17,0)          initial dcl 7-132
+picture_runtime_dtype                  internal static fixed bin(17,0)          initial dcl 7-125
+pointer_dtype                          internal static fixed bin(17,0)          initial dcl 7-25
+real_fix_bin_1_uns_dtype               internal static fixed bin(17,0)          initial dcl 7-25
+real_fix_bin_2_dtype                   internal static fixed bin(17,0)          initial dcl 7-25
+real_fix_bin_2_uns_dtype               internal static fixed bin(17,0)          initial dcl 7-25
+real_fix_dec_4bit_bytealigned_ls_dtype internal static fixed bin(17,0)          initial dcl 7-25
+real_fix_dec_4bit_bytealigned_uns_dtype
+                                       internal static fixed bin(17,0)          initial dcl 7-25
+real_fix_dec_4bit_ls_dtype             internal static fixed bin(17,0)          initial dcl 7-25
+real_fix_dec_4bit_ts_dtype             internal static fixed bin(17,0)          initial dcl 7-25
+real_fix_dec_4bit_uns_dtype            internal static fixed bin(17,0)          initial dcl 7-25
+real_fix_dec_9bit_ls_dtype             internal static fixed bin(17,0)          initial dcl 7-25
+real_fix_dec_9bit_ls_overp_dtype       internal static fixed bin(17,0)          initial dcl 7-25
+real_fix_dec_9bit_ts_dtype             internal static fixed bin(17,0)          initial dcl 7-25
+real_fix_dec_9bit_ts_overp_dtype       internal static fixed bin(17,0)          initial dcl 7-25
+real_fix_dec_9bit_uns_dtype            internal static fixed bin(17,0)          initial dcl 7-25
+real_flt_bin_1_dtype                   internal static fixed bin(17,0)          initial dcl 7-25
+real_flt_bin_2_dtype                   internal static fixed bin(17,0)          initial dcl 7-25
+real_flt_bin_generic_dtype             internal static fixed bin(17,0)          initial dcl 7-25
+real_flt_dec_4bit_bytealigned_dtype    internal static fixed bin(17,0)          initial dcl 7-25
+real_flt_dec_4bit_dtype                internal static fixed bin(17,0)          initial dcl 7-25
+real_flt_dec_9bit_dtype                internal static fixed bin(17,0)          initial dcl 7-25
+real_flt_dec_extended_dtype            internal static fixed bin(17,0)          initial dcl 7-25
+real_flt_dec_generic_dtype             internal static fixed bin(17,0)          initial dcl 7-25
+real_flt_hex_1_dtype                   internal static fixed bin(17,0)          initial dcl 7-25
+real_flt_hex_2_dtype                   internal static fixed bin(17,0)          initial dcl 7-25
+segment_acl                            based           structure                level 1 dcl 2-40
+segment_acl_array                      based           structure                array level 1 dcl 2-46
+structure_dtype                        internal static fixed bin(17,0)          initial dcl 7-25
+terminate_file_switches                based           structure                level 1 packed packed unaligned dcl 9-4
+varying_bit_dtype                      internal static fixed bin(17,0)          initial dcl 7-25
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+CHAR_N                          001520 constant        entry                    internal dcl 304 ref 245
+COMMON                          000207 constant        label                    dcl 187 ref 177 185
+ERROR_RETURN                    001445 constant        entry                    internal dcl 267 ref 197 209 211 213 216 351
+FIXED_BIN_17                    001463 constant        entry                    internal dcl 280 ref 232
+FIXED_BIN_35                    001501 constant        entry                    internal dcl 292 ref 242
+PUNT_WARNING                    002047 constant        label                    dcl 345 ref 342
+RETURN                          001442 constant        label                    dcl 264 ref 276 347
+WRITE_MESSAGE                   001662 constant        entry                    internal dcl 328 ref 262
+dm_log_                         000145 constant        entry                    external dcl 98
+from_arg_ptr                    000171 constant        entry                    external dcl 180
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      2522        2604    2172        2532
+Length      3226    2172        62         406     327           2
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+dm_log_                            1247 external procedure  is an external procedure.  
+ERROR_RETURN                         65 internal procedure  is called by several nonquick procedures.  
+FIXED_BIN_17                            internal procedure  shares stack frame of external procedure dm_log_.  
+FIXED_BIN_35                            internal procedure  shares stack frame of external procedure dm_log_.  
+CHAR_N                               83 internal procedure  uses returns(char(*)) or returns(bit(*)).  
+WRITE_MESSAGE                       116 internal procedure  is called during a stack extension, and enables or reverts conditions.  
+on unit on line 336                  68 on unit               
+on unit on line 341                 110 on unit             enables or reverts conditions.  
+on unit on line 342                  64 on unit               
+
+STORAGE FOR INTERNAL STATIC VARIABLES.
+
+   LOC IDENTIFIER                  BLOCK NAME
+000010 static_log_write_data_ptr   dm_log_
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+CHAR_N                   000100 char_varying_ptr            CHAR_N
+WRITE_MESSAGE            000100 saved_validation            WRITE_MESSAGE
+dm_log_                  000100 auto_create_branch_info     dm_log_
+                         000123 log_acl                     dm_log_
+                         000136 log_ring_brackets           dm_log_
+                         000141 message                     dm_log_
+                         000541 message1                    dm_log_
+                         001141 message2                    dm_log_
+                         001541 dm_system_log_path          dm_log_
+                         001613 log_dir_dname               dm_log_
+                         001665 log_dname                   dm_log_
+                         001737 long_report                 dm_log_
+                         001770 acct                        dm_log_
+                         002000 log_dir_ename               dm_log_
+                         002010 log_ename                   dm_log_
+                         002020 my_name                     dm_log_
+                         002030 person_id                   dm_log_
+                         002036 project_id                  dm_log_
+                         002042 short_report                dm_log_
+                         002044 arg_packed                  dm_log_
+                         002046 arglist_ptr                 dm_log_
+                         002050 type                        dm_log_
+                         002051 arg_ndims                   dm_log_
+                         002052 arg_scale                   dm_log_
+                         002053 arg_type                    dm_log_
+                         002054 message_severity            dm_log_
+                         002055 message_len                 dm_log_
+                         002056 arg_size                    dm_log_
+                         002057 bit_count                   dm_log_
+                         002060 code                        dm_log_
+                         002061 error_code                  dm_log_
+                         002062 extended_arg_type           dm_log_
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+alloc_char_temp     call_ext_out_desc   call_ext_out        call_int_this_desc  call_int_other_desc return_mac
+tra_ext_1           enable_op           shorten_stack       ext_entry           int_entry           int_entry_desc
+return_chars_eis
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+convert_status_code_          cu_$arg_list_ptr              cu_$level_get                 cu_$level_set
+decode_descriptor_            dm_misc_util_$get_log_path    expand_pathname_              get_ring_
+hcs_$add_acl_entries          hcs_$create_branch_           hcs_$set_ring_brackets        hcs_$status_minf
+ioa_$general_rs               ioa_$rsnnl                    log_write_$message            log_write_$open
+pathname_                     user_info_$whoami
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$no_s_permission  error_table_$noentry
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+ 4   36 000140        98 000144       175 000153       176 000156       177 000165       180 000166       183 000177
+    184 000202       185 000206       187 000207       192 000214       193 000221       194 000231       195 000256
+    196 000314       197 000321       199 000351       200 000352       201 000354       202 000357       203 000361
+    204 000363       205 000365       206 000367       207 000407       208 000412       209 000436       210 000462
+    211 000511       212 000535       213 000536       215 000560       216 000611       220 000655       221 000660
+    222 000663       223 000665       225 000723       226 000743       231 000771       232 001012       233 001016
+    237 001024       238 001051       242 001063       243 001067       244 001077       245 001112       247 001177
+    248 001204       249 001252       250 001303       251 001304       252 001307       258 001310       259 001357
+    262 001417       264 001442       267 001444       276 001460       280 001463       286 001465       288 001477
+    292 001501       298 001503       300 001515       304 001517       312 001525       313 001551       314 001565
+    316 001610       318 001630       321 001632       322 001641       324 001651       328 001661       335 001675
+    336 001703       337 001717       338 001726       339 001727       341 001747       342 001763       343 002007
+    345 002047       347 002057       341 002062       350 002067       351 002124       353 002144       355 002146
+    357 002155
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

@@ -1,0 +1,721 @@
+	COMPILATION LISTING OF SEGMENT gcos_ids2_concur_
+	Compiled by: Multics PL/I Compiler, Release 28e, of February 14, 1985
+	Compiled at: Honeywell Multics Op. - System M
+	Compiled on: 04/09/85  1248.2 mst Tue
+	    Options: optimize map
+
+        1 
+        2 /* ***********************************************************
+        3*   *                                                         *
+        4*   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        5*   *                                                         *
+        6*   *********************************************************** */
+        7 gcos_ids2_concur_: proc;
+        8 
+        9 /*
+       10*   IDS 2 concurrency control
+       11*
+       12*   Provides for control of access of multiple processes to the same IDS2
+       13*   data bases.
+       14*
+       15*   Whenever an IDS file is created, a lock control seg will be created
+       16*   for it. When the simulator is asked by the IDS process to allocate
+       17*   an IDS file, the simulator gets the lock control seg and locks other
+       18*   processes out temporarily with set_lock_. The control seg is examined
+       19*   for a valid combination of Gcos access by current processes that will
+       20*   allow the requesting process allocation. If allocation is permitted,
+       21*   this is noted in the control seg, the seg is unlocked and the IDS
+       22*   file is allocated. If allocation is not permitted, the control seg
+       23*   is unlocked and the simulator returns to the IDS process with
+       24*   "file busy". When a file is deallocated, the control seg
+       25*   is locked and the allocation is removed from the record of current
+       26*   allocations in the control seg. When an IDS file is released (deleted)
+       27*   the control seg is also deleted.
+       28*
+       29*   In a Gcos environment there are basically two allocation types
+       30*   to keep track of.
+       31*      - one writer with no other readers
+       32*      - many readers with no concurrent writer
+       33*   Multiple readers are always ok. There are other esoteric types
+       34*   of allocation, but these two are the ones implemented.
+       35*
+       36*   The concurrency control is on a file basis rather than per record
+       37*   or per entry. The problem of deadlocks is dealt with by the
+       38*   application. If it has more that one data base then it has to
+       39*   decide what to do if it can't get one of them.
+       40*
+       41*   There are five entry points to this module. They are:
+       42*
+       43*      gcos_ids2_concur_$create_control  Create an ids2 control segment
+       44*      gcos_ids2_concur_$delete_control  Delete ids2 control segment
+       45*      gcos_ids2_concur_$allocate        Try allocate ids2 data base
+       46*      gcos_ids2_concur_$deallocate      remove allocation lock
+       47*      gcos_ids2_concur_$have_xid        returns "1"b if file has ids2 ACL
+       48*
+       49*   The parameters and returned status are discussed in the comments
+       50*   for each entry.
+       51*
+       52*   Written:  Ron Barstad  10/18/82
+       53**/
+       54 
+       55 dcl  ids_dir char (168) parameter;                          /* input */
+       56 dcl  ids_entry_name char (32) parameter;                    /* input */
+       57 dcl  read_access bit (1) parameter;                         /* input: "1"b if have read access */
+       58 dcl  write_access bit (1) parameter;                        /* input: "1"b if have write access */
+       59 dcl  busy_status bit (1) parameter;                         /* output: "1"b = busy, "0"b = ok, was allocated */
+       60 dcl  code fixed bin (35) parameter;                         /* output */
+       61 
+       62 dcl  acl_ptr ptr;
+       63 dcl  addr builtin;
+       64 dcl  adj_bit_count fixed bin (35);
+       65 dcl  adjust_bit_count_ entry (char(168), char(32), bit(1) aligned,
+       66 	fixed bin(35), fixed bin(35));
+       67 dcl  bit_count fixed bin (24);
+       68 dcl  control_seg_ename char (32);
+       69 dcl  CONTROL_SEG_SUFFIX char (12) internal static options (constant)
+       70      initial (".CONCURRENCY");
+       71 dcl  delete_$path entry (char (*), char (*), bit (6), char (*), fixed bin (35));
+       72 dcl  divide builtin;
+       73 dcl  e_code fixed bin(35); /* local version of code */
+       74 dcl  error_table_$invalid_lock_reset fixed bin (35) ext static;
+       75 dcl  error_table_$lock_not_locked fixed bin (35) ext static;
+       76 dcl  error_table_$lock_wait_time_exceeded fixed bin (35) ext static;
+       77 dcl  error_table_$locked_by_this_process fixed bin (35) ext static;
+       78 dcl  error_table_$segknown fixed bin (35) ext static;
+       79 dcl  have_ids_acl bit (1);
+       80 dcl  hcs_$add_acl_entries entry (char (*), char (*), ptr, fixed bin,
+       81      fixed bin (35));
+       82 dcl  hcs_$initiate_count entry (char (*), char (*), char (*), fixed bin (24),
+       83      fixed bin (2), ptr, fixed bin (35));
+       84 dcl  hcs_$list_acl entry (char (*), char (*), ptr, ptr, ptr, fixed bin,
+       85      fixed bin (35));
+       86 dcl  hcs_$make_seg entry (char (*), char (*), char (*), fixed bin (5), ptr,
+       87      fixed bin (35));
+       88 dcl  hcs_$set_bc entry (char(*), char(*), fixed bin(24), fixed bin(35));
+       89 dcl  lock_control_ptr pointer;
+       90 dcl  max builtin;
+       91 dcl  MAX_READERS fixed bin(17) internal static options(constant) init(1000);
+       92 dcl  null builtin;
+       93 dcl  read_index fixed bin (17);
+       94 dcl  rtrim builtin;
+       95 dcl  set_lock_$lock entry (bit (36) aligned, fixed bin, fixed bin (35));
+       96 dcl  set_lock_$unlock entry (bit (36) aligned, fixed bin (35));
+       97 dcl  terminate_file_ entry (ptr, fixed bin (24), bit (*), fixed bin (35));
+       98 
+       99 
+      100 dcl 01 segment_acl (1) aligned,
+      101     02 access_name char (32), 
+      102     02 modes bit (36),
+      103     02 xmodes bit (36),
+      104     02 acl_status_code fixed bin (35);
+      105 
+      106 
+      107 dcl 01 lock_control_seg_acl (1) aligned,
+      108     02 access_name char (32),
+      109     02 modes bit (36),
+      110     02 xmodes bit (36),
+      111     02 acl_status_code fixed bin (35);
+      112 
+      113 
+      114 dcl 01 lock_control_seg aligned based (lock_control_ptr),
+      115     02 seg_lock bit (36),
+      116     02 write_lock bit (36),
+      117     02 number_of_readers fixed bin (24),
+      118     02 read_lock (MAX_READERS) bit(36);
+      119 
+      120 /*
+      121*   create_control
+      122*
+      123*   Create the ids concurrency control segment. The ids data base file has
+      124*   just been created or the control segment was not found.
+      125*
+      126*   parameters:
+      127*
+      128*   ids_entry_name     the name of the ids file - input
+      129*   ids_dir            the directory of the ids file - input
+      130*   code               the error_table_ status - output
+      131*
+      132*   result:
+      133*
+      134*   If all goes well, the seg, <ids_file_abs_path>.CONCURRENCY will be
+      135*   created and initialized. An ACL is added to the IDS2 file to give it
+      136*   an extrinsic identification for later recognition.
+      137**/
+      138 create_control: entry (ids_dir, ids_entry_name, code);
+      139 
+      140 /* add an acl to ids2 file to give it an extrinsic characteristic */
+      141 	segment_acl.access_name = "*.*.I";
+      142 	segment_acl.modes = R_ACCESS;
+      143 	segment_acl.xmodes = "0"b;
+      144 	acl_ptr = addr (segment_acl);
+      145 	call hcs_$add_acl_entries (ids_dir, ids_entry_name, acl_ptr, 1, code);
+      146 	if code ^= 0 then goto create_exit;
+      147 
+      148 /* create the lock control seg */
+      149 	control_seg_ename = rtrim (ids_entry_name)||CONTROL_SEG_SUFFIX;
+      150 	call hcs_$make_seg (ids_dir, control_seg_ename, "",
+      151 	     RW_ACCESS_BIN, lock_control_ptr, code);
+      152 	if code ^= 0 then goto create_exit;
+      153 
+      154 /* add the acl to allow all to read and write */
+      155 	lock_control_seg_acl.access_name = "*.*.*";
+      156 	lock_control_seg_acl.modes = RW_ACCESS;
+      157 	lock_control_seg_acl.xmodes = "0"b;
+      158 	acl_ptr = addr (lock_control_seg_acl);
+      159 	call hcs_$add_acl_entries (ids_dir, control_seg_ename, acl_ptr, 1, code);
+      160 	if code ^= 0 then goto create_exit;
+      161 	
+      162 /* intialize control seg */
+      163 	lock_control_seg.seg_lock = "0"b;
+      164 	lock_control_seg.write_lock = "0"b;
+      165 	lock_control_seg.number_of_readers = 0;
+      166 	lock_control_seg.read_lock (1) = "0"b;
+      167 	call terminate_file_(lock_control_ptr, 4*36,
+      168 	     TERM_FILE_BC | TERM_FILE_TERM, code);
+      169 
+      170 create_exit:
+      171 	return;
+      172 
+      173 /*
+      174*   delete_control
+      175*
+      176*   Delete the ids concurrency control segment. The ids data base file has
+      177*   just been deleted.
+      178*
+      179*   parameters:
+      180*
+      181*   ids_entry_name     the name of the ids file - input
+      182*   ids_dir            the directory of the ids file - input
+      183*   code               the error_table_ status - output
+      184*
+      185*   result:
+      186*
+      187*   If all goes well, the seg, <ids_file_abs_path>.CONCURRENCY will be
+      188*   deleted.
+      189**/
+      190 delete_control: entry (ids_dir, ids_entry_name, code);
+      191 
+      192 	control_seg_ename = rtrim (ids_entry_name)||CONTROL_SEG_SUFFIX;
+      193 	call delete_$path (ids_dir, control_seg_ename,
+      194 	     "100100"b, "gcos", code);
+      195 
+      196 	return;
+      197 
+      198 /*
+      199*   allocate
+      200*
+      201*   Allocate, or attempt to allocate, the given ids file through the
+      202*   control seg.
+      203*
+      204*   parameters:
+      205*
+      206*   ids_entry_name     the name of the ids file - input
+      207*   ids_dir            the directory of the ids file - input
+      208*   read_access        "1"b if have read access - input
+      209*   write_access       "1"b if have write access - input
+      210*   busy_status        "0"b if ok, "1"b if busy - output
+      211*   code               the error_table_ status - output
+      212*
+      213*   algorithm:
+      214*
+      215*   lock the control seg
+      216*   if access_type includes write
+      217*      then
+      218*         if have any readers
+      219*            then busy := true
+      220*            else
+      221*               try write lock
+      222*               if ok
+      223*                  then busy := false
+      224*                  else busy := true
+      225*      else {read access}
+      226*         if valid write lock exits
+      227*            then busy := true
+      228*            else
+      229*               set another read lock and increment reader count
+      230*               busy := false
+      231*   unlock the control seg
+      232*
+      233*   result:
+      234*
+      235*   If the file is available for this allocation type, then status ok
+      236*   is returned, otherwise status busy is returned.
+      237**/
+      238 allocate:	entry (ids_dir, ids_entry_name, read_access, write_access, busy_status, code);
+      239 
+      240 	control_seg_ename = rtrim (ids_entry_name)||CONTROL_SEG_SUFFIX;
+      241 	call hcs_$initiate_count (ids_dir, control_seg_ename,
+      242 	     "", bit_count, 0, lock_control_ptr, code);
+      243 	if code ^= 0 
+      244 	     then if code ^= error_table_$segknown then goto allocate_exit;
+      245 
+      246 /* try to allocate */
+      247 
+      248 	busy_status = "0"b;			/* assume ok */
+      249 	call set_lock_$lock (lock_control_seg.seg_lock, 10, code);
+      250 	if code ^= 0 
+      251 	     then if code ^= error_table_$invalid_lock_reset
+      252 	     then if code ^= error_table_$locked_by_this_process then goto allocate_exit;
+      253 	if write_access
+      254 	then do;					/* write access */
+      255 	     if lock_control_seg.number_of_readers >0 then do;
+      256 		call clean_out_dead_locks;
+      257 		if lock_control_seg.number_of_readers /* still */ > 0 then goto alloc_busy_exit;
+      258 	     end;
+      259 	     call set_lock_$lock (lock_control_seg.write_lock, 0, code);
+      260 	     if (code = 0 | code = error_table_$invalid_lock_reset
+      261 		| code = error_table_$locked_by_this_process) then goto alloc_ok_exit;
+      262 	     if code = error_table_$lock_wait_time_exceeded then goto alloc_busy_exit;
+      263 	     goto alloc_unlock_exit;
+      264 	end;
+      265 	else do;					/* read access */
+      266 	     if lock_control_seg.write_lock then do;
+      267 		call set_lock_$lock(lock_control_seg.write_lock, 0, code); /* maybe it's dead, code is irrelevant now */
+      268 		call set_lock_$unlock(lock_control_seg.write_lock, code);
+      269 		if code ^= 0 then goto alloc_busy_exit; 
+      270 		end;
+      271 	     do read_index = 1 to MAX_READERS;
+      272 		call set_lock_$lock (lock_control_seg.read_lock (read_index), 0, code);
+      273 		if code = 0 then do;
+      274 		     lock_control_seg.number_of_readers = lock_control_seg.number_of_readers + 1;
+      275 		     call adjust_bit_count_(ids_dir, control_seg_ename, "0"b, adj_bit_count, code);
+      276 		     if code = 0 then goto alloc_ok_exit;
+      277 		     goto alloc_unlock_exit;
+      278 		end;
+      279 		if (code = error_table_$invalid_lock_reset
+      280 		| code = error_table_$locked_by_this_process) then goto alloc_ok_exit;
+      281 	     end;
+      282 	end;
+      283 
+      284 alloc_busy_exit:
+      285 	busy_status = "1"b; /* busy */
+      286 alloc_ok_exit:
+      287 	code = 0;
+      288 alloc_unlock_exit:
+      289 	call set_lock_$unlock (lock_control_seg.seg_lock, e_code);
+      290 	if code = 0 then code = e_code; /* report earliest error */
+      291 allocate_exit:
+      292 	return;
+      293 
+      294 /*
+      295*   deallocate
+      296*
+      297*   deallocate the given ids file through the control seg.
+      298*
+      299*   parameters:
+      300*
+      301*   ids_entry_name     the name of the ids file - input
+      302*   ids_dir            the directory of the ids file - input
+      303*   read_access        "1"b if have read access - input
+      304*   write_access       "1"b if have write access - input
+      305*   code               the error_table_ status - output
+      306*
+      307*   algorithm:
+      308*
+      309*   lock control seg
+      310*   if access_type includes write access
+      311*      then
+      312*         unlock write lock
+      313*      else
+      314*         for read_lock := first_read_lock to end of segment
+      315*            unlock read lock
+      316*            if ok then exit loop
+      317*   unlock control seg
+      318*   terminate control seg
+      319*
+      320*   result:
+      321*
+      322*   If the process id is in the control seg, then the lock is unlocked.
+      323*
+      324**/
+      325 deallocate: entry (ids_dir, ids_entry_name, read_access, write_access, code);
+      326 
+      327 	control_seg_ename = rtrim (ids_entry_name)||CONTROL_SEG_SUFFIX;
+      328 	call hcs_$initiate_count (ids_dir, control_seg_ename,
+      329 	     "", bit_count, 0, lock_control_ptr, code);
+      330 	if code ^= 0
+      331 	     then if code ^= error_table_$segknown then goto deallocate_exit;
+      332 
+      333 /* try to deallocate */
+      334 
+      335 	call set_lock_$lock (lock_control_seg.seg_lock, 120, code);
+      336 	if code ^= 0 
+      337 	     then if code ^= error_table_$invalid_lock_reset
+      338 	     then if code ^= error_table_$locked_by_this_process then goto deallocate_exit;
+      339 	if write_access
+      340 	then do;					/* write access */
+      341 	     call set_lock_$unlock (lock_control_seg.write_lock, code);
+      342 	     if code ^= 0 
+      343 		then if code ^= error_table_$lock_not_locked then goto dealloc_unlock_exit;
+      344 	end;
+      345 	else 					/* read access */
+      346 	     do read_index = 1 to (divide(bit_count,36,17)-3);
+      347 	        if (lock_control_seg.read_lock(read_index)) then do;
+      348 	           call set_lock_$unlock (lock_control_seg.read_lock (read_index), code);
+      349 		 if code = 0 then do;
+      350 		     lock_control_seg.number_of_readers = lock_control_seg.number_of_readers - 1;
+      351 		     call adjust_bit_count_(ids_dir, control_seg_ename, "0"b, adj_bit_count, code);
+      352 		     if code ^= 0 then goto dealloc_unlock_exit;
+      353 		     bit_count = max(adj_bit_count, 4*36);
+      354 		     call hcs_$set_bc(ids_dir, control_seg_ename, bit_count, code);
+      355 		     if code ^= 0 then goto dealloc_unlock_exit;
+      356 		     goto dealloc_ok_exit;
+      357 	           end;
+      358 	        end;
+      359 	     end;
+      360 dealloc_ok_exit:
+      361 	code = 0;
+      362 dealloc_unlock_exit:
+      363 	call set_lock_$unlock(lock_control_seg.seg_lock, e_code);
+      364 	if code = 0 then code = e_code; /* report only earliest error */
+      365           call terminate_file_(lock_control_ptr, bit_count, TERM_FILE_TERM,e_code);
+      366 	if code = 0 then code = e_code;
+      367 deallocate_exit:
+      368 	return;
+      369 
+      370 /*
+      371*   have_xid
+      372*
+      373*   returns "1"b if ids_entry_name has an acl (extrinsic id) identifying
+      374*   it as an IDS2 file
+      375**/
+      376 have_xid:	entry (ids_dir, ids_entry_name, code) returns (bit (1));
+      377 
+      378 	segment_acl.access_name = "*.*.I";
+      379 	segment_acl.modes = R_ACCESS;
+      380 	segment_acl.xmodes = "0"b;
+      381 
+      382 	have_ids_acl = "0"b;			/* assume not */
+      383 	acl_ptr = addr (segment_acl);
+      384 	call hcs_$list_acl (ids_dir, ids_entry_name, null (),
+      385 	     null (), acl_ptr, 1, code);
+      386 	if code = 0 & segment_acl (1).acl_status_code = 0
+      387 	then have_ids_acl = "1"b;
+      388 	return (have_ids_acl);
+      389 
+      390 clean_out_dead_locks:
+      391 	proc;
+      392 /* clean out all dead read processes in lock control seg */
+      393 	     do read_index = 1 to MAX_READERS;
+      394 		if (lock_control_seg.read_lock(read_index )) then do;
+      395 		     call set_lock_$lock (lock_control_seg.read_lock(read_index), 0, code);
+      396 		     if code = error_table_$invalid_lock_reset then do;
+      397 			lock_control_seg.number_of_readers = lock_control_seg.number_of_readers -1;
+      398 			code = 0;
+      399 			end;
+      400 		     if code = 0 then call set_lock_$unlock (lock_control_seg.read_lock (read_index), code);
+      401 		     end;
+      402 		end;
+      403 	     code = 0; /* code is irrelevant here */
+      404 	     return;
+      405 	end;
+      406 
+  1     1 /* BEGIN INCLUDE FILE ... access_mode_values.incl.pl1
+  1     2*
+  1     3*   Values for the "access mode" argument so often used in hardcore
+  1     4*   James R. Davis 26 Jan 81  MCR 4844
+  1     5*   Added constants for SM access 4/28/82 Jay Pattin
+  1     6*   Added text strings 03/19/85 Chris Jones
+  1     7**/
+  1     8 
+  1     9 
+  1    10 /* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+  1    11 dcl	(
+  1    12 	N_ACCESS		   init ("000"b),
+  1    13 	R_ACCESS		   init ("100"b),
+  1    14 	E_ACCESS		   init ("010"b),
+  1    15 	W_ACCESS		   init ("001"b),
+  1    16 	RE_ACCESS		   init ("110"b),
+  1    17 	REW_ACCESS	   init ("111"b),
+  1    18 	RW_ACCESS		   init ("101"b),
+  1    19 	S_ACCESS		   init ("100"b),
+  1    20 	M_ACCESS		   init ("010"b),
+  1    21 	A_ACCESS		   init ("001"b),
+  1    22 	SA_ACCESS		   init ("101"b),
+  1    23 	SM_ACCESS		   init ("110"b),
+  1    24 	SMA_ACCESS	   init ("111"b)
+  1    25 	)		   bit (3) internal static options (constant);
+  1    26 
+  1    27 /* The following arrays are meant to be accessed by doing either 1) bin (bit_value) or
+  1    28*   2) divide (bin_value, 2) to come up with an index into the array. */
+  1    29 
+  1    30 dcl	SEG_ACCESS_MODE_NAMES  (0:7) init ("null", "W", "E", "EW", "R", "RW", "RE", "REW") char (4) internal
+  1    31 			   static options (constant);
+  1    32 
+  1    33 dcl	DIR_ACCESS_MODE_NAMES  (0:7) init ("null", "A", "M", "MA", "S", "SA", "SM", "SMA") char (4) internal
+  1    34 			   static options (constant);
+  1    35 
+  1    36 dcl	(
+  1    37 	N_ACCESS_BIN	   init (00000b),
+  1    38 	R_ACCESS_BIN	   init (01000b),
+  1    39 	E_ACCESS_BIN	   init (00100b),
+  1    40 	W_ACCESS_BIN	   init (00010b),
+  1    41 	RW_ACCESS_BIN	   init (01010b),
+  1    42 	RE_ACCESS_BIN	   init (01100b),
+  1    43 	REW_ACCESS_BIN	   init (01110b),
+  1    44 	S_ACCESS_BIN	   init (01000b),
+  1    45 	M_ACCESS_BIN	   init (00010b),
+  1    46 	A_ACCESS_BIN	   init (00001b),
+  1    47 	SA_ACCESS_BIN	   init (01001b),
+  1    48 	SM_ACCESS_BIN	   init (01010b),
+  1    49 	SMA_ACCESS_BIN	   init (01011b)
+  1    50 	)		   fixed bin (5) internal static options (constant);
+  1    51 
+  1    52 /* END INCLUDE FILE ... access_mode_values.incl.pl1 */
+      407 
+  2     1 /* BEGIN INCLUDE FILE ... terminate_file.incl.pl1 */
+  2     2 /* format: style2,^inddcls,idind32 */
+  2     3 
+  2     4 declare 1 terminate_file_switches	based,
+  2     5 	2 truncate		bit (1) unaligned,
+  2     6 	2 set_bc			bit (1) unaligned,
+  2     7 	2 terminate		bit (1) unaligned,
+  2     8 	2 force_write		bit (1) unaligned,
+  2     9 	2 delete			bit (1) unaligned;
+  2    10 
+  2    11 declare TERM_FILE_TRUNC		bit (1) internal static options (constant) initial ("1"b);
+  2    12 declare TERM_FILE_BC		bit (2) internal static options (constant) initial ("01"b);
+  2    13 declare TERM_FILE_TRUNC_BC		bit (2) internal static options (constant) initial ("11"b);
+  2    14 declare TERM_FILE_TERM		bit (3) internal static options (constant) initial ("001"b);
+  2    15 declare TERM_FILE_TRUNC_BC_TERM	bit (3) internal static options (constant) initial ("111"b);
+  2    16 declare TERM_FILE_FORCE_WRITE		bit (4) internal static options (constant) initial ("0001"b);
+  2    17 declare TERM_FILE_DELETE		bit (5) internal static options (constant) initial ("00001"b);
+  2    18 
+  2    19 /* END INCLUDE FILE ... terminate_file.incl.pl1 */
+      408 
+      409      end gcos_ids2_concur_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/08/85  1131.7  gcos_ids2_concur_.pl1             >special_ldd>online>41-15-04/10/85>gcos_ids2_concur_.pl1
+407          1    04/09/85  1109.7  access_mode_values.incl.pl1       >special_ldd>online>41-15-04/10/85>access_mode_values.incl.pl1
+408          2    04/06/83  1239.4  terminate_file.incl.pl1           >ldd>include>terminate_file.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+CONTROL_SEG_SUFFIX              000001 constant        char(12)                 initial unaligned dcl 69 ref 149 192 240 327
+MAX_READERS                            constant        fixed bin(17,0)          initial dcl 91 ref 271 393
+RW_ACCESS                              constant        bit(3)                   initial unaligned dcl 1-11 ref 156
+RW_ACCESS_BIN                   000005 constant        fixed bin(5,0)           initial dcl 1-36 set ref 150*
+R_ACCESS                               constant        bit(3)                   initial unaligned dcl 1-11 ref 142 379
+TERM_FILE_BC                           constant        bit(2)                   initial unaligned dcl 2-12 ref 167
+TERM_FILE_TERM                  000000 constant        bit(3)                   initial unaligned dcl 2-14 set ref 167 365*
+access_name                     000121 automatic       char(32)                 array level 2 in structure "segment_acl" dcl 100
+                                                                                  in procedure "gcos_ids2_concur_" set ref 141* 378*
+access_name                     000134 automatic       char(32)                 array level 2 in structure "lock_control_seg_acl"
+                                                                                  dcl 107 in procedure "gcos_ids2_concur_" set ref
+                                                                                  155*
+acl_ptr                         000100 automatic       pointer                  dcl 62 set ref 144* 145* 158* 159* 383* 384*
+acl_status_code          12     000121 automatic       fixed bin(35,0)          array level 2 dcl 100 set ref 386
+addr                                                   builtin function         dcl 63 ref 144 158 383
+adj_bit_count                   000102 automatic       fixed bin(35,0)          dcl 64 set ref 275* 351* 353
+adjust_bit_count_               000010 constant        entry                    external dcl 65 ref 275 351
+bit_count                       000103 automatic       fixed bin(24,0)          dcl 67 set ref 241* 328* 345 353* 354* 365*
+busy_status                            parameter       bit(1)                   unaligned dcl 59 set ref 238 248* 284*
+code                                   parameter       fixed bin(35,0)          dcl 60 set ref 138 145* 146 150* 152 159* 160 167*
+                                                                                  190 193* 238 241* 243 243 249* 250 250 250 259*
+                                                                                  260 260 260 262 267* 268* 269 272* 273 275* 276
+                                                                                  279 279 286* 290 290* 325 328* 330 330 335* 336
+                                                                                  336 336 341* 342 342 348* 349 351* 352 354* 355
+                                                                                  360* 364 364* 366 366* 376 384* 386 395* 396 398*
+                                                                                  400 400* 403*
+control_seg_ename               000104 automatic       char(32)                 unaligned dcl 68 set ref 149* 150* 159* 192* 193*
+                                                                                  240* 241* 275* 327* 328* 351* 354*
+delete_$path                    000012 constant        entry                    external dcl 71 ref 193
+divide                                                 builtin function         dcl 72 ref 345
+e_code                          000114 automatic       fixed bin(35,0)          dcl 73 set ref 288* 290 362* 364 365* 366
+error_table_$invalid_lock_reset 000014 external static fixed bin(35,0)          dcl 74 ref 250 260 279 336 396
+error_table_$lock_not_locked    000016 external static fixed bin(35,0)          dcl 75 ref 342
+error_table_$lock_wait_time_exceeded
+                                000020 external static fixed bin(35,0)          dcl 76 ref 262
+error_table_$locked_by_this_process
+                                000022 external static fixed bin(35,0)          dcl 77 ref 250 260 279 336
+error_table_$segknown           000024 external static fixed bin(35,0)          dcl 78 ref 243 330
+have_ids_acl                    000115 automatic       bit(1)                   unaligned dcl 79 set ref 382* 386* 388
+hcs_$add_acl_entries            000026 constant        entry                    external dcl 80 ref 145 159
+hcs_$initiate_count             000030 constant        entry                    external dcl 82 ref 241 328
+hcs_$list_acl                   000032 constant        entry                    external dcl 84 ref 384
+hcs_$make_seg                   000034 constant        entry                    external dcl 86 ref 150
+hcs_$set_bc                     000036 constant        entry                    external dcl 88 ref 354
+ids_dir                                parameter       char(168)                unaligned dcl 55 set ref 138 145* 150* 159* 190 193*
+                                                                                  238 241* 275* 325 328* 351* 354* 376 384*
+ids_entry_name                         parameter       char(32)                 unaligned dcl 56 set ref 138 145* 149 190 192 238
+                                                                                  240 325 327 376 384*
+lock_control_ptr                000116 automatic       pointer                  dcl 89 set ref 150* 163 164 165 166 167* 241* 249
+                                                                                  255 257 259 266 267 268 272 274 274 288 328* 335
+                                                                                  341 347 348 350 350 362 365* 394 395 397 397 400
+lock_control_seg                       based           structure                level 1 dcl 114
+lock_control_seg_acl            000134 automatic       structure                array level 1 dcl 107 set ref 158
+max                                                    builtin function         dcl 90 ref 353
+modes                    10     000121 automatic       bit(36)                  array level 2 in structure "segment_acl" dcl 100
+                                                                                  in procedure "gcos_ids2_concur_" set ref 142* 379*
+modes                    10     000134 automatic       bit(36)                  array level 2 in structure "lock_control_seg_acl"
+                                                                                  dcl 107 in procedure "gcos_ids2_concur_" set ref
+                                                                                  156*
+null                                                   builtin function         dcl 92 ref 384 384 384 384
+number_of_readers         2            based           fixed bin(24,0)          level 2 dcl 114 set ref 165* 255 257 274* 274 350*
+                                                                                  350 397* 397
+read_access                            parameter       bit(1)                   unaligned dcl 57 ref 238 325
+read_index                      000120 automatic       fixed bin(17,0)          dcl 93 set ref 271* 272* 345* 347 348* 393* 394 395
+                                                                                  400*
+read_lock                 3            based           bit(36)                  array level 2 dcl 114 set ref 166* 272* 347 348* 394
+                                                                                  395* 400*
+rtrim                                                  builtin function         dcl 94 ref 149 192 240 327
+seg_lock                               based           bit(36)                  level 2 dcl 114 set ref 163* 249* 288* 335* 362*
+segment_acl                     000121 automatic       structure                array level 1 dcl 100 set ref 144 383
+set_lock_$lock                  000040 constant        entry                    external dcl 95 ref 249 259 267 272 335 395
+set_lock_$unlock                000042 constant        entry                    external dcl 96 ref 268 288 341 348 362 400
+terminate_file_                 000044 constant        entry                    external dcl 97 ref 167 365
+write_access                           parameter       bit(1)                   unaligned dcl 58 ref 238 253 325 339
+write_lock                1            based           bit(36)                  level 2 dcl 114 set ref 164* 259* 266 267* 268* 341*
+xmodes                   11     000121 automatic       bit(36)                  array level 2 in structure "segment_acl" dcl 100
+                                                                                  in procedure "gcos_ids2_concur_" set ref 143* 380*
+xmodes                   11     000134 automatic       bit(36)                  array level 2 in structure "lock_control_seg_acl"
+                                                                                  dcl 107 in procedure "gcos_ids2_concur_" set ref
+                                                                                  157*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+A_ACCESS                               internal static bit(3)                   initial unaligned dcl 1-11
+A_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+DIR_ACCESS_MODE_NAMES                  internal static char(4)                  initial array unaligned dcl 1-33
+E_ACCESS                               internal static bit(3)                   initial unaligned dcl 1-11
+E_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+M_ACCESS                               internal static bit(3)                   initial unaligned dcl 1-11
+M_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+N_ACCESS                               internal static bit(3)                   initial unaligned dcl 1-11
+N_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+REW_ACCESS                             internal static bit(3)                   initial unaligned dcl 1-11
+REW_ACCESS_BIN                         internal static fixed bin(5,0)           initial dcl 1-36
+RE_ACCESS                              internal static bit(3)                   initial unaligned dcl 1-11
+RE_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 1-36
+R_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+SA_ACCESS                              internal static bit(3)                   initial unaligned dcl 1-11
+SA_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 1-36
+SEG_ACCESS_MODE_NAMES                  internal static char(4)                  initial array unaligned dcl 1-30
+SMA_ACCESS                             internal static bit(3)                   initial unaligned dcl 1-11
+SMA_ACCESS_BIN                         internal static fixed bin(5,0)           initial dcl 1-36
+SM_ACCESS                              internal static bit(3)                   initial unaligned dcl 1-11
+SM_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 1-36
+S_ACCESS                               internal static bit(3)                   initial unaligned dcl 1-11
+S_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+TERM_FILE_DELETE                       internal static bit(5)                   initial unaligned dcl 2-17
+TERM_FILE_FORCE_WRITE                  internal static bit(4)                   initial unaligned dcl 2-16
+TERM_FILE_TRUNC                        internal static bit(1)                   initial unaligned dcl 2-11
+TERM_FILE_TRUNC_BC                     internal static bit(2)                   initial unaligned dcl 2-13
+TERM_FILE_TRUNC_BC_TERM                internal static bit(3)                   initial unaligned dcl 2-15
+W_ACCESS                               internal static bit(3)                   initial unaligned dcl 1-11
+W_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+terminate_file_switches                based           structure                level 1 packed unaligned dcl 2-4
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+alloc_busy_exit                 001070 constant        label                    dcl 284 ref 257 262 269
+alloc_ok_exit                   001075 constant        label                    dcl 286 ref 260 276 279
+alloc_unlock_exit               001076 constant        label                    dcl 288 ref 263 277
+allocate                        000542 constant        entry                    external dcl 238
+allocate_exit                   001113 constant        label                    dcl 291 ref 243 250
+clean_out_dead_locks            001657 constant        entry                    internal dcl 390 ref 256
+create_control                  000055 constant        entry                    external dcl 138
+create_exit                     000414 constant        label                    dcl 170 ref 146 152 160
+dealloc_ok_exit                 001432 constant        label                    dcl 360 ref 356
+dealloc_unlock_exit             001433 constant        label                    dcl 362 ref 342 352 355
+deallocate                      001127 constant        entry                    external dcl 325
+deallocate_exit                 001501 constant        label                    dcl 367 ref 330 336
+delete_control                  000425 constant        entry                    external dcl 190
+gcos_ids2_concur_               000041 constant        entry                    external dcl 7
+have_xid                        001515 constant        entry                    external dcl 376
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      2204        2252    1736        2214
+Length      2536    1736        46         247     245           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+gcos_ids2_concur_                   212 external procedure  is an external procedure.  
+clean_out_dead_locks                    internal procedure  shares stack frame of external procedure gcos_ids2_concur_.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+gcos_ids2_concur_        000100 acl_ptr                     gcos_ids2_concur_
+                         000102 adj_bit_count               gcos_ids2_concur_
+                         000103 bit_count                   gcos_ids2_concur_
+                         000104 control_seg_ename           gcos_ids2_concur_
+                         000114 e_code                      gcos_ids2_concur_
+                         000115 have_ids_acl                gcos_ids2_concur_
+                         000116 lock_control_ptr            gcos_ids2_concur_
+                         000120 read_index                  gcos_ids2_concur_
+                         000121 segment_acl                 gcos_ids2_concur_
+                         000134 lock_control_seg_acl        gcos_ids2_concur_
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+alloc_cs            call_ext_out_desc   call_ext_out        return              signal              shorten_stack
+ext_entry
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+adjust_bit_count_             delete_$path                  hcs_$add_acl_entries          hcs_$initiate_count
+hcs_$list_acl                 hcs_$make_seg                 hcs_$set_bc                   set_lock_$lock
+set_lock_$unlock              terminate_file_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$invalid_lock_reset                             error_table_$lock_not_locked
+error_table_$lock_wait_time_exceeded                        error_table_$locked_by_this_process
+error_table_$segknown
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+      7 000040       138 000050       141 000067       142 000102       143 000114       144 000125       145 000127
+    146 000163       149 000165       150 000215       152 000253       155 000255       156 000272       157 000304
+    158 000315       159 000317       160 000353       163 000355       164 000356       165 000360       166 000361
+    167 000362       170 000414       190 000423       192 000437       193 000467       196 000525       238 000534
+    240 000554       241 000604       243 000647       248 000654       249 000661       250 000676       253 000705
+    255 000713       256 000716       257 000717       259 000722       260 000737       262 000746       263 000750
+    266 000751       267 000754       268 000770       269 001002       271 001004       272 001013       273 001030
+    274 001032       275 001034       276 001056       277 001060       279 001061       281 001066       284 001070
+    286 001075       288 001076       290 001107       291 001113       325 001122       327 001141       328 001171
+    330 001234       335 001241       336 001256       339 001265       341 001273       342 001305       344 001312
+    345 001313       347 001325       348 001330       349 001341       350 001343       351 001346       352 001370
+    353 001372       354 001377       355 001425       356 001427       359 001430       360 001432       362 001433
+    364 001444       365 001450       366 001475       367 001501       376 001510       378 001526       379 001542
+    380 001554       382 001565       383 001566       384 001570       386 001635       388 001643       390 001657
+    393 001660       394 001667       395 001672       396 001706       397 001712       398 001715       400 001716
+    402 001732       403 001734       404 001735
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

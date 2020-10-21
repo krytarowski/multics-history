@@ -1,0 +1,1193 @@
+	COMPILATION LISTING OF SEGMENT lm_fast_lock_
+	Compiled by: Multics PL/I Compiler, Release 28e, of February 14, 1985
+	Compiled at: Honeywell Multics Op. - System M
+	Compiled on: 04/24/85  0838.2 mst Wed
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        4*   *                                                         *
+        5*   *********************************************************** */
+        6 
+        7 /*  DESCRIPTION:
+        8*    This is the inner-ring portion of fast locking. It is called when the
+        9*    ruthlessly efficient user-ring routine code can not handle the
+       10*    request in its entirety. This means the following:
+       11*
+       12*    1. The process could not lock the fast lock, and it is not locked
+       13*       to this process.
+       14*
+       15*    2. The process has just unlocked the lock, but the notify switch
+       16*       was set after the unlock (it is reset now).
+       17*
+       18*    The following entries are provided:
+       19*
+       20*      lock_fast
+       21*
+       22*      notify_unlock
+       23*
+       24*    Note that efficiency is not of particular import here.
+       25**/
+       26 /* HISTORY:
+       27*Written by J. Bongiovanni 06/15/82.
+       28*Modified:
+       29*83-04-24 by BIM: race when lock was unlocked just after failing
+       30*      stac in TRY_TO_LOCK corrected.
+       31*83-05-05 by BIM: logged all mylocks and timeouts.
+       32*10/11/84 by Stanford S. Cox:  MAIN: Chg all int procs to have prefix var names
+       33*      and use ER, chg to use dm_system_data_$lock_ips_mask.  MWB: Added
+       34*      lock_list_meters_ptr to lm_fast_lock_list_ call.  NOTIFY: Same as MWB.
+       35*      ER: Added for common return.  ELR: Renamed from LOG_ERROR.
+       36*12/11/84 by Stanford S. Cox:  notify_unlock: Add version check of fast_lock_data
+       37*      and lock_list_meters.
+       38*02/15/85 by Stanford S. Cox:  RETURN: Added for guaranteed eligibility.
+       39*03/01/85 by Lindsey L. Spratt:  Added SEND_WAKEUP internal proc to handle
+       40*            calling hcs_$wakeup correctly.
+       41*03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+       42*05/16/85 by S. Cox: NOTIFY: Chg to meter thread_outs instead of thread_ins.
+       43**/
+       44 
+       45 /* format: style3 */
+       46 lm_fast_lock_$lock_fast:
+       47      proc (p_fast_lock_ptr, p_timeout, p_code);		/*  Parameter  */
+       48 
+       49 dcl	p_fast_lock_ptr	ptr;			/* Points to fast lock */
+       50 dcl	p_timeout		fixed bin (71);		/* Wait increment in microseconds */
+       51 dcl	p_code		fixed bin (35);		/* Status code */
+       52 
+       53 /*  Automatic  */
+       54 
+       55 dcl	code		fixed bin (35);
+       56 dcl	done_try_loop	bit (1) aligned;
+       57 dcl	owner_processid	bit (36) aligned;
+       58 dcl	timeout_time	fixed bin (71);		/* Absolute timeout time */
+       59 
+       60 /*  Static  */
+       61 
+       62 dcl	fast_lock_channel_id
+       63 			fixed bin (71) int static init (0);
+       64 dcl	first_time	bit (1) aligned int static init ("1"b);
+       65 dcl	ips_mask		bit (36) aligned int static init (""b);
+       66 dcl	my_processid	bit (36) aligned int static init (""b);
+       67 dcl	1 wait_list	aligned int static,
+       68 	  2 nchan		fixed bin init (1),
+       69 	  2 pad		fixed bin init (0),
+       70 	  2 channel_id	(1) fixed bin (71) init (0);
+       71 
+       72 dcl	(
+       73 	INVALID_RESET	fixed bin init (1),
+       74 	VALID_LOCK	fixed bin init (0),
+       75 	IPS_NAMES		(3) char (32) init ("alrm", "quit", "cput"),
+       76 	MAX_WAIT_TIME	fixed bin (71) init (30000000),
+       77 	ME		char (13) init ("lm_fast_lock_"),
+       78 	MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS
+       79 			fixed bin init (10),
+       80 	YES		bit (1) aligned init ("1"b),
+       81 	NO		bit (1) aligned init ("0"b),
+       82 	ITT_OVERFLOW_WAIT_TIME
+       83 			fixed bin (71) init (10000000 /* 10 seconds */),
+       84 	RELATIVE_SECONDS	bit (2) init ("11"b)
+       85 	)		internal static options (constant);
+       86 
+       87 /*  External  */
+       88 
+       89 dcl	dm_system_data_$lock_ips_mask
+       90 			bit (36) aligned external;
+       91 dcl	lm_data_$fast_lock_data_ptr
+       92 			ptr external;
+       93 dcl	lm_data_$lock_list_meters_ptr
+       94 			ptr external;
+       95 dcl	dm_error_$fast_lock_invalid_lock
+       96 			fixed bin (35) external static;
+       97 dcl	dm_error_$fast_lock_invalid_reset
+       98 			fixed bin (35) external static;
+       99 dcl	dm_error_$fast_lock_mylock
+      100 			fixed bin (35) external static;
+      101 dcl	dm_error_$fast_lock_no_free
+      102 			fixed bin (35) external static;
+      103 dcl	dm_error_$fast_lock_not_cleared
+      104 			fixed bin (35) external;
+      105 dcl	dm_error_$fast_lock_timeout
+      106 			fixed bin (35) external static;
+      107 dcl	(
+      108 	error_table_$unimplemented_version,
+      109 	error_table_$itt_overflow,
+      110 	error_table_$process_unknown
+      111 	)		fixed bin (35) ext static;
+      112 
+      113 /*  Entry  */
+      114 
+      115 dcl	cu_$caller_ptr	entry returns (pointer);
+      116 dcl	dm_hcs_$guaranteed_eligibility_off
+      117 			entry ();
+      118 dcl	dm_hcs_$guaranteed_eligibility_on
+      119 			entry ();
+      120 dcl	dm_misc_util_$log	entry options (variable);
+      121 dcl	create_ips_mask_	entry (ptr, fixed bin, bit (36) aligned);
+      122 dcl	find_pathname_	entry (ptr, ptr, fixed bin (35));
+      123 dcl	get_process_id_	entry () returns (bit (36));
+      124 dcl	hcs_$get_alarm_timer
+      125 			entry (fixed bin (71), fixed bin (71));
+      126 dcl	hcs_$get_uid_seg	entry (ptr, bit (36) aligned, fixed bin (35));
+      127 dcl	hcs_$reset_ips_mask entry (bit (36) aligned, bit (36) aligned);
+      128 dcl	hcs_$set_alarm_timer
+      129 			entry (fixed bin (71), fixed bin, fixed bin (71));
+      130 dcl	hcs_$set_ips_mask	entry (bit (36) aligned, bit (36) aligned);
+      131 dcl	hcs_$validate_processid
+      132 			entry (bit (36) aligned, fixed bin (35));
+      133 dcl	hcs_$wakeup	entry (bit (36) aligned, fixed bin (71), fixed bin (71), fixed bin (35));
+      134 dcl	lm_init_fast_lock_	entry (ptr, fixed bin (35));
+      135 dcl	ipc_$block	entry (ptr, ptr, fixed bin (35));
+      136 dcl	ipc_$create_ev_chn	entry (fixed bin (71), fixed bin (35));
+      137 dcl	ipc_$drain_chn	entry (fixed bin (71), fixed bin (35));
+      138 dcl	lm_fast_lock_list_$thread_in
+      139 			entry (ptr, ptr, ptr);
+      140 dcl	lm_fast_lock_list_$thread_out_first
+      141 			entry (ptr, ptr, ptr, ptr);
+      142 dcl	timer_manager_$sleep
+      143 			entry (fixed bin (71), bit (2));
+      144 dcl	sub_err_		entry () options (variable);
+      145 
+      146 /*  Condition  */
+      147 
+      148 dcl	cleanup		condition;
+      149 
+      150 /*  Builtin  */
+      151 
+      152 dcl	addr		builtin;
+      153 dcl	bin		builtin;
+      154 dcl	clock		builtin;
+      155 dcl	divide		builtin;
+      156 dcl	hbound		builtin;
+      157 dcl	min		builtin;
+      158 dcl	mod		builtin;
+      159 dcl	null		builtin;
+      160 dcl	ptr		builtin;
+      161 dcl	rel		builtin;
+      162 dcl	size		builtin;
+      163 dcl	stac		builtin;
+      164 dcl	stacq		builtin;
+      165 dcl	string		builtin;
+      166 dcl	substr		builtin;
+      167 dcl	unspec		builtin;
+      168 
+      169 
+      170 	p_code = 0;
+      171 	timeout_time = clock () + p_timeout;
+      172 	fast_lock_ptr = p_fast_lock_ptr;
+      173 
+      174 
+      175 	if first_time
+      176 	then do;
+      177 		call INIT ();
+      178 		first_time = "0"b;
+      179 	     end;
+      180 
+      181 	fast_lock_data_ptr = lm_data_$fast_lock_data_ptr;
+      182 	call CHECK_VERSION (FAST_LOCK_DATA_VERSION_1, fast_lock_data.version, "fast_lock_data");
+      183 	lock_list_meters_ptr = lm_data_$lock_list_meters_ptr;
+      184 	if lock_list_meters_ptr ^= null ()
+      185 	then call CHECK_VERSION (LOCK_LIST_METERS_VERSION_1, lock_list_meters.version, "lock_list_meters");
+      186 
+      187 /*  Validate that the fast lock itself is good */
+      188 
+      189 	call VALIDATE_FAST_LOCK (fast_lock_ptr, fast_lock_block_ptr);
+      190 
+      191 /*  Main loop of fast locking.
+      192*
+      193*    1. Try to lock the lock. Return if successful.
+      194*
+      195*    2. Validate that the owner is an active process. Bust the lock to this
+      196*       process if not.
+      197*
+      198*    3. Wait until notified, the user's time has expired, or our timeout
+      199*       has expired.
+      200**/
+      201 
+      202 TRY_TO_LOCK:
+      203 	do while ("1"b);
+      204 	     done_try_loop = "0"b;
+      205 	     code = 0;
+      206 
+      207 	     do while (^done_try_loop);
+      208 		if stac (addr (fast_lock.lock_word), my_processid)
+      209 		then call RETURN (VALID_LOCK);
+      210 
+      211 		owner_processid = fast_lock.lock_word;
+      212 		if owner_processid = my_processid
+      213 		then call ERROR_LOG_AND_RETURN (dm_error_$fast_lock_mylock, fast_lock_ptr, cu_$caller_ptr ());
+      214 		else if owner_processid ^= ""b
+      215 		then do;
+      216 			call hcs_$validate_processid (owner_processid, code);
+      217 			if code = 0
+      218 			then done_try_loop = "1"b;
+      219 			else do;
+      220 				if stacq (fast_lock.lock_word, my_processid, owner_processid)
+      221 				then call RETURN (INVALID_RESET);
+      222 			     end;
+      223 		     end;
+      224 	     end;
+      225 
+      226 
+      227 /*  Check for the user's timeout expiring  */
+      228 
+      229 	     if timeout_time < clock ()
+      230 	     then call ERROR_LOG_AND_RETURN (dm_error_$fast_lock_timeout, fast_lock_ptr, cu_$caller_ptr ());
+      231 
+      232 /*  Thread ourselves into the wait list, set the notify switch, and wait.  */
+      233 
+      234 	     call MAKE_WAIT_BLOCK (fast_lock_block_ptr);
+      235 
+      236 	     fast_lock.notify_sw = "1"b;
+      237 
+      238 	     call ipc_$drain_chn (fast_lock_channel_id, code);
+      239 
+      240 /* Try once more for the lock. We could get it because of a race.  */
+      241 
+      242 	     if stac (addr (fast_lock.lock_word), my_processid)
+      243 	     then call RETURN (VALID_LOCK);
+      244 
+      245 /*  Now wait a bit. Notify to prevent congestion of wait blocks. */
+      246 
+      247 	     call BLOCK;
+      248 
+      249 	     call NOTIFY (fast_lock_block_ptr);
+      250 
+      251 	end TRY_TO_LOCK;
+      252 
+      253 MAIN_RETURN:
+      254 	return;
+
+      255 
+      256 RETURN:
+      257      proc (r_p_status);
+      258 
+      259 dcl	r_p_status	fixed bin (17) parameter;
+      260 
+      261 	if r_p_status = INVALID_RESET
+      262 	then p_code = dm_error_$fast_lock_invalid_reset;
+      263 	else p_code = 0;
+      264 	call dm_hcs_$guaranteed_eligibility_on ();
+      265 	goto MAIN_RETURN;
+      266      end RETURN;
+      267 
+      268 
+      269 /*  notify_unlock -
+      270*
+      271*     Entry to notify all processes waiting for a lock. Called after the lock has
+      272*     been unlocked.
+      273**/
+      274 
+      275 notify_unlock:
+      276      entry (p_fast_lock_ptr, p_code);
+      277 
+      278 	p_code = 0;
+      279 	fast_lock_ptr = p_fast_lock_ptr;
+      280 
+      281 	call dm_hcs_$guaranteed_eligibility_off ();
+      282 
+      283 	if first_time
+      284 	then do;
+      285 		call INIT;
+      286 		first_time = "0"b;
+      287 	     end;
+      288 
+      289 	fast_lock_data_ptr = lm_data_$fast_lock_data_ptr;
+      290 	call CHECK_VERSION (FAST_LOCK_DATA_VERSION_1, fast_lock_data.version, "fast_lock_data");
+      291 	lock_list_meters_ptr = lm_data_$lock_list_meters_ptr;
+      292 	if lock_list_meters_ptr ^= null ()
+      293 	then call CHECK_VERSION (LOCK_LIST_METERS_VERSION_1, lock_list_meters.version, "lock_list_meters");
+      294 
+      295 /*  Validate that we've been passed a valid fast lock  */
+      296 
+      297 	call VALIDATE_FAST_LOCK (fast_lock_ptr, fast_lock_block_ptr);
+      298 
+      299 /*  Notify any process which is waiting  */
+      300 
+      301 	call NOTIFY (fast_lock_block_ptr);
+      302 
+      303 
+      304 	goto MAIN_RETURN;
+      305 
+      306 /*  Internal Procedure to wait until notified or until we time out.
+      307*    We can time out if we hit the user's timeout time, or if we
+      308*    hit our own. The latter is a safety valve - if we hit it, our
+      309*    caller retries locking, possibly calling us again.
+      310**/
+      311 
+      312 BLOCK:
+      313      proc;
+      314 
+      315 
+      316 dcl	1 b_event_info	aligned,
+      317 	  2 channel_id	fixed bin (71),
+      318 	  2 message	fixed bin (71),
+      319 	  2 sender	bit (36) aligned,
+      320 	  2 origin,
+      321 	    3 dev_signal	bit (18) unaligned,
+      322 	    3 ring	bit (18) unaligned,
+      323 	  2 channel_index	fixed bin;
+      324 dcl	b_saved_channel	fixed bin (71);
+      325 dcl	b_saved_ips_mask	bit (36) aligned;
+      326 dcl	b_saved_timer	fixed bin (71);
+      327 dcl	b_wait_time	fixed bin (71);
+      328 
+      329 
+      330 /*  Setup a cleanup handler to reset the IPS mask and ring-0 timer  */
+      331 
+      332 	b_saved_ips_mask = ""b;
+      333 	b_saved_channel = -1;
+      334 
+      335 	on cleanup
+      336 	     begin;
+      337 		if substr (b_saved_ips_mask, 36, 1) = "1"b
+      338 		then call hcs_$reset_ips_mask (b_saved_ips_mask, b_saved_ips_mask);
+      339 		if b_saved_channel ^= -1
+      340 		then call hcs_$set_alarm_timer (b_saved_timer, 2, b_saved_channel);
+      341 	     end;
+      342 
+      343 
+      344 /*  Determine the wait time  */
+      345 
+      346 	b_wait_time = min (clock () + MAX_WAIT_TIME, timeout_time);
+      347 
+      348 
+      349 /*  Mask IPS Signals and set our own ring-0 timer  */
+      350 
+      351 	call hcs_$set_ips_mask (dm_system_data_$lock_ips_mask, b_saved_ips_mask);
+      352 
+      353 	call hcs_$get_alarm_timer (b_saved_timer, b_saved_channel);
+      354 	call hcs_$set_alarm_timer (b_wait_time, 2, fast_lock_channel_id);
+      355 
+      356 /*  Wait for something  */
+      357 
+      358 	call ipc_$block (addr (wait_list), addr (b_event_info), code);
+      359 
+      360 /*  Restore the ring-0 timer and the IPS mask  */
+      361 
+      362 	call hcs_$set_alarm_timer (b_saved_timer, 2, b_saved_channel);
+      363 	call hcs_$reset_ips_mask (b_saved_ips_mask, b_saved_ips_mask);
+      364 
+      365 
+      366      end BLOCK;
+      367 
+      368 /*  Internal procedure to initialize static variables.  */
+      369 
+      370 INIT:
+      371      proc ();
+      372 
+      373 dcl	i_code		fixed bin (35);
+      374 
+      375 	my_processid = get_process_id_ ();
+      376 
+      377 	call ipc_$create_ev_chn (fast_lock_channel_id, i_code);
+      378 	wait_list.channel_id (1) = fast_lock_channel_id;
+      379 
+      380 	call create_ips_mask_ (addr (IPS_NAMES), hbound (IPS_NAMES, 1), ips_mask);
+      381 
+      382      end INIT;
+      383 
+      384 /*  Internal Procedure to thread this process into the list of waiters
+      385*    for this fast lock
+      386**/
+      387 MAKE_WAIT_BLOCK:
+      388      proc (mw_p_fast_lock_block_ptr);
+      389 
+      390 dcl	mw_p_fast_lock_block_ptr
+      391 			ptr;
+      392 dcl	1 mw_fast_lock_block
+      393 			aligned like fast_lock_block based (mw_p_fast_lock_block_ptr);
+      394 
+      395 dcl	mw_tfast_lock_wakeup_block_ptr
+      396 			ptr;
+      397 dcl	mw_tlock_list_block_ptr
+      398 			ptr;
+      399 dcl	1 mw_tfast_lock_wakeup_block
+      400 			aligned like fast_lock_wakeup_block based (mw_tfast_lock_wakeup_block_ptr);
+      401 dcl	1 mw_tlock_list_block
+      402 			aligned like lock_list_block based (mw_tlock_list_block_ptr);
+      403 
+      404 
+      405 	call lm_fast_lock_list_$thread_out_first (addr (fast_lock_data.free_list_head), fast_lock_data_ptr, null (),
+      406 	     mw_tlock_list_block_ptr);
+      407 	if mw_tlock_list_block_ptr = null ()
+      408 	then call ERROR_RETURN (dm_error_$fast_lock_no_free);
+      409 
+      410 	mw_tfast_lock_wakeup_block_ptr = addr (mw_tlock_list_block.block_data);
+      411 	mw_tfast_lock_wakeup_block.event_channel = fast_lock_channel_id;
+      412 	mw_tfast_lock_wakeup_block.processid = my_processid;
+      413 	mw_tfast_lock_wakeup_block.message = "WAIT";
+      414 
+      415 	call lm_fast_lock_list_$thread_in (addr (mw_fast_lock_block.list_head), lock_list_meters_ptr,
+      416 	     mw_tlock_list_block_ptr);
+      417 
+      418 
+      419      end MAKE_WAIT_BLOCK;
+      420 
+      421 /*  Internal Procedure to notify all processes waiting for a fast lock.
+      422*    This is done one at a time to avoid races with other processes doing
+      423*    the same thing.
+      424**/
+      425 
+      426 NOTIFY:
+      427      proc (nt_p_fast_lock_block_ptr);
+      428 
+      429 dcl	nt_p_fast_lock_block_ptr
+      430 			ptr;
+      431 dcl	1 nt_fast_lock_block
+      432 			aligned like fast_lock_block based (nt_p_fast_lock_block_ptr);
+      433 
+      434 dcl	nt_done_notify	bit (1) aligned;
+      435 dcl	nt_message_71	fixed bin (71);
+      436 dcl	nt_message_8	char (8) aligned;
+      437 dcl	nt_tfast_lock_wakeup_block_ptr
+      438 			ptr;
+      439 dcl	nt_tlock_list_block_ptr
+      440 			ptr;
+      441 
+      442 dcl	1 nt_tfast_lock_wakeup_block
+      443 			aligned like fast_lock_wakeup_block based (nt_tfast_lock_wakeup_block_ptr);
+      444 dcl	1 nt_tlock_list_block
+      445 			aligned like lock_list_block based (nt_tlock_list_block_ptr);
+      446 
+      447 	nt_done_notify = "0"b;
+      448 
+      449 	do while (^nt_done_notify);
+      450 	     call lm_fast_lock_list_$thread_out_first (addr (nt_fast_lock_block.list_head), fast_lock_data_ptr,
+      451 		lock_list_meters_ptr, nt_tlock_list_block_ptr);
+      452 	     if nt_tlock_list_block_ptr = null ()
+      453 	     then nt_done_notify = "1"b;
+      454 	     else do;
+      455 		     nt_tfast_lock_wakeup_block_ptr = addr (nt_tlock_list_block.block_data);
+      456 		     if nt_tfast_lock_wakeup_block.processid ^= my_processid
+      457 						/* Don't wakeup ourselves */
+      458 		     then do;
+      459 			     nt_message_8 = nt_tfast_lock_wakeup_block.message;
+      460 			     unspec (nt_message_71) = unspec (nt_message_8);
+      461 			     call SEND_WAKEUP ("fast_lock unlock notification",
+      462 				nt_tfast_lock_wakeup_block.processid, nt_tfast_lock_wakeup_block.event_channel,
+      463 				nt_message_71);
+      464 			end;
+      465 		     call lm_fast_lock_list_$thread_in (addr (fast_lock_data.free_list_head), null (),
+      466 			nt_tlock_list_block_ptr);
+      467 		end;
+      468 	end;
+      469 
+      470      end NOTIFY;
+      471 
+      472 
+      473 /*  Internal Procedure to validate a fast lock supplied by the outer ring.
+      474*    If it is valid,  a pointer to the inner-ring block is returned. If it
+      475*    has never been initialized, it is done now. Note that this initialization
+      476*    (which is really binding to an inner-ring block) is done on demand, when
+      477*    first some process waits for it.
+      478**/
+      479 
+      480 VALIDATE_FAST_LOCK:
+      481      proc (vf_p_fast_lock_ptr, vf_p_fast_lock_block_ptr);
+      482 
+      483 
+      484 dcl	vf_p_fast_lock_ptr	ptr;
+      485 dcl	vf_p_fast_lock_block_ptr
+      486 			ptr;
+      487 dcl	vf_code		fixed bin (35);
+      488 
+      489 dcl	1 vf_fast_lock	aligned like fast_lock based (vf_p_fast_lock_ptr);
+      490 dcl	1 vf_fast_lock_block
+      491 			aligned like fast_lock_block based (vf_p_fast_lock_block_ptr);
+      492 
+      493 dcl	vf_block_offset	bit (18) aligned;
+      494 dcl	vf_listx		fixed bin;
+      495 dcl	vf_rel_offset	fixed bin (18);
+      496 dcl	vf_uid		bit (36) aligned;
+      497 
+      498 	if vf_fast_lock.offset = ""b			/* Not initialized yet */
+      499 	then do;
+      500 		call lm_init_fast_lock_ (vf_p_fast_lock_ptr, vf_code);
+      501 		if vf_code ^= 0
+      502 		then if vf_code ^= dm_error_$fast_lock_not_cleared
+      503 		     then call ERROR_RETURN (vf_code);
+      504 	     end;
+      505 
+      506 	lock_list_block_words = size (fast_lock_wakeup_block);
+      507 	vf_block_offset = vf_fast_lock.offset;
+      508 	vf_rel_offset = bin (vf_block_offset) - bin (rel (addr (fast_lock_data.list)));
+      509 
+      510 	if vf_rel_offset < 0
+      511 	then call ERROR_RETURN (dm_error_$fast_lock_invalid_lock);
+      512 
+      513 	if mod (vf_rel_offset, size (lock_list_block)) ^= 0
+      514 	then call ERROR_RETURN (dm_error_$fast_lock_invalid_lock);
+      515 
+      516 	vf_listx = divide (vf_rel_offset, size (lock_list_block), 17);
+      517 	if vf_listx < 0 | vf_listx > fast_lock_data.n_list_entries
+      518 	then call ERROR_RETURN (dm_error_$fast_lock_invalid_lock);
+      519 
+      520 	vf_p_fast_lock_block_ptr = addr (ptr (fast_lock_data_ptr, vf_block_offset) -> lock_list_block.block_data);
+      521 	if vf_fast_lock_block.offset ^= rel (vf_p_fast_lock_ptr)
+      522 	then call ERROR_RETURN (dm_error_$fast_lock_invalid_lock);
+      523 
+      524 	call hcs_$get_uid_seg (vf_p_fast_lock_ptr, vf_uid, code);
+      525 	if code ^= 0 | vf_uid ^= vf_fast_lock_block.uid
+      526 	then call ERROR_RETURN (dm_error_$fast_lock_invalid_lock);
+      527 
+      528 
+      529      end VALIDATE_FAST_LOCK;
+      530 
+      531 ERROR_LOG_AND_RETURN:
+      532      procedure (el_p_code, el_p_lock_ptr, el_p_caller_ptr);
+      533 
+      534 declare	el_p_code		fixed bin (35);
+      535 declare	el_p_lock_ptr	pointer;
+      536 declare	el_p_caller_ptr	pointer;
+      537 declare	1 el_lock_fpi	aligned like find_pathname_info;
+      538 declare	el_code		fixed bin (35);
+      539 
+      540 	string (el_lock_fpi.strings) = "";
+      541 
+      542 	call dm_misc_util_$log (INFORM_SV, el_p_code, "lm_fast_lock_", "Fast lock error.");
+      543 
+      544 	call find_pathname_ (el_p_lock_ptr, addr (el_lock_fpi), el_code);
+      545 	if el_code = 0
+      546 	then call dm_misc_util_$log (INFORM_SV, "   On lock ^a.", string (el_lock_fpi.strings));
+      547 	else call dm_misc_util_$log (INFORM_SV, "   On lock ^p.", el_p_lock_ptr);
+      548 	call ERROR_RETURN (el_p_code);
+      549      end ERROR_LOG_AND_RETURN;
+
+      550 
+      551 ERROR_RETURN:
+      552      proc (er_p_code);
+      553 
+      554 dcl	er_p_code		fixed bin (35) parameter;
+      555 
+      556 	p_code = er_p_code;
+      557 	goto MAIN_RETURN;
+      558      end ERROR_RETURN;
+      559 
+      560 SEND_WAKEUP:
+      561      proc (sw_p_wakeup_description, sw_p_process_id, sw_p_ev_channel, sw_p_message);
+      562 dcl	sw_p_wakeup_description
+      563 			char (*) parm;
+      564 dcl	sw_p_process_id	bit (36) aligned parm;
+      565 dcl	sw_p_ev_channel	fixed bin (71) parm;
+      566 dcl	sw_p_message	fixed bin (71) parm;
+      567 
+      568 dcl	sw_code		fixed bin (35) init (0);
+      569 dcl	sw_try_wakeup	bit (1) aligned init (YES);
+      570 dcl	sw_wakeup_attempt_count
+      571 			fixed bin init (0);
+      572 
+      573 	do sw_wakeup_attempt_count = 1 to MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS while (sw_try_wakeup = YES);
+      574 	     call hcs_$wakeup (sw_p_process_id, sw_p_ev_channel, sw_p_message, sw_code);
+      575 	     if sw_code = 0 | (sw_code = error_table_$process_unknown & sw_p_process_id ^= "0"b)
+      576 						/* Probably a process_id for a now-dead process. */
+      577 	     then sw_try_wakeup = NO;
+      578 	     else if sw_code = error_table_$itt_overflow
+      579 	     then call timer_manager_$sleep (ITT_OVERFLOW_WAIT_TIME, RELATIVE_SECONDS);
+      580 	     else do;
+      581 		     call dm_misc_util_$log (INFORM_SV, sw_code, ME,
+      582 			"^/Unable to send a ^a for process ^w on event channel ^o.", sw_p_wakeup_description,
+      583 			sw_p_process_id, sw_p_ev_channel);
+      584 		     sw_try_wakeup = NO;
+      585 		end;
+      586 	end;
+      587 	if sw_wakeup_attempt_count > MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS
+      588 	then call dm_misc_util_$log (INFORM_SV, error_table_$itt_overflow, ME,
+      589 		"^/Unable to send a ^a for process ^w on event channel ^w, after ^d attempts.",
+      590 		sw_p_wakeup_description, sw_p_process_id, sw_p_ev_channel, MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS);
+      591      end SEND_WAKEUP;
+      592 
+      593 
+      594 CHECK_VERSION:
+      595      proc (cv_p_expected_version, cv_p_received_version, cv_p_structure_name);
+      596 
+      597 dcl	cv_p_expected_version
+      598 			char (8) aligned parameter;
+      599 dcl	cv_p_received_version
+      600 			char (8) aligned parameter;
+      601 dcl	cv_p_structure_name char (32) aligned parameter;
+      602 
+      603 	if cv_p_expected_version ^= cv_p_received_version
+      604 	then call sub_err_ (error_table_$unimplemented_version, ME, ACTION_CANT_RESTART, null (), 0,
+      605 		"^/Expected version ^a of the ^a structure." || "^/Received version ^a instead.",
+      606 		cv_p_expected_version, cv_p_structure_name, cv_p_received_version);
+      607      end CHECK_VERSION;
+      608 
+  1     1 /* BEGIN INCLUDE FILE find_pathname_info.incl.pl1 BIM April 1981 */
+  1     2 /* format: style2 */
+  1     3 
+  1     4      declare find_pathname_info_ptr pointer;
+  1     5 
+  1     6      declare 1 find_pathname_info   aligned based (find_pathname_info_ptr),
+  1     7 	     2 strings	      unaligned,
+  1     8 	       3 component_ename  character (32),
+  1     9 	       3 adjusted_offset  character (7),
+  1    10 	       3 dirname	      character (168),
+  1    11 	       3 gt_char	      character (1),
+  1    12 	       3 real_ename	      character (32),
+  1    13 	       3 real_offset      character (7),
+  1    14 	       3 pdir_string      character (17),
+  1    15 	       3 offset_msg	      character (40),
+  1    16 	     2 bin_adjusted_off   fixed bin (18),
+  1    17 	     2 bin_real_off	      fixed bin (18);
+  1    18 
+  1    19 /* END INCLUDE FILE find_pathname_info */
+      609 
+  2     1 /*  START OF:	dm_fast_lock_strucs.incl.pl1 ... June 1982   *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+  2     2 
+  2     3 /* DESCRIPTION:
+  2     4*   There is a fast_lock_block per segment to be locked.  There is a
+  2     5*   fast_lock_wakeup_block per waiter on the lock.  The fast*block's are
+  2     6*   taken from the fast_lock_data.list, which is a list of lock_list_block's.
+  2     7**/
+  2     8 
+  2     9 /* HISTORY:
+  2    10*Written by J. Bongiovanni, 06/15/82.
+  2    11*Modified:
+  2    12*10/12/84 by Stanford S. Cox:  Added version constants.
+  2    13*11/14/84 by Stanford S. Cox:  Chg to make fast_lock_data.free_list_head
+  2    14*   like lock_list_head.
+  2    15**/
+  2    16 
+  2    17 /* format: style2,^inddcls,ifthenstmt,ifthendo,^indnoniterdo,^inditerdo,ind3,idind32 */
+  2    18 dcl     fast_lock_ptr		ptr;
+  2    19 dcl     fast_lock_block_ptr		ptr;
+  2    20 dcl     fast_lock_wakeup_block_ptr	ptr;
+  2    21 dcl     fast_lock_data_ptr		ptr;
+  2    22 
+  2    23 dcl     FAST_LOCK_DATA_VERSION_1	char (8) aligned init ("fastlk 1") int static options (constant);
+  2    24 
+  2    25 dcl     1 fast_lock			aligned based (fast_lock_ptr),
+  2    26 						/* A fast lock */
+  2    27 	2 lock_word		bit (36) aligned,	/* "0"b (unlocked) or processid (locked) */
+  2    28 	2 notify_sw		bit (1) unal,	/* ON => notify on unlock */
+  2    29 	2 pad			bit (17) unal,
+  2    30 	2 offset			bit (18) unal;	/* Offset of block in fast_lock_data */
+  2    31 
+  2    32 
+  2    33 dcl     1 fast_lock_block		aligned based (fast_lock_block_ptr),
+  2    34 						/* Per-lock info, inner-ring */
+  2    35 	2 uid			bit (36) aligned,	/* Unique ID of segment */
+  2    36 	2 offset			bit (18) unal,	/* Offset of lock in segment */
+  2    37 	2 pad			bit (18) unal,
+  2    38 	2 list_head		bit (18) unal,	/* Thread pointer for wakeups */
+  2    39 	2 mbz			bit (18) unal,
+  2    40 	2 pad1			bit (36) aligned;
+  2    41 
+  2    42 
+  2    43 dcl     1 fast_lock_wakeup_block	aligned based (fast_lock_wakeup_block_ptr),
+  2    44 						/* Notify info */
+  2    45 	2 event_channel		fixed bin (71),
+  2    46 	2 processid		bit (36) aligned,
+  2    47 	2 message			char (4);
+  2    48 
+  2    49 dcl     1 fast_lock_data		aligned based (fast_lock_data_ptr),
+  2    50 	2 version			char (8),
+  2    51 	2 size			fixed bin,
+  2    52 	2 n_list_entries		fixed bin,
+  2    53 	2 free_list_head		aligned like lock_list_head,
+  2    54 	2 list			fixed bin (71) aligned;
+  2    55 
+  2    56 /*  END OF:	dm_fast_lock_strucs.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+      610 
+  3     1 /*  START OF:	dm_lock_list_strucs_.incl.pl1	June 1982  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+  3     2 
+  3     3 /* DESCRIPTION:
+  3     4*   fast_lock_data.free_list_head is lock_list_head. fast_lock_data.list is the
+  3     5*   first two words of lock_list_block.  Other lock_list_block's are threaded
+  3     6*   to make a list.  block_data is large enough to contain 
+  3     7*   fast_lock_wakeup_block (largest fast lock block type).
+  3     8**/
+  3     9 
+  3    10 /* HISTORY:
+  3    11*Written by John Bongiovanni, 06/15/82.
+  3    12*Modified:
+  3    13*10/12/84 by Stanford S. Cox:  Added version constants.
+  3    14*11/14/84 by Stanford S. Cox:  Removed lock_list_head.version as fast_lock_data
+  3    15*   has a version.
+  3    16**/
+  3    17 
+  3    18 /* format: style2,^inddcls,ifthenstmt,ifthendo,^indnoniterdo,^inditerdo,ind3,idind32 */
+  3    19 dcl     lock_list_head_ptr		ptr;
+  3    20 dcl     lock_list_block_ptr		ptr;
+  3    21 dcl     lock_list_meters_ptr		ptr;
+  3    22 
+  3    23 dcl     lock_list_block_words		fixed bin;
+  3    24 
+  3    25 dcl     LOCK_LIST_METERS_VERSION_1	char (8) aligned init ("lklsmt 1") int static options (constant);
+  3    26 
+  3    27 dcl     1 lock_list_head		aligned based (lock_list_head_ptr),
+  3    28 	2 firstp			bit (18) unal,
+  3    29 	2 mbz			bit (18) unal;
+  3    30 
+  3    31 dcl     1 lock_list_block		aligned based (lock_list_block_ptr),
+  3    32 	2 nextp			bit (18) unal,
+  3    33 	2 mbz			bit (18) unal,
+  3    34 	2 block_words		fixed bin (17) unal,
+  3    35 	2 pad			bit (18) unal,
+  3    36 	2 block_data		(lock_list_block_words refer (lock_list_block.block_words)) bit (36) aligned;
+  3    37 
+  3    38 dcl     1 lock_list_meters		aligned based (lock_list_meters_ptr),
+  3    39 	2 version			char (8) aligned,
+  3    40 	2 thrdout_calls		fixed bin (35),
+  3    41 	2 thrdin_calls		fixed bin (35),
+  3    42 	2 thrdout_steps		fixed bin (35),
+  3    43 	2 thrdin_steps		fixed bin (35);
+  3    44 
+  3    45 
+  3    46 /*  END OF:	dm_lock_list_strucs_.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+      611 
+  4     1 /* BEGIN INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+  4     2 
+  4     3 /* format: ^indcom */
+  4     4 
+  4     5 /* DESCRIPTION:
+  4     6*   These are the severity codes used by the dms daemon when calling its logger.
+  4     7*   The severity is ranked thusly:
+  4     8*
+  4     9*   severity log write situation
+  4    10*   -------- --- ----- ---------
+  4    11*          0 no  yes   standard output, query, etc.
+  4    12*          1 yes yes   fatal error, terminate dms daemon.
+  4    13*          2 yes yes   nonfatal error.
+  4    14*          3 yes yes   informative message.
+  4    15*          4 yes no    log information only.
+  4    16**/
+  4    17 
+  4    18 /* HISTORY:
+  4    19*
+  4    20*Written by M. Pandolf, 10/06/82.
+  4    21*Modified:
+  4    22*12/10/84 by R. Michael Tague: Rename and reformat description/history.
+  4    23*01/13/85 by Lee A. Newcomb:  Renamed to dm_log_sv_codes from
+  4    24*            dm_daemon_sv_codes as the severity codes for the DM log are not
+  4    25*            restrained to the DM Daemon's use.
+  4    26*01/24/85 by Lee A. Newcomb:  Fixed to say dm_log_sv_codes.incl.pl1 in the
+  4    27*            BEGIN and END INCLUDE comments, instead of dm_daemon_sv_codes.==.
+  4    28**/
+  4    29 
+  4    30 /* format: style5 */
+  4    31 
+  4    32      dcl	   (PRINT_SV, QUERY_SV)    fixed bin internal static
+  4    33 			       options (constant) init (0);
+  4    34      dcl	   (CRASH_SV, FATAL_SV)    fixed bin internal static
+  4    35 			       options (constant) init (1);
+  4    36      dcl	   ERROR_SV	       fixed bin internal static
+  4    37 			       options (constant) init (2);
+  4    38      dcl	   INFORM_SV	       fixed bin internal static
+  4    39 			       options (constant) init (3);
+  4    40      dcl	   LOG_SV		       fixed bin internal static
+  4    41 			       options (constant) init (4);
+  4    42 
+  4    43 /* END INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+      612 
+  5     1 /* BEGIN INCLUDE FILE sub_err_flags.incl.pl1 BIM 11/81 */
+  5     2 /* format: style3 */
+  5     3 
+  5     4 /* These constants are to be used for the flags argument of sub_err_ */
+  5     5 /* They are just "string (condition_info_header.action_flags)" */
+  5     6 
+  5     7 declare	(
+  5     8 	ACTION_CAN_RESTART	init (""b),
+  5     9 	ACTION_CANT_RESTART init ("1"b),
+  5    10 	ACTION_DEFAULT_RESTART
+  5    11 			init ("01"b),
+  5    12 	ACTION_QUIET_RESTART
+  5    13 			init ("001"b),
+  5    14 	ACTION_SUPPORT_SIGNAL
+  5    15 			init ("0001"b)
+  5    16 	)		bit (36) aligned internal static options (constant);
+  5    17 
+  5    18 /* End include file */
+      613 
+      614      end lm_fast_lock_$lock_fast;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/24/85  0804.0  lm_fast_lock_.pl1                 >spec>on>41-21>lm_fast_lock_.pl1
+609          1    07/18/81  1100.0  find_pathname_info.incl.pl1       >ldd>include>find_pathname_info.incl.pl1
+610          2    01/07/85  0858.7  dm_fast_lock_strucs.incl.pl1      >ldd>include>dm_fast_lock_strucs.incl.pl1
+611          3    01/07/85  0859.2  dm_lock_list_strucs.incl.pl1      >ldd>include>dm_lock_list_strucs.incl.pl1
+612          4    03/06/85  1031.1  dm_log_sv_codes.incl.pl1          >ldd>include>dm_log_sv_codes.incl.pl1
+613          5    04/16/82  0958.1  sub_err_flags.incl.pl1            >ldd>include>sub_err_flags.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+ACTION_CANT_RESTART             000070 constant        bit(36)                  initial dcl 5-7 set ref 603*
+FAST_LOCK_DATA_VERSION_1        000002 constant        char(8)                  initial dcl 2-23 set ref 182* 290*
+INFORM_SV                       000072 constant        fixed bin(17,0)          initial dcl 4-38 set ref 542* 545* 547* 581* 587*
+INVALID_RESET                          constant        fixed bin(17,0)          initial dcl 72 set ref 220* 261
+IPS_NAMES                       000020 constant        char(32)                 initial array unaligned dcl 72 set ref 380 380 380
+                                                                                  380
+ITT_OVERFLOW_WAIT_TIME          000006 constant        fixed bin(71,0)          initial dcl 72 set ref 578*
+LOCK_LIST_METERS_VERSION_1      000000 constant        char(8)                  initial dcl 3-25 set ref 184* 292*
+MAXIMUM_NUMBER_OF_WAKEUP_ATTEMPTS
+                                000010 constant        fixed bin(17,0)          initial dcl 72 set ref 573 587 587*
+MAX_WAIT_TIME                   000016 constant        fixed bin(71,0)          initial dcl 72 ref 346
+ME                              000011 constant        char(13)                 initial unaligned dcl 72 set ref 581* 587* 603*
+NO                                     constant        bit(1)                   initial dcl 72 ref 575 584
+RELATIVE_SECONDS                000004 constant        bit(2)                   initial unaligned dcl 72 set ref 578*
+VALID_LOCK                             constant        fixed bin(17,0)          initial dcl 72 set ref 208* 242*
+YES                                    constant        bit(1)                   initial dcl 72 ref 569 573
+addr                                                   builtin function         dcl 152 ref 208 242 358 358 358 358 380 380 405 405
+                                                                                  410 415 415 450 450 455 465 465 508 520 544 544
+b_event_info                    000100 automatic       structure                level 1 dcl 316 set ref 358 358
+b_saved_channel                 000110 automatic       fixed bin(71,0)          dcl 324 set ref 333* 339 339* 353* 362*
+b_saved_ips_mask                000112 automatic       bit(36)                  dcl 325 set ref 332* 337 337* 337* 351* 363* 363*
+b_saved_timer                   000114 automatic       fixed bin(71,0)          dcl 326 set ref 339* 353* 362*
+b_wait_time                     000116 automatic       fixed bin(71,0)          dcl 327 set ref 346* 354*
+bin                                                    builtin function         dcl 153 ref 508 508
+block_data                2            based           bit(36)                  array level 2 in structure "nt_tlock_list_block"
+                                                                                  dcl 444 in procedure "NOTIFY" set ref 455
+block_data                2            based           bit(36)                  array level 2 in structure "mw_tlock_list_block"
+                                                                                  dcl 401 in procedure "MAKE_WAIT_BLOCK" set ref 410
+block_data                2            based           bit(36)                  array level 2 in structure "lock_list_block"
+                                                                                  dcl 3-31 in procedure "lm_fast_lock_$lock_fast"
+                                                                                  set ref 520
+channel_id                2     000016 internal static fixed bin(71,0)          initial array level 2 dcl 67 set ref 378*
+cleanup                         000000 stack reference condition                dcl 148 ref 335
+clock                                                  builtin function         dcl 154 ref 171 229 346
+code                            000100 automatic       fixed bin(35,0)          dcl 55 set ref 205* 216* 217 238* 358* 524* 525
+create_ips_mask_                000062 constant        entry                    external dcl 121 ref 380
+cu_$caller_ptr                  000052 constant        entry                    external dcl 115 ref 212 212 229 229
+cv_p_expected_version                  parameter       char(8)                  dcl 597 set ref 594 603 603*
+cv_p_received_version                  parameter       char(8)                  dcl 599 set ref 594 603 603*
+cv_p_structure_name                    parameter       char(32)                 dcl 601 set ref 594 603*
+divide                                                 builtin function         dcl 155 ref 516
+dm_error_$fast_lock_invalid_lock
+                                000030 external static fixed bin(35,0)          dcl 95 set ref 510* 513* 517* 521* 525*
+dm_error_$fast_lock_invalid_reset
+                                000032 external static fixed bin(35,0)          dcl 97 ref 261
+dm_error_$fast_lock_mylock      000034 external static fixed bin(35,0)          dcl 99 set ref 212*
+dm_error_$fast_lock_no_free     000036 external static fixed bin(35,0)          dcl 101 set ref 407*
+dm_error_$fast_lock_not_cleared 000040 external static fixed bin(35,0)          dcl 103 ref 501
+dm_error_$fast_lock_timeout     000042 external static fixed bin(35,0)          dcl 105 set ref 229*
+dm_hcs_$guaranteed_eligibility_off
+                                000054 constant        entry                    external dcl 116 ref 281
+dm_hcs_$guaranteed_eligibility_on
+                                000056 constant        entry                    external dcl 118 ref 264
+dm_misc_util_$log               000060 constant        entry                    external dcl 120 ref 542 545 547 581 587
+dm_system_data_$lock_ips_mask   000022 external static bit(36)                  dcl 89 set ref 351*
+done_try_loop                   000101 automatic       bit(1)                   dcl 56 set ref 204* 207 217*
+el_code                         000332 automatic       fixed bin(35,0)          dcl 538 set ref 544* 545
+el_lock_fpi                     000214 automatic       structure                level 1 dcl 537 set ref 544 544
+el_p_caller_ptr                        parameter       pointer                  dcl 536 ref 531
+el_p_code                              parameter       fixed bin(35,0)          dcl 534 set ref 531 542* 548*
+el_p_lock_ptr                          parameter       pointer                  dcl 535 set ref 531 544* 547*
+er_p_code                              parameter       fixed bin(35,0)          dcl 554 ref 551 556
+error_table_$itt_overflow       000046 external static fixed bin(35,0)          dcl 107 set ref 578 587*
+error_table_$process_unknown    000050 external static fixed bin(35,0)          dcl 107 ref 575
+error_table_$unimplemented_version
+                                000044 external static fixed bin(35,0)          dcl 107 set ref 603*
+event_channel                          based           fixed bin(71,0)          level 2 in structure "mw_tfast_lock_wakeup_block"
+                                                                                  dcl 399 in procedure "MAKE_WAIT_BLOCK" set ref
+                                                                                  411*
+event_channel                          based           fixed bin(71,0)          level 2 in structure "nt_tfast_lock_wakeup_block"
+                                                                                  dcl 442 in procedure "NOTIFY" set ref 461*
+fast_lock                              based           structure                level 1 dcl 2-25
+fast_lock_block                        based           structure                level 1 dcl 2-33
+fast_lock_block_ptr             000110 automatic       pointer                  dcl 2-19 set ref 189* 234* 249* 297* 301*
+fast_lock_channel_id            000010 internal static fixed bin(71,0)          initial dcl 62 set ref 238* 354* 377* 378 411
+fast_lock_data                         based           structure                level 1 dcl 2-49
+fast_lock_data_ptr              000112 automatic       pointer                  dcl 2-21 set ref 181* 182 289* 290 405 405 405* 450*
+                                                                                  465 465 508 517 520
+fast_lock_ptr                   000106 automatic       pointer                  dcl 2-18 set ref 172* 189* 208 211 212* 220 229* 236
+                                                                                  242 279* 297*
+fast_lock_wakeup_block                 based           structure                level 1 dcl 2-43 ref 506
+fast_lock_wakeup_block_ptr             automatic       pointer                  dcl 2-20 ref 506
+find_pathname_                  000064 constant        entry                    external dcl 122 ref 544
+find_pathname_info                     based           structure                level 1 dcl 1-6
+first_time                      000012 internal static bit(1)                   initial dcl 64 set ref 175 178* 283 286*
+free_list_head            4            based           structure                level 2 dcl 2-49 set ref 405 405 465 465
+get_process_id_                 000066 constant        entry                    external dcl 123 ref 375
+hbound                                                 builtin function         dcl 156 ref 380 380
+hcs_$get_alarm_timer            000070 constant        entry                    external dcl 124 ref 353
+hcs_$get_uid_seg                000072 constant        entry                    external dcl 126 ref 524
+hcs_$reset_ips_mask             000074 constant        entry                    external dcl 127 ref 337 363
+hcs_$set_alarm_timer            000076 constant        entry                    external dcl 128 ref 339 354 362
+hcs_$set_ips_mask               000100 constant        entry                    external dcl 130 ref 351
+hcs_$validate_processid         000102 constant        entry                    external dcl 131 ref 216
+hcs_$wakeup                     000104 constant        entry                    external dcl 133 ref 574
+i_code                          000136 automatic       fixed bin(35,0)          dcl 373 set ref 377*
+ipc_$block                      000110 constant        entry                    external dcl 135 ref 358
+ipc_$create_ev_chn              000112 constant        entry                    external dcl 136 ref 377
+ipc_$drain_chn                  000114 constant        entry                    external dcl 137 ref 238
+ips_mask                        000013 internal static bit(36)                  initial dcl 65 set ref 380*
+list                      6            based           fixed bin(71,0)          level 2 dcl 2-49 set ref 508
+list_head                 2            based           bit(18)                  level 2 in structure "nt_fast_lock_block" packed
+                                                                                  unaligned dcl 431 in procedure "NOTIFY" set ref
+                                                                                  450 450
+list_head                 2            based           bit(18)                  level 2 in structure "mw_fast_lock_block" packed
+                                                                                  unaligned dcl 392 in procedure "MAKE_WAIT_BLOCK"
+                                                                                  set ref 415 415
+lm_data_$fast_lock_data_ptr     000024 external static pointer                  dcl 91 ref 181 289
+lm_data_$lock_list_meters_ptr   000026 external static pointer                  dcl 93 ref 183 291
+lm_fast_lock_list_$thread_in    000116 constant        entry                    external dcl 138 ref 415 465
+lm_fast_lock_list_$thread_out_first
+                                000120 constant        entry                    external dcl 140 ref 405 450
+lm_init_fast_lock_              000106 constant        entry                    external dcl 134 ref 500
+lock_list_block                        based           structure                level 1 dcl 3-31 set ref 513 516
+lock_list_block_ptr                    automatic       pointer                  dcl 3-20 ref 513 516
+lock_list_block_words           000116 automatic       fixed bin(17,0)          dcl 3-23 set ref 506* 513 516
+lock_list_head                         based           structure                level 1 dcl 3-27
+lock_list_meters                       based           structure                level 1 dcl 3-38
+lock_list_meters_ptr            000114 automatic       pointer                  dcl 3-21 set ref 183* 184 184 291* 292 292 415* 450*
+lock_word                              based           bit(36)                  level 2 dcl 2-25 set ref 208 211 220 242
+message                   3            based           char(4)                  level 2 in structure "mw_tfast_lock_wakeup_block"
+                                                                                  dcl 399 in procedure "MAKE_WAIT_BLOCK" set ref
+                                                                                  413*
+message                   3            based           char(4)                  level 2 in structure "nt_tfast_lock_wakeup_block"
+                                                                                  dcl 442 in procedure "NOTIFY" ref 459
+min                                                    builtin function         dcl 157 ref 346
+mod                                                    builtin function         dcl 158 ref 513
+mw_fast_lock_block                     based           structure                level 1 dcl 392
+mw_p_fast_lock_block_ptr               parameter       pointer                  dcl 390 ref 387 415 415
+mw_tfast_lock_wakeup_block             based           structure                level 1 dcl 399
+mw_tfast_lock_wakeup_block_ptr  000146 automatic       pointer                  dcl 395 set ref 410* 411 412 413
+mw_tlock_list_block                    based           structure                level 1 dcl 401
+mw_tlock_list_block_ptr         000150 automatic       pointer                  dcl 397 set ref 405* 407 410 415*
+my_processid                    000014 internal static bit(36)                  initial dcl 66 set ref 208 212 220 242 375* 412 456
+n_list_entries            3            based           fixed bin(17,0)          level 2 dcl 2-49 ref 517
+notify_sw                 1            based           bit(1)                   level 2 packed unaligned dcl 2-25 set ref 236*
+nt_done_notify                  000160 automatic       bit(1)                   dcl 434 set ref 447* 449 452*
+nt_fast_lock_block                     based           structure                level 1 dcl 431
+nt_message_71                   000162 automatic       fixed bin(71,0)          dcl 435 set ref 460* 461*
+nt_message_8                    000164 automatic       char(8)                  dcl 436 set ref 459* 460
+nt_p_fast_lock_block_ptr               parameter       pointer                  dcl 429 ref 426 450 450
+nt_tfast_lock_wakeup_block             based           structure                level 1 dcl 442
+nt_tfast_lock_wakeup_block_ptr  000166 automatic       pointer                  dcl 437 set ref 455* 456 459 461 461
+nt_tlock_list_block                    based           structure                level 1 dcl 444
+nt_tlock_list_block_ptr         000170 automatic       pointer                  dcl 439 set ref 450* 452 455 465*
+null                                                   builtin function         dcl 159 ref 184 292 405 405 407 452 465 465 603 603
+offset                    1(18)        based           bit(18)                  level 2 in structure "vf_fast_lock" packed unaligned
+                                                                                  dcl 489 in procedure "VALIDATE_FAST_LOCK" ref 498
+                                                                                  507
+offset                    1            based           bit(18)                  level 2 in structure "vf_fast_lock_block" packed
+                                                                                  unaligned dcl 490 in procedure
+                                                                                  "VALIDATE_FAST_LOCK" ref 521
+owner_processid                 000102 automatic       bit(36)                  dcl 57 set ref 211* 212 214 216* 220
+p_code                                 parameter       fixed bin(35,0)          dcl 51 set ref 46 170* 261* 263* 275 278* 556*
+p_fast_lock_ptr                        parameter       pointer                  dcl 49 ref 46 172 275 279
+p_timeout                              parameter       fixed bin(71,0)          dcl 50 ref 46 171
+processid                 2            based           bit(36)                  level 2 in structure "mw_tfast_lock_wakeup_block"
+                                                                                  dcl 399 in procedure "MAKE_WAIT_BLOCK" set ref
+                                                                                  412*
+processid                 2            based           bit(36)                  level 2 in structure "nt_tfast_lock_wakeup_block"
+                                                                                  dcl 442 in procedure "NOTIFY" set ref 456 461*
+ptr                                                    builtin function         dcl 160 ref 520
+r_p_status                             parameter       fixed bin(17,0)          dcl 259 ref 256 261
+rel                                                    builtin function         dcl 161 ref 508 521
+size                                                   builtin function         dcl 162 ref 506 513 516
+stac                                                   builtin function         dcl 163 ref 208 242
+stacq                                                  builtin function         dcl 164 ref 220
+string                                                 builtin function         dcl 165 set ref 540* 545 545
+strings                         000214 automatic       structure                level 2 packed unaligned dcl 537 set ref 540* 545
+                                                                                  545
+sub_err_                        000124 constant        entry                    external dcl 144 ref 603
+substr                                                 builtin function         dcl 166 ref 337
+sw_code                         000350 automatic       fixed bin(35,0)          initial dcl 568 set ref 568* 574* 575 575 578 581*
+sw_p_ev_channel                        parameter       fixed bin(71,0)          dcl 565 set ref 560 574* 581* 587*
+sw_p_message                           parameter       fixed bin(71,0)          dcl 566 set ref 560 574*
+sw_p_process_id                        parameter       bit(36)                  dcl 564 set ref 560 574* 575 581* 587*
+sw_p_wakeup_description                parameter       char                     unaligned dcl 562 set ref 560 581* 587*
+sw_try_wakeup                   000351 automatic       bit(1)                   initial dcl 569 set ref 569* 573 575* 584*
+sw_wakeup_attempt_count         000352 automatic       fixed bin(17,0)          initial dcl 570 set ref 570* 573* 587
+timeout_time                    000104 automatic       fixed bin(71,0)          dcl 58 set ref 171* 229 346
+timer_manager_$sleep            000122 constant        entry                    external dcl 142 ref 578
+uid                                    based           bit(36)                  level 2 dcl 490 ref 525
+unspec                                                 builtin function         dcl 167 set ref 460* 460
+version                                based           char(8)                  level 2 in structure "fast_lock_data" dcl 2-49
+                                                                                  in procedure "lm_fast_lock_$lock_fast" set ref
+                                                                                  182* 290*
+version                                based           char(8)                  level 2 in structure "lock_list_meters" dcl 3-38
+                                                                                  in procedure "lm_fast_lock_$lock_fast" set ref
+                                                                                  184* 292*
+vf_block_offset                 000201 automatic       bit(18)                  dcl 493 set ref 507* 508 520
+vf_code                         000200 automatic       fixed bin(35,0)          dcl 487 set ref 500* 501 501 501*
+vf_fast_lock                           based           structure                level 1 dcl 489
+vf_fast_lock_block                     based           structure                level 1 dcl 490
+vf_listx                        000202 automatic       fixed bin(17,0)          dcl 494 set ref 516* 517 517
+vf_p_fast_lock_block_ptr               parameter       pointer                  dcl 485 set ref 480 520* 521 525
+vf_p_fast_lock_ptr                     parameter       pointer                  dcl 484 set ref 480 498 500* 507 521 524*
+vf_rel_offset                   000203 automatic       fixed bin(18,0)          dcl 495 set ref 508* 510 513 516
+vf_uid                          000204 automatic       bit(36)                  dcl 496 set ref 524* 525
+wait_list                       000016 internal static structure                level 1 dcl 67 set ref 358 358
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+ACTION_CAN_RESTART                     internal static bit(36)                  initial dcl 5-7
+ACTION_DEFAULT_RESTART                 internal static bit(36)                  initial dcl 5-7
+ACTION_QUIET_RESTART                   internal static bit(36)                  initial dcl 5-7
+ACTION_SUPPORT_SIGNAL                  internal static bit(36)                  initial dcl 5-7
+CRASH_SV                               internal static fixed bin(17,0)          initial dcl 4-34
+ERROR_SV                               internal static fixed bin(17,0)          initial dcl 4-36
+FATAL_SV                               internal static fixed bin(17,0)          initial dcl 4-34
+LOG_SV                                 internal static fixed bin(17,0)          initial dcl 4-40
+PRINT_SV                               internal static fixed bin(17,0)          initial dcl 4-32
+QUERY_SV                               internal static fixed bin(17,0)          initial dcl 4-32
+find_pathname_info_ptr                 automatic       pointer                  dcl 1-4
+lock_list_head_ptr                     automatic       pointer                  dcl 3-19
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+BLOCK                           000643 constant        entry                    internal dcl 312 ref 247
+CHECK_VERSION                   002121 constant        entry                    internal dcl 594 ref 182 184 290 292
+ERROR_LOG_AND_RETURN            001524 constant        entry                    internal dcl 531 ref 212 229
+ERROR_RETURN                    001676 constant        entry                    internal dcl 551 ref 407 501 510 513 517 521 525 548
+INIT                            001043 constant        entry                    internal dcl 370 ref 177 285
+MAIN_RETURN                     000513 constant        label                    dcl 253 ref 265 304 557
+MAKE_WAIT_BLOCK                 001110 constant        entry                    internal dcl 387 ref 234
+NOTIFY                          001201 constant        entry                    internal dcl 426 ref 249 301
+RETURN                          000622 constant        entry                    internal dcl 256 ref 208 220 242
+SEND_WAKEUP                     001703 constant        entry                    internal dcl 560 ref 461
+TRY_TO_LOCK                     000333 constant        label                    dcl 202
+VALIDATE_FAST_LOCK              001324 constant        entry                    internal dcl 480 ref 189 297
+lm_fast_lock_$lock_fast         000236 constant        entry                    external dcl 46
+notify_unlock                   000520 constant        entry                    external dcl 275
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      2762        3110    2244        2772
+Length      3474    2244       126         347     515          12
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+lm_fast_lock_$lock_fast             608 external procedure  is an external procedure.  
+RETURN                                  internal procedure  shares stack frame of external procedure lm_fast_lock_$lock_fast.  
+BLOCK                               106 internal procedure  enables or reverts conditions.  
+on unit on line 335                  80 on unit               
+INIT                                    internal procedure  shares stack frame of external procedure lm_fast_lock_$lock_fast.  
+MAKE_WAIT_BLOCK                         internal procedure  shares stack frame of external procedure lm_fast_lock_$lock_fast.  
+NOTIFY                                  internal procedure  shares stack frame of external procedure lm_fast_lock_$lock_fast.  
+VALIDATE_FAST_LOCK                      internal procedure  shares stack frame of external procedure lm_fast_lock_$lock_fast.  
+ERROR_LOG_AND_RETURN                    internal procedure  shares stack frame of external procedure lm_fast_lock_$lock_fast.  
+ERROR_RETURN                            internal procedure  shares stack frame of external procedure lm_fast_lock_$lock_fast.  
+SEND_WAKEUP                             internal procedure  shares stack frame of external procedure lm_fast_lock_$lock_fast.  
+CHECK_VERSION                           internal procedure  shares stack frame of external procedure lm_fast_lock_$lock_fast.  
+
+STORAGE FOR INTERNAL STATIC VARIABLES.
+
+   LOC IDENTIFIER                  BLOCK NAME
+000010 fast_lock_channel_id        lm_fast_lock_$lock_fast
+000012 first_time                  lm_fast_lock_$lock_fast
+000013 ips_mask                    lm_fast_lock_$lock_fast
+000014 my_processid                lm_fast_lock_$lock_fast
+000016 wait_list                   lm_fast_lock_$lock_fast
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+BLOCK                    000100 b_event_info                BLOCK
+                         000110 b_saved_channel             BLOCK
+                         000112 b_saved_ips_mask            BLOCK
+                         000114 b_saved_timer               BLOCK
+                         000116 b_wait_time                 BLOCK
+lm_fast_lock_$lock_fast  000100 code                        lm_fast_lock_$lock_fast
+                         000101 done_try_loop               lm_fast_lock_$lock_fast
+                         000102 owner_processid             lm_fast_lock_$lock_fast
+                         000104 timeout_time                lm_fast_lock_$lock_fast
+                         000106 fast_lock_ptr               lm_fast_lock_$lock_fast
+                         000110 fast_lock_block_ptr         lm_fast_lock_$lock_fast
+                         000112 fast_lock_data_ptr          lm_fast_lock_$lock_fast
+                         000114 lock_list_meters_ptr        lm_fast_lock_$lock_fast
+                         000116 lock_list_block_words       lm_fast_lock_$lock_fast
+                         000136 i_code                      INIT
+                         000146 mw_tfast_lock_wakeup_block_ptr
+                                                            MAKE_WAIT_BLOCK
+                         000150 mw_tlock_list_block_ptr     MAKE_WAIT_BLOCK
+                         000160 nt_done_notify              NOTIFY
+                         000162 nt_message_71               NOTIFY
+                         000164 nt_message_8                NOTIFY
+                         000166 nt_tfast_lock_wakeup_block_ptr
+                                                            NOTIFY
+                         000170 nt_tlock_list_block_ptr     NOTIFY
+                         000200 vf_code                     VALIDATE_FAST_LOCK
+                         000201 vf_block_offset             VALIDATE_FAST_LOCK
+                         000202 vf_listx                    VALIDATE_FAST_LOCK
+                         000203 vf_rel_offset               VALIDATE_FAST_LOCK
+                         000204 vf_uid                      VALIDATE_FAST_LOCK
+                         000214 el_lock_fpi                 ERROR_LOG_AND_RETURN
+                         000332 el_code                     ERROR_LOG_AND_RETURN
+                         000350 sw_code                     SEND_WAKEUP
+                         000351 sw_try_wakeup               SEND_WAKEUP
+                         000352 sw_wakeup_attempt_count     SEND_WAKEUP
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+call_ext_out_desc   call_ext_out        call_int_this       return              stac                mod_fx1
+enable              ext_entry           int_entry           stacq               clock
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+create_ips_mask_              cu_$caller_ptr                dm_hcs_$guaranteed_eligibility_off
+dm_hcs_$guaranteed_eligibility_on                           dm_misc_util_$log             find_pathname_
+get_process_id_               hcs_$get_alarm_timer          hcs_$get_uid_seg              hcs_$reset_ips_mask
+hcs_$set_alarm_timer          hcs_$set_ips_mask             hcs_$validate_processid       hcs_$wakeup
+ipc_$block                    ipc_$create_ev_chn            ipc_$drain_chn                lm_fast_lock_list_$thread_in
+lm_fast_lock_list_$thread_out_first                         lm_init_fast_lock_            sub_err_
+timer_manager_$sleep
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+dm_error_$fast_lock_invalid_lock                            dm_error_$fast_lock_invalid_reset
+dm_error_$fast_lock_mylock    dm_error_$fast_lock_no_free   dm_error_$fast_lock_not_cleared
+dm_error_$fast_lock_timeout   dm_system_data_$lock_ips_mask error_table_$itt_overflow     error_table_$process_unknown
+error_table_$unimplemented_version                          lm_data_$fast_lock_data_ptr   lm_data_$lock_list_meters_ptr
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     46 000232       170 000246       171 000247       172 000253       175 000256       177 000261       178 000262
+    181 000264       182 000267       183 000304       184 000310       189 000331       202 000333       204 000334
+    205 000335       207 000336       208 000340       211 000351       212 000353       214 000400       216 000402
+    217 000412       220 000417       224 000427       229 000430       234 000455       236 000457       238 000462
+    242 000473       247 000504       249 000510       251 000512       253 000513       275 000514       278 000530
+    279 000531       281 000535       283 000542       285 000545       286 000546       289 000550       290 000553
+    291 000570       292 000574       297 000615       301 000617       304 000621       256 000622       261 000624
+    263 000633       264 000634       265 000641       312 000642       332 000650       333 000651       335 000653
+    337 000667       339 000703       341 000726       346 000727       351 000736       353 000747       354 000760
+    358 000775       362 001015       363 001032       366 001042       370 001043       375 001044       377 001056
+    378 001066       380 001071       382 001107       387 001110       405 001112       407 001134       410 001147
+    411 001152       412 001155       413 001157       415 001161       419 001200       426 001201       447 001203
+    449 001204       450 001206       452 001230       455 001237       456 001242       459 001246       460 001252
+    461 001254       465 001302       468 001322       470 001323       480 001324       498 001326       500 001333
+    501 001344       506 001353       507 001355       508 001363       510 001374       513 001405       516 001423
+    517 001431       520 001444       521 001452       524 001471       525 001505       529 001523       531 001524
+    540 001526       542 001531       544 001567       545 001605       547 001640       548 001666       549 001675
+    551 001676       556 001700       557 001702       560 001703       568 001714       569 001715       570 001717
+    573 001720       574 001732       575 001750       578 001762       581 001775       584 002042       586 002043
+    587 002045       591 002120       594 002121       603 002123       607 002212
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

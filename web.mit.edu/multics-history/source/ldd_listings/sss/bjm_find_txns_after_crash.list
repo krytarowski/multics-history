@@ -1,0 +1,1968 @@
+	COMPILATION LISTING OF SEGMENT bjm_find_txns_after_crash
+	Compiled by: Multics PL/I Compiler, Release 28e, of February 14, 1985
+	Compiled at: Honeywell Multics Op. - System M
+	Compiled on: 05/06/86  1309.1 mst Tue
+	    Options: optimize map
+
+        1 /****^  ***********************************************************
+        2*        *                                                         *
+        3*        * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        4*        *                                                         *
+        5*        *********************************************************** */
+        6 
+        7 
+        8 
+        9 /****^  HISTORY COMMENTS:
+       10*  1) change(86-01-07,Pierret), approve(86-01-30,MCR7331),
+       11*     audit(86-04-28,Newcomb), install(86-05-06,MR12.0-1054):
+       12*     Changed to check the tid in bj_rec_hdr and log an error if it is less than
+       13*     or equal to 0.
+       14*                                                   END HISTORY COMMENTS */
+       15 
+       16 
+       17 /* HISTORY PRIOR TO INITIAL INSTALLATION:
+       18*
+       19*Written by Lee A. Newcomb, 11/15/82.
+       20*Modified:
+       21*12/06/82 by L. A. Newcomb:  handle Check_mode and fill in bj_txte.bj_uid.
+       22*03/02/83 by L. A. Newcomb: to recognize file_manager_ rollback and
+       23*	  post-commit handlers, and the begin commit mark;  this is
+       24*	  preparation for their actual use, more work is needed.  In
+       25*	  addition, the program is brought up-to-date with modifications
+       26*	  made to the bj_txt.
+       27*04/29/83 by L. A. Newcomb:  Added setting of bj_txte.(last_completed_operation
+       28*            ok_to_write) so writing an abort mark will work; initialized entry
+       29*            counts in the TDT and TXT; expanded inline documentation.
+       30*05/18/83 by Lindsey L. Spratt:  Changed to use the version 3 TDT.
+       31*12/06/83 by L. A. Newcomb:  Renamed before_journal_manager_static_ to
+       32*            bjm_data_ and moved some cells from dm_data_ to bjm_data_.
+       33*06/07/84 by Lee Baldwin:  Renamed dm_error_$bj_first_txn_record_type_bad to
+       34*            $bj_bad first_txn_record_type, $bj_inconsistent_txn_records to
+       35*            $bj_unexpected_eot_mark, and $bj_prev_rec_id_wrong to
+       36*            $wrong_prev_rec_id.
+       37*06/11/84 by Lee Baldwin:  Renamed dm_error_$bj_bad_txn_id_in_prev_record
+       38*            to $bj_rec_txn_id_mismatch.
+       39*10/24/84 by Lee A. Newcomb:  Changed user id in TDT to "<PRE-CRASH>" from
+       40*            "<GUESS WHO>" and did some small fixing up of format.
+       41*12/10/84 by R. Michael Tague:  Changed incl name to dm_daemon_sv_codes.
+       42*01/16/85 by Lee A. Newcomb:  Fixed to use dm_log_sv_codes.incl.pl1 instead of
+       43*            the obsolete dm_daemon_sv_codes.incl.pl1; fixed the BJM entry
+       44*            protocol to only invoke the cleanup procedure if we can set
+       45*            bj_data_$bj_operation; minor format changes.
+       46*02/28/85 by Lee A. Newcomb:  Added understanding FM_(ROLLBACK
+       47*            POSTCOMMIT)_HANDLER's can be first records of a txn chain; removed
+       48*            tests for HANDLER records as they are not currently supported;
+       49*            reset code at each step through the GET_PREVIOUS_LOOP as
+       50*            check_mode would cause an error to occur for each record read
+       51*            after the one in error was read; fixed to set the txn state to
+       52*            TM_COMMIT_WRITING_MARK_STATE when a BEGIN_COMMIT record is found
+       53*            so we will roll the txn forward.
+       54*03/04/85 by Lee A. Newcomb:  Fixed to report txn ID's in decimal and not read
+       55*            past a ROLLED_BACK mark in the FIND_FIRST_RECORD do group.
+       56*03/05/85 by Steve Herbst: Replaced dm_log_ with dm_misc_util_$log.
+       57*03/19/85 by Steve Herbst: Fixed to initialize bjm_data_$bj_code.
+       58*
+       59*END HISTORY PRIOR TO INITIAL INSTALLATION */
+       60 
+       61 
+       62 /* DESCRIPTION:
+       63*
+       64*	bjm_find_txns_after_crash is THE program to read a before journal
+       65*     opened for crash recovery.  ANY CHANGES TO BJM_WRITE OR BJ_TXTE_UTIL
+       66*     SHOULD BE EXAMINED TO BE SURE THEY DO NOT INVALIDATE ASSUMPTIONS MADE
+       67*     IN THIS MODULE.  Likewise, any changes to this module should be sure
+       68*     to not contradict the journal writing mechanisms in the above modules.
+       69*
+       70*	This program is contracted to find all unfinished transactions in a
+       71*     before journal (BJ) that was open during a crash.  Its intended caller is
+       72*     dm_recovery_.  Two lists are created for "registering" txns: unfinished
+       73*     txns to be rolled back or, if multi-phase commits, to be completed; and
+       74*     finished txns (i.e., a commit or abort mark is in the BJ for the txn).
+       75*     These two lists are kept in temp.  segs.  in the process' [pd] for
+       76*     accounting purposes.  However, ONLY INFORMATION NEEDED FOR RECOVERY OF THE
+       77*     UNFINISHED TRANSACTIONS IS RETURNED TO THE CALLER.  This data is returned
+       78*     in two structures provided by the caller that are currently images of the
+       79*     tm_tdt and bj_txt.  No information on any found, finished txns is returned
+       80*     to the caller.
+       81*
+       82*	Currently, if any error in processing is encountered, a non-zero code
+       83*     is returned and no data is returned.  The exception to this is when
+       84*     check mode is enabled; then the fact that too many or few unfinished
+       85*     (active) transactions were found is reported.  The entire journal will be
+       86*     swept in reverse order and the bj_storage_get loop will not be reached
+       87*     (N.B., it is theoretically possible for check_mode to find non-existant
+       88*     errors).  In general, if a "fatal" error occurs, the caller's lists will
+       89*     contain the data acquired up to the time the error happens.
+       90*
+       91*	The main procedure is responsible for detecting gross errors (e.g.
+       92*     multiple commit or abort marks for the same transaction).  The error
+       93*     detection should stand out when the main proc.  is read as it is all
+       94*     over the place.  Besides the normal clean_up proc., there are four
+       95*     other internal procedures, in two sets.  The first set is called to see
+       96*     if a transaction has been recognized as either finished or unfinished.
+       97*     These do a simple sequential search through the lists of finished or
+       98*     unfinished transactons, returning true or false; they also set
+       99*     "txn_idx", the slot into the appropriate list where this transaction's
+      100*     data is kept.  If false is returned, txn_idx is zero indicating a new
+      101*     transaction has been encountered in the journal.  The second set
+      102*     registers the data for the transaction in the appropriate list.  They
+      103*     also do consistency checking (e.g., the owner's process_id is the same
+      104*     in all records of the transaction).  These two require txn_idx to be
+      105*     set to the proper index into the list(s), zero (register a new txn), or
+      106*     -1 (must find the correct position in the lists).
+      107*
+      108*	Note: changes will have to be made when checkpoints, multi-phase
+      109*     commits, and any change to the before journal record structure are
+      110*     made.  Also, the effect of "orphan" records in the journal must be
+      111*     examined and allowances made for them if necessary.
+      112**/
+      113 
+      114 /* format: style2,ll79,ind3,^indprocbody,ifthendo,ifthen,^indnoniterdo,^inddcls,dclind5,idind35,linecom */
+      115 
+      116 bjm_find_txns_after_crash:
+      117    proc (p_old_tm_tdt_ptr, p_old_bj_txt_ptr, p_bj_oid, p_check_mode, p_code);
+      118 
+      119 /* START OF DECLARATIONS */
+      120 
+      121 /* Parameters */
+      122 dcl  (
+      123      p_old_tm_tdt_ptr		ptr,
+      124      p_old_bj_txt_ptr		ptr,
+      125      p_bj_oid			bit (36) aligned,
+      126      p_check_mode			bit (1) aligned,	/* sweep the entire journal for inconsistencies? */
+      127      p_code			fixed bin (35)	/* OUTPUT: normal error code, recovery fails if ^= 0 */
+      128      )				parameter;
+      129 
+      130 /* Automatic */
+      131 dcl  (
+      132      bit_bucket			bit (1) aligned,
+      133      bj_oid			bit (36) aligned,	/* local holder of param. */
+      134      bj_rec_id			bit (36) aligned,
+      135      bj_uid			bit (36) aligned,	/* for error reporting */
+      136      check_mode			bit (1) aligned,	/* local holder of param. */
+      137      clean_code			fixed bin (35),
+      138      code				fixed bin (35),	/* local holder of error code */
+      139      finished_txns_list_p		ptr,		/* local finished txn list loc. */
+      140      get_previous_loop		bit (1) aligned,	/* so register_unknown knows how to cmp rec_id's */
+      141      last_bj_rec_id			bit (36) aligned,	/* for error reporting in get_previous loop */
+      142      1 local_bj_rec_hdr		aligned like bj_rec_hdr,
+      143 						/* local copy since it's small */
+      144      n_registered_finished_txns	fixed bin,	/* # of finished txns found */
+      145      n_registered_unfinished_txns	fixed bin,	/* # of unfinished txns found */
+      146      n_unfinished_txns		fixed bin,	/* # of unfinished txns recorded in last bj rec. */
+      147      old_bj_txt_p			ptr,		/* local of loc. of caller's bjm data list */
+      148      old_tm_tdt_p			ptr,		/* local of loc. of caller's tm data list */
+      149      txn_idx			fixed bin,	/* used for loops in is_("" un)finished_txn */
+      150      unfinished_txns_list_p		ptr		/* local unfinished txn list loc. */
+      151      )				automatic;
+      152 
+      153 /* Based */
+      154 
+      155 /* the next two structures are used to keep track of the transactions found */
+      156 /*     in the before journal.  Extra data is currently being kept during */
+      157 /*     development phase to help detect errors in recording journal records */
+      158 /*     (if they occur). */
+      159 
+      160 dcl  1 finished_txns_list		dim (1:n_registered_finished_txns)
+      161 				aligned based (finished_txns_list_p),
+      162        2 txn_id			bit (36),
+      163        2 owners_process_id		bit (36),		/* of txn owner */
+      164        2 n_effective_records_written	fixed bin (36) unsigned,
+      165 						/* would have matched bj_txte.tx_rec_no */
+      166        2 n_effective_records_read	fixed bin (36) unsigned,
+      167 						/* never to exceed ...written */
+      168        2 prev_rec_id		bit (36),		/* may restart after rollback mark found */
+      169        2 rollback_mark_found		bit (1);		/* allows extra records after ...written = ...read */
+      170 
+      171 dcl  1 unfinished_txns_list		dim (1:n_registered_unfinished_txns)
+      172 				aligned based (unfinished_txns_list_p),
+      173 						/* most data kept in tm_tdt and bj_txt */
+      174        2 n_effective_records_read	fixed bin (36) unsigned,
+      175 						/* never to exceed bj_txte.n_rec_written */
+      176        2 prev_rec_id		bit (36),		/* may restart after rollback mark found */
+      177        2 rollback_mark_found		bit (1);		/* allows extra records after ...written = ...read */
+      178 
+      179 /* Builtin */
+      180 dcl  (addr, bin, null, unspec)	builtin;
+      181 
+      182 /* Condition */
+      183 dcl  cleanup			condition;
+      184 
+      185 /* Entry */
+      186 dcl  (
+      187      bj_cleanup_tables$handler	entry (fixed bin (35)),
+      188      bj_oid_util$get_uid		entry (bit (36) aligned)
+      189 				returns (bit (36) aligned),
+      190      bj_storage_get_header		entry (bit (36) aligned,
+      191 				bit (36) aligned, ptr),
+      192      bj_storage_get_header$last	entry (bit (36) aligned,
+      193 				bit (36) aligned, ptr),
+      194      bj_storage_get_header$previous	entry (bit (36) aligned,
+      195 				bit (36) aligned, ptr),
+      196      dm_misc_util_$log		entry options (variable),
+      197      get_temp_segment_		entry (char (*), ptr, fixed bin (35)),
+      198      release_temp_segment_		entry (char (*), ptr, fixed bin (35))
+      199      )				external;
+      200 
+      201 /* External */
+      202 dcl  (
+      203      dm_error_$bj_rec_txn_id_mismatch,
+      204      dm_error_$bj_first_txn_rec_not_found,
+      205      dm_error_$bj_bad_first_txn_record_type,
+      206      dm_error_$bj_bad_tid,
+      207      dm_error_$bj_unexpected_eot_mark,
+      208      dm_error_$bj_neg_txns_in_unfinished_rec,
+      209      dm_error_$bj_wrong_prev_rec_id,
+      210      dm_error_$bj_rec_process_id_mismatch,
+      211      dm_error_$bj_recursive_invoc,
+      212      dm_error_$bj_too_few_records,
+      213      dm_error_$bj_too_few_unfinished_txns,
+      214      dm_error_$bj_too_many_unfinished_txns,
+      215      dm_error_$bj_wrong_numb_txn_records,
+      216      dm_error_$bj_zero_txns_in_unfinished_rec,
+      217      error_table_$unimplemented_version
+      218      )				fixed bin (35) ext static;
+      219 
+      220 /* END OF DECLARATIONS */
+      221 
+      222 COPY_INPUT_AND_INIT_OUTPUT_PARAMETERS:
+      223    do;
+      224       old_tm_tdt_p = p_old_tm_tdt_ptr;
+      225       if old_tm_tdt_p -> tm_tdt.version ^= TM_TDT_VERSION_3 then do;
+      226          p_code = error_table_$unimplemented_version;
+      227          return;
+      228       end;
+      229       old_bj_txt_p = p_old_bj_txt_ptr;
+      230       if old_bj_txt_p -> bj_txt.version ^= BJ_TXT_VERSION_1 then do;
+      231          p_code = error_table_$unimplemented_version;
+      232          return;
+      233       end;
+      234 
+      235       bj_oid = p_bj_oid;
+      236       bj_uid = bj_oid_util$get_uid (bj_oid);		/* we want the UID for reporting errors */
+      237       check_mode = p_check_mode;
+      238       p_code = 0;					/* let's be optimistic */
+      239 
+      240    end COPY_INPUT_AND_INIT_OUTPUT_PARAMETERS;
+      241 
+      242 BJM_STANDARD_ENTRY_PROTOCOL:
+      243    do;
+      244 
+      245       if bjm_data_$bj_operation ^= "" then do;
+      246          code = dm_error_$bj_recursive_invoc;
+      247          go to no_cleanup_return;
+      248       end;
+      249 
+      250 SET_CLEANUP_HANDLER:
+      251       do;
+      252 
+      253 /* N.B. we do not cross rings for now as this should only	*/
+      254 /* be used as this should be used from DM ring only.	*/
+      255 /* However, we must be able to reset bj_operation before it */
+      256 /* we set it.					*/
+      257 
+      258          finished_txns_list_p, unfinished_txns_list_p = null ();
+      259          code = 0;
+      260          on cleanup call clean_up ();
+      261 
+      262       end SET_CLEANUP_HANDLER;
+      263 
+      264       bjm_data_$bj_operation = "bjm_find_txns_after_crash";
+      265       bjm_data_$bj_code = 0;
+      266 
+      267    end BJM_STANDARD_ENTRY_PROTOCOL;
+      268 
+      269 GET_TEMP_STORAGE:
+      270    call get_temp_segment_ ("bjm_find_txns_after_crash", finished_txns_list_p,
+      271         code);
+      272    if code ^= 0 then do;
+      273       call dm_misc_util_$log (LOG_SV, code, "bjm_find_txns_after_crash",
+      274 	 "Unable to get temp. storage for finished txn. list.");
+      275       go to clean_and_return;
+      276    end;
+      277 
+      278    call get_temp_segment_ ("bjm_find_txns_after_crash", unfinished_txns_list_p,
+      279         code);
+      280    if code ^= 0 then do;
+      281       call dm_misc_util_$log (LOG_SV, code, "bjm_find_txns_after_crash",
+      282 	 "Unable to get temp. storage for unfinished txn. list.");
+      283       go to clean_and_return;
+      284    end;
+      285 
+      286 
+      287 SET_COUNTERS:
+      288    do;
+      289       n_registered_unfinished_txns,			/* initialize these for the register_* procs. */
+      290 	 n_registered_finished_txns, old_tm_tdt_p -> tm_tdt.entry_count,
+      291 	 old_bj_txt_p -> bj_txt.n_entries_used = 0;
+      292    end SET_COUNTERS;
+      293 
+      294    bj_rec_hdr_ptr = addr (local_bj_rec_hdr);		/* for convience */
+      295 
+      296 GET_LAST_JOURNAL_RECORD:				/* must get the last record of the journal to start things off; better known */
+      297 						/*     as the head chasing the tail.  Must set up bj_... error handling, */
+      298 						/*     though I can't think why getting the last record hdr would blow up */
+      299 						/*     Note the special mercy given if check_mode is true. */
+      300    bjm_data_$bj_exit_err = cannot_get_last_journal_record;
+      301    call bj_storage_get_header$last (bj_oid, bj_rec_id, bj_rec_hdr_ptr);
+      302 
+      303    if bj_rec_id = ""b then				/* no records in journal ==> nothing to do */
+      304       go to clean_and_return;
+      305 
+      306    n_unfinished_txns = bj_rec_hdr.n_txn;		/* # of active txns in before journal */
+      307 
+      308    if n_unfinished_txns < 0 then do;			/* a negative # of active txns?? */
+      309 
+      310       code = dm_error_$bj_neg_txns_in_unfinished_rec;
+      311       call dm_misc_util_$log (LOG_SV, code, "bjm_find_txns_after_crash",
+      312 	 "Last journal record, BJ uid ^o, record id ^o.", bj_uid, bj_rec_id);
+      313       if check_mode then
+      314          go to register_last_record;			/* keep plugging */
+      315       else go to clean_and_return;			/* or use the die_immediate instruction */
+      316    end;
+      317 
+      318    if n_unfinished_txns = 0 then do;			/* better be a commit or abort */
+      319 
+      320       if bj_rec_hdr.type ^= BJ_RECORD_TYPE.COMMITTED
+      321 	 & bj_rec_hdr.type ^= BJ_RECORD_TYPE.ABORTED then do;
+      322 
+      323          code = dm_error_$bj_zero_txns_in_unfinished_rec;
+      324          call dm_misc_util_$log (LOG_SV, code, "bjm_find_txns_after_crash",
+      325 	    "Invalid last before journal record, BJ uid ^o, record id ^o.",
+      326 	    bj_uid, bj_rec_id);
+      327       end;
+      328       if check_mode then
+      329          go to register_last_record;			/* we sweep the whole journal */
+      330       else go to clean_and_return;			/* or nothing to do */
+      331    end;
+      332 
+      333    else go to register_last_record;
+      334 
+      335 cannot_get_last_journal_record:
+      336    do;
+      337 
+      338 /* we come here if a non-local goto is done by the bj_storage_get_header$last */
+      339 /*     call.  Even check_mode can't save us this time. */
+      340 
+      341       code = bjm_data_$bj_code;
+      342       call dm_misc_util_$log (LOG_SV, code, "bjm_find_txns_after_crash",
+      343 	 "Unable to read last record in before journal, BJ uid ^o.", bj_uid);
+      344       go to clean_and_return;
+      345    end;
+
+
+
+
+      346 
+      347 register_last_record:
+      348    do;
+      349 
+      350 /* If we get here, we have the header of the last record in the journal. */
+      351 /*     Since our lists of txns. are empty, must always add the txn. data. */
+      352 /*     Remember, if we decide the record is active, register_unfinished_txn */
+      353 /*     will decrement n_unfinished_txns. */
+      354 
+      355       txn_idx = 0;					/* know the txn list is empty */
+      356 
+      357       if bj_rec_hdr.type = BJ_RECORD_TYPE.COMMITTED
+      358 	 | bj_rec_hdr.type = BJ_RECORD_TYPE.ABORTED then
+      359          call register_finished_txn (code);
+      360       else call register_unfinished_txn (code);
+      361 
+      362       if code ^= 0 then do;				/* can't do a thing */
+      363 
+      364          call dm_misc_util_$log (LOG_SV, code, "bjm_find_txns_after_crash",
+      365 	    "Could not register last BJ record, BJ uid ^o, record id ^o.",
+      366 	    bj_uid, bj_rec_id);
+      367          if ^check_mode then
+      368 	  go to clean_and_return;
+      369       end;
+      370    end;
+      371 
+      372 /* Now loop until all unfinished txns have been found and	*/
+      373 /* most or all of the data required for recovery has been	*/
+      374 /* recorded in the caller's storage.  If check_mode is on,	*/
+      375 /* we will never leave this loop until all journal records	*/
+      376 /* have been read or an error is taken by the		*/
+      377 /* get_header$previous call.  If check_mode is off, the	*/
+      378 /* get_header loop (following this loop) will be used to	*/
+      379 /* make sure all recovery data has been found.		*/
+      380 
+      381 FIND_AND_REGISTER_TRANSACTONS:
+      382    do;
+      383       get_previous_loop = "1"b;			/* for register_unfinished... */
+      384       last_bj_rec_id = ""b;				/* for error reporting */
+      385       bjm_data_$bj_exit_err = cannot_get_previous_record;
+      386 
+      387 /* Loop until we have what we think are all active txns or the entire */
+      388 /* BJ has been read backwards chronologically (latter if check_mode on). */
+      389 /* Note we clear any error from the code cell; this is only	*/
+      390 /* really useful if we are in check_mode as any error found	*/
+      391 /* will stay with us for ALL records read from that point	*/
+      392 /* on; as the setting is cheap, we do not bother to test	*/
+      393 /* check_mode to see if we need to set code to zero.	*/
+      394 
+      395 GET_PREVIOUS_LOOP:
+      396       do while (n_unfinished_txns > 0 | check_mode);
+      397 
+      398          code = 0;
+      399          call bj_storage_get_header$previous (bj_oid, bj_rec_id,
+      400 	    bj_rec_hdr_ptr);
+      401 
+      402          if bj_rec_id = ""b then do;			/* We have read all the records in the BJ. */
+      403 
+      404 	  if ^check_mode then do;			/* should not happen unless in check mode */
+      405 	     code = dm_error_$bj_too_few_records;	/* by definition */
+      406 	     call dm_misc_util_$log (LOG_SV, code,
+      407 		"bjm_find_txns_after_crash",
+      408 		"In get_previous loop, BJ uid ^o, last read record id ^o.",
+      409 		bj_uid, last_bj_rec_id);
+      410 	     go to clean_and_return;
+      411 	  end;
+      412 
+      413 	  if n_unfinished_txns > 0 then do;		/* we missed some active txns */
+      414 	     code = dm_error_$bj_too_few_unfinished_txns;
+      415 	     call dm_misc_util_$log (LOG_SV, code,
+      416 		"bjm_find_txns_after_crash",
+      417 		"BJ uid ^o, last read record id ^o.", bj_uid,
+      418 		last_bj_rec_id);
+      419 	  end;
+      420 	  else if n_unfinished_txns < 0 then do;	/* we got too many active txns */
+      421 	     code = dm_error_$bj_too_many_unfinished_txns;
+      422 	     call dm_misc_util_$log (LOG_SV, code,
+      423 		"bjm_find_txns_after_crash",
+      424 		"BJ uid ^o, last read record id ^o.", bj_uid, bj_rec_id);
+      425 	  end;
+      426 	  else do;				/* must check all 1st records of active txns found */
+      427 						/* if code stays zero, no problems in journal */
+      428 	     do txn_idx = 1 to n_registered_unfinished_txns;
+      429 	        if unfinished_txns_list.prev_rec_id (txn_idx) ^= ""b then do;
+      430 		 code = dm_error_$bj_first_txn_rec_not_found;
+      431 		 call dm_misc_util_$log (LOG_SV, code,
+      432 		      "bjm_find_txns_after_crash",
+      433 		      "While in check_mode with all transactions found, BJ uid ^o, txn id ^d.",
+      434 		      bj_uid,
+      435 		      bin (old_tm_tdt_p -> tm_tdt.entry (txn_idx).txn_id));
+      436 	        end;
+      437 	     end;					/* of checking for 1st records */
+      438 	  end;
+      439 
+      440 	  go to clean_and_return;
+      441          end;					/* end beginning of BJ check */
+      442 
+      443 /* LOOP CONTINUED ON NEXT PAGE */
+      444 
+      445 /* LOOP CONTINUED FROM PREVIOUS PAGE */
+      446 
+      447          if bj_rec_hdr.n_txn < 0 then do;
+      448 	  code = dm_error_$bj_neg_txns_in_unfinished_rec;
+      449 	  call dm_misc_util_$log (LOG_SV, code, "bjm_find_txns_after_crash",
+      450 	       "During bj_storage_get_header$previous loop, BJ uid ^o, record id ^o.",
+      451 	       bj_uid, bj_rec_id);
+      452 	  if check_mode then
+      453 	     go to end_get_previous_loop;		/* continue reading */
+      454 	  else go to clean_and_return;
+      455          end;
+      456 
+      457          if bin (bj_rec_hdr.tid) <= 0 then do;
+      458 	  code = dm_error_$bj_bad_tid;
+      459 	  call dm_misc_util_$log (LOG_SV, code, "bjm_find_txns_after_crash",
+      460 	       "During bj_storage_get_header$previous loop, BJ uid ^o, record id ^o, TID ^d.",
+      461 	       bj_uid, bj_rec_id, bin (bj_rec_hdr.tid));
+      462 	  if check_mode then
+      463 	     go to end_get_previous_loop;		/* continue reading */
+      464 	  else go to clean_and_return;
+      465          end;
+      466 
+      467          if bj_rec_hdr.type = BJ_RECORD_TYPE.COMMITTED
+      468 	    | bj_rec_hdr.type = BJ_RECORD_TYPE.ABORTED then do;
+      469 
+      470 	  if is_unfinished_txn () then do;		/* finished and then unfinished? */
+      471 
+      472 	     code = dm_error_$bj_unexpected_eot_mark;
+      473 	     call dm_misc_util_$log (LOG_SV, code,
+      474 		"bjm_find_txns_after_crash",
+      475 		"Commit or abort mark found ahead of a before image.  "
+      476 		|| "BJ uid ^o, record id ^o, txn id ^d.", bj_uid,
+      477 		bj_rec_id, bin (bj_rec_hdr.tid));
+      478 	     if check_mode then
+      479 	        go to end_get_previous_loop;
+      480 	     else go to clean_and_return;
+      481 	  end;
+      482 
+      483 	  if is_finished_txn () then do;		/* can't be finished more than once */
+      484 
+      485 	     code = dm_error_$bj_unexpected_eot_mark;
+      486 	     call dm_misc_util_$log (LOG_SV, code,
+      487 		"bjm_find_txns_after_crash",
+      488 		"Multiple commit or abort marks found for the same txn.  BJ uid ^o, "
+      489 		|| "record id ^o, txn id ^d.", bj_uid, bj_rec_id,
+      490 		bin (bj_rec_hdr.tid));
+      491 	     if check_mode then
+      492 	        go to end_get_previous_loop;
+      493 	     else go to clean_and_return;
+      494 	  end;
+      495 
+      496 /* LOOP CONTINUED ON NEXT PAGE */
+      497 
+      498 /* LOOP CONTINUED FROM PREVIOUS PAGE */
+      499 /* OK, it's a good record and is_finished_txn has set txn_idx to 0 for us. */
+      500 /*     Add the record to the list of finished transactions. */
+      501 
+      502 	  call register_finished_txn (code);
+      503 
+      504 	  if code ^= 0 then do;
+      505 finsihed_txn_reg_err:				/* to avoid some duplication later */
+      506 	     call dm_misc_util_$log (LOG_SV, code,
+      507 		"bjm_find_txns_after_crash",
+      508 		"Error registering finished txn., BJ uid ^o, record id ^o, txn id ^d.",
+      509 		bj_uid, bj_rec_id, bin (bj_rec_hdr.tid));
+      510 	     if check_mode then
+      511 	        go to end_get_previous_loop;
+      512 	     else go to clean_and_return;
+      513 	  end;
+      514          end;
+      515 
+      516          else if ^is_finished_txn () then do;		/* if not a before image of an already finished txn */
+      517 
+      518 	  txn_idx = -1;				/* must find the place in lists */
+      519 	  call register_unfinished_txn (code);		/* will affect n_unfinished_txns */
+      520 	  if code ^= 0 then do;
+      521 
+      522 	     call dm_misc_util_$log (LOG_SV, code,
+      523 		"bjm_find_txns_after_crash",
+      524 		"Error registering unfinished txn., BJ uid ^o, record id ^o, txn id ^d.",
+      525 		bj_uid, bj_rec_id, bin (bj_rec_hdr.tid));
+      526 	     if check_mode then
+      527 	        go to end_get_previous_loop;
+      528 	     else go to clean_and_return;
+      529 	  end;
+      530          end;
+      531          else do;					/* for now do consistency checking on finished txn */
+      532 
+      533 	  call register_finished_txn (code);		/* is_finsihed_txn call still has txn_idx set */
+      534 	  if code ^= 0 then
+      535 	     go to finsihed_txn_reg_err;		/* just being a bit lazy */
+      536          end;
+      537 
+      538 end_get_previous_loop:
+      539          last_bj_rec_id = bj_rec_id;			/* for error reporting only */
+      540 
+      541       end GET_PREVIOUS_LOOP;
+      542 
+      543    end FIND_AND_REGISTER_TRANSACTONS;
+      544 
+      545    go to GET_FIRST_RECORD_FOR_UNFINISHED_TXNS;		/* this loop worked, skip its unwinding handler */
+      546 
+      547 cannot_get_previous_record:
+      548    do;
+      549 
+      550 /* We come here if bj_storage_get_header$previous call takes an error and */
+      551 /* unwinds.  We don't care about check_mode in this case. */
+      552 
+      553       code = bjm_data_$bj_code;
+      554 
+      555       call dm_misc_util_$log (LOG_SV, code, "bjm_find_txns_after_crash",
+      556 	 "A call to bj_storage_get_previous in recovery phase failed, BJ uid ^o, last read record id ^o.",
+      557 	 bj_uid, bj_rec_id);
+      558       go to clean_and_return;
+      559    end;
+      560 
+      561 /* GET LOOP */
+      562 
+      563 /* We now have a list of all unfinished txns in the before journal being */
+      564 /*     used.  If the 1st record in the journal for a txn. has not yet been */
+      565 /*     found, find it.  For now, any error will cause processing to stop. */
+      566 /*     It is not advised to attempt to rollback any txns with the data */
+      567 /*     gathered before the error.  Note: this loop will never be executed if */
+      568 /*     check_mode is on. */
+      569 
+      570 GET_FIRST_RECORD_FOR_UNFINISHED_TXNS:
+      571    do;
+      572       get_previous_loop = ""b;			/* for register_unfinished... */
+      573       bjm_data_$bj_exit_err = cannot_get_a_record;
+      574 
+      575 WALK_UNFINISHED_TXNS_LIST:
+      576       do txn_idx = 1 to n_registered_unfinished_txns;	/* get 1st record of the unfinished txns */
+      577 
+      578 FIND_FIRST_RECORD:					/* done when previous record ID is null, or we have found a	*/
+      579 						/* ROLLED_BACK mark with checkpoint ID zero (in this case,	*/
+      580 						/* we cannot trust previous records have not been		*/
+      581 						/* recycled).  THIS CODE WILL NEED MODIFICATION WHEN A	*/
+      582 						/* CHECKPOINT FACILITY IS AVAILABLE.			*/
+      583          do while (unfinished_txns_list.prev_rec_id (txn_idx) ^= ""b
+      584 	    & ^unfinished_txns_list.rollback_mark_found (txn_idx));
+      585 
+      586 	  call bj_storage_get_header (bj_oid,
+      587 	       unfinished_txns_list.prev_rec_id (txn_idx), bj_rec_hdr_ptr);
+      588 
+      589 	  if bj_rec_hdr.n_txn < 0 then do;
+      590 
+      591 	     code = dm_error_$bj_neg_txns_in_unfinished_rec;
+      592 	     call dm_misc_util_$log (LOG_SV, code,
+      593 		"bjm_find_txns_after_crash",
+      594 		"During bj_storage_get_header loop, BJ uid ^o, record id ^o.",
+      595 		bj_uid, unfinished_txns_list.prev_rec_id (txn_idx));
+      596 	     go to clean_and_return;
+      597 	  end;
+      598 	  if bj_rec_hdr.n_txn = 0 then do;
+      599 
+      600 	     code = dm_error_$bj_zero_txns_in_unfinished_rec;
+      601 	     call dm_misc_util_$log (LOG_SV, code,
+      602 		"bjm_find_txns_after_crash",
+      603 		"During bj_storage_get_header loop, BJ uid ^o, record id ^o.",
+      604 		bj_uid, unfinished_txns_list.prev_rec_id (txn_idx));
+      605 	     go to clean_and_return;
+      606 	  end;
+      607 
+      608 	  if bj_rec_hdr.type = BJ_RECORD_TYPE.COMMITTED | /* finished and then unfinished?? */
+      609 	       bj_rec_hdr.type = BJ_RECORD_TYPE.ABORTED then do;
+      610 
+      611 	     code = dm_error_$bj_unexpected_eot_mark;
+      612 	     call dm_misc_util_$log (LOG_SV, code,
+      613 		"bjm_find_txns_after_crash",
+      614 		"Commit or abort mark found ahead of before image.  BJ uid ^o, record id ^o, txn id ^d.",
+      615 		bj_uid, unfinished_txns_list.prev_rec_id (txn_idx),
+      616 		bin (old_tm_tdt_p -> tm_tdt.entry (txn_idx).txn_id));
+      617 	     go to clean_and_return;
+      618 	  end;
+      619 
+      620 	  if bj_rec_hdr.tid ^= old_tm_tdt_p -> tm_tdt.entry (txn_idx).txn_id
+      621 	  then do;
+      622 
+      623 	     code = dm_error_$bj_rec_txn_id_mismatch;
+      624 	     call dm_misc_util_$log (LOG_SV, code,
+      625 		"bjm_find_txns_after_crash",
+      626 		"During bj_storage_get_header loop, BJ uid ^o, record id ^o, txn id ^d.",
+      627 		bj_uid, unfinished_txns_list.prev_rec_id (txn_idx),
+      628 		bin (old_tm_tdt_p -> tm_tdt.entry (txn_idx).txn_id));
+      629 	     go to clean_and_return;
+      630 	  end;
+      631 
+      632 	  call register_unfinished_txn (code);		/* merges in required data for caller */
+      633 
+      634 	  if code ^= 0 then do;
+      635 	     call dm_misc_util_$log (LOG_SV, code,
+      636 		"bjm_find_txns_after_crash",
+      637 		"Error while looking for 1st record of unfinished txn. BJ uid ^o, record id ^o, txn id ^d.",
+      638 		bj_uid, unfinished_txns_list.prev_rec_id (txn_idx),
+      639 		bin (old_tm_tdt_p -> tm_tdt.entry (txn_idx).txn_id));
+      640 	     go to clean_and_return;
+      641 	  end;
+      642 
+      643          end FIND_FIRST_RECORD;			/* of getting 1st record for a single txn */
+      644 
+      645       end WALK_UNFINISHED_TXNS_LIST;			/* of getting all txns 1st records */
+      646 
+      647    end GET_FIRST_RECORD_FOR_UNFINISHED_TXNS;
+      648 
+      649    go to clean_and_return;				/* loop worked, skip its unwinding handler */
+
+
+
+
+      650 
+      651 cannot_get_a_record:				/* come here if get call unwinds */
+      652    do;
+      653 
+      654       code = bjm_data_$bj_code;
+      655 
+      656       call dm_misc_util_$log (LOG_SV, code, "bjm_find_txns_after_crash",
+      657 	 "A call to bj_storage_get in recovery phase failed, BJ uid ^o, record id ^o, txn id ^d.",
+      658 	 bj_uid, unfinished_txns_list.prev_rec_id (txn_idx),
+      659 	 bin (old_tm_tdt_p -> tm_tdt.entry (txn_idx).txn_id));
+      660       go to clean_and_return;
+      661    end;
+
+
+
+
+
+
+      662 
+      663 /* we're DONE, error or not */
+      664 clean_and_return:
+      665    call clean_up ();
+      666 no_cleanup_return:
+      667    p_code = code;					/* in case clean_up took error */
+      668 
+      669    return;
+      670 
+      671 is_finished_txn:
+      672    proc () returns (bit (1) aligned);
+      673 
+      674 /* This procedure does a simple look through the finished_txns_list to see */
+      675 /*     if the txn we are working over has had a commit or abort mark found */
+      676 /*     in a previously read before image.  If so, "1"b is returned, */
+      677 /*     otherwise, ""b. N.B., txn_idx is left as a residue for the */
+      678 /*     registering routines for efficency, and zeroed if the txn id is */
+      679 /*     not found. */
+      680 
+      681    do txn_idx = 1 to n_registered_finished_txns;
+      682 
+      683       if finished_txns_list.txn_id (txn_idx) = bj_rec_hdr.tid then
+      684          return ("1"b);
+      685    end;
+      686 
+      687    txn_idx = 0;					/* for registering proc. */
+      688    return (""b);					/* did not find the txn id in the temp list */
+      689 
+      690    end is_finished_txn;
+
+
+
+
+
+
+      691 
+      692 is_unfinished_txn:
+      693    proc () returns (bit (1) aligned);
+      694 
+      695 /* This procedure does a simple look to see if the txn we are working over */
+      696 /*     has never had a commit or abort mark found in a previously read */
+      697 /*     before image.  If so, "1"b is returned, otherwise, ""b.  N.B. see */
+      698 /*     is_finished_txn proc for use of txn_idx */
+      699 
+      700    do txn_idx = 1 to n_registered_unfinished_txns;
+      701 
+      702       if old_tm_tdt_p -> tm_tdt.entry (txn_idx).txn_id = bj_rec_hdr.tid then
+      703          return ("1"b);
+      704    end;
+      705 
+      706    txn_idx = 0;					/* let registering routines know a new entry needed */
+      707    return (""b);					/* did not find the txn id in the temp list */
+      708 
+      709    end is_unfinished_txn;
+      710 
+      711 register_finished_txn:
+      712    proc (temp_code);
+      713 
+      714 /* This proc. records a list of finished txns for later searching. */
+      715 /*     Some consistency checking will also be done. */
+      716 /*     Note the only way for a txn. to get registered initially is for a */
+      717 /*     commit or abort record to be found.  This fact is used in the */
+      718 /*     "if txn_idx = 0" do group which does the initial registration. */
+      719 
+      720 dcl  temp_code			fixed bin (35) parameter;
+      721 
+      722    if txn_idx = -1 then				/* must get it */
+      723       bit_bucket = is_finished_txn ();
+      724 
+      725    if txn_idx = 0 then do;				/* totally new data */
+      726       n_registered_finished_txns, txn_idx = n_registered_finished_txns + 1;
+      727 
+      728       finished_txns_list.txn_id (txn_idx) = bj_rec_hdr.tid;
+      729       finished_txns_list.owners_process_id (txn_idx) = bj_rec_hdr.process_id;
+      730       finished_txns_list.n_effective_records_written (txn_idx) =
+      731 	 bj_rec_hdr.tx_rec_no;
+      732       finished_txns_list.n_effective_records_read (txn_idx) = 1;
+      733 
+      734       if bj_rec_hdr.prev_rec_id = ""b then do;		/* must verify some things */
+      735          temp_code = dm_error_$bj_bad_first_txn_record_type;
+      736          if check_mode then
+      737 	  go to finish_initializing_data;		/* so we don't lose error code */
+      738          else return;
+      739       end;
+      740 
+      741       if bj_rec_hdr.tx_rec_no <= 1 then do;
+      742          temp_code = dm_error_$bj_wrong_numb_txn_records;
+      743          if ^check_mode then
+      744 	  return;
+      745       end;
+      746 
+      747 finish_initializing_data:
+      748       finished_txns_list.prev_rec_id (txn_idx) = bj_rec_hdr.prev_rec_id;
+      749       finished_txns_list.rollback_mark_found (txn_idx) = ""b;
+      750 
+      751 
+      752       return;					/* done with initial data recording */
+      753    end;
+      754 
+      755 /* THIS TRANSACTION ALREADY IN LIST, so do some consistency checking */
+      756 /*     compared to what we expected to find.  If the checks pass, update */
+      757 /*     some of the saved data for future possible checks.  Note this code */
+      758 /*     only called if we are in the get_previous calling loop. */
+      759 
+      760    if bj_rec_hdr.process_id ^= finished_txns_list.owners_process_id (txn_idx)
+      761    then do;
+      762       temp_code = dm_error_$bj_rec_process_id_mismatch;
+      763       if check_mode then
+      764          go to update_data;
+      765       else return;
+      766    end;
+      767 
+      768    if finished_txns_list.rollback_mark_found (txn_idx) then /* no more checks are meaningfull */
+      769       if check_mode then
+      770          go to update_data;
+      771       else return;
+      772 
+      773    if bj_rec_id ^= finished_txns_list.prev_rec_id (txn_idx) then do;
+      774       temp_code = dm_error_$bj_wrong_prev_rec_id;
+      775       if check_mode then
+      776          go to update_data;
+      777       else return;
+      778    end;
+      779 
+      780    if bj_rec_hdr.prev_rec_id = ""b then do;
+      781 
+      782       if bj_rec_hdr.type ^= BJ_RECORD_TYPE.ROLLED_BACK
+      783 	 & bj_rec_hdr.type ^= BJ_RECORD_TYPE.FM_POSTCOMMIT_HANDLER
+      784 	 & bj_rec_hdr.type ^= BJ_RECORD_TYPE.FM_ROLLBACK_HANDLER
+      785 	 & bj_rec_hdr.type ^= BJ_RECORD_TYPE.BEFORE_IMAGE then do;
+      786 
+      787          temp_code = dm_error_$bj_bad_first_txn_record_type;
+      788          if check_mode then
+      789 	  go to update_data;
+      790          else return;
+      791       end;
+      792 
+      793 /* must be last record to read */
+      794       if finished_txns_list.n_effective_records_read (txn_idx)
+      795 	 ^= finished_txns_list.n_effective_records_written (txn_idx) - 1
+      796       then do;
+      797 
+      798          temp_code = dm_error_$bj_wrong_numb_txn_records;
+      799          if check_mode then
+      800 	  go to update_data;
+      801          else return;
+      802       end;
+      803    end;
+      804 
+      805 /* checks out, OK to update registered data */
+      806 
+      807 update_data:
+      808    finished_txns_list.n_effective_records_read (txn_idx) =
+      809         finished_txns_list.n_effective_records_read (txn_idx) + 1;
+      810    if bj_rec_hdr.type = BJ_RECORD_TYPE.ROLLED_BACK then
+      811       finished_txns_list.rollback_mark_found (txn_idx) = "1"b;
+      812    finished_txns_list.prev_rec_id (txn_idx) = bj_rec_hdr.prev_rec_id;
+      813 
+      814 
+      815    return;					/* free again */
+      816 
+      817    end register_finished_txn;
+      818 
+      819 register_unfinished_txn:
+      820    proc (temp_code);
+      821 
+      822 /* This procedure is responsible for maintaining the internal list of */
+      823 /*     unfinished txns.  There is actually a second important function for */
+      824 /*     this proc.:  to update the caller's list of information needed to */
+      825 /*     rollback the txns.  The internal list is kept for consistency checks */
+      826 
+      827 dcl  temp_code			fixed bin (35) parameter;
+      828 
+      829    if txn_idx = -1 then				/* must get it */
+      830       bit_bucket = is_unfinished_txn ();		/* and this does it */
+      831 
+      832    if txn_idx = 0 then do;				/* a new one comes into the fold */
+      833 
+      834       if n_unfinished_txns <= 0 & ^check_mode then do;	/* don't do this test in check_mode */
+      835          temp_code = dm_error_$bj_too_many_unfinished_txns;
+      836          return;
+      837       end;
+      838 
+      839       n_unfinished_txns = n_unfinished_txns - 1;		/* one less to look for */
+      840       n_registered_unfinished_txns, txn_idx,
+      841 	 old_tm_tdt_p -> tm_tdt.entry_count,
+      842 	 old_bj_txt_p -> bj_txt.max_n_entries,
+      843 	 old_bj_txt_p -> bj_txt.n_entries_used =
+      844 	 n_registered_unfinished_txns + 1;		/* the next slot */
+      845 
+      846 /* fill in new slot with data available first, the internal list */
+      847 
+      848       unfinished_txns_list.n_effective_records_read (txn_idx) = 1;
+      849       unfinished_txns_list.prev_rec_id (txn_idx) = bj_rec_hdr.prev_rec_id;
+      850       if bj_rec_hdr.prev_rec_id = ""b then do;
+      851 
+      852          if bj_rec_hdr.type ^= BJ_RECORD_TYPE.ROLLED_BACK
+      853 	    & bj_rec_hdr.type ^= BJ_RECORD_TYPE.BEFORE_IMAGE
+      854 	    & bj_rec_hdr.type ^= BJ_RECORD_TYPE.FM_ROLLBACK_HANDLER
+      855 	    & bj_rec_hdr.type ^= BJ_RECORD_TYPE.FM_POSTCOMMIT_HANDLER
+      856          then do;
+      857 
+      858 	  temp_code = dm_error_$bj_bad_first_txn_record_type;
+      859 	  if check_mode then
+      860 	     go to finish_initializing_data;
+      861 	  else return;
+      862          end;
+      863 
+      864          if bj_rec_hdr.tx_rec_no < 1 then do;
+      865 
+      866 	  temp_code = dm_error_$bj_wrong_numb_txn_records;
+      867 	  if check_mode then
+      868 	     go to finish_initializing_data;
+      869 	  else return;
+      870          end;
+      871       end;
+      872 
+      873 finish_initializing_data:
+      874       if bj_rec_hdr.type = BJ_RECORD_TYPE.ROLLED_BACK then
+      875          unfinished_txns_list.rollback_mark_found (txn_idx) = "1"b;
+      876       else unfinished_txns_list.rollback_mark_found (txn_idx) = ""b;
+      877 
+      878 /* Initialize the tdt and txt entries and fill in common data after zeroing */
+      879 /* the entries.  tm_recover_after_crash and bjm_rebuild_after_crash are */
+      880 /* responsible for filling any values left zeroed that must be set for */
+      881 /* tm_adjust and cannot be set in this procedure. */
+      882 
+      883 /* The following TDT entry elements are set to zero and left that way: */
+      884 /*	all mbzN's, event_channel, abandoned_sw, date_time_created, mode, */
+      885 /*	error_code, daemon_adjust_count, return_idx, and all flags and */
+      886 /*	post_commit_flags. */
+      887 /* The following TXT entry elements are set to zero and left that way: */
+      888 /*	bj_uid, all operator_info, curr_checkpoint_rec_id, */
+      889 /*	n_bytes_written, last_fm_postcommit_handler_rec_id, all */
+      890 /*	append_state, pad_entry_to_32_words */
+      891 
+      892       unspec (old_tm_tdt_p -> tm_tdt.entry (txn_idx)),
+      893 	 unspec (old_bj_txt_p -> bj_txt.entry (txn_idx)) = ""b;
+      894       old_tm_tdt_p -> tm_tdt.entry (txn_idx).txn_id,
+      895 	 old_bj_txt_p -> bj_txt.entry (txn_idx).tid = bj_rec_hdr.tid;
+      896       old_tm_tdt_p -> tm_tdt.entry (txn_idx).process_id,
+      897 	 old_bj_txt_p -> bj_txt.entry (txn_idx).owner_info.process_id =
+      898 	 bj_rec_hdr.process_id;
+      899 
+      900       if bj_rec_hdr.type = BJ_RECORD_TYPE.BEGIN_COMMIT then do;
+      901          old_tm_tdt_p -> tm_tdt.entry (txn_idx).state =
+      902 	    TM_COMMIT_WRITING_MARK_STATE;
+      903          old_bj_txt_p -> bj_txt.entry (txn_idx).last_completed_operation =
+      904 	    BJ_RECORD_TYPE.BEGIN_COMMIT;
+      905       end;
+      906       else old_tm_tdt_p -> tm_tdt.entry (txn_idx).state =
+      907 	      TM_ABORT_FLUSHING_TXN_STATE;
+      908       old_bj_txt_p -> bj_txt.entry (txn_idx).bj_uid = bj_uid;
+      909       old_bj_txt_p -> bj_txt.entry (txn_idx).last_bj_rec_id = bj_rec_id;
+      910       old_bj_txt_p -> bj_txt.entry (txn_idx).n_rec_written =/* === n_effective_records_written in finished */
+      911 	 bj_rec_hdr.tx_rec_no;
+      912       old_bj_txt_p -> bj_txt.entry (txn_idx).last_completed_operation =
+      913 	 bj_rec_hdr.type;
+      914       old_bj_txt_p -> bj_txt.entry (txn_idx).ok_to_write = "1"b;
+      915 						/* so we can write mark */
+      916 
+      917 /* NEED TEST ON POST COMMIT HANDLER HERE WHEN IMPLEMENTED */
+      918       if bj_rec_hdr.prev_rec_id = ""b then
+      919          old_bj_txt_p -> bj_txt.entry (txn_idx).first_bj_rec_id = bj_rec_id;
+      920 
+      921 /* fill in things we don't currently get */
+      922       old_tm_tdt_p -> tm_tdt.owner_name = "<PRE-CRASH>";
+      923 
+      924       return;					/* done initilizing this txn in our lists */
+      925    end;
+      926 
+      927 /* register_unfinished_txn CONTINUED ON NEXT PAGE */
+      928 
+      929 /* CONTINUATION OF register_unfinished_txn PROC */
+      930 
+      931 KNOWN_UNFINISHED_TXN:				/* so do some consistency checking */
+      932    if bj_rec_hdr.process_id
+      933         ^= old_tm_tdt_p -> tm_tdt.entry (txn_idx).process_id then do;
+      934 
+      935       temp_code = dm_error_$bj_rec_process_id_mismatch;
+      936       if ^check_mode then
+      937          return;
+      938    end;
+      939 
+      940    if unfinished_txns_list.rollback_mark_found (txn_idx) & ^check_mode then
+      941 						/* we have the active part of the chain */
+      942       return;					/* no more checks are meaningful */
+      943 
+      944 /* special check if we are in get_previous call loop */
+      945 
+      946    if get_previous_loop then
+      947       if n_unfinished_txns >= 0 then			/* must check prev_rec_id against curr. one */
+      948          if bj_rec_id ^= unfinished_txns_list.prev_rec_id (txn_idx) then do;
+      949 
+      950 	  temp_code = dm_error_$bj_wrong_prev_rec_id;
+      951 	  if check_mode then
+      952 	     go to update_data;
+      953 	  else return;
+      954          end;
+      955 
+      956 /* register_unfinished_txn CONTINUED ON NEXT PAGE */
+      957 
+      958 /* CONTINUATION OF register_unfinished_txn PROC */
+      959 
+      960    if bj_rec_hdr.prev_rec_id = ""b then do;		/* better be 1st image, handler, or rollback */
+      961 
+      962       if bj_rec_hdr.type ^= BJ_RECORD_TYPE.ROLLED_BACK
+      963 	 & bj_rec_hdr.type ^= BJ_RECORD_TYPE.BEFORE_IMAGE
+      964 	 & bj_rec_hdr.type ^= BJ_RECORD_TYPE.FM_ROLLBACK_HANDLER
+      965 	 & bj_rec_hdr.type ^= BJ_RECORD_TYPE.FM_POSTCOMMIT_HANDLER then do;
+      966 
+      967          temp_code = dm_error_$bj_bad_first_txn_record_type;
+      968          if check_mode then
+      969 	  go to update_data;
+      970          else return;
+      971       end;
+      972 
+      973       if unfinished_txns_list.n_effective_records_read (txn_idx) ^=
+      974 						/* must be last record to read */
+      975 	 old_bj_txt_p -> bj_txt.entry (txn_idx).n_rec_written - 1 then do;
+      976 
+      977          temp_code = dm_error_$bj_wrong_numb_txn_records;
+      978          if check_mode then
+      979 	  go to update_data;
+      980          else return;
+      981       end;
+      982    end;
+      983 
+      984 /* checks out, OK to register new data */
+      985 
+      986 update_data:
+      987    unfinished_txns_list.n_effective_records_read (txn_idx) =
+      988         unfinished_txns_list.n_effective_records_read (txn_idx) + 1;
+      989 
+      990    if bj_rec_hdr.type = BJ_RECORD_TYPE.ROLLED_BACK then
+      991       unfinished_txns_list.rollback_mark_found (txn_idx) = "1"b;
+      992 
+      993    if bj_rec_hdr.prev_rec_id = ""b then
+      994       if get_previous_loop then
+      995          old_bj_txt_p -> bj_txt.entry (txn_idx).first_bj_rec_id = bj_rec_id;
+      996       else old_bj_txt_p -> bj_txt.entry (txn_idx).first_bj_rec_id =
+      997 	      unfinished_txns_list.prev_rec_id (txn_idx);
+      998 
+      999    unfinished_txns_list.prev_rec_id (txn_idx) = bj_rec_hdr.prev_rec_id;
+     1000 
+     1001 /* MUST ADD TEST/UPDATE OF USER POSTCOMMIT HANDLER RECORD WHEN IMPLEMENTED */
+     1002 
+     1003    return;					/* free at last */
+     1004 
+     1005    end register_unfinished_txn;
+     1006 
+     1007 clean_up:
+     1008    proc ();
+     1009 
+     1010    call release_temp_segment_ ("bjm_find_txns_after_crash",
+     1011         finished_txns_list_p, clean_code);
+     1012 
+     1013    if clean_code ^= 0 then
+     1014       call dm_misc_util_$log (LOG_SV, clean_code, "bjm_find_txns_after_crash",
+     1015 	 "Unable to release temp. storage for finished txn. list.");
+     1016 
+     1017    if code = 0 then
+     1018       code = clean_code;
+     1019 
+     1020 
+     1021    call release_temp_segment_ ("bjm_find_txns_after_crash",
+     1022         unfinished_txns_list_p, clean_code);
+     1023 
+     1024    if clean_code ^= 0 then
+     1025       call dm_misc_util_$log (LOG_SV, clean_code, "bjm_find_txns_after_crash",
+     1026 	 "Unable to release temp. storage for unfinished txn. list.");
+     1027 
+     1028    if code = 0 then
+     1029       code = clean_code;
+     1030 
+     1031 
+     1032    call bj_cleanup_tables$handler (clean_code);
+     1033 
+     1034    if clean_code ^= 0 then
+     1035       call dm_misc_util_$log (LOG_SV, clean_code, "bjm_find_txns_after_crash",
+     1036 	 "Unable to cleanup BJ tables.");
+     1037 
+     1038    if code = 0 then
+     1039       code = clean_code;
+     1040 
+     1041 
+     1042    bjm_data_$bj_operation = "";			/* ALWAYS release our hold */
+     1043    bjm_data_$bj_exit_err = bjm_data_$bj_default_error_label;
+     1044 
+     1045    return;
+     1046 
+     1047    end clean_up;
+     1048 
+  1     1 /* format: style4,indattr,idind33,^indcomtxt */
+  1     2 
+  1     3 /* BEGIN INCLUDE FILE:	dm_bj_records.incl.pl1	*/
+  1     4 /*
+  1     5*Before journal records - images and marks
+  1     6*
+  1     7*Designed by Andre Bensoussan 02/03/82
+  1     8*Written by Mike Pandolf 07/07/82
+  1     9*Modified:
+  1    10*10/01/82 by Lee A. Newcomb:  To add n_txn to all records so rollback after
+  1    11*	  crash knows how many transactions were active at crash time.
+  1    12*15feb83  by M. Pandolf: To add fm_handler_rec for both rollback and postcommit
+  1    13*	  handler used exclusively by file_manager_, add BEGIN_COMMIT mark,
+  1    14*	  and add PREFORM_BEGIN mark (for housekeeping, never written).
+  1    15*05apr83 by M. Pandolf to add BEGIN_MARK for bj_txte.last_completed_operation
+  1    16**/
+  1    17 
+  1    18 
+  1    19 dcl  bj_rec_hdr_ptr		        ptr;		/* pointer to various bj records */
+  1    20 
+  1    21 dcl  1 bj_rec_hdr		        aligned based (bj_rec_hdr_ptr),
+  1    22        2 type		        char (4),		/* see types below */
+  1    23        2 tid		        bit (36),		/* transaction id for this record */
+  1    24        2 process_id		        bit (36),		/* of process initiating this transaction */
+  1    25        2 prev_rec_id	        bit (36),		/* of record in this transaction */
+  1    26        2 prev_rec_byte_size	        fixed bin (24),	/* of record in this transaction */
+  1    27        2 tx_rec_no		        fixed bin (35),	/* number of this record in transaction list */
+  1    28        2 n_txn		        fixed bin;		/* number of active txn's in the BJ containing this txn */
+  1    29 						/* with at least one record written in the BJ.  This is */
+  1    30 						/* used for rollback after crash */
+  1    31 						/* N.B. commits and abort marks do not count themselves */
+  1    32 
+  1    33 /* before journal records for the various record types */
+  1    34 
+  1    35 dcl  1 bj_committed_rec	        aligned like bj_rec_hdr based (bj_rec_hdr_ptr);
+  1    36 
+  1    37 dcl  1 bj_begin_commit_rec	        aligned like bj_rec_hdr based (bj_rec_hdr_ptr);
+  1    38 
+  1    39 dcl  1 bj_aborted_rec	        aligned like bj_rec_hdr based (bj_rec_hdr_ptr);
+  1    40 
+  1    41 dcl  1 bj_rolled_back_rec	        aligned based (bj_rec_hdr_ptr),
+  1    42        2 header		        like bj_rec_hdr,
+  1    43        2 checkpoint_no	        fixed bin (35),
+  1    44        2 last_rolled_back_rec_id      bit (36);
+  1    45 
+  1    46 dcl  1 bj_rollback_handler_rec        aligned based (bj_rec_hdr_ptr),
+  1    47        2 header		        like bj_rec_hdr,
+  1    48        2 name_len		        fixed bin (24),
+  1    49        2 info_len		        fixed bin (24),
+  1    50        2 proc_name		        char (bj_rollback_name_len refer (bj_rollback_handler_rec.name_len)),
+  1    51        2 info_bits		        bit (bj_rollback_info_len refer (bj_rollback_handler_rec.info_len));
+  1    52 
+  1    53 /* dm_bj_records.incl.pl1 CONTINUED NEXT PAGE */
+  1    54 
+  1    55 /* dm_bj_records.incl.pl1 CONTINUATION FROM PREVIOUS PAGE */
+  1    56 
+  1    57 dcl  1 bj_before_image	        aligned based (bj_rec_hdr_ptr),
+  1    58        2 header		        like bj_rec_hdr,
+  1    59        2 fm_uid		        bit (36),
+  1    60        2 fm_oid		        bit (36),
+  1    61        2 ci_no		        fixed bin (35),
+  1    62        2 n_parts		        fixed bin (17),
+  1    63        2 image_len		        fixed bin (24),
+  1    64        2 part		        dim (bj_before_image_n_parts refer (bj_before_image.n_parts)),
+  1    65          3 byte_offset	        fixed bin (24),
+  1    66          3 byte_length	        fixed bin (24),
+  1    67        2 image		        char (bj_before_image_len refer (bj_before_image.image_len));
+  1    68 
+  1    69 dcl  1 bj_fm_handler_rec	        aligned based (bj_rec_hdr_ptr),
+  1    70        2 header		        like bj_rec_hdr,
+  1    71        2 fm_uid		        bit (36),
+  1    72        2 fm_oid		        bit (36),
+  1    73        2 prev_fm_handler_rec_id       bit (36),
+  1    74        2 info_len		        fixed bin,
+  1    75        2 info_bytes		        char (bj_fm_handler_info_len refer (bj_fm_handler_rec.info_len));
+  1    76 
+  1    77 /* extent definers */
+  1    78 
+  1    79 dcl  bj_rollback_name_len	        fixed bin (24);
+  1    80 dcl  bj_rollback_info_len	        fixed bin (24);
+  1    81 dcl  bj_before_image_n_parts	        fixed bin;
+  1    82 dcl  bj_before_image_len	        fixed bin (24);
+  1    83 dcl  bj_fm_handler_info_len	        fixed bin (24);
+  1    84 
+  1    85 /* record type identifiers */
+  1    86 
+  1    87 dcl  1 BJ_RECORD_TYPE	        int static options (constant) aligned,
+  1    88      ( 2 BEGIN_COMMIT	        init ("bcom"),
+  1    89        2 PERFORM_COMMIT	        init ("pcom"),
+  1    90        2 COMMITTED		        init ("comm"),
+  1    91        2 ABORTED		        init ("abor"),
+  1    92        2 ROLLED_BACK	        init ("roll"),
+  1    93        2 HANDLER		        init ("hand"),
+  1    94        2 FM_ROLLBACK_HANDLER	        init ("fmrb"),
+  1    95        2 FM_POSTCOMMIT_HANDLER        init ("fmpc"),
+  1    96        2 BEGIN_MARK		        init ("begi"),
+  1    97        2 BEFORE_IMAGE	        init ("befo")) char (4);
+  1    98 
+  1    99 /* END INCLUDE FILE:	dm_bj_records.incl.pl1	*/
+     1049 
+     1050 
+  2     1 /* BEGIN INCLUDE FILE:	dm_bj_txt.incl.pl1	*/
+  2     2 /* 
+  2     3*dm_bj_txt - before journal per-system transaction table.
+  2     4*
+  2     5*Designed by A. Bensoussan
+  2     6*Written  by M. Pandolf 06/02/82
+  2     7*Modified:
+  2     8*10/01/82 by Lee A. Newcomb:  To use dm_system_data_ for dimension attributes
+  2     9*	  and specify alignment on level one.
+  2    10*08feb83  by M. Pandolf:      To restructure the TXT and TXTE.
+  2    11*30mar83  by M. Pandolf:      To add last_completed_operation and ok_to_write.
+  2    12**/
+  2    13 /* format: style4,indattr,idind33,^indcomtxt */
+  2    14 
+  2    15 dcl  BJ_TXT_VERSION_1	        fixed bin int static options (constant) init (1);
+  2    16 
+  2    17 dcl  bj_txt_ptr		        ptr;		/* pointer to transaction table */
+  2    18 dcl  bj_txte_ptr		        ptr;		/* pointer to transaction table element */
+  2    19 
+  2    20 dcl  1 bj_txt		        aligned based (bj_txt_ptr), /* transaction table */
+  2    21        2 version		        fixed bin,		/* should be BJ_TXT_VERSION_1 */
+  2    22        2 max_n_entries	        fixed bin,
+  2    23        2 n_entries_used	        fixed bin,		/* assumed contiguous */
+  2    24        2 pad_header_to_32_words       bit (36) dim (29),	/* to mod32 align bj_txt.entry */
+  2    25        2 entry		        dim (dm_system_data_$max_n_transactions refer (bj_txt.max_n_entries))
+  2    26 			        like bj_txte;
+  2    27 
+  2    28 dcl  1 bj_txte		        based (bj_txte_ptr) aligned, /* single entry, must be mod32 word aligned */
+  2    29        2 tid		        bit (36),		/* transaction id if this or last txn */
+  2    30        2 bj_uid		        bit (36),		/* UID of before journal chosen at begin mark */
+  2    31        2 entry_state aligned,
+  2    32          3 last_completed_operation   char (4),		/* to prevent multiple abort and commit */
+  2    33          3 ok_to_write                bit (1),		/* basically validates using this entry */
+  2    34        2 owner_info aligned,				/* info about creation of txte */
+  2    35          3 process_id	        bit (36),		/* of process that wrote begin mark */
+  2    36        2 operator_info aligned,			/* of process that is currently using this txte */
+  2    37          3 process_id	        bit (36),		/* of process that shall write subsequent marks */
+  2    38          3 ppte_ptr		        ptr,		/* pointer to PPTE for this transaction */
+  2    39          3 bj_oid		        bit (36),		/* before journal opening ID for operator */
+  2    40        2 records_info aligned,			/* grouped to be saved and restored as one unit */
+  2    41          3 curr_checkpoint_rec_id     bit (36),		/* ident of checkpoint record if doing a rollback, */
+  2    42 						/* else, this value must be zero. */
+  2    43          3 first_bj_rec_id	        bit (36),		/* ident of first mark for this transaction */
+  2    44          3 last_bj_rec_id	        bit (36),		/* ident of current mark for this transaction */
+  2    45          3 n_rec_written	        fixed bin (35),	/* count of marks written for this transaction */
+  2    46          3 n_bytes_written	        fixed bin (35),	/* count of total bytes written to journal */
+  2    47          3 last_fm_postcommit_handler_rec_id
+  2    48 			        bit (36),		/* ident of last special handler in list */
+  2    49        2 append_state aligned,			/* the first two members define the state of this */
+  2    50          3 current_operation	        char (4),		/* transaction and its interaction with bj_storage: */
+  2    51          3 pending_bj_rec_id	        bit (36),		/* operation  rec_id  state */
+  2    52 						/*   *null*    XXX    quiesed */
+  2    53 						/*   ^null     "0"b   write pending */
+  2    54 						/*   ^null     ^"0"b  write completed, needs flushing */
+  2    55 						/* */
+  2    56          3 pending_n_rec_written      fixed bin (35),	/* copy to n_rec_written before flush */
+  2    57          3 pending_n_bytes_written    fixed bin (35),	/* copy to n_bytes_written before flush */
+  2    58        2 pad_entry_to_32_words        bit (36) dim (13);	/* make any part of table 32 words long */
+  2    59 
+  2    60 /* END INCLUDE FILE:	dm_bj_txt_ptr	*/
+     1051 
+     1052 
+  3     1 /*  START OF:	dm_tm_tdt.incl.pl1		*/
+  3     2 
+  3     3 /* Transaction Definition Table for transaction_manager_ */
+  3     4 /* This structure is used to reference the TDT. The process_id field for the
+  3     5*   i'th TDT entry, for example, is usually referenced as tm_tdt.process_id (i).
+  3     6*   A TDT entry is in use by a process when its process_id field is nonzero.
+  3     7*   An entry is reserved by using the stacq builtin to set process_id, if and
+  3     8*   only if it is already zero. The entry is being used for a transaction when
+  3     9*   tm_tdt.txn_id (i) is nonzero. The possible values of tm_tdt.state (i) are
+  3    10*   listed in dm_tm_states.incl.pl1. If state = 0, no operation has been
+  3    11*   performed yet on the transaction. */
+  3    12 
+  3    13 
+  3    14 /* HISTORY:
+  3    15*Designed by Matt Pierret, 01/26/82.
+  3    16*Coded by Steve Herbst, 07/27/82.
+  3    17*Modified:
+  3    18*08/05/82 by Steve Herbst: Added tm_tdt.operation and padded last_uid to full word.
+  3    19*08/05/82 by Steve Herbst: Changed creator_process_id to bit (36).
+  3    20*08/16/82 by Steve Herbst: Added contents of dm_tm_tdt_entry.incl.pl1.
+  3    21*09/09/82 by Steve Herbst: Removed in_use flag from TDT entry and rearranged fields.
+  3    22*09/20/82 by Steve Herbst: Removed tm_tdt.operation.
+  3    23*11/01/82 by Steve Herbst: Added event_channel and error_sw to tm_tdt_entry.
+  3    24*11/05/82 by Steve Herbst: Added suspended_sw and error_code to tm_tdt_entry.
+  3    25*11/11/82 by Steve Herbst: Deleted tm_tdt_entry.alloc_complete.
+  3    26*11/23/82 by Steve Herbst: Compacted, changed some numbers to unsigned.
+  3    27*12/14/82 by Steve Herbst: Added tm_tdt_entry.daemon_error_sw.
+  3    28*01/11/83 by Steve Herbst: Added owner_name, abandoned_sw & kill_sw to tm_tdt_entry.
+  3    29*01/24/83 by Steve Herbst: Replaced daemon_error_sw with daemon_adjust_count.
+  3    30*01/25/83 by Steve Herbst: Moved abandoned_sw from transaction portion to entry header portion.
+  3    31*05/13/83 by Steve Herbst: Version 3, changed all fixed bin (18) unal uns numbers to fixed bin (17) unaligned.
+  3    32*05/26/83 by Steve Herbst: Added rollback_count and checkpoint_id.
+  3    33**/
+  3    34 
+  3    35 dcl	tm_tdt_ptr	ptr;
+  3    36 dcl	tdt_max_count	fixed bin;
+  3    37 
+  3    38 dcl TM_TDT_VERSION_3 char (8) int static options (constant) init ("TM-TDT 3");
+  3    39 
+  3    40 
+  3    41 dcl  1	tm_tdt		aligned based (tm_tdt_ptr),
+  3    42       2	version char (8),				/* = "TM-TDT 3" */
+  3    43       2	lock fixed bin (71),			/* (currently not used) */
+  3    44       2	last_uid		bit (27) aligned,		/* last transaction uid assigned */
+  3    45       2	flags,
+  3    46        3	no_begins		bit (1) unaligned,		/* ON => only priv process can begin transaction */
+  3    47        3	mbz1		bit (35) unaligned,
+  3    48       2	entry_count	fixed bin,		/* number of slots allocated */
+  3    49       2	mbz2		fixed bin,		/* for even word boundary */
+  3    50       2	entry  (tdt_max_count refer (tm_tdt.entry_count))
+  3    51 			like tm_tdt_entry;
+  3    52 
+  3    53 
+  3    54 
+  3    55 /* TDT entries: */
+  3    56 
+  3    57 dcl	tm_tdt_entry_ptr	ptr;
+  3    58 
+  3    59 dcl  1	tm_tdt_entry	aligned based (tm_tdt_entry_ptr),
+  3    60       2	event_channel	fixed bin (71),		/* for communication with the process */
+  3    61       2	process_id	bit (36) aligned,		/* process for which this entry is reserved */
+  3    62       2	owner_name	char (32),		/* person.project of owner process */
+  3    63       2	entry_flags,
+  3    64        3	abandoned_sw	bit (1) unaligned,		/* ON => owner has called tm_$abandon on this entry */
+  3    65        3	mbz3		bit (35) unaligned,
+  3    66       2	transaction	unaligned,
+  3    67        3	txn_id		bit (36) aligned,		/* unique identifier assigned at begin time */
+  3    68        3	date_time_created	fixed bin (71) aligned,
+  3    69        3	mode		fixed bin (17) unaligned,	/* mode specified with transaction begin */
+  3    70        3	state		fixed bin (17) unaligned,	/* state transaction is currently in */
+  3    71        3  error_code	fixed bin (35) aligned,	/* goes along with error_sw and error state */
+  3    72        3 	checkpoint_id	fixed bin (17) unaligned,	/* identifier of the current rollback checkpoint */
+  3    73        3	rollback_count	fixed bin (17) unaligned,	/* number of times bjm_$rollback has been called */
+  3    74        3	daemon_adjust_count	fixed bin (17) unaligned,	/* number of times daemon has tried to adjust since user */
+  3    75        3	return_idx	fixed bin (17) unaligned,	/* parent transaction, or zero */
+  3    76        3	flags,
+  3    77         4 dead_process_sw	bit (1) unaligned,		/* ON => treat process as dead even if it isn't yet */
+  3    78         4 suspended_sw	bit (1) unaligned,		/* ON => suspended by tm_$suspend_txn */
+  3    79         4 error_sw		bit (1) unaligned,		/* ON => state is one of the error states */
+  3    80         4 kill_sw		bit (1) unaligned,		/* ON => being processed by tm_$kill */
+  3    81         4	mbz4		bit (29) unaligned,
+  3    82        3	post_commit_flags,
+  3    83         4 (fmgr,
+  3    84 	 bjmgr,
+  3    85 	 ajmgr)	 	 bit (1) unaligned,
+  3    86        3	mbz4		fixed bin;
+  3    87 
+  3    88 
+  3    89 /*  END OF:	dm_tm_tdt.incl.pl1		*/
+     1053 
+     1054 
+  4     1 /* BEGIN INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+  4     2 
+  4     3 /* format: ^indcom */
+  4     4 
+  4     5 /* DESCRIPTION:
+  4     6*   These are the severity codes used by the dms daemon when calling its logger.
+  4     7*   The severity is ranked thusly:
+  4     8*
+  4     9*   severity log write situation
+  4    10*   -------- --- ----- ---------
+  4    11*          0 no  yes   standard output, query, etc.
+  4    12*          1 yes yes   fatal error, terminate dms daemon.
+  4    13*          2 yes yes   nonfatal error.
+  4    14*          3 yes yes   informative message.
+  4    15*          4 yes no    log information only.
+  4    16**/
+  4    17 
+  4    18 /* HISTORY:
+  4    19*
+  4    20*Written by M. Pandolf, 10/06/82.
+  4    21*Modified:
+  4    22*12/10/84 by R. Michael Tague: Rename and reformat description/history.
+  4    23*01/13/85 by Lee A. Newcomb:  Renamed to dm_log_sv_codes from
+  4    24*            dm_daemon_sv_codes as the severity codes for the DM log are not
+  4    25*            restrained to the DM Daemon's use.
+  4    26*01/24/85 by Lee A. Newcomb:  Fixed to say dm_log_sv_codes.incl.pl1 in the
+  4    27*            BEGIN and END INCLUDE comments, instead of dm_daemon_sv_codes.==.
+  4    28**/
+  4    29 
+  4    30 /* format: style5 */
+  4    31 
+  4    32      dcl	   (PRINT_SV, QUERY_SV)    fixed bin internal static
+  4    33 			       options (constant) init (0);
+  4    34      dcl	   (CRASH_SV, FATAL_SV)    fixed bin internal static
+  4    35 			       options (constant) init (1);
+  4    36      dcl	   ERROR_SV	       fixed bin internal static
+  4    37 			       options (constant) init (2);
+  4    38      dcl	   INFORM_SV	       fixed bin internal static
+  4    39 			       options (constant) init (3);
+  4    40      dcl	   LOG_SV		       fixed bin internal static
+  4    41 			       options (constant) init (4);
+  4    42 
+  4    43 /* END INCLUDE FILE dm_log_sv_codes.incl.pl1 */
+     1055 
+     1056 
+  5     1 /*  START OF:	dm_tm_states.incl.pl1	*/
+  5     2 
+  5     3 /* HISTORY:
+  5     4*
+  5     5*Designed by Matthew Pierret, 01/26/82.
+  5     6*Coded by Steve Herbst, 08/05/82.
+  5     7*Modified:
+  5     8*09/20/82 by Steve Herbst: States renames for distinct operations.
+  5     9*10/05/82 by Steve Herbst: Added TM_ABORT_POST_COMMIT_STATE.
+  5    10*01/14/83 by Steve Herbst: Added TM_ERROR_INCREMENT.
+  5    11*01/18/83 by Steve Herbst: Added HIGHEST_ABORT_STATE, etc.
+  5    12*08/23/84 by Steve Herbst: Added OP_NAME... constants.
+  5    13**/
+  5    14 
+  5    15 
+  5    16 /* NOTE: Changing this file necessitates changes tm_cleanup */
+  5    17 
+  5    18 dcl (HIGHEST_STATE init (96),
+  5    19      LOWEST_ABORT_STATE init (21),
+  5    20      HIGHEST_ABORT_STATE init (30),
+  5    21      LOWEST_COMMIT_STATE init (31),
+  5    22      HIGHEST_COMMIT_STATE init (40),
+  5    23      LOWEST_ROLLBACK_STATE init (41),
+  5    24      HIGHEST_ROLLBACK_STATE init (50)) fixed bin int static options (constant);
+  5    25 
+  5    26 dcl TM_ERROR_INCREMENT fixed bin int static options (constant) init (50);
+  5    27 						/* error state = corresponding pre-call state + 50 */
+  5    28 
+  5    29 
+  5    30 dcl (	TM_IN_PROGRESS_STATE		init (1),
+  5    31 
+  5    32 	TM_BEGIN_STARTING_STATE		init (11),
+  5    33 
+  5    34 	TM_ABORT_FLUSHING_TXN_STATE		init (21),
+  5    35 	TM_ABORT_FLUSHING_TXN_ERROR		init (71),
+  5    36 	TM_ABORT_ROLLING_BACK_STATE		init (22),
+  5    37 	TM_ABORT_ROLLING_BACK_ERROR		init (72),
+  5    38 	TM_ABORT_FLUSHING_CI_STATE		init (23),
+  5    39 	TM_ABORT_FLUSHING_CI_ERROR		init (73),
+  5    40 	TM_ABORT_WRITING_MARK_STATE		init (24),
+  5    41 	TM_ABORT_WRITING_MARK_ERROR		init (74),
+  5    42 	TM_ABORT_UNLOCKING_STATE		init (25),
+  5    43 	TM_ABORT_UNLOCKING_ERROR		init (75),
+  5    44 	TM_ABORT_METERING_STATE		init (26),
+  5    45 	TM_ABORT_METERING_ERROR		init (76),
+  5    46 
+  5    47 	TM_COMMIT_FLUSHING_TXN_STATE		init (31),
+  5    48 	TM_COMMIT_FLUSHING_TXN_ERROR		init (81),
+  5    49 	TM_COMMIT_FLUSHING_CI_STATE		init (32),
+  5    50 	TM_COMMIT_FLUSHING_CI_ERROR		init (82),
+  5    51 	TM_COMMIT_WRITING_MARK_STATE		init (33),
+  5    52 	TM_COMMIT_WRITING_MARK_ERROR		init (83),
+  5    53 	TM_COMMIT_POST_COMMIT_STATE		init (34),
+  5    54 	TM_COMMIT_POST_COMMIT_ERROR		init (84),
+  5    55 	TM_COMMIT_UNLOCKING_STATE		init (35),
+  5    56 	TM_COMMIT_UNLOCKING_ERROR		init (85),
+  5    57 	TM_COMMIT_METERING_STATE		init (36),
+  5    58 	TM_COMMIT_METERING_ERROR		init (86),
+  5    59 
+  5    60 	TM_ROLLBACK_FLUSHING_TXN_STATE	init (41),
+  5    61 	TM_ROLLBACK_FLUSHING_TXN_ERROR	init (91),
+  5    62 	TM_ROLLBACK_ROLLING_BACK_STATE	init (42),
+  5    63 	TM_ROLLBACK_ROLLING_BACK_ERROR	init (92),
+  5    64 	TM_ROLLBACK_FLUSHING_CI_STATE		init (43),
+  5    65 	TM_ROLLBACK_FLUSHING_CI_ERROR		init (93),
+  5    66 	TM_ROLLBACK_WRITING_MARK_STATE	init (44),
+  5    67 	TM_ROLLBACK_WRITING_MARK_ERROR	init (94),
+  5    68 	TM_ROLLBACK_UNLOCKING_STATE		init (45),
+  5    69 	TM_ROLLBACK_UNLOCKING_ERROR		init (95),
+  5    70 	TM_ROLLBACK_METERING_STATE		init (46),
+  5    71 	TM_ROLLBACK_METERING_ERROR		init (96))
+  5    72 
+  5    73 			fixed bin int static options (constant);
+  5    74 
+  5    75 dcl (OP_NAME_ABORT init ("abort"),
+  5    76      OP_NAME_COMMIT init ("commit"),
+  5    77      OP_NAME_ROLLBACK init ("rollback")) char (32) int static options (constant);
+  5    78 
+  5    79 /* END OF:	dm_tm_states.incl.pl1	*/
+     1057 
+     1058 
+  6     1 /* BEGIN INCLUDE FILE dm_bj_global_error_info.incl.pl1 */
+  6     2 
+  6     3 /* Originally found in before journal primitives written by */
+  6     4 /* A. Bensoussan.  Gathered into an include file for ease of use. */
+  6     5 /* See the bjm_data_.alm source for details of use. */
+  6     6 
+  6     7 /* HISTORY:
+  6     8*Written by Mike Pandolf, 07/14/82.
+  6     9*Modified:
+  6    10*12/06/83 by L. A. Newcomb:  Renamed before_journal_manager_static_ to
+  6    11*            bjm_data_ and moved some cells from dm_data_ to bjm_data_.
+  6    12**/
+  6    13 
+  6    14 /* format: style4,indattr,ifthenstmt,ifthen,^indcomtxt,idind33 */
+  6    15 dcl  bjm_data_$bj_operation	        char (32) external static;
+  6    16 
+  6    17 dcl  bjm_data_$bj_exit_err	        label variable external;
+  6    18 
+  6    19 dcl  bjm_data_$bj_code	        fixed bin (35) external;
+  6    20 
+  6    21 dcl  bjm_data_$bj_default_error_label label external static;
+  6    22 
+  6    23 
+  6    24 /* END INCLUDE FILE dm_bj_global_error_info.incl.pl1 */
+     1059 
+     1060 
+     1061 
+     1062    end bjm_find_txns_after_crash;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    05/06/86  1305.4  bjm_find_txns_after_crash.pl1     >spec>install>1054>bjm_find_txns_after_crash.pl1
+1049         1    01/07/85  0857.7  dm_bj_records.incl.pl1            >ldd>include>dm_bj_records.incl.pl1
+1051         2    01/07/85  0858.0  dm_bj_txt.incl.pl1                >ldd>include>dm_bj_txt.incl.pl1
+1053         3    01/07/85  0900.1  dm_tm_tdt.incl.pl1                >ldd>include>dm_tm_tdt.incl.pl1
+1055         4    03/06/85  1031.1  dm_log_sv_codes.incl.pl1          >ldd>include>dm_log_sv_codes.incl.pl1
+1057         5    01/07/85  0900.1  dm_tm_states.incl.pl1             >ldd>include>dm_tm_states.incl.pl1
+1059         6    01/07/85  0857.3  dm_bj_global_error_info.incl.pl1  >ldd>include>dm_bj_global_error_info.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+ABORTED                   3     000000 constant        char(4)                  initial level 2 dcl 1-87 ref 320 357 467 608
+BEFORE_IMAGE             11     000000 constant        char(4)                  initial level 2 dcl 1-87 ref 782 852 962
+BEGIN_COMMIT                    000000 constant        char(4)                  initial level 2 dcl 1-87 ref 900 903
+BJ_RECORD_TYPE                  000000 constant        structure                level 1 dcl 1-87
+BJ_TXT_VERSION_1                       constant        fixed bin(17,0)          initial dcl 2-15 ref 230
+COMMITTED                 2     000000 constant        char(4)                  initial level 2 dcl 1-87 ref 320 357 467 608
+FM_POSTCOMMIT_HANDLER
+                          7     000000 constant        char(4)                  initial level 2 dcl 1-87 ref 782 852 962
+FM_ROLLBACK_HANDLER       6     000000 constant        char(4)                  initial level 2 dcl 1-87 ref 782 852 962
+LOG_SV                          000042 constant        fixed bin(17,0)          initial dcl 4-40 set ref 273* 281* 311* 324* 342*
+                                                                                  364* 406* 415* 422* 431* 449* 459* 473* 486* 505*
+                                                                                  522* 555* 592* 601* 612* 624* 635* 656* 1013*
+                                                                                  1024* 1034*
+ROLLED_BACK               4     000000 constant        char(4)                  initial level 2 dcl 1-87 ref 782 810 852 873 962 990
+TM_ABORT_FLUSHING_TXN_STATE            constant        fixed bin(17,0)          initial dcl 5-30 ref 906
+TM_COMMIT_WRITING_MARK_STATE           constant        fixed bin(17,0)          initial dcl 5-30 ref 901
+TM_TDT_VERSION_3                000012 constant        char(8)                  initial unaligned dcl 3-38 ref 225
+addr                                                   builtin function         dcl 180 ref 294
+bin                                                    builtin function         dcl 180 ref 431 431 457 459 459 473 473 486 486 505
+                                                                                  505 522 522 612 612 624 624 635 635 656 656
+bit_bucket                      000100 automatic       bit(1)                   dcl 131 set ref 722* 829*
+bj_cleanup_tables$handler       000010 constant        entry                    external dcl 186 ref 1032
+bj_oid                          000101 automatic       bit(36)                  dcl 131 set ref 235* 236* 301* 399* 586*
+bj_oid_util$get_uid             000012 constant        entry                    external dcl 186 ref 236
+bj_rec_hdr                             based           structure                level 1 dcl 1-21
+bj_rec_hdr_ptr                  000144 automatic       pointer                  dcl 1-19 set ref 294* 301* 306 320 320 357 357 399*
+                                                                                  447 457 459 459 467 467 473 473 486 486 505 505
+                                                                                  522 522 586* 589 598 608 608 620 683 702 728 729
+                                                                                  730 734 741 747 760 780 782 782 782 782 810 812
+                                                                                  849 850 852 852 852 852 864 873 894 896 900 910
+                                                                                  912 918 931 960 962 962 962 962 990 993 999
+bj_rec_id                       000102 automatic       bit(36)                  dcl 131 set ref 301* 303 311* 324* 364* 399* 402
+                                                                                  422* 449* 459* 473* 486* 505* 522* 538 555* 773
+                                                                                  909 918 946 993
+bj_storage_get_header           000014 constant        entry                    external dcl 186 ref 586
+bj_storage_get_header$last      000016 constant        entry                    external dcl 186 ref 301
+bj_storage_get_header$previous  000020 constant        entry                    external dcl 186 ref 399
+bj_txt                                 based           structure                level 1 dcl 2-20
+bj_txte                                based           structure                level 1 dcl 2-28
+bj_uid                          000103 automatic       bit(36)                  dcl 131 in procedure "bjm_find_txns_after_crash" set
+                                                                                  ref 236* 311* 324* 342* 364* 406* 415* 422* 431*
+                                                                                  449* 459* 473* 486* 505* 522* 555* 592* 601* 612*
+                                                                                  624* 635* 656* 908
+bj_uid                   41            based           bit(36)                  array level 3 in structure "bj_txt" dcl 2-20
+                                                                                  in procedure "bjm_find_txns_after_crash" set ref
+                                                                                  908*
+bjm_data_$bj_code               000072 external static fixed bin(35,0)          dcl 6-19 set ref 265* 341 553 654
+bjm_data_$bj_default_error_label
+                                000074 external static label variable           dcl 6-21 ref 1043
+bjm_data_$bj_exit_err           000070 external static label variable           dcl 6-17 set ref 296* 385* 573* 1043*
+bjm_data_$bj_operation          000066 external static char(32)                 unaligned dcl 6-15 set ref 245 264* 1042*
+check_mode                      000104 automatic       bit(1)                   dcl 131 set ref 237* 313 328 367 395 404 452 462 478
+                                                                                  491 510 526 736 743 763 768 775 788 799 834 859
+                                                                                  867 936 940 951 968 978
+clean_code                      000105 automatic       fixed bin(35,0)          dcl 131 set ref 1010* 1013 1013* 1017 1021* 1024
+                                                                                  1024* 1028 1032* 1034 1034* 1038
+cleanup                         000136 stack reference condition                dcl 183 ref 260
+code                            000106 automatic       fixed bin(35,0)          dcl 131 set ref 246* 259* 269* 272 273* 278* 280
+                                                                                  281* 310* 311* 323* 324* 341* 342* 357* 360* 362
+                                                                                  364* 398* 405* 406* 414* 415* 421* 422* 430* 431*
+                                                                                  448* 449* 458* 459* 472* 473* 485* 486* 502* 504
+                                                                                  505* 519* 520 522* 533* 534 553* 555* 591* 592*
+                                                                                  600* 601* 611* 612* 623* 624* 632* 634 635* 654*
+                                                                                  656* 666 1017 1017* 1028 1028* 1038 1038*
+dm_error_$bj_bad_first_txn_record_type
+                                000034 external static fixed bin(35,0)          dcl 202 ref 735 787 858 967
+dm_error_$bj_bad_tid            000036 external static fixed bin(35,0)          dcl 202 ref 458
+dm_error_$bj_first_txn_rec_not_found
+                                000032 external static fixed bin(35,0)          dcl 202 ref 430
+dm_error_$bj_neg_txns_in_unfinished_rec
+                                000042 external static fixed bin(35,0)          dcl 202 ref 310 448 591
+dm_error_$bj_rec_process_id_mismatch
+                                000046 external static fixed bin(35,0)          dcl 202 ref 762 935
+dm_error_$bj_rec_txn_id_mismatch
+                                000030 external static fixed bin(35,0)          dcl 202 ref 623
+dm_error_$bj_recursive_invoc    000050 external static fixed bin(35,0)          dcl 202 ref 246
+dm_error_$bj_too_few_records    000052 external static fixed bin(35,0)          dcl 202 ref 405
+dm_error_$bj_too_few_unfinished_txns
+                                000054 external static fixed bin(35,0)          dcl 202 ref 414
+dm_error_$bj_too_many_unfinished_txns
+                                000056 external static fixed bin(35,0)          dcl 202 ref 421 835
+dm_error_$bj_unexpected_eot_mark
+                                000040 external static fixed bin(35,0)          dcl 202 ref 472 485 611
+dm_error_$bj_wrong_numb_txn_records
+                                000060 external static fixed bin(35,0)          dcl 202 ref 742 798 866 977
+dm_error_$bj_wrong_prev_rec_id  000044 external static fixed bin(35,0)          dcl 202 ref 774 950
+dm_error_$bj_zero_txns_in_unfinished_rec
+                                000062 external static fixed bin(35,0)          dcl 202 ref 323 600
+dm_misc_util_$log               000022 constant        entry                    external dcl 186 ref 273 281 311 324 342 364 406 415
+                                                                                  422 431 449 459 473 486 505 522 555 592 601 612
+                                                                                  624 635 656 1013 1024 1034
+entry                    10            based           structure                array level 2 in structure "tm_tdt" dcl 3-41
+                                                                                  in procedure "bjm_find_txns_after_crash" set ref
+                                                                                  892*
+entry                    40            based           structure                array level 2 in structure "bj_txt" dcl 2-20
+                                                                                  in procedure "bjm_find_txns_after_crash" set ref
+                                                                                  892*
+entry_count               6            based           fixed bin(17,0)          level 2 dcl 3-41 set ref 289* 840* 922
+entry_state              42            based           structure                array level 3 dcl 2-20
+error_table_$unimplemented_version
+                                000064 external static fixed bin(35,0)          dcl 202 ref 226 231
+finished_txns_list                     based           structure                array level 1 dcl 160
+finished_txns_list_p            000110 automatic       pointer                  dcl 131 set ref 258* 269* 683 728 729 730 732 747
+                                                                                  749 760 768 773 794 794 807 807 810 812 1010*
+first_bj_rec_id          54            based           bit(36)                  array level 4 dcl 2-20 set ref 918* 993* 996*
+get_previous_loop               000112 automatic       bit(1)                   dcl 131 set ref 383* 572* 946 993
+get_temp_segment_               000024 constant        entry                    external dcl 186 ref 269 278
+last_bj_rec_id                  000113 automatic       bit(36)                  dcl 131 in procedure "bjm_find_txns_after_crash" set
+                                                                                  ref 384* 406* 415* 538*
+last_bj_rec_id           55            based           bit(36)                  array level 4 in structure "bj_txt" dcl 2-20
+                                                                                  in procedure "bjm_find_txns_after_crash" set ref
+                                                                                  909*
+last_completed_operation
+                         42            based           char(4)                  array level 4 dcl 2-20 set ref 903* 912*
+local_bj_rec_hdr                000114 automatic       structure                level 1 dcl 131 set ref 294
+max_n_entries             1            based           fixed bin(17,0)          level 2 dcl 2-20 set ref 840*
+n_effective_records_read               based           fixed bin(36,0)          array level 2 in structure "unfinished_txns_list"
+                                                                                  unsigned dcl 171 in procedure
+                                                                                  "bjm_find_txns_after_crash" set ref 848* 973 986*
+                                                                                  986
+n_effective_records_read
+                          4            based           fixed bin(36,0)          array level 2 in structure "finished_txns_list"
+                                                                                  unsigned dcl 160 in procedure
+                                                                                  "bjm_find_txns_after_crash" set ref 732* 794 807*
+                                                                                  807
+n_effective_records_written
+                          2            based           fixed bin(36,0)          array level 2 unsigned dcl 160 set ref 730* 794
+n_entries_used            2            based           fixed bin(17,0)          level 2 dcl 2-20 set ref 289* 840*
+n_rec_written            56            based           fixed bin(35,0)          array level 4 dcl 2-20 set ref 910* 973
+n_registered_finished_txns      000123 automatic       fixed bin(17,0)          dcl 131 set ref 289* 681 726 726*
+n_registered_unfinished_txns    000124 automatic       fixed bin(17,0)          dcl 131 set ref 289* 428 575 700 840 840*
+n_txn                     6            based           fixed bin(17,0)          level 2 dcl 1-21 ref 306 447 589 598
+n_unfinished_txns               000125 automatic       fixed bin(17,0)          dcl 131 set ref 306* 308 318 395 413 420 834 839*
+                                                                                  839 946
+null                                                   builtin function         dcl 180 ref 258
+ok_to_write              43            based           bit(1)                   array level 4 dcl 2-20 set ref 914*
+old_bj_txt_p                    000126 automatic       pointer                  dcl 131 set ref 229* 230 289 840 840 892 894 896 903
+                                                                                  908 909 910 912 914 918 973 993 996
+old_tm_tdt_p                    000130 automatic       pointer                  dcl 131 set ref 224* 225 289 431 431 612 612 620 624
+                                                                                  624 635 635 656 656 702 840 892 894 896 901 906
+                                                                                  922 931
+owner_info               44            based           structure                array level 3 dcl 2-20
+owner_name               13            based           char(32)                 array level 3 dcl 3-41 set ref 922*
+owners_process_id         1            based           bit(36)                  array level 2 dcl 160 set ref 729* 760
+p_bj_oid                               parameter       bit(36)                  dcl 122 ref 116 235
+p_check_mode                           parameter       bit(1)                   dcl 122 ref 116 237
+p_code                                 parameter       fixed bin(35,0)          dcl 122 set ref 116 226* 231* 238* 666*
+p_old_bj_txt_ptr                       parameter       pointer                  dcl 122 ref 116 229
+p_old_tm_tdt_ptr                       parameter       pointer                  dcl 122 ref 116 224
+prev_rec_id               3            based           bit(36)                  level 2 in structure "bj_rec_hdr" dcl 1-21
+                                                                                  in procedure "bjm_find_txns_after_crash" ref 734
+                                                                                  747 780 812 849 850 918 960 993 999
+prev_rec_id               2            based           bit(36)                  array level 2 in structure "unfinished_txns_list"
+                                                                                  dcl 171 in procedure "bjm_find_txns_after_crash"
+                                                                                  set ref 429 578 586* 592* 601* 612* 624* 635* 656*
+                                                                                  849* 946 996 999*
+prev_rec_id               6            based           bit(36)                  array level 2 in structure "finished_txns_list"
+                                                                                  dcl 160 in procedure "bjm_find_txns_after_crash"
+                                                                                  set ref 747* 773 812*
+process_id                2            based           bit(36)                  level 2 in structure "bj_rec_hdr" dcl 1-21
+                                                                                  in procedure "bjm_find_txns_after_crash" ref 729
+                                                                                  760 896 931
+process_id               44            based           bit(36)                  array level 4 in structure "bj_txt" dcl 2-20
+                                                                                  in procedure "bjm_find_txns_after_crash" set ref
+                                                                                  896*
+process_id               12            based           bit(36)                  array level 3 in structure "tm_tdt" dcl 3-41
+                                                                                  in procedure "bjm_find_txns_after_crash" set ref
+                                                                                  896* 931
+records_info             53            based           structure                array level 3 dcl 2-20
+release_temp_segment_           000026 constant        entry                    external dcl 186 ref 1010 1021
+rollback_mark_found       7            based           bit(1)                   array level 2 in structure "finished_txns_list"
+                                                                                  dcl 160 in procedure "bjm_find_txns_after_crash"
+                                                                                  set ref 749* 768 810*
+rollback_mark_found       3            based           bit(1)                   array level 2 in structure "unfinished_txns_list"
+                                                                                  dcl 171 in procedure "bjm_find_txns_after_crash"
+                                                                                  set ref 578 873* 876* 940 990*
+state                    30(18)        based           fixed bin(17,0)          array level 4 packed unaligned dcl 3-41 set ref 901*
+                                                                                  906*
+temp_code                              parameter       fixed bin(35,0)          dcl 720 in procedure "register_finished_txn" set ref
+                                                                                  711 735* 742* 762* 774* 787* 798*
+temp_code                              parameter       fixed bin(35,0)          dcl 827 in procedure "register_unfinished_txn" set
+                                                                                  ref 819 835* 858* 866* 935* 950* 967* 977*
+tid                       1            based           bit(36)                  level 2 in structure "bj_rec_hdr" dcl 1-21
+                                                                                  in procedure "bjm_find_txns_after_crash" ref 457
+                                                                                  459 459 473 473 486 486 505 505 522 522 620 683
+                                                                                  702 728 894
+tid                      40            based           bit(36)                  array level 3 in structure "bj_txt" dcl 2-20
+                                                                                  in procedure "bjm_find_txns_after_crash" set ref
+                                                                                  894*
+tm_tdt                                 based           structure                level 1 dcl 3-41
+tm_tdt_entry                           based           structure                level 1 dcl 3-59
+transaction              24            based           structure                array level 3 unaligned dcl 3-41
+tx_rec_no                 5            based           fixed bin(35,0)          level 2 dcl 1-21 ref 730 741 864 910
+txn_id                                 based           bit(36)                  array level 2 in structure "finished_txns_list"
+                                                                                  dcl 160 in procedure "bjm_find_txns_after_crash"
+                                                                                  set ref 683 728*
+txn_id                   24            based           bit(36)                  array level 4 in structure "tm_tdt" dcl 3-41
+                                                                                  in procedure "bjm_find_txns_after_crash" set ref
+                                                                                  431 431 612 612 620 624 624 635 635 656 656 702
+                                                                                  894*
+txn_idx                         000132 automatic       fixed bin(17,0)          dcl 131 set ref 355* 428* 429 431 431* 518* 575* 578
+                                                                                  578 586 592 601 612 612 612 620 624 624 624 635
+                                                                                  635 635* 656 656 656 681* 683* 687* 700* 702* 706*
+                                                                                  722 725 726* 728 729 730 732 747 749 760 768 773
+                                                                                  794 794 807 807 810 812 829 832 840* 848 849 873
+                                                                                  876 892 892 894 894 896 896 901 903 906 908 909
+                                                                                  910 912 914 918 931 940 946 973 973 986 986 990
+                                                                                  993 996 996 999
+type                                   based           char(4)                  level 2 dcl 1-21 ref 320 320 357 357 467 467 608 608
+                                                                                  782 782 782 782 810 852 852 852 852 873 900 912
+                                                                                  962 962 962 962 990
+unfinished_txns_list                   based           structure                array level 1 dcl 171
+unfinished_txns_list_p          000134 automatic       pointer                  dcl 131 set ref 258* 278* 429 578 578 586 592 601
+                                                                                  612 624 635 656 848 849 873 876 940 946 973 986
+                                                                                  986 990 996 999 1021*
+unspec                                                 builtin function         dcl 180 set ref 892* 892*
+version                                based           char(8)                  level 2 in structure "tm_tdt" dcl 3-41 in procedure
+                                                                                  "bjm_find_txns_after_crash" ref 225
+version                                based           fixed bin(17,0)          level 2 in structure "bj_txt" dcl 2-20 in procedure
+                                                                                  "bjm_find_txns_after_crash" ref 230
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+CRASH_SV                               internal static fixed bin(17,0)          initial dcl 4-34
+ERROR_SV                               internal static fixed bin(17,0)          initial dcl 4-36
+FATAL_SV                               internal static fixed bin(17,0)          initial dcl 4-34
+HIGHEST_ABORT_STATE                    internal static fixed bin(17,0)          initial dcl 5-18
+HIGHEST_COMMIT_STATE                   internal static fixed bin(17,0)          initial dcl 5-18
+HIGHEST_ROLLBACK_STATE                 internal static fixed bin(17,0)          initial dcl 5-18
+HIGHEST_STATE                          internal static fixed bin(17,0)          initial dcl 5-18
+INFORM_SV                              internal static fixed bin(17,0)          initial dcl 4-38
+LOWEST_ABORT_STATE                     internal static fixed bin(17,0)          initial dcl 5-18
+LOWEST_COMMIT_STATE                    internal static fixed bin(17,0)          initial dcl 5-18
+LOWEST_ROLLBACK_STATE                  internal static fixed bin(17,0)          initial dcl 5-18
+OP_NAME_ABORT                          internal static char(32)                 initial unaligned dcl 5-75
+OP_NAME_COMMIT                         internal static char(32)                 initial unaligned dcl 5-75
+OP_NAME_ROLLBACK                       internal static char(32)                 initial unaligned dcl 5-75
+PRINT_SV                               internal static fixed bin(17,0)          initial dcl 4-32
+QUERY_SV                               internal static fixed bin(17,0)          initial dcl 4-32
+TM_ABORT_FLUSHING_CI_ERROR             internal static fixed bin(17,0)          initial dcl 5-30
+TM_ABORT_FLUSHING_CI_STATE             internal static fixed bin(17,0)          initial dcl 5-30
+TM_ABORT_FLUSHING_TXN_ERROR            internal static fixed bin(17,0)          initial dcl 5-30
+TM_ABORT_METERING_ERROR                internal static fixed bin(17,0)          initial dcl 5-30
+TM_ABORT_METERING_STATE                internal static fixed bin(17,0)          initial dcl 5-30
+TM_ABORT_ROLLING_BACK_ERROR            internal static fixed bin(17,0)          initial dcl 5-30
+TM_ABORT_ROLLING_BACK_STATE            internal static fixed bin(17,0)          initial dcl 5-30
+TM_ABORT_UNLOCKING_ERROR               internal static fixed bin(17,0)          initial dcl 5-30
+TM_ABORT_UNLOCKING_STATE               internal static fixed bin(17,0)          initial dcl 5-30
+TM_ABORT_WRITING_MARK_ERROR            internal static fixed bin(17,0)          initial dcl 5-30
+TM_ABORT_WRITING_MARK_STATE            internal static fixed bin(17,0)          initial dcl 5-30
+TM_BEGIN_STARTING_STATE                internal static fixed bin(17,0)          initial dcl 5-30
+TM_COMMIT_FLUSHING_CI_ERROR            internal static fixed bin(17,0)          initial dcl 5-30
+TM_COMMIT_FLUSHING_CI_STATE            internal static fixed bin(17,0)          initial dcl 5-30
+TM_COMMIT_FLUSHING_TXN_ERROR           internal static fixed bin(17,0)          initial dcl 5-30
+TM_COMMIT_FLUSHING_TXN_STATE           internal static fixed bin(17,0)          initial dcl 5-30
+TM_COMMIT_METERING_ERROR               internal static fixed bin(17,0)          initial dcl 5-30
+TM_COMMIT_METERING_STATE               internal static fixed bin(17,0)          initial dcl 5-30
+TM_COMMIT_POST_COMMIT_ERROR            internal static fixed bin(17,0)          initial dcl 5-30
+TM_COMMIT_POST_COMMIT_STATE            internal static fixed bin(17,0)          initial dcl 5-30
+TM_COMMIT_UNLOCKING_ERROR              internal static fixed bin(17,0)          initial dcl 5-30
+TM_COMMIT_UNLOCKING_STATE              internal static fixed bin(17,0)          initial dcl 5-30
+TM_COMMIT_WRITING_MARK_ERROR           internal static fixed bin(17,0)          initial dcl 5-30
+TM_ERROR_INCREMENT                     internal static fixed bin(17,0)          initial dcl 5-26
+TM_IN_PROGRESS_STATE                   internal static fixed bin(17,0)          initial dcl 5-30
+TM_ROLLBACK_FLUSHING_CI_ERROR          internal static fixed bin(17,0)          initial dcl 5-30
+TM_ROLLBACK_FLUSHING_CI_STATE          internal static fixed bin(17,0)          initial dcl 5-30
+TM_ROLLBACK_FLUSHING_TXN_ERROR         internal static fixed bin(17,0)          initial dcl 5-30
+TM_ROLLBACK_FLUSHING_TXN_STATE         internal static fixed bin(17,0)          initial dcl 5-30
+TM_ROLLBACK_METERING_ERROR             internal static fixed bin(17,0)          initial dcl 5-30
+TM_ROLLBACK_METERING_STATE             internal static fixed bin(17,0)          initial dcl 5-30
+TM_ROLLBACK_ROLLING_BACK_ERROR         internal static fixed bin(17,0)          initial dcl 5-30
+TM_ROLLBACK_ROLLING_BACK_STATE         internal static fixed bin(17,0)          initial dcl 5-30
+TM_ROLLBACK_UNLOCKING_ERROR            internal static fixed bin(17,0)          initial dcl 5-30
+TM_ROLLBACK_UNLOCKING_STATE            internal static fixed bin(17,0)          initial dcl 5-30
+TM_ROLLBACK_WRITING_MARK_ERROR         internal static fixed bin(17,0)          initial dcl 5-30
+TM_ROLLBACK_WRITING_MARK_STATE         internal static fixed bin(17,0)          initial dcl 5-30
+bj_aborted_rec                         based           structure                level 1 dcl 1-39
+bj_before_image                        based           structure                level 1 dcl 1-57
+bj_before_image_len                    automatic       fixed bin(24,0)          dcl 1-82
+bj_before_image_n_parts                automatic       fixed bin(17,0)          dcl 1-81
+bj_begin_commit_rec                    based           structure                level 1 dcl 1-37
+bj_committed_rec                       based           structure                level 1 dcl 1-35
+bj_fm_handler_info_len                 automatic       fixed bin(24,0)          dcl 1-83
+bj_fm_handler_rec                      based           structure                level 1 dcl 1-69
+bj_rollback_handler_rec                based           structure                level 1 dcl 1-46
+bj_rollback_info_len                   automatic       fixed bin(24,0)          dcl 1-80
+bj_rollback_name_len                   automatic       fixed bin(24,0)          dcl 1-79
+bj_rolled_back_rec                     based           structure                level 1 dcl 1-41
+bj_txt_ptr                             automatic       pointer                  dcl 2-17
+bj_txte_ptr                            automatic       pointer                  dcl 2-18
+tdt_max_count                          automatic       fixed bin(17,0)          dcl 3-36
+tm_tdt_entry_ptr                       automatic       pointer                  dcl 3-57
+tm_tdt_ptr                             automatic       pointer                  dcl 3-35
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+BJM_STANDARD_ENTRY_PROTOCOL     000763 constant        label                    dcl 242
+COPY_INPUT_AND_INIT_OUTPUT_PARAMETERS
+                                000720 constant        label                    dcl 222
+FIND_AND_REGISTER_TRANSACTONS   001477 constant        label                    dcl 381
+FIND_FIRST_RECORD               002565 constant        label                    dcl 578
+GET_FIRST_RECORD_FOR_UNFINISHED_TXNS
+                                002547 constant        label                    dcl 570 ref 545
+GET_LAST_JOURNAL_RECORD         001203 constant        label                    dcl 296
+GET_PREVIOUS_LOOP               001507 constant        label                    dcl 395
+GET_TEMP_STORAGE                001030 constant        label                    dcl 269
+KNOWN_UNFINISHED_TXN            004013 constant        label                    dcl 931
+SET_CLEANUP_HANDLER             000774 constant        label                    dcl 250
+SET_COUNTERS                    001173 constant        label                    dcl 287
+WALK_UNFINISHED_TXNS_LIST       002555 constant        label                    dcl 575
+bjm_find_txns_after_crash       000713 constant        entry                    external dcl 116
+cannot_get_a_record             003225 constant        label                    dcl 651 ref 573
+cannot_get_last_journal_record  001354 constant        label                    dcl 335 set ref 296
+cannot_get_previous_record      002502 constant        label                    dcl 547 set ref 385
+clean_and_return                003313 constant        label                    dcl 664 ref 275 283 303 315 330 344 367 410 440 454
+                                                                                  464 480 493 512 528 558 596 605 617 629 640 649
+                                                                                  660
+clean_up                        004160 constant        entry                    internal dcl 1007 ref 260 664
+end_get_previous_loop           002476 constant        label                    dcl 538 ref 452 462 478 491 510 526
+finish_initializing_data        003703 constant        label                    dcl 873 in procedure "register_unfinished_txn" ref
+                                                                                  859 867
+finish_initializing_data        003465 constant        label                    dcl 747 in procedure "register_finished_txn" ref 736
+finsihed_txn_reg_err            002323 constant        label                    dcl 505 ref 534
+is_finished_txn                 003323 constant        entry                    internal dcl 671 ref 483 516 722
+is_unfinished_txn               003355 constant        entry                    internal dcl 692 ref 470 829
+no_cleanup_return               003317 constant        label                    dcl 666 ref 247
+register_finished_txn           003407 constant        entry                    internal dcl 711 ref 357 502 533
+register_last_record            001416 constant        label                    dcl 347 ref 313 318 328
+register_unfinished_txn         003601 constant        entry                    internal dcl 819 ref 360 519 632
+update_data                     003565 constant        label                    dcl 807 in procedure "register_finished_txn" ref 763
+                                                                                  768 775 788 799
+update_data                     004124 constant        label                    dcl 986 in procedure "register_unfinished_txn" ref
+                                                                                  951 968 978
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      5074        5172    4447        5104
+Length      5574    4447        76         365     425           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+bjm_find_txns_after_crash           241 external procedure  is an external procedure.  
+on unit on line 260                  64 on unit               
+is_finished_txn                         internal procedure  shares stack frame of external procedure bjm_find_txns_after_crash.  
+is_unfinished_txn                       internal procedure  shares stack frame of external procedure bjm_find_txns_after_crash.  
+register_finished_txn                   internal procedure  shares stack frame of external procedure bjm_find_txns_after_crash.  
+register_unfinished_txn                 internal procedure  shares stack frame of external procedure bjm_find_txns_after_crash.  
+clean_up                            122 internal procedure  is called by several nonquick procedures.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+bjm_find_txns_after_crash
+                         000100 bit_bucket                  bjm_find_txns_after_crash
+                         000101 bj_oid                      bjm_find_txns_after_crash
+                         000102 bj_rec_id                   bjm_find_txns_after_crash
+                         000103 bj_uid                      bjm_find_txns_after_crash
+                         000104 check_mode                  bjm_find_txns_after_crash
+                         000105 clean_code                  bjm_find_txns_after_crash
+                         000106 code                        bjm_find_txns_after_crash
+                         000110 finished_txns_list_p        bjm_find_txns_after_crash
+                         000112 get_previous_loop           bjm_find_txns_after_crash
+                         000113 last_bj_rec_id              bjm_find_txns_after_crash
+                         000114 local_bj_rec_hdr            bjm_find_txns_after_crash
+                         000123 n_registered_finished_txns  bjm_find_txns_after_crash
+                         000124 n_registered_unfinished_txns
+                                                            bjm_find_txns_after_crash
+                         000125 n_unfinished_txns           bjm_find_txns_after_crash
+                         000126 old_bj_txt_p                bjm_find_txns_after_crash
+                         000130 old_tm_tdt_p                bjm_find_txns_after_crash
+                         000132 txn_idx                     bjm_find_txns_after_crash
+                         000134 unfinished_txns_list_p      bjm_find_txns_after_crash
+                         000144 bj_rec_hdr_ptr              bjm_find_txns_after_crash
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+call_ext_out_desc   call_ext_out        call_int_this       call_int_other      return              enable
+ext_entry           int_entry
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+bj_cleanup_tables$handler     bj_oid_util$get_uid           bj_storage_get_header         bj_storage_get_header$last
+bj_storage_get_header$previous                              dm_misc_util_$log             get_temp_segment_
+release_temp_segment_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+bjm_data_$bj_code             bjm_data_$bj_default_error_label                            bjm_data_$bj_exit_err
+bjm_data_$bj_operation        dm_error_$bj_bad_first_txn_record_type                      dm_error_$bj_bad_tid
+dm_error_$bj_first_txn_rec_not_found                        dm_error_$bj_neg_txns_in_unfinished_rec
+dm_error_$bj_rec_process_id_mismatch                        dm_error_$bj_rec_txn_id_mismatch
+dm_error_$bj_recursive_invoc  dm_error_$bj_too_few_records  dm_error_$bj_too_few_unfinished_txns
+dm_error_$bj_too_many_unfinished_txns                       dm_error_$bj_unexpected_eot_mark
+dm_error_$bj_wrong_numb_txn_records                         dm_error_$bj_wrong_prev_rec_id
+dm_error_$bj_zero_txns_in_unfinished_rec                    error_table_$unimplemented_version
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+    116 000706       224 000720       225 000724       226 000730       227 000732       229 000733       230 000736
+    231 000741       232 000743       235 000744       236 000746       237 000756       238 000762       245 000763
+    246 000771       247 000773       258 000774       259 000777       260 001000       264 001022       265 001027
+    269 001030       272 001053       273 001055       275 001110       278 001111       280 001135       281 001137
+    283 001172       289 001173       294 001201       296 001203       301 001210       303 001222       306 001224
+    308 001227       310 001230       311 001233       313 001274       315 001276       318 001277       320 001300
+    323 001305       324 001310       328 001351       330 001353       341 001354       342 001357       344 001415
+    355 001416       357 001417       360 001427       362 001431       364 001433       367 001475       383 001477
+    384 001501       385 001502       395 001507       398 001514       399 001515       402 001530       404 001532
+    405 001534       406 001537       410 001600       413 001601       414 001603       415 001606       419 001647
+    420 001650       421 001651       422 001654       425 001715       428 001716       429 001725       430 001731
+    431 001734       437 002004       440 002006       447 002007       448 002012       449 002015       452 002056
+    454 002060       457 002061       458 002064       459 002067       462 002137       464 002141       467 002142
+    470 002147       472 002154       473 002157       478 002230       480 002232       483 002233       485 002240
+    486 002243       491 002314       493 002316       502 002317       504 002321       505 002323       510 002375
+    512 002377       514 002400       516 002401       518 002406       519 002410       520 002412       522 002414
+    526 002466       528 002470       530 002471       533 002472       534 002474       538 002476       541 002500
+    545 002501       553 002502       555 002505       558 002546       572 002547       573 002550       575 002555
+    578 002565       586 002576       589 002611       591 002614       592 002617       596 002666       598 002667
+    600 002670       601 002673       605 002742       608 002743       611 002750       612 002753       617 003035
+    620 003036       623 003045       624 003050       629 003130       632 003131       634 003133       635 003135
+    640 003220       643 003221       645 003222       649 003224       654 003225       656 003230       660 003312
+    664 003313       666 003317       669 003322       671 003323       681 003325       683 003335       685 003347
+    687 003351       688 003352       692 003355       700 003357       702 003367       704 003401       706 003403
+    707 003404       711 003407       722 003411       725 003416       726 003420       728 003424       729 003431
+    730 003433       732 003437       734 003441       735 003444       736 003450       738 003452       741 003453
+    742 003456       743 003462       747 003465       749 003467       752 003470       760 003471       762 003500
+    763 003504       765 003506       768 003507       771 003513       773 003514       774 003517       775 003523
+    777 003525       780 003526       782 003530       787 003541       788 003545       790 003547       794 003550
+    798 003556       799 003562       801 003564       807 003565       810 003571       812 003576       815 003600
+    819 003601       829 003603       832 003610       834 003612       835 003616       836 003622       839 003623
+    840 003625       848 003636       849 003643       850 003646       852 003651       858 003662       859 003666
+    861 003670       864 003671       866 003674       867 003700       869 003702       873 003703       876 003711
+    892 003712       894 003730       896 003734       900 003737       901 003744       903 003747       905 003751
+    906 003752       908 003755       909 003757       910 003761       912 003764       914 003766       918 003770
+    922 003774       924 004012       931 004013       935 004021       936 004025       940 004030       946 004041
+    950 004051       951 004055       953 004057       960 004060       962 004062       967 004073       968 004077
+    970 004101       973 004102       977 004115       978 004121       980 004123       986 004124       990 004130
+    993 004135       996 004147       999 004154      1003 004156      1007 004157      1010 004165      1013 004211
+   1017 004247      1021 004254      1024 004300      1028 004336      1032 004343      1034 004352      1038 004410
+   1042 004415      1043 004422      1045 004430
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

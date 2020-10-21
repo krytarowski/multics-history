@@ -1,0 +1,985 @@
+	COMPILATION LISTING OF SEGMENT move_log_segments
+	Compiled by: Multics PL/I Compiler, Release 28e, of February 14, 1985
+	Compiled at: Honeywell Multics Op. - System M
+	Compiled on: 04/09/85  1300.4 mst Tue
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1984 *
+        4*   *                                                         *
+        5*   *********************************************************** */
+        6 move_log_segments:
+        7      procedure ();
+        8 
+        9 /* *      MOVE_LOG_SEGMENTS
+       10*   *
+       11*   *      An interim solution to the problem of migrating log segments from one
+       12*   *      directory to the next.  Someday, this should be done to individual
+       13*   *      messages, not just whole segments, but since log_migrate_ doesn't work
+       14*   *      yet, this will have to do.
+       15*   *
+       16*   *      84-10-31, W. Olin Sibert: Initial coding, mostly out of log_list_history_
+       17*   *	85-03-07, Steve Herbst: Added -force/-no_force, namedup handling.
+       18*   *	85-03-21, Steve Herbst: Fixed bug that saw relative time cutoff
+       19*   *		such as -2days as a control argument.
+       20*   */
+       21 
+       22 declare   code fixed bin (35);
+       23 declare   system_area_ptr pointer;
+       24 declare   system_area area based (system_area_ptr);
+       25 declare   sort_pointers_ptr pointer;
+       26 declare   next_log_ptr pointer;
+       27 declare   this_log_ptr pointer;
+       28 declare   segment_count fixed bin;
+       29 declare   move_count fixed bin;
+       30 declare	force_sw bit (1);
+       31 
+       32 declare 1 sort_pointers aligned based (sort_pointers_ptr),
+       33           2 n_entries fixed bin,
+       34           2 ptr (star_entry_count refer (sort_pointers.n_entries)) pointer unaligned;
+       35 
+       36 declare   log_dir char (168);
+       37 declare   log_name char (32);
+       38 declare   migration_dir char (168);
+       39 declare   cutoff fixed bin (71);
+       40 
+       41 declare   absolute_pathname_ entry (char (*), char (*), fixed bin (35));
+       42 declare   com_err_ entry options (variable);
+       43 declare	error_table_$badopt fixed bin (35) external static;
+       44 declare   error_table_$no_w_permission fixed bin (35) external static;
+       45 
+       46 declare   convert_date_to_binary_ entry (char (*), fixed bin (71), fixed bin (35));
+       47 declare   copy_ entry (pointer);
+       48 declare   cu_$arg_count entry (fixed bin, fixed bin (35));
+       49 declare   cu_$arg_ptr entry (fixed bin, pointer, fixed bin (21), fixed bin (35));
+       50 declare   expand_pathname_ entry (char (*), char (*), char (*), fixed bin (35));
+       51 declare   get_system_free_area_ entry () returns (pointer);
+       52 declare   hcs_$fs_get_mode entry (pointer, fixed bin (5), fixed bin (35));
+       53 declare   hcs_$star_ entry (char (*), char (*), fixed bin (2), pointer, fixed bin, pointer, pointer, fixed bin (35));
+       54 declare   hcs_$terminate_noname entry (pointer, fixed bin (35));
+       55 declare   ioa_ entry options (variable);
+       56 declare   log_initiate_ entry (char (*), char (*), fixed bin, pointer, fixed bin (35));
+       57 declare   log_name_$starname entry (char (*)) returns (char (32));
+       58 declare   log_name_$time entry (char (*)) returns (fixed bin (71));
+       59 declare	pathname_ entry (char(*), char(*)) returns(char(168));
+       60 declare   sort_items_$general entry (pointer, entry);
+       61 
+       62 declare	index builtin;
+       63 
+       64 declare   WHOAMI char (32) internal static options (constant) init ("move_log_segments");
+       65 
+       66 declare   cleanup condition;
+       67 
+       68 /*  */
+       69 
+       70           star_entry_ptr = null ();                         /* Initialize for cleanup handler */
+       71           star_names_ptr = null ();                         /* Initialize for cleanup handler */
+       72           sort_pointers_ptr = null ();                      /* Initialize for cleanup handler */
+       73           next_log_ptr = null ();
+       74           this_log_ptr = null ();
+       75           system_area_ptr = get_system_free_area_ ();
+       76 
+       77           on condition (cleanup) begin;
+       78                call clean_up ();
+       79                end;
+       80 
+       81           call process_arguments ();
+       82 
+       83           call list_directory ();
+       84 
+       85           call move_segments ();
+       86 
+       87           call ioa_ ("^a: ^[No log segments moved.^;Moved ^d log segment^[s^] to ^a.^]",
+       88                WHOAMI, (move_count = 0), move_count, (move_count ^= 1), migration_dir);
+       89 
+       90 MAIN_RETURN:
+       91           call clean_up ();
+       92           return;
+       93 
+       94 /*  */
+       95 
+       96 list_directory:
+       97      procedure ();
+       98 
+       99 declare   entry_idx fixed bin;
+      100 declare   log_starname char (32);
+      101 
+      102 
+      103           log_starname = log_name_$starname (log_name);
+      104 
+      105           call hcs_$star_ (log_dir, log_starname, star_BRANCHES_ONLY, system_area_ptr,
+      106                star_entry_count, star_entry_ptr, star_names_ptr, code);
+      107 
+      108           if (code ^= 0) then do;
+      109                call com_err_ (code, WHOAMI, "Listing ^a>^a", log_dir, log_starname);
+      110                goto MAIN_RETURN;
+      111                end;
+      112 
+      113           allocate sort_pointers in (system_area) set (sort_pointers_ptr);
+      114           sort_pointers.n_entries = star_entry_count;
+      115 
+      116           segment_count = 0;
+      117           move_count = 0;
+      118           do entry_idx = 1 to star_entry_count;
+      119                sort_pointers.ptr (entry_idx) = addr (star_entries (entry_idx));
+      120                if (star_entries.type (entry_idx) = star_SEGMENT) then
+      121                     segment_count = segment_count + 1;
+      122                end;
+      123 
+      124           if (segment_count < 2) then do;
+      125                call com_err_ (0, WHOAMI,
+      126                     "At least two log segments must be present in ^a in order to migrate one.",
+      127 		     pathname_ (log_dir, log_name));
+      128                goto MAIN_RETURN;
+      129                end;
+      130 
+      131           call sort_items_$general (addr (sort_pointers), compare_entries);
+      132 
+      133           end list_directory;
+      134 
+      135 /*  */
+      136 
+      137 compare_entries:
+      138      procedure (P_entry_1, P_entry_2) returns (fixed bin (35));
+      139 
+      140 declare   P_entry_1 unaligned pointer parameter;
+      141 declare   P_entry_2 unaligned pointer parameter;
+      142 
+      143 declare   entry_1_ptr pointer;
+      144 declare   entry_2_ptr pointer;
+      145 declare 1 entry_1 aligned like star_entries based (entry_1_ptr);
+      146 declare 1 entry_2 aligned like star_entries based (entry_2_ptr);
+      147 
+      148 
+      149           entry_1_ptr = P_entry_1;
+      150           entry_2_ptr = P_entry_2;
+      151 
+      152 /* These first two cases make non-segments always sort at the end, which means
+      153*   they will be ignored when collection time comes. */
+      154 
+      155           if (entry_1.type = star_SEGMENT) & (entry_2.type ^= star_SEGMENT) then
+      156                return (-1);
+      157           else if (entry_1.type ^= star_SEGMENT) & (entry_2.type = star_SEGMENT) then
+      158                return (1);
+      159           else if (star_names (entry_1.nindex) < star_names (entry_2.nindex)) then
+      160                return (1);
+      161           else return (-1);
+      162 
+      163           end compare_entries;
+      164 
+      165 /*  */
+      166 
+      167 move_segments:
+      168      procedure ();
+      169 
+      170 declare   segment_idx fixed bin;
+      171 declare   this_ename char (32);
+      172 declare   next_ename char (32);
+      173 declare   suffix_time fixed bin (71);
+      174 
+      175 declare 1 copy_opt aligned like copy_options automatic;
+      176 declare 1 one_star_entry aligned based like star_entries;
+      177 
+      178 
+      179           unspec (copy_opt) = ""b;
+      180           copy_opt.version = COPY_OPTIONS_VERSION_1;
+      181           copy_opt.caller_name = WHOAMI;
+      182           copy_opt.source_dir = log_dir;
+      183           copy_opt.target_dir = migration_dir;
+      184           copy_opt.force = force_sw;
+      185           copy_opt.delete = "1"b;
+      186 
+      187           copy_opt.copy_items.names = "1"b;
+      188           copy_opt.copy_items.acl = "1"b;
+      189           copy_opt.copy_items.ring_brackets = "1"b;
+      190           copy_opt.copy_items.max_length = "1"b;
+      191           copy_opt.copy_items.safety_switch = "1"b;
+      192 
+      193           do segment_idx = segment_count to 2 by -1;        /* Do NOT move the first one */
+      194                this_ename = star_names (sort_pointers.ptr (segment_idx) -> one_star_entry.nindex);
+      195                next_ename = star_names (sort_pointers.ptr (segment_idx - 1) -> one_star_entry.nindex);
+      196                suffix_time = log_name_$time (this_ename);
+      197 
+      198                if (suffix_time > cutoff) then               /* All finished */
+      199                     return;
+      200 
+      201                call initiate_log (next_ename, next_log_ptr); /* Get the next log so we can set its history */
+      202 
+      203                if (segment_idx = segment_count) then do;    /* If first moved, set its history dir, too */
+      204                     call initiate_log (this_ename, this_log_ptr);
+      205                     this_log_ptr -> log_segment.previous_log_dir = migration_dir;
+      206                     call hcs_$terminate_noname (this_log_ptr, (0));
+      207                     end;
+      208 
+      209                copy_opt.source_name = this_ename;
+      210                copy_opt.target_name = this_ename;
+      211 
+      212                call ioa_ ("^a: Moving ^a>^a", WHOAMI, log_dir, this_ename);
+      213 
+      214                call copy_ (addr (copy_opt));
+      215 
+      216                if copy_opt.target_err_switch then
+      217                     return;
+      218                else move_count = move_count + 1;
+      219 
+      220                next_log_ptr -> log_segment.previous_log_dir = migration_dir;
+      221                call hcs_$terminate_noname (next_log_ptr, (0));
+      222                end;
+      223 
+      224           return;
+      225           end move_segments;
+      226 
+      227 /*  */
+      228 
+      229 initiate_log:
+      230      procedure (P_name, P_ptr);
+      231 
+      232 declare   P_name char (*) parameter;
+      233 declare   P_ptr pointer parameter;
+      234 
+      235 declare   log_mode fixed bin (5);
+      236 
+      237 
+      238           call log_initiate_ (log_dir, P_name, 10, P_ptr, code);
+      239 
+      240           if (code ^= 0) then do;
+      241                call com_err_ (code, WHOAMI, "Cannot initiate ^a>^a", log_dir, P_name);
+      242                goto MAIN_RETURN;
+      243                end;
+      244 
+      245           call hcs_$fs_get_mode (P_ptr, log_mode, code);
+      246           if (code = 0) then
+      247                if (log_mode ^= RW_ACCESS_BIN) & (log_mode ^= REW_ACCESS_BIN) then
+      248                     code = error_table_$no_w_permission;
+      249 
+      250           if (code ^= 0) then do;
+      251                call com_err_ (code, WHOAMI, "^a>^a", log_dir, P_name);
+      252                goto MAIN_RETURN;
+      253                end;
+      254 
+      255           return;
+      256           end initiate_log;
+      257 
+      258 /*  */
+      259 
+      260 process_arguments:
+      261      procedure ();
+      262 
+      263 declare   arg_ptr pointer;
+      264 declare   arg_lth fixed bin (21);
+      265 declare   arg char (arg_lth) based (arg_ptr);
+      266 declare   arg_count fixed bin;
+      267 declare   arg_idx fixed bin;
+      268 declare  (got_log_name, got_from_dir, got_to_dir, got_time_cutoff) bit (1);
+      269 
+      270           call cu_$arg_count (arg_count, code);
+      271           if (arg_count < 4) then do;
+      272 USAGE:         call com_err_ (0, WHOAMI, "Usage:^-^a LogName FromDir ToDir TimeCutoff {-control_args}", WHOAMI);
+      273                goto MAIN_RETURN;
+      274                end;
+      275 
+      276 	force_sw = "0"b;
+      277 	got_log_name, got_from_dir, got_to_dir, got_time_cutoff = "0"b;
+      278 
+      279 	do arg_idx = 1 to arg_count;
+      280 
+      281 	     call cu_$arg_ptr (arg_idx, arg_ptr, arg_lth, (0));
+      282 
+      283 	     if index (arg, "-") = 1 then do;
+      284 		if got_to_dir & ^got_time_cutoff then do;
+      285 		     call convert_date_to_binary_ (arg, cutoff, code);
+      286 		     if code = 0 then do;		/* relative time, not a control arg */
+      287 			got_time_cutoff = "1"b;
+      288 			go to END_ARG_LOOP;
+      289 			end;
+      290 		     end;
+      291 		if arg = "-force" | arg = "-fc" then force_sw = "1"b;
+      292 		else if arg = "-no_force" | arg = "-nfc" then force_sw = "0"b;
+      293 		else do;
+      294 		     call com_err_ (error_table_$badopt, WHOAMI, "^a", arg);
+      295 		     go to MAIN_RETURN;
+      296 		     end;
+      297 		end;
+      298 
+      299 	     else if ^got_log_name then do;
+      300 		got_log_name = "1"b;
+      301 		log_name = arg;
+      302 		end;
+      303 
+      304 	     else if ^got_from_dir then do;
+      305 		got_from_dir = "1"b;
+      306 		call absolute_pathname_ (arg, log_dir, code);
+      307 		if code ^= 0 then do;
+      308 		     call com_err_ (code, WHOAMI, "Directory to move from: ^a", arg);
+      309 		     go to MAIN_RETURN;
+      310 		     end;
+      311 		end;
+      312 
+      313 	     else if ^got_to_dir then do;
+      314 		got_to_dir = "1"b;
+      315 		call absolute_pathname_ (arg, migration_dir, code);
+      316 		if code ^= 0 then do;
+      317 		     call com_err_ (code, WHOAMI, "Directory to move to: ^a", arg);
+      318 		     go to MAIN_RETURN;
+      319 		     end;
+      320 		end;
+      321 
+      322 	     else if ^got_time_cutoff then do;
+      323 		got_time_cutoff = "1"b;
+      324 		call convert_date_to_binary_ (arg, cutoff, code);
+      325 		if code ^= 0 then do;
+      326 		     call com_err_ (code, WHOAMI, "Cutoff time ^a", arg);
+      327 		     go to MAIN_RETURN;
+      328 		     end;
+      329 		end;
+      330 
+      331 	     else go to USAGE;
+      332 END_ARG_LOOP:
+      333 	     end;
+      334 
+      335 	if ^got_time_cutoff then go to USAGE;
+      336 
+      337           return;
+      338 
+      339           end process_arguments;
+      340 
+      341 /*  */
+      342 
+      343 clean_up:
+      344      procedure ();
+      345 
+      346 declare   based_word fixed bin based;
+      347 
+      348 /* This procedure has to have its own based variable to use when freeing, because the
+      349*   standard include file declares the star structures in a way that requires various
+      350*   pointers to be set properly when they may not be. BRAINDAMAGE. It should use fixed
+      351*   array bounds the way it used to before Davidoff got to it. */
+      352 
+      353 
+      354           if (star_entry_ptr ^= null ()) then
+      355                free star_entry_ptr -> based_word in (system_area);
+      356           if (star_names_ptr ^= null ()) then
+      357                free star_names_ptr -> based_word in (system_area);
+      358           if (sort_pointers_ptr ^= null ()) then
+      359                free sort_pointers_ptr -> based_word in (system_area);
+      360           if (next_log_ptr ^= null ()) then
+      361                call hcs_$terminate_noname (next_log_ptr, (0));
+      362 
+      363           if (this_log_ptr ^= null ()) then
+      364                call hcs_$terminate_noname (this_log_ptr, (0));
+      365 
+      366           return;
+      367           end clean_up;
+      368 
+      369  /* BEGIN INCLUDE FILE . . . star_structures.incl.pl1 */
+  1     2 
+  1     3 /* This include file contains structures for the hcs_$star_,
+  1     4*   hcs_$star_list_ and hcs_$star_dir_list_ entry points.
+  1     5*
+  1     6*   Written 23 October 1978 by Monte Davidoff.
+  1     7*   Modified January 1979 by Michael R. Jordan to use unsigned and different pointers for different structures.
+  1     8*   Modified June 1981 by C. Hornig to count link pathnames more efficiently.
+  1     9**/
+  1    10 
+  1    11 /* automatic */
+  1    12 
+  1    13 declare  star_branch_count fixed binary;		/* hcs_$star_list_, hcs_$star_dir_list_: matching branch count */
+  1    14 declare  star_entry_count fixed binary;			/* hcs_$star_: number of matching entries */
+  1    15 declare  star_entry_ptr pointer;			/* hcs_$star_: pointer to array of entry information */
+  1    16 declare  star_list_branch_ptr pointer;			/* hcs_$star_list_, hcs_$star_dir_list_: ptr to array of info */
+  1    17 declare  star_link_count fixed binary;			/* hcs_$star_list_, hcs_$star_dir_list_: matching link count */
+  1    18 declare  star_linkx fixed binary;			/* hcs_$star_list_, hcs_$star_dir_list_: index into star_links */
+  1    19 declare  star_names_ptr pointer;			/* hcs_$star_: pointer to array of entry names */
+  1    20 declare  star_list_names_ptr pointer;			/* hcs_$star_list_, hcs_$star_dir_list_: ptr to entry names */
+  1    21 declare  star_select_sw fixed binary (3);		/* hcs_$star_list_, hcs_$star_dir_list_: what info to return */
+  1    22 
+  1    23 /* based */
+  1    24 
+  1    25 /* hcs_$star_ entry structure */
+  1    26 
+  1    27 declare 1 star_entries (star_entry_count) aligned based (star_entry_ptr),
+  1    28         2 type fixed binary (2) unsigned unaligned,
+  1    29 						/* storage system type */
+  1    30         2 nnames fixed binary (16) unsigned unaligned,
+  1    31 						/* number of names of entry that match star_name */
+  1    32         2 nindex fixed binary (18) unsigned unaligned;
+  1    33 						/* index of first name in star_names */
+  1    34 
+  1    35 /* hcs_$star_ name structure */
+  1    36 
+  1    37 declare  star_names (sum (star_entries (*).nnames)) char (32) based (star_names_ptr);
+  1    38 
+  1    39 /* hcs_$star_list_ branch structure */
+  1    40 
+  1    41 declare 1 star_list_branch (star_branch_count + star_link_count) aligned based (star_list_branch_ptr),
+  1    42         2 type fixed binary (2) unsigned unaligned,
+  1    43 						/* storage system type */
+  1    44         2 nnames fixed binary (16) unsigned unaligned,
+  1    45 						/* number of names of entry that match star_name */
+  1    46         2 nindex fixed binary (18) unsigned unaligned,
+  1    47 						/* index of first name in star_list_names */
+  1    48         2 dtcm bit (36) unaligned,			/* date-time contents of branch were last modified */
+  1    49         2 dtu bit (36) unaligned,			/* date-time branch was last used */
+  1    50         2 mode bit (5) unaligned,			/* user's access mode to the branch */
+  1    51         2 raw_mode bit (5) unaligned,			/* user's ACL access mode */
+  1    52         2 master_dir bit (1) unaligned,			/* is branch a master directory */
+  1    53         2 pad bit (7) unaligned,
+  1    54         2 records fixed binary (18) unsigned unaligned;
+  1    55 						/* records used by branch */
+  1    56 
+  1    57 /* hcs_$star_dir_list_ branch structure */
+  1    58 
+  1    59 declare 1 star_dir_list_branch (star_branch_count + star_link_count) aligned based (star_list_branch_ptr),
+  1    60         2 type fixed binary (2) unsigned unaligned,
+  1    61 						/* storage system type */
+  1    62         2 nnames fixed binary (16) unsigned unaligned,
+  1    63 						/* number of names of entry that match star_name */
+  1    64         2 nindex fixed binary (18) unsigned unaligned,
+  1    65 						/* index of first name in star_list_names */
+  1    66         2 dtem bit (36) unaligned,			/* date-time directory entry of branch was last modified */
+  1    67         2 pad bit (36) unaligned,
+  1    68         2 mode bit (5) unaligned,			/* user's access mode to the branch */
+  1    69         2 raw_mode bit (5) unaligned,			/* user's ACL access mode */
+  1    70         2 master_dir bit (1) unaligned,			/* is branch a master directory */
+  1    71         2 bit_count fixed binary (24) unaligned;
+  1    72 						/* bit count of the branch */
+  1    73 
+  1    74 /* hcs_$star_list_ and hcs_$star_dir_list_ link structure */
+  1    75 
+  1    76 declare 1 star_links (star_branch_count + star_link_count) aligned based (star_list_branch_ptr),
+  1    77         2 type fixed binary (2) unsigned unaligned,
+  1    78 						/* storage system type */
+  1    79         2 nnames fixed binary (16) unsigned unaligned,
+  1    80 						/* number of names of entry that match star_name */
+  1    81         2 nindex fixed binary (18) unsigned unaligned,
+  1    82 						/* index of first name in star_list_names */
+  1    83         2 dtem bit (36) unaligned,			/* date-time link was last modified */
+  1    84         2 dtd bit (36) unaligned,			/* date-time the link was last dumped */
+  1    85         2 pathname_len fixed binary (18) unsigned unaligned,
+  1    86 						/* length of the pathname of the link */
+  1    87         2 pathname_index fixed binary (18) unsigned unaligned;
+  1    88 						/* index of start of pathname in star_list_names */
+  1    89 
+  1    90 /* hcs_$star_list_ and hcs_$star_dir_list_ name array */
+  1    91 
+  1    92 declare  star_list_names char (32) based (star_list_names_ptr)
+  1    93 	dimension (star_links (star_branch_count + star_link_count).nindex
+  1    94 	 + star_links (star_branch_count + star_link_count).nnames
+  1    95 	 + divide (star_links (star_branch_count + star_link_count).pathname_len + 31, 32, 17, 0)
+  1    96 	   * binary (
+  1    97 	     (star_links (star_branch_count + star_link_count).type = star_LINK)
+  1    98 	     & (star_select_sw >= star_LINKS_ONLY_WITH_LINK_PATHS), 1));
+  1    99 
+  1   100 /* hcs_$star_list_ and hcs_$star_dir_list_ link pathname */
+  1   101 
+  1   102 declare  star_link_pathname char (star_links (star_linkx).pathname_len)
+  1   103          based (addr (star_list_names (star_links (star_linkx).pathname_index)));
+  1   104 
+  1   105 /* internal static */
+  1   106 
+  1   107 /* star_select_sw values */
+  1   108 
+  1   109 declare  star_LINKS_ONLY fixed binary (2) internal static options (constant) initial (1);
+  1   110 declare  star_BRANCHES_ONLY fixed binary (2) internal static options (constant) initial (2);
+  1   111 declare  star_ALL_ENTRIES fixed binary (2) internal static options (constant) initial (3);
+  1   112 declare  star_LINKS_ONLY_WITH_LINK_PATHS
+  1   113          fixed binary (3) internal static options (constant) initial (5);
+  1   114 declare  star_ALL_ENTRIES_WITH_LINK_PATHS
+  1   115          fixed binary (3) internal static options (constant) initial (7);
+  1   116 
+  1   117 /* storage system types */
+  1   118 
+  1   119 declare  star_LINK fixed binary (2) unsigned internal static options (constant) initial (0);
+  1   120 declare  star_SEGMENT fixed binary (2) unsigned internal static options (constant) initial (1);
+  1   121 declare  star_DIRECTORY fixed binary (2) unsigned internal static options (constant) initial (2);
+  1   122 
+  1   123 /* END INCLUDE FILE . . . star_structures.incl.pl1 */
+      369 
+      370  /* BEGIN INCLUDE FILE: copy_options.incl.pl1 */
+  2     2 
+  2     3 /* This structure declares the input structure used by the copy_ subroutine.
+  2     4*
+  2     5*   NOTE: This include file depends on declarations in the include file
+  2     6*   copy_flags.incl.pl1.
+  2     7*
+  2     8*   Jay Pattin 6/1/83 */
+  2     9 
+  2    10 declare   copy_options_ptr              ptr;
+  2    11 
+  2    12 declare   1 copy_options                aligned based (copy_options_ptr),
+  2    13           2 version                     char (8),           /* currently COPY_OPTIONS_VERSION_1 */
+  2    14           2 caller_name                 char (32) unal,     /* Used in nd_handler_ call */
+  2    15           2 source_dir                  char (168) unal,
+  2    16           2 source_name                 char (32) unal,
+  2    17           2 target_dir                  char (168) unal,
+  2    18           2 target_name                 char (32) unal,
+  2    19           2 flags,
+  2    20             3 no_name_dup               bit (1) unaligned,  /* ON = don't call nd_handler_ */
+  2    21             3 raw                       bit (1) unaligned,  /* ON = don't call object_type_, use hcs_ */
+  2    22             3 force                     bit (1) unaligned,  /* ON = delete or force access to target */
+  2    23             3 delete                    bit (1) unaligned,  /* ON = delete original after copy (for move) */
+  2    24             3 target_err_switch         bit (1) unaligned,
+  2    25             3 mbz                       bit (31) unaligned,
+  2    26           2 copy_items                  like copy_flags;    /* see copy_flags.incl.pl1 */
+  2    27 
+  2    28 declare   COPY_OPTIONS_VERSION_1        char (8) static options (constant) init ("CPOPT001");
+  2    29 
+  2    30 /* END INCLUDE FILE: copy_options.incl.pl1 */
+      370 
+      371  /* BEGIN INCLUDE FILE:  copy_flags.incl.pl1 */
+  3     2 
+  3     3 /* Flags for attributes that should/may be copied by the copy_ subroutine. This include file is
+  3     4*   required by suffix_info.incl.pl1 and copy_options.incl.pl1
+  3     5*
+  3     6*   Jay Pattin 6/23/83 */
+  3     7 
+  3     8 declare   1 copy_flags                  aligned based,      /* ON means that this attribute may be copied by copy_ */
+  3     9           2 names                       bit (1) unaligned,
+  3    10           2 acl                         bit (1) unaligned,
+  3    11           2 ring_brackets               bit (1) unaligned,
+  3    12           2 max_length                  bit (1) unaligned,
+  3    13           2 copy_switch                 bit (1) unaligned,
+  3    14           2 safety_switch               bit (1) unaligned,
+  3    15           2 dumper_switches             bit (1) unaligned,
+  3    16           2 entry_bound                 bit (1) unaligned,  /* only for vanilla object segments */
+  3    17           2 extend                      bit (1) unaligned,  /* copy_ may append to end of existing object */
+  3    18           2 update                      bit (1) unaligned,  /* copy_ may replace contents of existing object */
+  3    19           2 mbz                         bit (26) unaligned;
+  3    20 
+  3    21 /* END INCLUDE FILE:  copy_flags.incl.pl1 */
+      371 
+      372  /* BEGIN INCLUDE FILE ... access_mode_values.incl.pl1
+  4     2*
+  4     3*   Values for the "access mode" argument so often used in hardcore
+  4     4*   James R. Davis 26 Jan 81  MCR 4844
+  4     5*   Added constants for SM access 4/28/82 Jay Pattin
+  4     6*   Added text strings 03/19/85 Chris Jones
+  4     7**/
+  4     8 
+  4     9 
+  4    10 /* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+  4    11 dcl	(
+  4    12 	N_ACCESS		   init ("000"b),
+  4    13 	R_ACCESS		   init ("100"b),
+  4    14 	E_ACCESS		   init ("010"b),
+  4    15 	W_ACCESS		   init ("001"b),
+  4    16 	RE_ACCESS		   init ("110"b),
+  4    17 	REW_ACCESS	   init ("111"b),
+  4    18 	RW_ACCESS		   init ("101"b),
+  4    19 	S_ACCESS		   init ("100"b),
+  4    20 	M_ACCESS		   init ("010"b),
+  4    21 	A_ACCESS		   init ("001"b),
+  4    22 	SA_ACCESS		   init ("101"b),
+  4    23 	SM_ACCESS		   init ("110"b),
+  4    24 	SMA_ACCESS	   init ("111"b)
+  4    25 	)		   bit (3) internal static options (constant);
+  4    26 
+  4    27 /* The following arrays are meant to be accessed by doing either 1) bin (bit_value) or
+  4    28*   2) divide (bin_value, 2) to come up with an index into the array. */
+  4    29 
+  4    30 dcl	SEG_ACCESS_MODE_NAMES  (0:7) init ("null", "W", "E", "EW", "R", "RW", "RE", "REW") char (4) internal
+  4    31 			   static options (constant);
+  4    32 
+  4    33 dcl	DIR_ACCESS_MODE_NAMES  (0:7) init ("null", "A", "M", "MA", "S", "SA", "SM", "SMA") char (4) internal
+  4    34 			   static options (constant);
+  4    35 
+  4    36 dcl	(
+  4    37 	N_ACCESS_BIN	   init (00000b),
+  4    38 	R_ACCESS_BIN	   init (01000b),
+  4    39 	E_ACCESS_BIN	   init (00100b),
+  4    40 	W_ACCESS_BIN	   init (00010b),
+  4    41 	RW_ACCESS_BIN	   init (01010b),
+  4    42 	RE_ACCESS_BIN	   init (01100b),
+  4    43 	REW_ACCESS_BIN	   init (01110b),
+  4    44 	S_ACCESS_BIN	   init (01000b),
+  4    45 	M_ACCESS_BIN	   init (00010b),
+  4    46 	A_ACCESS_BIN	   init (00001b),
+  4    47 	SA_ACCESS_BIN	   init (01001b),
+  4    48 	SM_ACCESS_BIN	   init (01010b),
+  4    49 	SMA_ACCESS_BIN	   init (01011b)
+  4    50 	)		   fixed bin (5) internal static options (constant);
+  4    51 
+  4    52 /* END INCLUDE FILE ... access_mode_values.incl.pl1 */
+      372 
+      373  /* BEGIN INCLUDE FILE ... log_segment.incl.pl1 ... 84-05-03 ... W. Olin Sibert */
+  5     2 
+  5     3 declare   log_segment_ptr               pointer;
+  5     4 declare   log_segment_max_size          fixed bin (18);
+  5     5 declare   LOG_SEGMENT_VERSION_1         char (8) internal static options (constant) init ("SysLog01");
+  5     6 
+  5     7 
+  5     8 declare 1 log_segment                   aligned based (log_segment_ptr),
+  5     9           2 header                      aligned like log_segment_header,
+  5    10           2 data                        dim (log_segment_max_size refer (log_segment.max_size)) bit (36) aligned;
+  5    11 
+  5    12 
+  5    13 declare 1 log_segment_header            aligned based,
+  5    14           2 version                     char (8) unaligned, /* LOG_SEGMENT_VERSION_1 */
+  5    15           2 time_created                fixed bin (71),     /* When the segment header was initialized */
+  5    16           2 previous_log_dir            char (168) unaligned, /* Directory containing previous log segment */
+  5    17 
+  5    18           2 limits,
+  5    19             3 first_sequence            fixed bin (35),     /* First and last sequence numbers / time stamps */
+  5    20             3 last_sequence             fixed bin (35),     /* of messages in the log. These may be slightly */
+  5    21             3 first_time                fixed bin (71),     /* incorrect due to lockless updating strategy */
+  5    22             3 last_time                 fixed bin (71),
+  5    23 
+  5    24           2 alloc_info,                                     /* Complex STACQ hack for allocating and assigning */
+  5    25             3 word_1                    fixed bin (18),     /* sequence numbers locklessly. See log_segment_ */
+  5    26             3 word_2                    bit (36) aligned,   /* for details of strategy */
+  5    27           2 max_size                    fixed bin (18),     /* Total words in data area */
+  5    28 
+  5    29           2 listeners_registered        bit (1) aligned,    /* Set if ANY processes were ever registered-- it's only */
+  5    30           2 listener_bootload_time      fixed bin (71),     /* kept here for efficiency. The bootload time is used to */
+  5    31                                                             /* detect all the dead listeners after a reboot */
+  5    32           2 listener (25),                                  /* Processes waiting for messages in the log */
+  5    33             3 process_id                bit (36) aligned,
+  5    34             3 event_channel             fixed bin (71) unaligned, /* Saves space-- allows 3-word entries */
+  5    35 
+  5    36           2 last_wakeup_time            fixed bin (71),     /* When last wakeup was sent */
+  5    37           2 wakeup_delta                fixed bin (71),     /* Wakeups sent no more than once per this interval */
+  5    38 
+  5    39           2 pad (6)                     fixed bin (71);     /* Pad header to 150 words */
+  5    40 
+  5    41 
+  5    42 declare   LOG_SEGMENT_NEW_MESSAGE           init ("777111555333"b3) bit (36) aligned internal static options (constant);
+  5    43 declare   LOG_SEGMENT_COMPLETE_MESSAGE      init ("666000444222"b3) bit (36) aligned internal static options (constant);
+  5    44 
+  5    45 /* END INCLUDE FILE ... log_segment.incl.pl1 */
+      373 
+      374 
+      375           end move_log_segments;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/08/85  1132.9  move_log_segments.pl1             >special_ldd>online>41-15-04/10/85>move_log_segments.pl1
+369          1    06/10/82  1045.5  star_structures.incl.pl1          >ldd>include>star_structures.incl.pl1
+370          2    10/14/83  1606.7  copy_options.incl.pl1             >ldd>include>copy_options.incl.pl1
+371          3    10/14/83  1606.7  copy_flags.incl.pl1               >ldd>include>copy_flags.incl.pl1
+372          4    04/09/85  1109.7  access_mode_values.incl.pl1       >special_ldd>online>41-15-04/10/85>access_mode_values.incl.pl1
+373          5    12/04/84  2124.9  log_segment.incl.pl1              >ldd>include>log_segment.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+COPY_OPTIONS_VERSION_1          000000 constant        char(8)                  initial unaligned dcl 2-28 ref 180
+P_entry_1                              parameter       pointer                  unaligned dcl 140 ref 137 149
+P_entry_2                              parameter       pointer                  unaligned dcl 141 ref 137 150
+P_name                                 parameter       char                     unaligned dcl 232 set ref 229 238* 241* 251*
+P_ptr                                  parameter       pointer                  dcl 233 set ref 229 238* 245*
+REW_ACCESS_BIN                         constant        fixed bin(5,0)           initial dcl 4-36 ref 246
+RW_ACCESS_BIN                          constant        fixed bin(5,0)           initial dcl 4-36 ref 246
+WHOAMI                          000002 constant        char(32)                 initial unaligned dcl 64 set ref 87* 109* 125* 181
+                                                                                  212* 241* 251* 272* 272* 294* 308* 317* 326*
+absolute_pathname_              000010 constant        entry                    external dcl 41 ref 306 315
+acl                     157(01) 000342 automatic       bit(1)                   level 3 packed unaligned dcl 175 set ref 188*
+arg                                    based           char                     unaligned dcl 265 set ref 283 285* 291 291 292 292
+                                                                                  294* 301 306* 308* 315* 317* 324* 326*
+arg_count                       000543 automatic       fixed bin(17,0)          dcl 266 set ref 270* 271 279
+arg_idx                         000544 automatic       fixed bin(17,0)          dcl 267 set ref 279* 281*
+arg_lth                         000542 automatic       fixed bin(21,0)          dcl 264 set ref 281* 283 285 285 291 291 292 292 294
+                                                                                  294 301 306 306 308 308 315 315 317 317 324 324
+                                                                                  326 326
+arg_ptr                         000540 automatic       pointer                  dcl 263 set ref 281* 283 285 291 291 292 292 294 301
+                                                                                  306 308 315 317 324 326
+based_word                             based           fixed bin(17,0)          dcl 346 ref 354 356 358
+caller_name               2     000342 automatic       char(32)                 level 2 packed unaligned dcl 175 set ref 181*
+cleanup                         000254 stack reference condition                dcl 66 ref 77
+code                            000100 automatic       fixed bin(35,0)          dcl 22 set ref 105* 108 109* 238* 240 241* 245* 246
+                                                                                  246* 250 251* 270* 285* 286 306* 307 308* 315* 316
+                                                                                  317* 324* 325 326*
+com_err_                        000012 constant        entry                    external dcl 42 ref 109 125 241 251 272 294 308 317
+                                                                                  326
+convert_date_to_binary_         000020 constant        entry                    external dcl 46 ref 285 324
+copy_                           000022 constant        entry                    external dcl 47 ref 214
+copy_flags                             based           structure                level 1 dcl 3-8
+copy_items              157     000342 automatic       structure                level 2 dcl 175
+copy_opt                        000342 automatic       structure                level 1 dcl 175 set ref 179* 214 214
+copy_options                           based           structure                level 1 dcl 2-12
+cu_$arg_count                   000024 constant        entry                    external dcl 48 ref 270
+cu_$arg_ptr                     000026 constant        entry                    external dcl 49 ref 281
+cutoff                          000252 automatic       fixed bin(71,0)          dcl 39 set ref 198 285* 324*
+delete                  156(03) 000342 automatic       bit(1)                   level 3 packed unaligned dcl 175 set ref 185*
+entry_1                                based           structure                level 1 dcl 145
+entry_1_ptr                     000100 automatic       pointer                  dcl 143 set ref 149* 155 157 159
+entry_2                                based           structure                level 1 dcl 146
+entry_2_ptr                     000102 automatic       pointer                  dcl 144 set ref 150* 155 157 159
+entry_idx                       000276 automatic       fixed bin(17,0)          dcl 99 set ref 118* 119 119 120*
+error_table_$badopt             000014 external static fixed bin(35,0)          dcl 43 set ref 294*
+error_table_$no_w_permission    000016 external static fixed bin(35,0)          dcl 44 ref 246
+flags                   156     000342 automatic       structure                level 2 dcl 175
+force                   156(02) 000342 automatic       bit(1)                   level 3 packed unaligned dcl 175 set ref 184*
+force_sw                        000114 automatic       bit(1)                   unaligned dcl 30 set ref 184 276* 291* 292*
+get_system_free_area_           000030 constant        entry                    external dcl 51 ref 75
+got_from_dir                    000546 automatic       bit(1)                   unaligned dcl 268 set ref 277* 304 305*
+got_log_name                    000545 automatic       bit(1)                   unaligned dcl 268 set ref 277* 299 300*
+got_time_cutoff                 000550 automatic       bit(1)                   unaligned dcl 268 set ref 277* 284 287* 322 323* 335
+got_to_dir                      000547 automatic       bit(1)                   unaligned dcl 268 set ref 277* 284 313 314*
+hcs_$fs_get_mode                000032 constant        entry                    external dcl 52 ref 245
+hcs_$star_                      000034 constant        entry                    external dcl 53 ref 105
+hcs_$terminate_noname           000036 constant        entry                    external dcl 54 ref 206 221 360 363
+header                                 based           structure                level 2 dcl 5-8
+index                                                  builtin function         dcl 62 ref 283
+ioa_                            000040 constant        entry                    external dcl 55 ref 87 212
+log_dir                         000115 automatic       char(168)                unaligned dcl 36 set ref 105* 109* 125* 125* 182
+                                                                                  212* 238* 241* 251* 306*
+log_initiate_                   000042 constant        entry                    external dcl 56 ref 238
+log_mode                        000530 automatic       fixed bin(5,0)           dcl 235 set ref 245* 246 246
+log_name                        000167 automatic       char(32)                 unaligned dcl 37 set ref 103* 125* 125* 301*
+log_name_$starname              000044 constant        entry                    external dcl 57 ref 103
+log_name_$time                  000046 constant        entry                    external dcl 58 ref 196
+log_segment                            based           structure                level 1 dcl 5-8
+log_segment_header                     based           structure                level 1 dcl 5-13
+log_starname                    000277 automatic       char(32)                 unaligned dcl 100 set ref 103* 105* 109*
+max_length              157(03) 000342 automatic       bit(1)                   level 3 packed unaligned dcl 175 set ref 190*
+migration_dir                   000177 automatic       char(168)                unaligned dcl 38 set ref 87* 183 205 220 315*
+move_count                      000113 automatic       fixed bin(17,0)          dcl 29 set ref 87 87* 87 117* 218* 218
+n_entries                              based           fixed bin(17,0)          level 2 dcl 32 set ref 113* 114*
+names                   157     000342 automatic       bit(1)                   level 3 packed unaligned dcl 175 set ref 187*
+next_ename                      000327 automatic       char(32)                 unaligned dcl 172 set ref 195* 201*
+next_log_ptr                    000106 automatic       pointer                  dcl 26 set ref 73* 201* 220 221* 360 360*
+nindex                    0(18)        based           fixed bin(18,0)          level 2 in structure "one_star_entry" packed
+                                                                                  unsigned unaligned dcl 176 in procedure
+                                                                                  "move_segments" ref 194 195
+nindex                    0(18)        based           fixed bin(18,0)          level 2 in structure "entry_2" packed unsigned
+                                                                                  unaligned dcl 146 in procedure "compare_entries"
+                                                                                  ref 159
+nindex                    0(18)        based           fixed bin(18,0)          level 2 in structure "entry_1" packed unsigned
+                                                                                  unaligned dcl 145 in procedure "compare_entries"
+                                                                                  ref 159
+one_star_entry                         based           structure                level 1 dcl 176
+pathname_                       000050 constant        entry                    external dcl 59 ref 125 125
+previous_log_dir          4            based           char(168)                level 3 packed unaligned dcl 5-8 set ref 205* 220*
+ptr                       1            based           pointer                  array level 2 packed unaligned dcl 32 set ref 119*
+                                                                                  194 195
+ring_brackets           157(02) 000342 automatic       bit(1)                   level 3 packed unaligned dcl 175 set ref 189*
+safety_switch           157(05) 000342 automatic       bit(1)                   level 3 packed unaligned dcl 175 set ref 191*
+segment_count                   000112 automatic       fixed bin(17,0)          dcl 28 set ref 116* 120* 120 124 193 203
+segment_idx                     000316 automatic       fixed bin(17,0)          dcl 170 set ref 193* 194 195 203*
+sort_items_$general             000052 constant        entry                    external dcl 60 ref 131
+sort_pointers                          based           structure                level 1 dcl 32 set ref 113 131 131
+sort_pointers_ptr               000104 automatic       pointer                  dcl 25 set ref 72* 113* 114 119 131 131 194 195 358
+                                                                                  358
+source_dir               12     000342 automatic       char(168)                level 2 packed unaligned dcl 175 set ref 182*
+source_name              64     000342 automatic       char(32)                 level 2 packed unaligned dcl 175 set ref 209*
+star_BRANCHES_ONLY              000037 constant        fixed bin(2,0)           initial dcl 1-110 set ref 105*
+star_SEGMENT                           constant        fixed bin(2,0)           initial unsigned dcl 1-120 ref 120 155 155 157 157
+star_entries                           based           structure                array level 1 dcl 1-27 set ref 119
+star_entry_count                000262 automatic       fixed bin(17,0)          dcl 1-14 set ref 105* 113 113 114 118
+star_entry_ptr                  000264 automatic       pointer                  dcl 1-15 set ref 70* 105* 119 120 354 354
+star_names                             based           char(32)                 array unaligned dcl 1-37 ref 159 159 194 195
+star_names_ptr                  000266 automatic       pointer                  dcl 1-19 set ref 71* 105* 159 159 194 195 356 356
+suffix_time                     000340 automatic       fixed bin(71,0)          dcl 173 set ref 196* 198
+system_area                            based           area(1024)               dcl 24 ref 113 354 356 358
+system_area_ptr                 000102 automatic       pointer                  dcl 23 set ref 75* 105* 113 354 356 358
+target_dir               74     000342 automatic       char(168)                level 2 packed unaligned dcl 175 set ref 183*
+target_err_switch       156(04) 000342 automatic       bit(1)                   level 3 packed unaligned dcl 175 set ref 216
+target_name             146     000342 automatic       char(32)                 level 2 packed unaligned dcl 175 set ref 210*
+this_ename                      000317 automatic       char(32)                 unaligned dcl 171 set ref 194* 196* 204* 209 210
+                                                                                  212*
+this_log_ptr                    000110 automatic       pointer                  dcl 27 set ref 74* 204* 205 206* 363 363*
+type                                   based           fixed bin(2,0)           level 2 in structure "entry_1" packed unsigned
+                                                                                  unaligned dcl 145 in procedure "compare_entries"
+                                                                                  ref 155 157
+type                                   based           fixed bin(2,0)           level 2 in structure "entry_2" packed unsigned
+                                                                                  unaligned dcl 146 in procedure "compare_entries"
+                                                                                  ref 155 157
+type                                   based           fixed bin(2,0)           array level 2 in structure "star_entries" packed
+                                                                                  unsigned unaligned dcl 1-27 in procedure
+                                                                                  "move_log_segments" set ref 120
+version                         000342 automatic       char(8)                  level 2 dcl 175 set ref 180*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+A_ACCESS                               internal static bit(3)                   initial unaligned dcl 4-11
+A_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 4-36
+DIR_ACCESS_MODE_NAMES                  internal static char(4)                  initial array unaligned dcl 4-33
+E_ACCESS                               internal static bit(3)                   initial unaligned dcl 4-11
+E_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 4-36
+LOG_SEGMENT_COMPLETE_MESSAGE           internal static bit(36)                  initial dcl 5-43
+LOG_SEGMENT_NEW_MESSAGE                internal static bit(36)                  initial dcl 5-42
+LOG_SEGMENT_VERSION_1                  internal static char(8)                  initial unaligned dcl 5-5
+M_ACCESS                               internal static bit(3)                   initial unaligned dcl 4-11
+M_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 4-36
+N_ACCESS                               internal static bit(3)                   initial unaligned dcl 4-11
+N_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 4-36
+REW_ACCESS                             internal static bit(3)                   initial unaligned dcl 4-11
+RE_ACCESS                              internal static bit(3)                   initial unaligned dcl 4-11
+RE_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 4-36
+RW_ACCESS                              internal static bit(3)                   initial unaligned dcl 4-11
+R_ACCESS                               internal static bit(3)                   initial unaligned dcl 4-11
+R_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 4-36
+SA_ACCESS                              internal static bit(3)                   initial unaligned dcl 4-11
+SA_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 4-36
+SEG_ACCESS_MODE_NAMES                  internal static char(4)                  initial array unaligned dcl 4-30
+SMA_ACCESS                             internal static bit(3)                   initial unaligned dcl 4-11
+SMA_ACCESS_BIN                         internal static fixed bin(5,0)           initial dcl 4-36
+SM_ACCESS                              internal static bit(3)                   initial unaligned dcl 4-11
+SM_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 4-36
+S_ACCESS                               internal static bit(3)                   initial unaligned dcl 4-11
+S_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 4-36
+W_ACCESS                               internal static bit(3)                   initial unaligned dcl 4-11
+W_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 4-36
+copy_options_ptr                       automatic       pointer                  dcl 2-10
+expand_pathname_                000000 constant        entry                    external dcl 50
+log_segment_max_size                   automatic       fixed bin(18,0)          dcl 5-4
+log_segment_ptr                        automatic       pointer                  dcl 5-3
+star_ALL_ENTRIES                       internal static fixed bin(2,0)           initial dcl 1-111
+star_ALL_ENTRIES_WITH_LINK_PATHS       internal static fixed bin(3,0)           initial dcl 1-114
+star_DIRECTORY                         internal static fixed bin(2,0)           initial unsigned dcl 1-121
+star_LINK                              internal static fixed bin(2,0)           initial unsigned dcl 1-119
+star_LINKS_ONLY                        internal static fixed bin(2,0)           initial dcl 1-109
+star_LINKS_ONLY_WITH_LINK_PATHS        internal static fixed bin(3,0)           initial dcl 1-112
+star_branch_count                      automatic       fixed bin(17,0)          dcl 1-13
+star_dir_list_branch                   based           structure                array level 1 dcl 1-59
+star_link_count                        automatic       fixed bin(17,0)          dcl 1-17
+star_link_pathname                     based           char                     unaligned dcl 1-102
+star_links                             based           structure                array level 1 dcl 1-76
+star_linkx                             automatic       fixed bin(17,0)          dcl 1-18
+star_list_branch                       based           structure                array level 1 dcl 1-41
+star_list_branch_ptr                   automatic       pointer                  dcl 1-16
+star_list_names                        based           char(32)                 array unaligned dcl 1-92
+star_list_names_ptr                    automatic       pointer                  dcl 1-20
+star_select_sw                         automatic       fixed bin(3,0)           dcl 1-21
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+END_ARG_LOOP                    002053 constant        label                    dcl 332 ref 288
+MAIN_RETURN                     000315 constant        label                    dcl 90 ref 110 128 242 252 273 295 309 318 327
+USAGE                           001354 constant        label                    dcl 272 ref 322 335
+clean_up                        002061 constant        entry                    internal dcl 343 ref 78 90
+compare_entries                 000600 constant        entry                    internal dcl 137 ref 131 131
+initiate_log                    001141 constant        entry                    internal dcl 229 ref 201 204
+list_directory                  000322 constant        entry                    internal dcl 96 ref 83
+move_log_segments               000202 constant        entry                    external dcl 6
+move_segments                   000700 constant        entry                    internal dcl 167 ref 85
+process_arguments               001337 constant        entry                    internal dcl 260 ref 81
+
+NAMES DECLARED BY CONTEXT OR IMPLICATION.
+addr                                                   builtin function         ref 119 131 131 214 214
+null                                                   builtin function         ref 70 71 72 73 74 354 356 358 360 363
+unspec                                                 builtin function         ref 179
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      2446        2522    2176        2456
+Length      3052    2176        54         314     247           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+move_log_segments                   656 external procedure  is an external procedure.  
+on unit on line 77                   64 on unit               
+list_directory                          internal procedure  shares stack frame of external procedure move_log_segments.  
+compare_entries                      70 internal procedure  is assigned to an entry variable.  
+move_segments                           internal procedure  shares stack frame of external procedure move_log_segments.  
+initiate_log                            internal procedure  shares stack frame of external procedure move_log_segments.  
+process_arguments                       internal procedure  shares stack frame of external procedure move_log_segments.  
+clean_up                             72 internal procedure  is called by several nonquick procedures.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+compare_entries          000100 entry_1_ptr                 compare_entries
+                         000102 entry_2_ptr                 compare_entries
+move_log_segments        000100 code                        move_log_segments
+                         000102 system_area_ptr             move_log_segments
+                         000104 sort_pointers_ptr           move_log_segments
+                         000106 next_log_ptr                move_log_segments
+                         000110 this_log_ptr                move_log_segments
+                         000112 segment_count               move_log_segments
+                         000113 move_count                  move_log_segments
+                         000114 force_sw                    move_log_segments
+                         000115 log_dir                     move_log_segments
+                         000167 log_name                    move_log_segments
+                         000177 migration_dir               move_log_segments
+                         000252 cutoff                      move_log_segments
+                         000262 star_entry_count            move_log_segments
+                         000264 star_entry_ptr              move_log_segments
+                         000266 star_names_ptr              move_log_segments
+                         000276 entry_idx                   list_directory
+                         000277 log_starname                list_directory
+                         000316 segment_idx                 move_segments
+                         000317 this_ename                  move_segments
+                         000327 next_ename                  move_segments
+                         000340 suffix_time                 move_segments
+                         000342 copy_opt                    move_segments
+                         000530 log_mode                    initiate_log
+                         000540 arg_ptr                     process_arguments
+                         000542 arg_lth                     process_arguments
+                         000543 arg_count                   process_arguments
+                         000544 arg_idx                     process_arguments
+                         000545 got_log_name                process_arguments
+                         000546 got_from_dir                process_arguments
+                         000547 got_to_dir                  process_arguments
+                         000550 got_time_cutoff             process_arguments
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+r_e_as              r_ne_as             call_ext_out_desc   call_ext_out        call_int_this       call_int_other
+return              enable              ext_entry           int_entry           alloc_based         free_based
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+absolute_pathname_            com_err_                      convert_date_to_binary_       copy_
+cu_$arg_count                 cu_$arg_ptr                   get_system_free_area_         hcs_$fs_get_mode
+hcs_$star_                    hcs_$terminate_noname         ioa_                          log_initiate_
+log_name_$starname            log_name_$time                pathname_                     sort_items_$general
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$badopt           error_table_$no_w_permission
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+      6 000201        70 000207        71 000211        72 000212        73 000213        74 000214        75 000215
+     77 000223        78 000237        79 000244        81 000245        83 000246        85 000247        87 000250
+     90 000315        92 000321        96 000322       103 000323       105 000337       108 000402       109 000404
+    110 000442       113 000443       114 000453       116 000455       117 000456       118 000457       119 000467
+    120 000472       122 000501       124 000503       125 000506       128 000557       131 000560       133 000576
+    137 000577       149 000605       150 000614       155 000622       157 000641       159 000652       161 000675
+    167 000700       179 000701       180 000704       181 000706       182 000711       183 000714       184 000717
+    185 000724       187 000726       188 000730       189 000732       190 000734       191 000736       193 000740
+    194 000745       195 000756       196 000771       198 001006       201 001012       203 001015       204 001020
+    205 001023       206 001027       209 001041       210 001044       212 001047       214 001101       216 001112
+    218 001116       220 001117       221 001123       222 001135       224 001140       229 001141       238 001152
+    240 001207       241 001211       242 001247       245 001250       246 001264       250 001276       251 001300
+    252 001335       255 001336       260 001337       270 001340       271 001351       272 001354       273 001404
+    276 001405       277 001406       279 001412       281 001421       283 001437       284 001453       285 001457
+    286 001503       287 001505       288 001507       291 001510       292 001525       294 001537       295 001571
+    297 001572       299 001573       300 001575       301 001577       302 001603       304 001604       305 001606
+    306 001610       307 001634       308 001636       309 001671       311 001672       313 001673       314 001675
+    315 001677       316 001723       317 001725       318 001760       320 001761       322 001762       323 001764
+    324 001766       325 002012       326 002014       327 002052       332 002053       335 002055       337 002057
+    343 002060       354 002066       356 002075       358 002104       360 002113       363 002132       366 002151
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

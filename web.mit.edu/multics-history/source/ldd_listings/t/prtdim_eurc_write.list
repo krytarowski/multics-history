@@ -1,0 +1,1935 @@
+	COMPILATION LISTING OF SEGMENT prtdim_eurc_write
+	Compiled by: Multics PL/I Compiler, Release 29, of July 28, 1986
+	Compiled at: Honeywell Bull, Phoenix AZ, SysM
+	Compiled on: 02/02/88  1646.6 mst Tue
+	    Options: optimize map
+
+        1 /* ******************************************************
+        2*   *                                                    *
+        3*   *                                                    *
+        4*   * Copyright (c) 1972 by Massachusetts Institute of   *
+        5*   * Technology and Honeywell Information Systems, Inc. *
+        6*   *                                                    *
+        7*   *                                                    *
+        8*   ****************************************************** */
+        9 
+       10 
+       11 /* Printer DIM write module: responsible for actually sending print lines to the line printer and handling statuses
+       12*   returned from the printer by IOI */
+       13 
+       14 /* Created:  31 October 1974 by Noel I. Morris */
+       15 /* Modified: 16 March 1977 by Noel I. Morris */
+       16 /* Modified: June 1978 by J. C. Whitmore to suppress multiple error messages */
+       17 /* Modified: 7 August 1980 by Art Beattie to send error messages every N times and wait */
+       18 /* Modified: 27 November 1981 by G. Palter to fix entry number 0028 (phx04610) on the io_daemon error list:
+       19*   A power fault on a local printer will reset the VFC to the default state (6 lines/inch).  The entry in
+       20*   prt_status_table_ for "power fault" does not indicate that the VFC and train image are lost -- the fix for this bug
+       21*   is to add a new flag which is used by the printer DIM to indicate a VFC and image reload should be done after the
+       22*   operator readies the printer (the next special interrupt) */
+       23 /* Modified September 1983 by E. N. Kittlitz. Rewritten for multi-record IDCWs, no chaining or markers */
+       24 /* Modified 83-10-20 by E. N. Kittlitz for eurc/urmpc partitioning */
+       25 /* Modified 83-11-01 by E. N. Kittlitz for quit protection. Note that quit is the
+       26*   most likely IPS in the daemon environement which could result in further
+       27*   I/O to the attachment.  The older prtdim and the new prtdim_eurc_util
+       28*   do not have IPS/quit-only protection. */
+       29 
+       30 /* format: style4 */
+       31 prtdim_eurc_write:
+       32      procedure (arg_sdb_ptr, wkspptr, offset, nelem, nelemt, iostatus);
+       33 
+       34 dcl  arg_sdb_ptr ptr;				/* pointer to stream data block */
+       35 dcl  wkspptr ptr;					/* pointer to caller's data */
+       36 dcl  offset fixed bin (24);				/* offset into caller data */
+       37 dcl  nelem fixed bin (24);				/* number of elements to transmit */
+       38 dcl  nelemt fixed bin (24);				/* number of elements actually transmitted */
+       39 dcl  iostatus bit (72) aligned;			/* IOS status */
+       40 dcl  rcode fixed bin (35);				/* error code */
+       41 dcl  cur_page fixed bin;				/* current page number */
+       42 dcl  linep ptr;					/* pointer to place for data */
+       43 dcl  lth fixed bin (18);				/* remaining length of input */
+       44 dcl  inptr ptr;					/* pointer to rest of input */
+       45 dcl  errmess char (256) var;				/* error message on bad status */
+       46 dcl  n_dcws fixed bin;
+       47 dcl  unclean bit (1) aligned;				/* true if critical operation in progress */
+       48 dcl  quit_pending bit (1) aligned;
+       49 
+       50 dcl  last_iom_stat bit (72) aligned;			/* last status an error msg was printed for */
+       51 dcl  max_err_stat_count fixed bin init (10) int static options (constant); /* max no. of errors between reporting */
+       52 dcl  same_err_stat_count fixed bin;			/* counter for the same error status from printer */
+       53 
+       54 dcl  1 l_event_call_info aligned like event_call_info;
+       55 
+       56 dcl  (paper_low_flag init ("000000000000000001"b),	/* status flag for paper low */
+       57      image_flag init ("000000000000000010"b),		/* status flag for destroyed train image */
+       58      vfc_flag init ("000000000000000100"b),		/* status flag for destroyed VFC image */
+       59      slew_error init ("000000000000001000"b),		/* status flag for slew error on prev slew */
+       60      power_fault_flag init ("000000000000010000"b))	/* status flag for power fault */
+       61 	bit (18) aligned static options (constant);
+       62 
+       63 dcl  automagic bit (1) aligned init ("0"b);
+       64 dcl  dev_stat_bits bit (72) aligned int static options (constant) /* bits used by analyze_device_stat_ */
+       65 	init ("377700770000"b3 || (12)"0"b3);		/* bit string in octal to mask all but */
+       66 						/* power, maj, sub, channel and central status bits */
+       67 dcl  TIMEOUT fixed bin (71) init (180000000) int static options (constant);
+       68 						/* allow for any polling plus up to 63 lines */
+       69 
+       70 dcl  based_word bit (36) aligned based;
+       71 dcl  wksp char (1) based unal;			/* used for getting pointer to input string */
+       72 
+       73 dcl  prt_conv_ entry (ptr, fixed bin (18), ptr, fixed bin (18), ptr);
+       74 dcl  ioi_$connect entry (fixed bin, fixed bin (18), fixed bin (35));
+       75 dcl  ioi_$get_special_status entry (fixed bin, bit (1) aligned, bit (36) aligned, fixed bin (35));
+       76 dcl  ipc_$block entry (ptr, ptr, fixed bin (35));
+       77 dcl  ipc_$drain_chn entry (fixed bin (71), fixed bin (35));
+       78 dcl  analyze_device_stat_$rs entry (char (*) var, ptr, bit (72) aligned, bit (18) aligned);
+       79 dcl  analyze_system_fault_ entry (char (*) aligned, bit (72) aligned);
+       80 dcl  prtdim_eurc_util$finish_abort entry (ptr);
+       81 dcl  prtdim_eurc_util$load_image entry (ptr, fixed bin (35));
+       82 dcl  prtdim_eurc_util$load_vfc entry (ptr, fixed bin (35));
+       83 dcl  com_err_ entry options (variable);
+       84 dcl  timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2), fixed bin (71));
+       85 dcl  timer_manager_$reset_alarm_wakeup entry (fixed bin (71));
+       86 
+       87 dcl  prt_status_table_$prt_status_table_ ext;
+       88 
+       89 dcl  error_table_$data_loss fixed bin (35) ext static;
+       90 dcl  error_table_$net_timeout ext fixed bin (35);
+       91 dcl  error_table_$request_pending fixed bin (35) ext static;
+       92 
+       93 dcl  (addr, addrel, bin, bit, clock, divide, mod, null, rel, stackbaseptr, stackframeptr, stacq, string, substr, unspec, wordno) builtin;
+       94 
+       95 dcl  (cleanup, quit) condition;
+       96 
+       97 	unclean = "1"b;				/* pretty unsophisto, huh? */
+       98 	iostatus = "0"b;				/* Clear IOS status. */
+       99 	sdb_ptr = arg_sdb_ptr;			/* Copy pointer to stream data block. */
+      100 	pip = addr (sdb.info);			/* Get pointer to printer info structure. */
+      101 	pcip = addr (sdb.conv_info);			/* Get pointer to conversion info structure. */
+      102 	isp = null;
+      103 	statp = null;
+      104 	imp = null;
+      105 	rcode = 0;				/* Clear the error code. */
+      106 	call set_status (0, iostatus);		/* initialize status */
+      107 	nelemt = 0;				/* Zero elements transmitted. */
+      108 	quit_pending = ""b;
+      109 	on cleanup call tidy_up;
+      110 	on quit call process_quit;
+      111 	if sdb.aborting then do;			/* this shouldn't happen */
+      112 	     call finish_abort;			/* foo! no i/o */
+      113 	     go to write_returns;
+      114 	end;
+      115 
+      116 	last_iom_stat = ""b;			/* start clean on each write */
+      117 	same_err_stat_count = 0;
+      118 	lth = nelem;				/* Get initial length of input string. */
+      119 	inptr = addr (substr (wkspptr -> wksp, offset + 1, 1)); /* Get pointer to input string. */
+      120 	n_dcws = 0;
+      121 	prt_bufferp = null;
+      122 
+      123 	do while (lth > 0);				/* Loop until all elements transmitted. */
+      124 	     if quit_pending then do;			/* someone hit QUIT */
+      125 		if n_dcws > 0 then call close_buffer;	/* stop any work in progress */
+      126 		if sdb.running then call wait_io;	/* wait for device to quiesce */
+      127 		quit_pending = "0"b;		/* flag QUIT resignalled */
+      128 		revert quit;			/* suspend handler */
+      129 		signal quit;			/* resignal */
+      130 		on quit call process_quit;		/* re-establish handler */
+      131 		if rcode ^= 0 then go to write_returns; /* from wait_io */
+      132 	     end;
+      133 	     if n_dcws >= sdb.n_dcws then
+      134 		call close_buffer;
+      135 	     cur_page = pci.page_count;		/* Remember current page count. */
+      136 	     if prt_bufferp = null then
+      137 		call get_buffer (prt_bufferp, linep);
+      138 	     else do;
+      139 		linep = get_line_space ();
+      140 		if linep = null then call close_buffer;
+      141 	     end;
+      142 	     if prt_bufferp ^= null then
+      143 		call set_io;
+      144 	     else call wait_io;
+      145 
+      146 	     if rcode ^= 0 then go to write_returns;
+      147 
+      148 	     if cur_page ^= pci.page_count then do;	/* If going to a new page ... */
+      149 		sdb.stop_counter = sdb.stop_counter + 1;/* Bump the page stop counter. */
+      150 
+      151 		if sdb.single_page | (sdb.stop_every ^= 0 & sdb.stop_counter >= sdb.stop_every) then do;
+      152 		     if n_dcws > 0 then call close_buffer;
+      153 		     sdb.stop_counter = 0;		/* If time to stop ... */
+      154 		     call set_status (error_table_$request_pending, iostatus);
+      155 		     go to write_returns;
+      156 		end;
+      157 	     end;
+      158 	end;
+      159 
+      160 	if n_dcws > 0 then
+      161 	     call close_buffer;
+      162 write_returns:
+      163 	revert quit;				/* no more protection needed */
+      164 	if quit_pending then do;			/* any QUITs at last minute? */
+      165 	     quit_pending = "0"b;			/* be tidy */
+      166 	     signal quit;				/* resignal */
+      167 	end;
+      168 	sdb.chars_printed = sdb.chars_printed + nelem - lth; /* boost the number done */
+      169 	if rcode = 0 then do;			/* no nasty problems */
+      170 	     if ^sdb.running & prt_buffers (sdb.b_begin).busy then /* something to print */
+      171 		call start_io;			/* try to start printer */
+      172 	     if rcode ^= 0 then call set_status (rcode, iostatus); /* preserve status of request_pending unless error */
+      173 	end;
+      174 	else call set_status (rcode, iostatus);
+      175 	return;
+      176 
+      177 /* close buffer plops in the IDCW */
+      178 
+      179 close_buffer: proc;
+      180 
+      181 dcl  i fixed bin;
+      182 dcl  prevb fixed bin;
+      183 
+      184 	if n_dcws > sdb.max_dcws | n_dcws <= 0 then
+      185 	     call abort ("close_buffer: n_dcws is outrageous");
+      186 	if prt_buffer.busy then call abort ("closing busy buffer");
+      187 	idcwp = addr (prt_buffer.idcw);
+      188 	unspec (idcw) = prt_info.print_idcw;
+      189 	idcw.chan_cmd = "06"b3;			/* multi-record */
+      190 	idcw.count = bit (bin (n_dcws, 6), 6);
+      191 	prt_buffer.dcw_count = n_dcws;
+      192 	prt_buffer.data_ends = sdb.stop;
+      193 	do i = n_dcws + 1 to hbound (prt_buffer.ddcw, 1);
+      194 	     prt_buffer.ddcw (i) = sdb.null_line_dcw;
+      195 	end;
+      196 	n_dcws = 0;
+      197 	if sdb.b_stop = prt_buffer.number then do;
+      198 	     if sdb.b_stop ^= sdb.b_begin then
+      199 		call abort ("close buffer not first");
+      200 	end;
+      201 	else do;
+      202 	     if prt_buffer.number ^= mod (sdb.b_stop + 1, sdb.n_buffers) then
+      203 		call abort ("close buffer circular buffer error");
+      204 	     sdb.b_stop = prt_buffer.number;
+      205 	end;
+      206 	prt_buffer.busy = "1"b;
+      207 	prt_bufferp = null;
+      208 
+      209      end close_buffer;
+      210 
+      211 /* buffer management is not a strict circular buffer because we don't want to waste
+      212*   a buffer entry just for circular buffer discipline.  So...
+      213*   Note that the code is capable of coping with 1 - N buffers.
+      214**/
+      215 
+      216 get_buffer: proc (a_bufferp, a_linep);
+      217 dcl  a_bufferp ptr;
+      218 dcl  a_linep ptr;
+      219 dcl  n fixed bin;
+      220 
+      221 	a_bufferp = null;
+      222 	a_linep = get_line_space ();
+      223 	if a_linep = null then return;		/* no line space, why bother */
+      224 	n = mod (sdb.b_stop + 1, sdb.n_buffers);
+      225 	if prt_buffers (sdb.b_stop).busy then		/* some busy buffers */
+      226 	     if prt_buffers (n).busy then return;	/* no free buffer */
+      227 	     else a_bufferp = addr (prt_buffers (n));	/* use next buffer */
+      228 	else if sdb.b_stop ^= sdb.b_begin then		/* check that we're really idle */
+      229 	     call abort ("get_buffer stop^=begin, stop ^busy");
+      230 	else do;
+      231 	     a_bufferp = addr (prt_buffers (sdb.b_stop)); /* idle, use this one */
+      232 	end;
+      233 	do n = sdb.b_begin to sdb.b_stop;
+      234 	     if ^prt_buffers (n).busy then
+      235 		if n = sdb.b_begin & sdb.b_begin = sdb.b_stop then ;
+      236 		else call abort ("get buffer circular error");
+      237 	end;
+      238 
+      239      end get_buffer;
+      240 
+      241 
+      242 
+      243 /* try to get data space in the data portion of the workspace.  This is
+      244*   managed as a circular buffer. */
+      245 
+      246 get_line_space: proc returns (ptr);
+      247 
+      248 	if sdb.stop >= sdb.bgin then do;		/* not wrapped, maybe empty */
+      249 	     if sdb.stop + sdb.max_dcw_size > sdb.data_end then /* no room at top end */
+      250 		if sdb.data_begin + sdb.max_dcw_size >= sdb.bgin then /* no room at beginning */
+      251 		     return (null);
+      252 		else do;				/* wrap around */
+      253 		     if sdb.stop = sdb.bgin then	/* if empty */
+      254 			sdb.bgin = sdb.data_end;	/* keep it empty */
+      255 		     sdb.stop = sdb.data_begin;	/* wrap stop location */
+      256 		end;
+      257 	     else ;				/* use top end */
+      258 	end;					/* sdb.stop > sdb.bgin */
+      259 	else if sdb.stop + sdb.max_dcw_size >= sdb.bgin then /* crash into old stuff */
+      260 	     return (null);
+      261 	return (addr (wseg (sdb.stop)));		/* where to put it */
+      262 
+      263      end get_line_space;
+      264 
+      265 /* handle the QUIT condition */
+      266 
+      267 process_quit: proc;
+      268 dcl  continue_to_signal_ entry (fixed bin (35));
+      269 
+      270 	if sdb.wait_flag then			/* no i/o in progress, blast it through */
+      271 	     call continue_to_signal_ ((0));
+      272 	else quit_pending = "1"b;
+      273 
+      274      end process_quit;
+      275 
+      276 /* convert the input to something acceptable to printer, build the dcw */
+      277 
+      278 set_io: proc;
+      279 
+      280 dcl  word_cnt fixed bin (18);
+      281 dcl  char_cnt fixed bin (18);
+      282 
+      283 	call prt_conv_ (inptr, lth, linep, char_cnt, pcip); /* Perform code conversion. */
+      284 	word_cnt = divide (char_cnt + 3, 4, 18, 0);	/* Compute number of words to write. */
+      285 	if word_cnt > sdb.max_dcw_size then		/* oh dear */
+      286 	     call abort ("prt_conv_ output exceeded max DCW size");
+      287 	nelemt = nelem - lth;			/* Update the number of elements xmitted. */
+      288 	if sdb.noprint then return;			/* Just return if print suppressed. */
+      289 	n_dcws = n_dcws + 1;
+      290 	dcwp = addr (prt_buffer.ddcw (n_dcws));
+      291 	string (dcw) = "0"b;			/* Clear the DCW. */
+      292 	dcw.address = rel (linep);			/* Set address to point to data. */
+      293 	dcw.tally = bit (bin (word_cnt, 12));		/* Set tally of DCW. */
+      294 	sdb.stop = sdb.stop + word_cnt;		/* admit we used it */
+      295 	return;
+      296 
+      297      end set_io;
+      298 
+      299 /* make the printer listen to us */
+      300 
+      301 start_io: proc;
+      302 
+      303 	if ^sdb.wait_flag then
+      304 	     if prt_buffers (sdb.b_begin).busy then do;
+      305 		if sdb.running then
+      306 		     call abort ("start_io called with device running");
+      307 		call ioi_$connect (prt_info.devx, fixed (rel (addr (prt_buffers (sdb.b_begin).idcw))), rcode); /* Fire up the device. */
+      308 		if rcode = 0 then do;
+      309 		     sdb.alarm_time = clock () + TIMEOUT;
+      310 		     call timer_manager_$alarm_wakeup ((sdb.alarm_time), "00"b, sdb.evchan);
+      311 		     sdb.running = "1"b;		/* Indicate device now running. */
+      312 		end;
+      313 		else call abort ("connect failed " || ltrim (char (rcode)));
+      314 	     end;
+      315 	     else call abort ("start_io called with nothing to do");
+      316 	return;
+      317 
+      318      end start_io;
+      319 
+      320 /* wait for I/O in progress.  */
+      321 
+      322 wait_io: proc;					/* need buffer space - keep device busy */
+      323 
+      324 	if ^sdb.running then do;			/* If printer not running ... */
+      325 	     call start_io;				/* Get it in motion. */
+      326 	     if rcode ^= 0 then return;
+      327 	end;
+      328 	call ipc_$block (addr (sdb.ev_list), addr (l_event_call_info), rcode);
+      329 	if rcode ^= 0 then				/* Wait for I/O completion. */
+      330 	     return;
+      331 	call stat_check;				/* Examine status and set flags. */
+      332 	return;
+      333 
+      334      end wait_io;
+      335 
+      336 /* Printer status check entry. */
+      337 
+      338 stat_check: proc;
+      339 
+      340 dcl  dcws_done fixed bin;
+      341 dcl  flags bit (18) aligned;
+      342 dcl  i fixed bin;
+      343 dcl  residue fixed bin;
+      344 dcl  pp ptr;
+      345 dcl  l_idcwp ptr;
+      346 dcl  l_prt_bufferp ptr;
+      347 dcl  er bit (1) aligned;
+      348 dcl  level fixed bin;
+      349 dcl  time_out bit (1) aligned;
+      350 dcl  run bit (1) aligned;
+      351 dcl  offset fixed bin (18) unsigned;
+      352 dcl  st bit (1) aligned;
+      353 dcl  timer_rang bit (1) aligned;
+      354 dcl  special_flag bit (1) aligned;
+      355 dcl  temp_iom_stat bit (72) aligned;			/* temp area for iom status */
+      356 
+      357 dcl  l_timer_message char (8) based (imp);
+      358 
+      359 dcl  1 l_idcw aligned like idcw based (l_idcwp);
+      360 dcl  1 l_prt_buffer aligned like prt_buffer based (l_prt_bufferp);
+      361 dcl  1 l_istat aligned like istat;
+      362 
+      363 	isp = null;
+      364 	statp = null;
+      365 	imp = addr (l_event_call_info.message);		/* get pointer to ioi message */
+      366 
+      367 	if l_timer_message = "alarm___" then do;	/* check for timer ringing */
+      368 	     if clock () >= sdb.alarm_time & sdb.alarm_time ^= 0 then
+      369 		timer_rang = "1"b;			/* real alarm */
+      370 	     else return;				/* bogus timer */
+      371 	end;
+      372 	else timer_rang = "0"b;
+      373 	if sdb.wait_flag then do;			/* check for SPECIAL */
+      374 	     sdb.alarm_time = 0;
+      375 	     call timer_manager_$reset_alarm_wakeup (sdb.evchan); /* no more alarms */
+      376 	     call ioi_$get_special_status (prt_info.devx, special_flag, (""b), rcode);
+      377 	     if ^special_flag | rcode ^= 0 then do;	/* still not ready? */
+      378 		if rcode = 0 then do;		/* if no error, set another alarm timer */
+      379 		     sdb.alarm_time = clock () + TIMEOUT;
+      380 		     call timer_manager_$alarm_wakeup ((sdb.alarm_time), "00"b, sdb.evchan);
+      381 		end;
+      382 		return;
+      383 	     end;
+      384 	     sdb.alarm_time = 0;
+      385 	     sdb.wait_flag = "0"b;			/* not waiting any more */
+      386 	     if sdb.reload_vfc_train_after_special then do; /* whatever required operator intervention ... */
+      387 		call prtdim_eurc_util$load_image (sdb_ptr, (0)); /* ... also destroyed the train and VFC images */
+      388 		call prtdim_eurc_util$load_vfc (sdb_ptr, (0));
+      389 		sdb.reload_vfc_train_after_special = "0"b;
+      390 	     end;
+      391 	     imp = null;
+      392 	     return;
+      393 	end;
+      394 
+      395 	imp = null;
+      396 	l_istat = sdb.status_ptr -> istat;
+      397 	flags = "0"b;				/* Clear flags. */
+      398 	residue = -1;
+      399 
+      400 	st = l_istat.st;				/* put all this crap in local variables */
+      401 	level = bin (l_istat.level);			/* ... */
+      402 	er = l_istat.er;				/* ... */
+      403 	run = l_istat.run;				/* ... */
+      404 	time_out = l_istat.time_out;			/* ... */
+      405 	offset = bin (l_istat.offset);		/* ... */
+      406 	temp_iom_stat = l_istat.iom_stat;		/* ... */
+      407 	if run then
+      408 	     call abort ("run status returned");
+      409 
+      410 	if ^st then do;				/* foo */
+      411 	     statp = null;
+      412 	     if timer_rang then			/* blow out */
+      413 		call abort ("Completion of I/O was never indicated.");
+      414 	     else return;				/* wait some more */
+      415 	end;
+      416 	sdb.status_ptr -> istat.st = "0"b;
+      417 	sdb.running = "0"b;
+      418 	sdb.alarm_time = 0;
+      419 	call timer_manager_$reset_alarm_wakeup (sdb.evchan); /* no more alarms */
+      420 	if time_out then do;			/* if caused by time out */
+      421 	     call com_err_ (0, prt_info.devname, "IOI signalled device timeout.");
+      422 	     rcode = error_table_$net_timeout;		/* indicate error */
+      423 	     return;
+      424 	end;
+      425 
+      426 	statp = addr (temp_iom_stat);
+      427 	l_prt_bufferp = addr (prt_buffers (sdb.b_begin)); /* status must be on b_begin buffer */
+      428 	if ^l_prt_buffer.busy then
+      429 	     call abort ("stat_check found begin buffer ^busy");
+      430 	l_idcwp = addr (l_prt_buffer.idcw);
+      431 	if offset < bin (rel (l_idcwp))		/* check status offset */
+      432 
+      433 /*	     | offset > bin (rel (addr (l_prt_buffer.ddcw (l_prt_buffer.dcw_count)))) /* EURC sometimes goes too high */
+      434 
+      435 	then call abort ("invalid status offset");
+      436 	residue = bin (status.rcount);
+      437 
+      438 	if er then do;				/* If error occurred ... */
+      439 	     if level = IO_SYSTEM_FAULT_INTERRUPT_LEVEL then do; /* If system fault ... */
+      440 		call analyze_system_fault_ (prt_info.devname, temp_iom_stat);
+      441 		sdb.wait_flag = "1"b;		/* Wait for operator intervention. */
+      442 		sdb.error_count = sdb.error_count + 1;
+      443 		call abort ("system fault");
+      444 	     end;
+      445 	     else do;				/* If terminate ... */
+      446 		call analyze_device_stat_$rs (errmess, addr (prt_status_table_$prt_status_table_),
+      447 		     temp_iom_stat, flags);
+      448 		if status.channel_stat ^= ""b | status.central_stat ^= ""b then
+      449 		     call abort ((errmess));
+      450 
+      451 		if flags & paper_low_flag then
+      452 		     if pci.overflow_off then		/* If in overflow_off mode ... */
+      453 			flags = flags | report_flag | halt_flag;
+      454 						/* Stop now to avoid printing on perf. */
+      455 		     else if ^sdb.paper_low then do;	/* Report paper low only once. */
+      456 			sdb.paper_low = "1"b;
+      457 			flags = flags | report_flag;
+      458 		     end;
+      459 
+      460 		if flags & power_fault_flag then	/* power fault: VFC/train images no longer valid */
+      461 		     sdb.reload_vfc_train_after_special = "1"b;
+      462 
+      463 		if flags & report_flag then do;	/* If error should be reported ... */
+      464 		     sdb.error_count = sdb.error_count + 1;
+      465 
+      466 		     if (temp_iom_stat & dev_stat_bits) ^= last_iom_stat then do; /* if not reported */
+      467 			last_iom_stat = (temp_iom_stat & dev_stat_bits); /* save for next error */
+      468 			same_err_stat_count = 1;
+      469 			call com_err_ (0, prt_info.devname, errmess);
+      470 		     end;
+      471 		     else do;
+      472 			same_err_stat_count = same_err_stat_count + 1;
+      473 						/* Allow only a resonable amount of unreported */
+      474 						/* errors to occur.  Then report again. */
+      475 						/* Also want to report again if need to wait. */
+      476 			if same_err_stat_count >= max_err_stat_count | (flags & halt_flag) ^= "0"b
+      477 			then do;
+      478 			     sdb.wait_flag = "1"b;
+      479 			     call com_err_ (0, prt_info.devname, errmess);
+      480 			end;
+      481 		     end;
+      482 		end;
+      483 		sdb.wait_flag = ((flags & halt_flag) ^= "0"b) | sdb.wait_flag;
+      484 						/* Decide if operator intervention required. */
+      485 
+      486 		if flags & image_flag then do;	/* If train image destroyed ... */
+      487 		     call prtdim_eurc_util$load_image (sdb_ptr, rcode);
+      488 		     if rcode ^= 0 then do;
+      489 			statp = null;
+      490 			return;
+      491 		     end;
+      492 		end;
+      493 
+      494 		if flags & vfc_flag then do;		/* If VFC image destroyed ... */
+      495 		     call prtdim_eurc_util$load_vfc (sdb_ptr, rcode);
+      496 		     if rcode ^= 0 then do;
+      497 			statp = null;
+      498 			return;
+      499 		     end;
+      500 		end;
+      501 	     end;
+      502 
+      503 	     if sdb.wait_flag then do;
+      504 		sdb.alarm_time = clock + TIMEOUT;
+      505 		call timer_manager_$alarm_wakeup ((sdb.alarm_time), "00"b, sdb.evchan);
+      506 		same_err_stat_count = 0;
+      507 		call com_err_ (0, prt_info.devname, "***** OPERATOR INTERVENTION REQUIRED^/");
+      508 	     end;
+      509 
+      510 	end;
+      511 
+      512 	else					/* If no error ... */
+      513 	     sdb.paper_low = "0"b;			/* Reset paper low flag. */
+      514 
+      515 	if residue > l_prt_buffer.dcw_count | residue > sdb.max_dcws then
+      516 	     call abort ("residue exceeds dcw count or max dcws");
+      517 	if flags & backup_flag then			/* think you want to back up ? */
+      518 	     if ((flags & eurc_no_backup_flag) = ""b) | ^sdb.flags.eurc then /* no eurc special case or not eurc */
+      519 		residue = residue + 1;
+      520 	if residue > l_prt_buffer.dcw_count | residue > sdb.max_dcws then
+      521 	     call abort ("adjusted residue exceeds dcw count or max dcws");
+      522 
+      523 	if ^er | residue <= 0 then do;		/* terminated this buffer, too */
+      524 	     if l_prt_buffer.data_ends <= 0 | l_prt_buffer.dcw_count <= 0 then
+      525 		call abort ("last buffer bad data_ends/dcw_count");
+      526 	     sdb.bgin = l_prt_buffer.data_ends;		/* only update bgin when whole buffer is done */
+      527 	     l_prt_buffer.busy = "0"b;
+      528 	     l_prt_buffer.ddcw (*) = sdb.null_line_dcw;
+      529 	     l_prt_buffer.idcw = "777777000014"b3;
+      530 	     l_prt_buffer.data_ends = 0;
+      531 	     l_prt_buffer.dcw_count = 0;
+      532 	     if sdb.b_begin ^= sdb.b_stop then
+      533 		sdb.b_begin = mod (sdb.b_begin + 1, sdb.n_buffers);
+      534 	     l_prt_bufferp = null;
+      535 	end;
+      536 	else do;
+      537 	     if l_prt_buffer.data_ends <= 0 | l_prt_buffer.dcw_count <= 0 then
+      538 		call abort ("processing error buffer - bad data_ends/dcw_count");
+      539 	     dcws_done = l_prt_buffer.dcw_count - residue;
+      540 	     do i = 1 to hbound (l_prt_buffer.ddcw, 1);	/* fix up dcws */
+      541 		if i <= residue then		/* this dcw or trailing slot will be used in next connect */
+      542 		     l_prt_buffer.ddcw (i) = l_prt_buffer.ddcw (i + dcws_done);
+      543 		else l_prt_buffer.ddcw (i) = sdb.null_line_dcw;
+      544 	     end;
+      545 	     l_idcw.count = bit (bin (residue, 6), 6);
+      546 	     l_prt_buffer.dcw_count = residue;
+      547 	     l_prt_bufferp = null;
+      548 	end;					/* er */
+      549 	statp = null;
+      550 	return;
+      551 
+      552      end stat_check;
+      553 
+      554 /* entry to wait out current I/O and scrap unprinted info  */
+      555 
+      556 prtdim_resetwrite: entry (arg_sdb_ptr, iostatus);
+      557 
+      558 	unclean = "1"b;
+      559 	iostatus = "0"b;
+      560 	sdb_ptr = arg_sdb_ptr;
+      561 	pip = addr (sdb.info);
+      562 	pcip = addr (sdb.conv_info);
+      563 	isp = null;
+      564 	statp = null;
+      565 	imp = null;
+      566 	rcode = 0;
+      567 	quit_pending = ""b;
+      568 	on cleanup call tidy_up;
+      569 	on quit call process_quit;
+      570 	if sdb.aborting then do;			/* wants to throw away the world, be nice */
+      571 	     call prtdim_eurc_util$finish_abort (sdb_ptr);
+      572 	     if sdb.aborting then do;
+      573 		call set_status (error_table_$data_loss, iostatus);
+      574 		go to resetwrite_returns;		/* still a mess */
+      575 	     end;
+      576 	     iostatus = ""b;
+      577 	     sdb.wait_flag = "0"b;
+      578 	end;
+      579 	do while (sdb.running);			/* Wait for printer to stop. */
+      580 	     call wait_io;				/* stop */
+      581 	     if quit_pending then do;			/* any defered QUIT? */
+      582 		quit_pending = "0"b;
+      583 		revert quit;
+      584 		signal quit;
+      585 		on quit call process_quit;
+      586 	     end;
+      587 	     if rcode ^= 0 then do;			/* from wait_io, not disturbed by QUIT hack */
+      588 		call set_status (rcode, iostatus);
+      589 		go to resetwrite_returns;
+      590 	     end;
+      591 	end;
+      592 
+      593 	sdb.bgin,
+      594 	     sdb.stop = sdb.data_begin;		/* Reset all indices. */
+      595 	prt_buffers (*).busy = "0"b;
+      596 	sdb.b_stop, sdb.b_begin = 0;
+      597 
+      598 resetwrite_returns:
+      599 	revert quit;
+      600 	if quit_pending then do;
+      601 	     quit_pending = "0"b;
+      602 	     signal quit;
+      603 	end;
+      604 	return;					/* Output all scrapped. */
+      605 
+      606 /* entry to await all pending unprinted information */
+      607 
+      608 runout: entry (arg_sdb_ptr, iostatus);
+      609 
+      610 	unclean = "1"b;
+      611 	iostatus = "0"b;
+      612 	sdb_ptr = arg_sdb_ptr;
+      613 	pip = addr (sdb.info);
+      614 	pcip = addr (sdb.conv_info);
+      615 	isp = null;
+      616 	statp = null;
+      617 	imp = null;
+      618 	rcode = 0;
+      619 	quit_pending = ""b;
+      620 	on cleanup call tidy_up;
+      621 	on quit call process_quit;
+      622 	if sdb.aborting then do;			/* shouldn't happen */
+      623 	     call finish_abort;
+      624 	     go to runout_returns;
+      625 	end;
+      626 	do while (prt_buffers (sdb.b_begin).busy);	/* as long as there's stuff to do */
+      627 	     call wait_io;				/* Start printer and wait for completion. */
+      628 	     if quit_pending then do;			/* process quit first */
+      629 		quit_pending = "0"b;
+      630 		revert quit;
+      631 		signal quit;
+      632 		on quit call process_quit;
+      633 	     end;
+      634 	     if rcode ^= 0 then do;
+      635 		call set_status (rcode, iostatus);
+      636 		go to runout_returns;
+      637 	     end;
+      638 	end;
+      639 	call ipc_$drain_chn (sdb.evchan, (0));		/* ioi has nothing left to say */
+      640 runout_returns:
+      641 	revert quit;
+      642 	if quit_pending then do;
+      643 	     quit_pending = "0"b;
+      644 	     signal quit;
+      645 	end;
+      646 	return;					/* Output all flushed. */
+      647 
+      648 abort: proc (a_message);
+      649 dcl  a_message char (132);
+      650 dcl  sub_err_ entry () options (variable);
+      651 
+      652 	call dump (a_message);
+      653 	sdb.aborting = "1"b;
+      654 	call com_err_ (0, prt_info.devname, "***** Unexpected status or program error.");
+      655 	call com_err_ (0, prt_info.devname, "***** ^a.", a_message);
+      656 	call com_err_ (0, prt_info.devname, "***** Data has been lost.");
+      657 	call finish_abort;				/* try to clean it up now */
+      658 	call sub_err_ (error_table_$data_loss, "prtdim_eurc_write", ACTION_CANT_RESTART, null (), (0), "Unexpected status or program error.");
+      659 
+      660      end abort;
+      661 
+      662 
+      663 dump: proc (a_message);
+      664 dcl  a_message char (*);
+      665 dcl  copy_length fixed bin (19);
+      666 dcl  name char (30) varying;
+      667 dcl  d_stackp ptr;
+      668 dcl  d_wsegp ptr;
+      669 dcl  code fixed bin (35);
+      670 dcl  sb ptr;
+      671 
+      672 dcl  1 bumf aligned based,
+      673        2 version fixed bin (71),
+      674        2 time fixed bin (71),
+      675        2 sp ptr,
+      676        2 message char (128);
+      677 
+      678 dcl  copy_seg (copy_length * 4) char unaligned based;
+      679 
+      680 dcl  hcs_$get_max_length_seg entry (ptr, fixed bin (19), fixed bin (35));
+      681 dcl  hcs_$make_seg entry (char (*), char (*), char (*), fixed bin (5), ptr, fixed bin (35));
+      682 dcl  terminate_file_ entry (ptr, fixed bin (24), bit (*), fixed bin (35));
+      683 dcl  unique_chars_ entry (bit (*)) returns (char (15));
+      684 
+      685 	name = "prtdim." || unique_chars_ (""b) || "." || prt_info.devname;
+      686 	call hcs_$make_seg (">dumps>printer_dumps", name || ".s", "", RW_ACCESS_BIN, d_stackp, code);
+      687 	if code ^= 0 then return;
+      688 	call com_err_ (0, prt_info.devname, "***** creating dump ^a (^a), sp=^o.", name, a_message, fixed (rel (stackframeptr ())));
+      689 	sb = stackbaseptr ();
+      690 	copy_length = fixed (rel (sb -> stack_header.stack_end_ptr));
+      691 	d_stackp -> copy_seg = sb -> copy_seg;
+      692 	call terminate_file_ (d_stackp, copy_length * 36, TERM_FILE_TRUNC_BC_TERM, (0));
+      693 	call hcs_$make_seg (">dumps>printer_dumps", name || ".w", "", RW_ACCESS_BIN, d_wsegp, code);
+      694 	if code ^= 0 then return;
+      695 	copy_length = 1024 * (divide (fixed (rel (sdb.status_ptr)), 1024, 17, 0) + 1);
+      696 	d_wsegp -> copy_seg = sdb.wsegp -> copy_seg;
+      697 	d_wsegp = addrel (d_wsegp, copy_length);
+      698 	d_wsegp -> bumf.version = 1;
+      699 	d_wsegp -> time = clock ();
+      700 	d_wsegp -> bumf.sp = stackframeptr ();
+      701 	d_wsegp -> bumf.message = a_message;
+      702 	d_wsegp = addrel (d_wsegp, size (bumf));
+      703 	copy_length = size (sdb);
+      704 	d_wsegp -> copy_seg = sdb_ptr -> copy_seg;
+      705 	d_wsegp = addrel (d_wsegp, copy_length);
+      706 	call terminate_file_ (d_wsegp, fixed (rel (d_wsegp)) * 36, TERM_FILE_TRUNC_BC_TERM, (0));
+      707      end dump;
+      708 
+      709 
+      710 finish_abort: proc;
+      711 dcl  old_wait_flag bit (1) aligned;
+      712 
+      713 	old_wait_flag = sdb.wait_flag;
+      714 	call prtdim_resetwrite (sdb_ptr, iostatus);
+      715 	sdb.wait_flag = old_wait_flag;
+      716 	call set_status (error_table_$data_loss, iostatus);
+      717 
+      718      end finish_abort;
+      719 
+      720 
+      721 set_status: proc (a_code, a_iostatus);
+      722 dcl  a_code fixed bin (35);
+      723 dcl  a_iostatus bit (72) aligned;
+      724 
+      725 	substr (a_iostatus, 1, 36) = unspec (a_code);
+      726 	substr (a_iostatus, 41, 1) = "1"b;
+      727 
+      728      end set_status;
+      729 
+      730 
+      731 tidy_up: proc;
+      732 
+      733 	if ^unclean | sdb.aborting then return;		/* if nothing to worry about or already cleaning up */
+      734 	sdb.aborting = "1"b;
+      735 	call finish_abort;				/* try to quiesce device now */
+      736 
+      737      end tidy_up;
+      738 
+      739 /* format: off */
+      740  /* BEGIN INCLUDE FILE ... access_mode_values.incl.pl1
+  1     2*
+  1     3*   Values for the "access mode" argument so often used in hardcore
+  1     4*   James R. Davis 26 Jan 81  MCR 4844
+  1     5*   Added constants for SM access 4/28/82 Jay Pattin
+  1     6*   Added text strings 03/19/85 Chris Jones
+  1     7**/
+  1     8 
+  1     9 
+  1    10 /* format: style4,delnl,insnl,indattr,ifthen,dclind10 */
+  1    11 dcl	(
+  1    12 	N_ACCESS		   init ("000"b),
+  1    13 	R_ACCESS		   init ("100"b),
+  1    14 	E_ACCESS		   init ("010"b),
+  1    15 	W_ACCESS		   init ("001"b),
+  1    16 	RE_ACCESS		   init ("110"b),
+  1    17 	REW_ACCESS	   init ("111"b),
+  1    18 	RW_ACCESS		   init ("101"b),
+  1    19 	S_ACCESS		   init ("100"b),
+  1    20 	M_ACCESS		   init ("010"b),
+  1    21 	A_ACCESS		   init ("001"b),
+  1    22 	SA_ACCESS		   init ("101"b),
+  1    23 	SM_ACCESS		   init ("110"b),
+  1    24 	SMA_ACCESS	   init ("111"b)
+  1    25 	)		   bit (3) internal static options (constant);
+  1    26 
+  1    27 /* The following arrays are meant to be accessed by doing either 1) bin (bit_value) or
+  1    28*   2) divide (bin_value, 2) to come up with an index into the array. */
+  1    29 
+  1    30 dcl	SEG_ACCESS_MODE_NAMES  (0:7) init ("null", "W", "E", "EW", "R", "RW", "RE", "REW") char (4) internal
+  1    31 			   static options (constant);
+  1    32 
+  1    33 dcl	DIR_ACCESS_MODE_NAMES  (0:7) init ("null", "A", "M", "MA", "S", "SA", "SM", "SMA") char (4) internal
+  1    34 			   static options (constant);
+  1    35 
+  1    36 dcl	(
+  1    37 	N_ACCESS_BIN	   init (00000b),
+  1    38 	R_ACCESS_BIN	   init (01000b),
+  1    39 	E_ACCESS_BIN	   init (00100b),
+  1    40 	W_ACCESS_BIN	   init (00010b),
+  1    41 	RW_ACCESS_BIN	   init (01010b),
+  1    42 	RE_ACCESS_BIN	   init (01100b),
+  1    43 	REW_ACCESS_BIN	   init (01110b),
+  1    44 	S_ACCESS_BIN	   init (01000b),
+  1    45 	M_ACCESS_BIN	   init (00010b),
+  1    46 	A_ACCESS_BIN	   init (00001b),
+  1    47 	SA_ACCESS_BIN	   init (01001b),
+  1    48 	SM_ACCESS_BIN	   init (01010b),
+  1    49 	SMA_ACCESS_BIN	   init (01011b)
+  1    50 	)		   fixed bin (5) internal static options (constant);
+  1    51 
+  1    52 /* END INCLUDE FILE ... access_mode_values.incl.pl1 */
+      740 
+      741  /* BEGIN INCLUDE FILE event_call_info.incl.pl1 */
+  2     2 
+  2     3 /* T. Casey, May 1978 */
+  2     4 
+  2     5 dcl  event_call_info_ptr ptr;
+  2     6 
+  2     7 dcl 1 event_call_info aligned based (event_call_info_ptr),	/* argument structure passed to event call procedure */
+  2     8     2 channel_id fixed bin (71),			/* event channel on which wakeup occurred */
+  2     9     2 message fixed bin (71),				/* 72 bits of information passed by sender of wakeup */
+  2    10     2 sender bit (36),				/* process id of sender */
+  2    11     2 origin,
+  2    12       3 dev_signal bit (18) unaligned,			/* "1"b if device signal */
+  2    13       3 ring fixed bin (17) unaligned,			/* ring from which sent */
+  2    14     2 data_ptr ptr;					/* ptr given to dcl_event_call_channel */
+  2    15 
+  2    16 /* END INCLUDE FILE event_call_info.incl.pl1 */
+      741 
+      742  /*  START OF:	interrupt_levels.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+  3     2 
+  3     3 /* Written 14 June 1982 by Chris Jones */
+  3     4 
+  3     5 /* format: style4,delnl,insnl,indattr,ifthen,declareind10,dclind10 */
+  3     6 dcl	IO_SYSTEM_FAULT_INTERRUPT_LEVEL
+  3     7 			   fixed bin internal static options (constant) init (1);
+  3     8 dcl	IO_TERMINATE_INTERRUPT_LEVEL
+  3     9 			   fixed bin internal static options (constant) init (3);
+  3    10 dcl	IO_MARKER_INTERRUPT_LEVEL
+  3    11 			   fixed bin internal static options (constant) init (5);
+  3    12 dcl	IO_SPECIAL_INTERRUPT_LEVEL
+  3    13 			   fixed bin internal static options (constant) init (7);
+  3    14 
+  3    15 /*  END OF:	interrupt_levels.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+      742 
+      743  
+  4     2 /* Begin include file ...... ioi_stat.incl.pl1 */
+  4     3 /* Last modified 3/24/75 by Noel I. Morris */
+  4     4 
+  4     5 dcl  isp ptr;					/* pointer to status structure */
+  4     6 
+  4     7 dcl 1 istat based (isp) aligned,			/* I/O Interfacer status structure */
+  4     8     2 completion,					/* completion flags */
+  4     9      (3 st bit (1),					/* "1"b if status returned */
+  4    10       3 er bit (1),					/* "1"b if status indicates error condition */
+  4    11       3 run bit (1),				/* "1"b if channel still running */
+  4    12       3 time_out bit (1)) unal,			/* "1"b if time-out occurred */
+  4    13     2 level fixed bin (3),				/* IOM interrupt level */
+  4    14     2 offset fixed bin (18),				/* DCW list offset */
+  4    15     2 absaddr fixed bin (24),				/* absolute address of workspace */
+  4    16     2 iom_stat bit (72),				/* IOM status */
+  4    17     2 lpw bit (72);					/* LPW residue */
+  4    18 
+  4    19 dcl  imp ptr;					/* pointer to message structure */
+  4    20 
+  4    21 dcl 1 imess based (imp) aligned,			/* I/O Interfacer event message structure */
+  4    22    (2 completion like istat.completion,			/* completion flags */
+  4    23     2 pad bit (11),
+  4    24     2 level bit (3),				/* interrupt level */
+  4    25     2 offset bit (18),				/* DCW list offset */
+  4    26     2 status bit (36)) unal;				/* first 36 bits of status */
+  4    27 
+  4    28 /* End of include file ...... ioi_stat.incl.pl1 */
+  4    29 
+      743 
+      744  
+  5     2 /* Begin include file ...... iom_dcw.incl.pl1 */
+  5     3 
+  5     4 dcl  dcwp ptr,					/* pointer to DCW */
+  5     5      tdcwp ptr;					/* pointer to TDCW */
+  5     6 
+  5     7 dcl 1 dcw based (dcwp) aligned,			/* Data Control Word */
+  5     8      (2 address bit (18),				/* address for data transfer */
+  5     9       2 char_pos bit (3),				/* character position */
+  5    10       2 m64 bit (1),				/* non-zero for mod 64 address */
+  5    11       2 type bit (2),				/* DCW type */
+  5    12       2 tally bit (12)) unal;				/* tally for data transfer */
+  5    13 
+  5    14 dcl 1 tdcw based (tdcwp) aligned,			/* Transfer DCW */
+  5    15      (2 address bit (18),				/* address to transfer to */
+  5    16       2 mbz1 bit (4),
+  5    17       2 type bit (2),				/* should be "10"b for TDCW */
+  5    18       2 mbz2 bit (9),
+  5    19       2 ec bit (1),					/* non-zero to set LPW AE bit */
+  5    20       2 res bit (1),				/* non-zero to restrict further use of IDCW */
+  5    21       2 rel bit (1)) unal;				/* non-zero to set relative mode after transfer */
+  5    22 
+  5    23 /* End of include file ...... iom_dcw.incl.pl1 */
+  5    24 
+      744 
+      745  
+  6     2 /* Begin include file ...... iom_pcw.incl.pl1 */
+  6     3 
+  6     4 dcl  pcwp ptr;					/* pointer to PCW */
+  6     5 
+  6     6 dcl 1 pcw based (pcwp) aligned,			/* Peripheral Control Word */
+  6     7      (2 command bit (6),				/* device command */
+  6     8       2 device bit (6),				/* device code */
+  6     9       2 ext bit (6),				/* address extension */
+  6    10       2 code bit (3),				/* should be "111"b for PCW */
+  6    11       2 mask bit (1),				/* channel mask bit */
+  6    12       2 control bit (2),				/* terminate/proceed and marker control bits */
+  6    13       2 chan_cmd bit (6),				/* type of I/O operation */
+  6    14       2 count bit (6),				/* record count or control character */
+  6    15       2 mbz1 bit (3),
+  6    16       2 channel bit (6),				/* channel number */
+  6    17       2 mbz2 bit (27)) unal;
+  6    18 
+  6    19 dcl  idcwp ptr;					/* pointer to IDCW */
+  6    20 
+  6    21 dcl 1 idcw based (idcwp) aligned,			/* Instruction DCW */
+  6    22      (2 command bit (6),				/* device command */
+  6    23       2 device bit (6),				/* device code */
+  6    24       2 ext bit (6),				/* address extension */
+  6    25       2 code bit (3),				/* should be "111"b for PCW */
+  6    26       2 ext_ctl bit (1),				/* "1"b if address extension to be used */
+  6    27       2 control bit (2),				/* terminate/proceed and marker control bits */
+  6    28       2 chan_cmd bit (6),				/* type of I/O operation */
+  6    29       2 count bit (6)) unal;				/* record count or control character */
+  6    30 
+  6    31 /* End include file ...... iom_pcw.incl.pl1 */
+  6    32 
+      745 
+      746  
+  7     2 /* Begin include file ...... iom_stat.incl.pl1 */
+  7     3 /* Last modified on 10/31/74 by Noel I. Morris */
+  7     4 
+  7     5 dcl  statp ptr;					/* pointer to status */
+  7     6 
+  7     7 dcl 1 status based (statp) aligned,			/* IOM status information */
+  7     8      (2 t bit (1),					/* set to "1"b by IOM */
+  7     9       2 power bit (1),				/* non-zero if peripheral absent or power off */
+  7    10       2 major bit (4),				/* major status */
+  7    11       2 sub bit (6),				/* substatus */
+  7    12       2 eo bit (1),					/* even/odd bit */
+  7    13       2 marker bit (1),				/* non-zero if marker status */
+  7    14       2 soft bit (2),				/* software status */
+  7    15       2 initiate bit (1),				/* initiate bit */
+  7    16       2 abort bit (1),				/* software abort bit */
+  7    17       2 channel_stat bit (3),				/* IOM channel status */
+  7    18       2 central_stat bit (3),				/* IOM central status */
+  7    19       2 mbz bit (6),
+  7    20       2 rcount bit (6),				/* record count residue */
+  7    21       2 address bit (18),				/* DCW address residue */
+  7    22       2 char_pos bit (3),				/* character position residue */
+  7    23       2 r bit (1),					/* non-zero if reading */
+  7    24       2 type bit (2),				/* type of last DCW */
+  7    25       2 tally bit (12)) unal;				/* DCW tally residue */
+  7    26 
+  7    27 dcl 1 faultword based (statp) aligned,			/* system fault word */
+  7    28      (2 mbz1 bit (9),
+  7    29       2 channel bit (9),				/* channel number */
+  7    30       2 serv_req bit (5),				/* service request */
+  7    31       2 mbz2 bit (3),
+  7    32       2 controller_fault bit (4),			/* system controller fault code */
+  7    33       2 io_fault bit (6)) unal;			/* I/O fault code */
+  7    34 
+  7    35 dcl 1 special_status based (statp) aligned,		/* special status from PSIA */
+  7    36    (2 t bit (1),					/* entry present bit */
+  7    37     2 channel bit (8),				/* channel number */
+  7    38     2 pad1 bit (3),
+  7    39     2 device bit (6),				/* device address */
+  7    40     2 pad2 bit (1),
+  7    41     2 byte2 bit (8),				/* device dependent information */
+  7    42     2 pad3 bit (1),
+  7    43     2 byte3 bit (8)) unal;				/* device dependent information */
+  7    44 
+  7    45 /* End of include file iom_stat.incl.pl1 */
+  7    46 
+      746 
+      747  
+  8     2 /* BEGIN INCLUDE FILE ... prt_conv_info.incl.pl1 */
+  8     3 /* Modified: 12 September 1980 by G. Palter */
+  8     4 
+  8     5 
+  8     6 /****^  HISTORY COMMENTS:
+  8     7*  1) change(87-05-10,Gilcrease), approve(87-07-31,MCR7686),
+  8     8*     audit(88-02-01,Farley), install(88-02-02,MR12.2-1019):
+  8     9*     Add modes.line_nbrs, flags.(eol eof)  bits for eor -nb.
+  8    10*                                                   END HISTORY COMMENTS */
+  8    11 
+  8    12 
+  8    13 dcl  pcip ptr;					/* pointer to conversion info structure */
+  8    14 
+  8    15 dcl 1 pci based (pcip) aligned,			/* printer conversion info structure */
+  8    16     2 cv_proc ptr,					/* pointer to character conversion procedure */
+  8    17     2 lmarg fixed bin,				/* left margin indentation */
+  8    18     2 rmarg fixed bin,				/* right margin limit */
+  8    19     2 page_length fixed bin,				/* number of lines on page */
+  8    20     2 phys_line_length fixed bin,			/* physical width of paper */
+  8    21     2 phys_page_length fixed bin,			/* physical length of paper */
+  8    22     2 lpi fixed bin,				/* lines per inch */
+  8    23     2 sheets_per_page fixed bin,			/* sheets of paper per logical page */
+  8    24     2 line_count fixed bin,				/* count of converted lines */
+  8    25     2 page_count fixed bin,				/* count of converted pages */
+  8    26     2 func fixed bin,				/* special conversion function */
+  8    27 						/* 0 => normal conversion */
+  8    28 						/* 1 => change NL to FF */
+  8    29 						/* 2 => change NL to top inside page */
+  8    30 						/* 3 => change NL to end of page */
+  8    31                                                             /* 4 => change NL to top of outside page */
+  8    32     (2 modes,					/* conversion modes */
+  8    33      3 overflow_off bit (1),				/* "1"b to suppress end of page overflow */
+  8    34       3 single_space bit (1),				/* "1"b to change all forms advance chars to NL */
+  8    35       3 non_edited bit (1),				/* "1"b to print ASCII control chars */
+  8    36       3 truncate bit (1),				/* "1"b to truncate lines that are too long */
+  8    37       3 esc bit (1),				/* "1"b to process ESC character */
+  8    38       3 ctl_char bit (1),				/* "1"b to output control characters */
+  8    39       3 line_nbrs bit (1),				/* "1"b to output line numbers */
+  8    40       3 pci_pad bit (5),
+  8    41     2 flags,					/* flags internal to prt_conv_ */
+  8    42       3 ignore_next_ff bit (1),			/* ON => prt_conv_ just output a FF; ignore next character if
+  8    43*						   it's a FF */
+  8    44       3 eol bit (1),				/* "1"b = end-of-line encountered */
+  8    45       3 eof bit (1),				/* "1"b = end-of-segment encountered */
+  8    46       3 flags_pad bit (3),
+  8    47     2 coroutine_modes,
+  8    48       3 upper_case bit(1),				/* "1"b to convert to upper case */
+  8    49       3 ht bit(1),					/* "1"b to skip tab conversion */
+  8    50       3 coroutine_pad bit(13),
+  8    51       3 slew_table_idx bit(3) ) unal,			/* slew table index */
+  8    52     2 top_label_line char (136),			/* contains an optional top of page label */
+  8    53     2 bot_label_line char (136),			/* contains an optional bottom of page label */
+  8    54     2 top_label_length fixed bin,			/* length of top label line */
+  8    55     2 bot_label_length fixed bin,			/* length of bottom label line */
+  8    56     2 form_stops (256) unal,				/* logical form stops */
+  8    57       3 lbits bit (9),				/* leftmost bits */
+  8    58       3 rbits bit (9),				/* rightmost bits */
+  8    59 
+  8    60 /* The following items are for internal use by the print conversion procedure.
+  8    61*   They should be zeroed once and then never referenced again.		*/
+  8    62 
+  8    63     2 level fixed bin,				/* overstrike level */
+  8    64     2 pos fixed bin,				/* print position at end of incomplete line */
+  8    65     2 line fixed bin,				/* current line number */
+  8    66     2 slew_residue fixed bin,				/* number of lines remaining to be slewed */
+  8    67     2 label_nelem fixed bin,				/* characters remaining in label */
+  8    68     2 label_wksp ptr,				/* pointer to label being processed */
+  8    69     2 sav_pos fixed bin,				/* position saved during label processing */
+  8    70     2 esc_state fixed bin,				/* state of ESC processing */
+  8    71     2 esc_num fixed bin,				/* number following ESC sequence */
+  8    72     2 temp bit (36);				/* conversion proc temporary */
+  8    73 
+  8    74 /* End of include file ...... prt_conv_info.incl.pl1 */
+  8    75 
+      747 
+      748  
+  9     2 /* Begin include file ...... prt_info.incl.pl1 */
+  9     3 /* last modified 6/12/75 by Noel I. Morris	*/
+  9     4 
+  9     5 dcl  pip ptr;					/* pointer to printer info structure */
+  9     6 
+  9     7 dcl 1 prt_info based (pip) aligned,			/* printer info structure */
+  9     8     2 devname char (4),				/* name of device */
+  9     9     2 devx fixed bin,				/* device index */
+  9    10     2 model fixed bin,				/* printer model number */
+  9    11     2 type fixed bin,				/* printer type number */
+  9    12     2 train fixed bin,				/* print train ID */
+  9    13     2 line_length fixed bin,				/* max length of printed line */
+  9    14     2 print_idcw bit (36),				/* IDCW to print 1 line */
+  9    15     2 term_idcw bit (36);				/* IDCW to stop printer channel */
+  9    16 
+  9    17 /* End of include file ...... prt_info.incl.pl1 */
+  9    18 
+      748 
+      749  /* BEGIN INCLUDE FILE ... prt_sdb.incl.pl1 */
+ 10     2 /* Note: there is a corresponding prt_sdb.incl.alm */
+ 10     3 
+ 10     4 /* Created 10/28/74 by Noel I. Morris	*/
+ 10     5 /* Modified 3/15/77 by Noel I. Morris	*/
+ 10     6 /* Modified 1/25/78 by J. C. Whitmore to merge prtdim and spooling_dim versions */
+ 10     7 /* Modified: 27 November 1981 by G. Palter to add reload_vfc_train_after_special flag */
+ 10     8 /* Modified: 16 August 1983 by E. N. Kittlitz for new printer dim */
+ 10     9 
+ 10    10 dcl  sdb_ptr ptr;					/* pointer to stream data block */
+ 10    11 
+ 10    12 dcl 1 sdb aligned based (sdb_ptr),			/* printer stream data block */
+ 10    13     2 outer_module_name char (32) aligned,
+ 10    14     2 device_name_list_ptr pointer,
+ 10    15     2 device_name,
+ 10    16       3 next_device_ptr pointer,
+ 10    17       3 name_size fixed bin (17),
+ 10    18       3 name char (32) aligned,
+ 10    19     2 ev_list aligned,				/* Event list for ipc_ */
+ 10    20       3 count fixed bin (17),				/* Event count = Always one */
+ 10    21       3 evchan fixed bin (71),			/* Event channel name */
+ 10    22     2 stream_name char (32),				/* stream name of this attachment */
+ 10    23     2 areap ptr,					/* pointer to system free area */
+ 10    24     2 info like prt_info aligned,			/* printer info */
+ 10    25     2 conv_info like pci aligned,			/* conversion info */
+ 10    26     2 chars_printed fixed bin (35),			/* input chars processed since "reset" */
+ 10    27     2 stop_every fixed bin,				/* non-zero to stop after number of pages */
+ 10    28     2 stop_counter fixed bin,				/* page stop counter */
+ 10    29     2 mode,					/* additional modes */
+ 10    30      (3 single_page bit (1),				/* "1"b to stop after each page */
+ 10    31       3 noprint bit (1),				/* "1"b to suppress printing */
+ 10    32       3 pad bit (34)) unal,
+ 10    33     2 rcp_id bit (36),				/* RCP attachment ID */
+ 10    34     2 wsegp ptr,					/* pointer to IOI working segment */
+ 10    35     2 running bit (1),				/* "1"b if channel running */
+ 10    36     2 bgin fixed bin (18),				/* index to oldest print line */
+ 10    37     2 stop fixed bin (18),				/* index to next print line */
+ 10    38     2 prev fixed bin (18),				/* index to previous print line */
+ 10    39     2 wait_flag bit (1) aligned,			/* non-zero if waiting for special */
+ 10    40     2 marker_count fixed bin,				/* counter for marker status insertion */
+ 10    41     2 paper_low bit (1) aligned,			/* "1"b if paper low */
+ 10    42     2 error_count fixed bin,				/* error counter */
+ 10    43     2 buffer_ptr ptr,				/* pointer to output buffer (spooler) */
+ 10    44     2 spool_info (56) fixed bin,			/* place to store spooling_info */
+ 10    45     2 reload_vfc_train_after_special bit (1) aligned,	/* "1"b if VFC/train images should be reloaded after next
+ 10    46*						   special interrupt */
+ 10    47     2 max_dcw_size fixed bin (12) uns unal,		/* max wordcount of dcw */
+ 10    48     2 max_dcws fixed bin (6) uns unal,			/* max dcws per idcw/buffer */
+ 10    49     2 n_dcws fixed bin (6) uns unal,			/* current limit of dcws/buffer */
+ 10    50     2 b_begin fixed bin (3) uns unal,			/* buffer index */
+ 10    51     2 b_stop fixed bin (3) uns unal,			/* likewise */
+ 10    52     2 max_buffers fixed bin (3) uns unal,		/* number of buffers allocated */
+ 10    53     2 n_buffers fixed bin (3) uns unal,			/* number of buffers in use now */
+ 10    54     2 data_begin fixed bin (18) uns unal,		/* first data word */
+ 10    55     2 data_end fixed bin (18) uns unal,			/* size of working space in words */
+ 10    56     2 status_ptr ptr unal,				/* ioi status area */
+ 10    57     2 flags aligned,
+ 10    58       3 aborting bit (1) unal,			/* next attempt to do i/o gets error and resets */
+ 10    59       3 eurc bit (1) unal,				/* true if we know we are using EURC */
+ 10    60       3 flags_pad bit (16) unal,
+ 10    61     2 version fixed bin unal,      
+ 10    62     2 status_table ptr unal,				/* for analyze_device_stat_ */
+ 10    63     2 null_line_data bit (36) aligned,
+ 10    64     2 null_line_dcw bit (36) aligned,
+ 10    65     2 alarm_time fixed bin (71) unaligned;		/* current timer_manager_ limit */
+ 10    66 dcl  prt_bufferp ptr;
+ 10    67 
+ 10    68 dcl 1 prt_buffer aligned based (prt_bufferp),
+ 10    69     2 header,
+ 10    70       3 number fixed bin (6) uns unal,
+ 10    71       3 busy bit (1) unal,
+ 10    72       3 pad bit (4) unal,
+ 10    73       3 dcw_count fixed bin (7) uns unal,
+ 10    74       3 data_ends fixed bin (18) uns unal,
+ 10    75     2 idcw bit (36),
+ 10    76     2 ddcw (sdb.max_dcws + 1) bit (36) aligned;
+ 10    77 
+ 10    78 dcl  wseg (0:sdb.data_end - 1) bit (36) aligned based (sdb.wsegp);	/* the IOI buffer segment */
+ 10    79 dcl 1 prt_buffers (0:sdb.max_buffers - 1) aligned like prt_buffer based (sdb.wsegp);
+ 10    80 
+ 10    81 /* NOTE:	The Spooling_dim IO Module also uses this include file,
+ 10    82*	as it uses the printer stream also. If changes are made to this include file,
+ 10    83*	see to it that the changes are also reflected in the Spooling_dim procedures.
+ 10    84*	The spooling_dim uses the standard printer_dim order and changemode procedures.
+ 10    85*	JCW 1/25/78  */
+ 10    86 
+ 10    87 /* END INCLUDE FILE ... prt_sdb.incl.pl1 */
+      749 
+      750  /* 	BEGIN INCLUDE FILE ... stack_header.incl.pl1 .. 3/72 Bill Silver  */
+ 11     2 /*	modified 7/76 by M. Weaver for *system links and more system use of areas */
+ 11     3 /*	modified 3/77 by M. Weaver to add rnt_ptr */
+ 11     4 /*	Modified April 1983 by C. Hornig for tasking */
+ 11     5 
+ 11     6 /****^  HISTORY COMMENTS:
+ 11     7*  1) change(86-06-24,DGHowe), approve(86-06-24,MCR7396),
+ 11     8*     audit(86-08-05,Schroth), install(86-11-03,MR12.0-1206):
+ 11     9*     added the heap_header_ptr definition.
+ 11    10*  2) change(86-08-12,Kissel), approve(86-08-12,MCR7473),
+ 11    11*     audit(86-10-10,Fawcett), install(86-11-03,MR12.0-1206):
+ 11    12*     Modified to support control point management.  These changes were actually
+ 11    13*     made in February 1985 by G. Palter.
+ 11    14*  3) change(86-10-22,Fawcett), approve(86-10-22,MCR7473),
+ 11    15*     audit(86-10-22,Farley), install(86-11-03,MR12.0-1206):
+ 11    16*     Remove the old_lot pointer and replace it with cpm_data_ptr. Use the 18
+ 11    17*     bit pad after cur_lot_size for the cpm_enabled. This was done to save some
+ 11    18*     space int the stack header and change the cpd_ptr unal to cpm_data_ptr
+ 11    19*     (ITS pair).
+ 11    20*                                                   END HISTORY COMMENTS */
+ 11    21 
+ 11    22 /* format: style2 */
+ 11    23 
+ 11    24      dcl	   sb		      ptr;		/* the  main pointer to the stack header */
+ 11    25 
+ 11    26      dcl	   1 stack_header	      based (sb) aligned,
+ 11    27 	     2 pad1	      (4) fixed bin,	/*  (0) also used as arg list by outward_call_handler  */
+ 11    28 	     2 cpm_data_ptr	      ptr,		/*  (4)  pointer to control point which owns this stack */
+ 11    29 	     2 combined_stat_ptr  ptr,		/*  (6)  pointer to area containing separate static */
+ 11    30 	     2 clr_ptr	      ptr,		/*  (8)  pointer to area containing linkage sections */
+ 11    31 	     2 max_lot_size	      fixed bin (17) unal,	/*  (10) DU  number of words allowed in lot */
+ 11    32 	     2 main_proc_invoked  fixed bin (11) unal,	/*  (10) DL  nonzero if main procedure invoked in run unit */
+ 11    33 	     2 have_static_vlas   bit (1) unal,		/*  (10) DL  "1"b if (very) large arrays are being used in static */
+ 11    34 	     2 pad4	      bit (2) unal,
+ 11    35 	     2 run_unit_depth     fixed bin (2) unal,	/*  (10) DL  number of active run units stacked */
+ 11    36 	     2 cur_lot_size	      fixed bin (17) unal,	/*  (11) DU  number of words (entries) in lot */
+ 11    37 	     2 cpm_enabled	      bit (18) unal,	/*  (11) DL  non-zero if control point management is enabled */
+ 11    38 	     2 system_free_ptr    ptr,		/*  (12)  pointer to system storage area */
+ 11    39 	     2 user_free_ptr      ptr,		/*  (14)  pointer to user storage area */
+ 11    40 	     2 null_ptr	      ptr,		/*  (16)  */
+ 11    41 	     2 stack_begin_ptr    ptr,		/*  (18)  pointer to first stack frame on the stack */
+ 11    42 	     2 stack_end_ptr      ptr,		/*  (20)  pointer to next useable stack frame */
+ 11    43 	     2 lot_ptr	      ptr,		/*  (22)  pointer to the lot for the current ring */
+ 11    44 	     2 signal_ptr	      ptr,		/*  (24)  pointer to signal procedure for current ring */
+ 11    45 	     2 bar_mode_sp	      ptr,		/*  (26)  value of sp before entering bar mode */
+ 11    46 	     2 pl1_operators_ptr  ptr,		/*  (28)  pointer to pl1_operators_$operator_table */
+ 11    47 	     2 call_op_ptr	      ptr,		/*  (30)  pointer to standard call operator */
+ 11    48 	     2 push_op_ptr	      ptr,		/*  (32)  pointer to standard push operator */
+ 11    49 	     2 return_op_ptr      ptr,		/*  (34)  pointer to standard return operator */
+ 11    50 	     2 return_no_pop_op_ptr
+ 11    51 			      ptr,		/*  (36)  pointer to standard return / no pop operator */
+ 11    52 	     2 entry_op_ptr	      ptr,		/*  (38)  pointer to standard entry operator */
+ 11    53 	     2 trans_op_tv_ptr    ptr,		/*  (40)  pointer to translator operator ptrs */
+ 11    54 	     2 isot_ptr	      ptr,		/*  (42)  pointer to ISOT */
+ 11    55 	     2 sct_ptr	      ptr,		/*  (44)  pointer to System Condition Table */
+ 11    56 	     2 unwinder_ptr	      ptr,		/*  (46)  pointer to unwinder for current ring */
+ 11    57 	     2 sys_link_info_ptr  ptr,		/*  (48)  pointer to *system link name table */
+ 11    58 	     2 rnt_ptr	      ptr,		/*  (50)  pointer to Reference Name Table */
+ 11    59 	     2 ect_ptr	      ptr,		/*  (52)  pointer to event channel table */
+ 11    60 	     2 assign_linkage_ptr ptr,		/*  (54)  pointer to storage for (obsolete) hcs_$assign_linkage */
+ 11    61 	     2 heap_header_ptr     ptr,		/*  (56)  pointer to the heap header for this ring */
+ 11    62 	     2 trace,
+ 11    63 	       3 frames,
+ 11    64 	         4 count	      fixed bin,		/*  (58)  number of trace frames */
+ 11    65 	         4 top_ptr	      ptr unal,		/*  (59)  pointer to last trace frame */
+ 11    66 	       3 in_trace	      bit (36) aligned,	/*  (60)  trace antirecursion flag */
+ 11    67 	     2 pad2	      bit (36),		/*  (61) */
+ 11    68                2 pad5	      pointer;		/*  (62)  pointer to future stuff */
+ 11    69 
+ 11    70 /*	The following offset refers to a table within the  pl1  operator table.  */
+ 11    71 
+ 11    72      dcl	   tv_offset	      fixed bin init (361) internal static;
+ 11    73 						/* (551) octal */
+ 11    74 
+ 11    75 
+ 11    76 /*	The following constants are offsets within this transfer vector table.  */
+ 11    77 
+ 11    78      dcl	   (
+ 11    79 	   call_offset	      fixed bin init (271),
+ 11    80 	   push_offset	      fixed bin init (272),
+ 11    81 	   return_offset	      fixed bin init (273),
+ 11    82 	   return_no_pop_offset   fixed bin init (274),
+ 11    83 	   entry_offset	      fixed bin init (275)
+ 11    84 	   )		      internal static;
+ 11    85 
+ 11    86 
+ 11    87 
+ 11    88 
+ 11    89 
+ 11    90 /*	The following declaration  is an overlay of the whole stack header.   Procedures which
+ 11    91*	move the whole stack header should use this overlay.
+ 11    92**/
+ 11    93 
+ 11    94      dcl	   stack_header_overlay   (size (stack_header)) fixed bin based (sb);
+ 11    95 
+ 11    96 
+ 11    97 
+ 11    98 /* 	END INCLUDE FILE ... stack_header.incl.pl1 */
+      750 
+      751  
+ 12     2 /* Begin include file ...... status_flags.incl.pl1 */
+ 12     3 /* created 6/11/75 by Noel I. Morris	*/
+ 12     4 
+ 12     5 dcl (backup_flag init ("100000000000000000"b),		/* indicates retry of previous operation */
+ 12     6      init_flag init ("010000000000000000"b),		/* indicates backup if failure during initiation */
+ 12     7      report_flag init ("001000000000000000"b),		/* indicates error should be reported */
+ 12     8      halt_flag init ("000100000000000000"b),		/* indicates error caused device to halt */
+ 12     9      eurc_no_backup_flag init ("000010000000000000"b))	/* indicates eurc device should ignore backup_flag */
+ 12    10 	bit (18) aligned static;
+ 12    11 
+ 12    12 /* End of include file ...... status_flags.incl.pl1 */
+ 12    13 
+      751 
+      752  /* BEGIN INCLUDE FILE sub_err_flags.incl.pl1 BIM 11/81 */
+ 13     2 /* format: style3 */
+ 13     3 
+ 13     4 /* These constants are to be used for the flags argument of sub_err_ */
+ 13     5 /* They are just "string (condition_info_header.action_flags)" */
+ 13     6 
+ 13     7 declare	(
+ 13     8 	ACTION_CAN_RESTART	init (""b),
+ 13     9 	ACTION_CANT_RESTART init ("1"b),
+ 13    10 	ACTION_DEFAULT_RESTART
+ 13    11 			init ("01"b),
+ 13    12 	ACTION_QUIET_RESTART
+ 13    13 			init ("001"b),
+ 13    14 	ACTION_SUPPORT_SIGNAL
+ 13    15 			init ("0001"b)
+ 13    16 	)		bit (36) aligned internal static options (constant);
+ 13    17 
+ 13    18 /* End include file */
+      752 
+      753  /* BEGIN INCLUDE FILE ... terminate_file.incl.pl1 */
+ 14     2 /* format: style2,^inddcls,idind32 */
+ 14     3 
+ 14     4 declare 1 terminate_file_switches	based,
+ 14     5 	2 truncate		bit (1) unaligned,
+ 14     6 	2 set_bc			bit (1) unaligned,
+ 14     7 	2 terminate		bit (1) unaligned,
+ 14     8 	2 force_write		bit (1) unaligned,
+ 14     9 	2 delete			bit (1) unaligned;
+ 14    10 
+ 14    11 declare TERM_FILE_TRUNC		bit (1) internal static options (constant) initial ("1"b);
+ 14    12 declare TERM_FILE_BC		bit (2) internal static options (constant) initial ("01"b);
+ 14    13 declare TERM_FILE_TRUNC_BC		bit (2) internal static options (constant) initial ("11"b);
+ 14    14 declare TERM_FILE_TERM		bit (3) internal static options (constant) initial ("001"b);
+ 14    15 declare TERM_FILE_TRUNC_BC_TERM	bit (3) internal static options (constant) initial ("111"b);
+ 14    16 declare TERM_FILE_FORCE_WRITE		bit (4) internal static options (constant) initial ("0001"b);
+ 14    17 declare TERM_FILE_DELETE		bit (5) internal static options (constant) initial ("00001"b);
+ 14    18 
+ 14    19 /* END INCLUDE FILE ... terminate_file.incl.pl1 */
+      753 
+      754 
+      755      end prtdim_eurc_write;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    02/02/88  1541.6  prtdim_eurc_write.pl1             >special_ldd>install>MR12.2-1019>prtdim_eurc_write.pl1
+740          1    04/11/85  1452.6  access_mode_values.incl.pl1       >ldd>include>access_mode_values.incl.pl1
+741          2    06/29/79  1728.0  event_call_info.incl.pl1          >ldd>include>event_call_info.incl.pl1
+742          3    12/01/82  1039.8  interrupt_levels.incl.pl1         >ldd>include>interrupt_levels.incl.pl1
+743          4    08/17/79  2215.0  ioi_stat.incl.pl1                 >ldd>include>ioi_stat.incl.pl1
+744          5    11/12/74  1550.1  iom_dcw.incl.pl1                  >ldd>include>iom_dcw.incl.pl1
+745          6    05/06/74  1742.1  iom_pcw.incl.pl1                  >ldd>include>iom_pcw.incl.pl1
+746          7    01/10/75  1343.6  iom_stat.incl.pl1                 >ldd>include>iom_stat.incl.pl1
+747          8    02/02/88  1529.2  prt_conv_info.incl.pl1            >special_ldd>install>MR12.2-1019>prt_conv_info.incl.pl1
+748          9    08/29/75  1310.5  prt_info.incl.pl1                 >ldd>include>prt_info.incl.pl1
+749         10    11/04/83  1107.6  prt_sdb.incl.pl1                  >ldd>include>prt_sdb.incl.pl1
+750         11    11/07/86  1550.3  stack_header.incl.pl1             >ldd>include>stack_header.incl.pl1
+751         12    09/13/83  1258.2  status_flags.incl.pl1             >ldd>include>status_flags.incl.pl1
+752         13    04/16/82  0958.1  sub_err_flags.incl.pl1            >ldd>include>sub_err_flags.incl.pl1
+753         14    04/06/83  1239.4  terminate_file.incl.pl1           >ldd>include>terminate_file.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+ACTION_CANT_RESTART             000035 constant        bit(36)                  initial dcl 13-7 set ref 658*
+IO_SYSTEM_FAULT_INTERRUPT_LEVEL        constant        fixed bin(17,0)          initial dcl 3-6 ref 439
+RW_ACCESS_BIN                   000006 constant        fixed bin(5,0)           initial dcl 1-36 set ref 686* 693*
+TERM_FILE_TRUNC_BC_TERM         000000 constant        bit(3)                   initial unaligned dcl 14-15 set ref 692* 706*
+TIMEOUT                         000002 constant        fixed bin(71,0)          initial dcl 67 ref 309 379 504
+a_bufferp                              parameter       pointer                  dcl 217 set ref 216 221* 227* 231*
+a_code                                 parameter       fixed bin(35,0)          dcl 722 ref 721 725
+a_iostatus                             parameter       bit(72)                  dcl 723 set ref 721 725* 726*
+a_linep                                parameter       pointer                  dcl 218 set ref 216 222* 223
+a_message                              parameter       char(132)                unaligned dcl 649 in procedure "abort" set ref 648
+                                                                                  652* 655*
+a_message                              parameter       char                     unaligned dcl 664 in procedure "dump" set ref 663
+                                                                                  688* 701
+aborting                530            based           bit(1)                   level 3 packed unaligned dcl 10-12 set ref 111 570
+                                                                                  572 622 653* 733 734*
+addr                                                   builtin function         dcl 93 ref 100 101 119 187 227 231 261 290 307 307
+                                                                                  328 328 328 328 365 426 427 430 446 446 561 562
+                                                                                  613 614
+addrel                                                 builtin function         dcl 93 ref 697 702 705
+address                                based           bit(18)                  level 2 packed unaligned dcl 5-7 set ref 292*
+alarm_time              535            based           fixed bin(71,0)          level 2 packed unaligned dcl 10-12 set ref 309* 310
+                                                                                  368 368 374* 379* 380 384* 418* 504* 505
+analyze_device_stat_$rs         000022 constant        entry                    external dcl 78 ref 446
+analyze_system_fault_           000024 constant        entry                    external dcl 79 ref 440
+arg_sdb_ptr                            parameter       pointer                  dcl 34 ref 31 99 556 560 608 612
+automagic                       000230 automatic       bit(1)                   initial dcl 63 set ref 63*
+b_begin                 525(24)        based           fixed bin(3,0)           level 2 packed unsigned unaligned dcl 10-12 set ref
+                                                                                  170 198 228 233 234 234 303 307 307 427 532 532*
+                                                                                  532 596* 626
+b_stop                  525(27)        based           fixed bin(3,0)           level 2 packed unsigned unaligned dcl 10-12 set ref
+                                                                                  197 198 202 204* 224 225 228 231 233 234 532 596*
+backup_flag                            constant        bit(18)                  initial dcl 12-5 ref 517
+bgin                    423            based           fixed bin(18,0)          level 2 dcl 10-12 set ref 248 249 253 253* 259 526*
+                                                                                  593*
+bin                                                    builtin function         dcl 93 ref 190 293 401 405 431 436 545
+bit                                                    builtin function         dcl 93 ref 190 293 545
+bumf                                   based           structure                level 1 dcl 672 set ref 702
+busy                      0(06)        based           bit(1)                   array level 3 in structure "prt_buffers" packed
+                                                                                  unaligned dcl 10-79 in procedure
+                                                                                  "prtdim_eurc_write" set ref 170 225 225 234 303
+                                                                                  595* 626
+busy                      0(06)        based           bit(1)                   level 3 in structure "l_prt_buffer" packed unaligned
+                                                                                  dcl 360 in procedure "stat_check" set ref 428 527*
+busy                      0(06)        based           bit(1)                   level 3 in structure "prt_buffer" packed unaligned
+                                                                                  dcl 10-68 in procedure "prtdim_eurc_write" set ref
+                                                                                  186 206*
+central_stat              0(21)        based           bit(3)                   level 2 packed unaligned dcl 7-7 ref 448
+chan_cmd                  0(24)        based           bit(6)                   level 2 packed unaligned dcl 6-21 set ref 189*
+channel_stat              0(18)        based           bit(3)                   level 2 packed unaligned dcl 7-7 ref 448
+char_cnt                        000333 automatic       fixed bin(18,0)          dcl 281 set ref 283* 284
+chars_printed           412            based           fixed bin(35,0)          level 2 dcl 10-12 set ref 168* 168
+cleanup                         000232 stack reference condition                dcl 95 ref 109 568 620
+clock                                                  builtin function         dcl 93 ref 309 368 379 504 699
+code                            000444 automatic       fixed bin(35,0)          dcl 669 set ref 686* 687 693* 694
+com_err_                        000034 constant        entry                    external dcl 83 ref 421 469 479 507 654 655 656 688
+completion                             based           structure                level 2 in structure "istat" dcl 4-7 in procedure
+                                                                                  "prtdim_eurc_write"
+completion                      000400 automatic       structure                level 2 in structure "l_istat" dcl 361 in procedure
+                                                                                  "stat_check"
+continue_to_signal_             000052 constant        entry                    external dcl 268 ref 270
+conv_info                54            based           structure                level 2 dcl 10-12 set ref 101 562 614
+copy_length                     000426 automatic       fixed bin(19,0)          dcl 665 set ref 690* 691 691 691 692 695* 696 696
+                                                                                  696 697 703* 704 704 704 705
+copy_seg                               based           char(1)                  array unaligned dcl 678 set ref 691* 691 696* 696
+                                                                                  704* 704
+count                     0(30)        based           bit(6)                   level 2 in structure "l_idcw" packed unaligned
+                                                                                  dcl 359 in procedure "stat_check" set ref 545*
+count                     0(30)        based           bit(6)                   level 2 in structure "idcw" packed unaligned
+                                                                                  dcl 6-21 in procedure "prtdim_eurc_write" set ref
+                                                                                  190*
+cur_page                        000101 automatic       fixed bin(17,0)          dcl 41 set ref 135* 148
+d_stackp                        000440 automatic       pointer                  dcl 667 set ref 686* 691 692*
+d_wsegp                         000442 automatic       pointer                  dcl 668 set ref 693* 696 697* 697 698 699 700 701
+                                                                                  702* 702 704 705* 705 706* 706
+data_begin              526            based           fixed bin(18,0)          level 2 packed unsigned unaligned dcl 10-12 ref 249
+                                                                                  255 593
+data_end                526(18)        based           fixed bin(18,0)          level 2 packed unsigned unaligned dcl 10-12 ref 249
+                                                                                  253
+data_ends                 0(18)        based           fixed bin(18,0)          level 3 in structure "l_prt_buffer" packed unsigned
+                                                                                  unaligned dcl 360 in procedure "stat_check" set
+                                                                                  ref 524 526 530* 537
+data_ends                 0(18)        based           fixed bin(18,0)          level 3 in structure "prt_buffer" packed unsigned
+                                                                                  unaligned dcl 10-68 in procedure
+                                                                                  "prtdim_eurc_write" set ref 192*
+dcw                                    based           structure                level 1 dcl 5-7 set ref 291*
+dcw_count                 0(11)        based           fixed bin(7,0)           level 3 in structure "prt_buffer" packed unsigned
+                                                                                  unaligned dcl 10-68 in procedure
+                                                                                  "prtdim_eurc_write" set ref 191*
+dcw_count                 0(11)        based           fixed bin(7,0)           level 3 in structure "l_prt_buffer" packed unsigned
+                                                                                  unaligned dcl 360 in procedure "stat_check" set
+                                                                                  ref 515 520 524 531* 537 539 546*
+dcwp                            000252 automatic       pointer                  dcl 5-4 set ref 290* 291 292 293
+dcws_done                       000356 automatic       fixed bin(17,0)          dcl 340 set ref 539* 541
+ddcw                      2            based           bit(36)                  array level 2 in structure "prt_buffer" dcl 10-68
+                                                                                  in procedure "prtdim_eurc_write" set ref 193 194*
+                                                                                  290
+ddcw                      2            based           bit(36)                  array level 2 in structure "l_prt_buffer" dcl 360
+                                                                                  in procedure "stat_check" set ref 528* 540 541*
+                                                                                  541 543*
+dev_stat_bits                   000004 constant        bit(72)                  initial dcl 64 ref 466 467
+devname                                based           char(4)                  level 2 dcl 9-7 set ref 421* 440* 469* 479* 507*
+                                                                                  654* 655* 656* 685 688*
+devx                      1            based           fixed bin(17,0)          level 2 dcl 9-7 set ref 307* 376*
+divide                                                 builtin function         dcl 93 ref 284 695
+er                              000366 automatic       bit(1)                   dcl 347 in procedure "stat_check" set ref 402* 438
+                                                                                  523
+er                        0(01) 000400 automatic       bit(1)                   level 3 in structure "l_istat" packed unaligned
+                                                                                  dcl 361 in procedure "stat_check" set ref 402
+errmess                         000110 automatic       varying char(256)        dcl 45 set ref 446* 448 469* 479*
+error_count             431            based           fixed bin(17,0)          level 2 dcl 10-12 set ref 442* 442 464* 464
+error_table_$data_loss          000044 external static fixed bin(35,0)          dcl 89 set ref 573* 658* 716*
+error_table_$net_timeout        000046 external static fixed bin(35,0)          dcl 90 ref 422
+error_table_$request_pending    000050 external static fixed bin(35,0)          dcl 91 set ref 154*
+eurc                    530(01)        based           bit(1)                   level 3 packed unaligned dcl 10-12 ref 517
+eurc_no_backup_flag                    constant        bit(18)                  initial dcl 12-5 ref 517
+ev_list                  26            based           structure                level 2 dcl 10-12 set ref 328 328
+evchan                   30            based           fixed bin(71,0)          level 3 dcl 10-12 set ref 310* 375* 380* 419* 505*
+                                                                                  639*
+event_call_info                        based           structure                level 1 dcl 2-7
+flags                           000357 automatic       bit(18)                  dcl 341 in procedure "stat_check" set ref 397* 446*
+                                                                                  451 451* 451 457* 457 460 463 476 483 486 494 517
+                                                                                  517
+flags                   530            based           structure                level 2 in structure "sdb" dcl 10-12 in procedure
+                                                                                  "prtdim_eurc_write"
+halt_flag                              constant        bit(18)                  initial dcl 12-5 ref 451 476 483
+hcs_$make_seg                   000056 constant        entry                    external dcl 681 ref 686 693
+header                                 based           structure                level 2 in structure "l_prt_buffer" dcl 360
+                                                                                  in procedure "stat_check"
+header                                 based           structure                array level 2 in structure "prt_buffers" dcl 10-79
+                                                                                  in procedure "prtdim_eurc_write"
+header                                 based           structure                level 2 in structure "prt_buffer" dcl 10-68
+                                                                                  in procedure "prtdim_eurc_write"
+i                               000360 automatic       fixed bin(17,0)          dcl 342 in procedure "stat_check" set ref 540* 541
+                                                                                  541 541 543*
+i                               000302 automatic       fixed bin(17,0)          dcl 181 in procedure "close_buffer" set ref 193*
+                                                                                  194*
+idcw                                   based           structure                level 1 dcl 6-21 in procedure "prtdim_eurc_write"
+                                                                                  set ref 188*
+idcw                      1            based           bit(36)                  array level 2 in structure "prt_buffers" dcl 10-79
+                                                                                  in procedure "prtdim_eurc_write" set ref 307 307
+idcw                      1            based           bit(36)                  level 2 in structure "prt_buffer" dcl 10-68
+                                                                                  in procedure "prtdim_eurc_write" set ref 187
+idcw                      1            based           bit(36)                  level 2 in structure "l_prt_buffer" dcl 360
+                                                                                  in procedure "stat_check" set ref 430 529*
+idcwp                           000254 automatic       pointer                  dcl 6-19 set ref 187* 188 189 190
+image_flag                             constant        bit(18)                  initial dcl 56 ref 486
+imp                             000250 automatic       pointer                  dcl 4-19 set ref 104* 365* 367 391* 395* 565* 617*
+info                     44            based           structure                level 2 dcl 10-12 set ref 100 561 613
+inptr                           000106 automatic       pointer                  dcl 44 set ref 119* 283*
+ioi_$connect                    000012 constant        entry                    external dcl 74 ref 307
+ioi_$get_special_status         000014 constant        entry                    external dcl 75 ref 376
+iom_stat                  4     000400 automatic       bit(72)                  level 2 dcl 361 set ref 406
+iostatus                               parameter       bit(72)                  dcl 39 set ref 31 98* 106* 154* 172* 174* 556 559*
+                                                                                  573* 576* 588* 608 611* 635* 714* 716*
+ipc_$block                      000016 constant        entry                    external dcl 76 ref 328
+ipc_$drain_chn                  000020 constant        entry                    external dcl 77 ref 639
+isp                             000246 automatic       pointer                  dcl 4-5 set ref 102* 363* 563* 615*
+istat                                  based           structure                level 1 dcl 4-7 set ref 396
+l_event_call_info               000220 automatic       structure                level 1 dcl 54 set ref 328 328
+l_idcw                                 based           structure                level 1 dcl 359
+l_idcwp                         000362 automatic       pointer                  dcl 345 set ref 430* 431 545
+l_istat                         000400 automatic       structure                level 1 dcl 361 set ref 396*
+l_prt_buffer                           based           structure                level 1 dcl 360
+l_prt_bufferp                   000364 automatic       pointer                  dcl 346 set ref 427* 428 430 515 520 524 524 526 527
+                                                                                  528 529 530 531 534* 537 537 539 540 541 541 543
+                                                                                  546 547*
+l_timer_message                        based           char(8)                  unaligned dcl 357 ref 367
+last_iom_stat                   000214 automatic       bit(72)                  dcl 50 set ref 116* 466 467*
+level                           000367 automatic       fixed bin(17,0)          dcl 348 in procedure "stat_check" set ref 401* 439
+level                     1     000400 automatic       fixed bin(3,0)           level 2 in structure "l_istat" dcl 361 in procedure
+                                                                                  "stat_check" set ref 401
+linep                           000102 automatic       pointer                  dcl 42 set ref 136* 139* 140 283* 292
+lth                             000104 automatic       fixed bin(18,0)          dcl 43 set ref 118* 123 168 283* 287
+max_buffers             525(30)        based           fixed bin(3,0)           level 2 packed unsigned unaligned dcl 10-12 ref 595
+max_dcw_size            525            based           fixed bin(12,0)          level 2 packed unsigned unaligned dcl 10-12 ref 249
+                                                                                  249 259 285
+max_dcws                525(12)        based           fixed bin(6,0)           level 2 packed unsigned unaligned dcl 10-12 ref 170
+                                                                                  184 193 225 225 227 231 234 303 307 307 427 515
+                                                                                  520 528 540 595 626
+max_err_stat_count              000006 constant        fixed bin(17,0)          initial dcl 51 ref 476
+message                   2     000220 automatic       fixed bin(71,0)          level 2 in structure "l_event_call_info" dcl 54
+                                                                                  in procedure "prtdim_eurc_write" set ref 365
+message                   6            based           char(128)                level 2 in structure "bumf" dcl 672 in procedure
+                                                                                  "dump" set ref 701*
+mod                                                    builtin function         dcl 93 ref 202 224 532
+mode                    415            based           structure                level 2 dcl 10-12
+modes                    14            based           structure                level 2 packed unaligned dcl 8-15
+n                               000312 automatic       fixed bin(17,0)          dcl 219 set ref 224* 225 227 233* 234 234*
+n_buffers               525(33)        based           fixed bin(3,0)           level 2 packed unsigned unaligned dcl 10-12 ref 202
+                                                                                  224 532
+n_dcws                  525(18)        based           fixed bin(6,0)           level 2 in structure "sdb" packed unsigned unaligned
+                                                                                  dcl 10-12 in procedure "prtdim_eurc_write" ref 133
+n_dcws                          000211 automatic       fixed bin(17,0)          dcl 46 in procedure "prtdim_eurc_write" set ref 120*
+                                                                                  125 133 152 160 184 184 190 191 193 196* 289* 289
+                                                                                  290
+name                            000427 automatic       varying char(30)         dcl 666 set ref 685* 686 688* 693
+nelem                                  parameter       fixed bin(24,0)          dcl 37 ref 31 118 168 287
+nelemt                                 parameter       fixed bin(24,0)          dcl 38 set ref 31 107* 287*
+noprint                 415(01)        based           bit(1)                   level 3 packed unaligned dcl 10-12 ref 288
+null                                                   builtin function         dcl 93 ref 102 103 104 121 136 140 142 207 221 223
+                                                                                  249 259 363 364 391 395 411 489 497 534 547 549
+                                                                                  563 564 565 615 616 617 658 658
+null_line_dcw           534            based           bit(36)                  level 2 dcl 10-12 ref 194 528 543
+number                                 based           fixed bin(6,0)           level 3 packed unsigned unaligned dcl 10-68 ref 197
+                                                                                  202 204
+offset                                 parameter       fixed bin(24,0)          dcl 36 in procedure "prtdim_eurc_write" ref 31 119
+offset                          000372 automatic       fixed bin(18,0)          unsigned dcl 351 in procedure "stat_check" set ref
+                                                                                  405* 431
+offset                    2     000400 automatic       fixed bin(18,0)          level 2 in structure "l_istat" dcl 361 in procedure
+                                                                                  "stat_check" set ref 405
+old_wait_flag                   000100 automatic       bit(1)                   dcl 711 set ref 713* 715
+overflow_off             14            based           bit(1)                   level 3 packed unaligned dcl 8-15 ref 451
+page_count               12            based           fixed bin(17,0)          level 2 dcl 8-15 ref 135 148
+paper_low               430            based           bit(1)                   level 2 dcl 10-12 set ref 455 456* 512*
+paper_low_flag                         constant        bit(18)                  initial dcl 56 ref 451
+pci                                    based           structure                level 1 dcl 8-15
+pcip                            000260 automatic       pointer                  dcl 8-13 set ref 101* 135 148 283* 451 562* 614*
+pip                             000262 automatic       pointer                  dcl 9-5 set ref 100* 188 307 376 421 440 469 479 507
+                                                                                  561* 613* 654 655 656 685 688
+power_fault_flag                       constant        bit(18)                  initial dcl 56 ref 460
+print_idcw                6            based           bit(36)                  level 2 dcl 9-7 ref 188
+prt_buffer                             based           structure                level 1 dcl 10-68
+prt_bufferp                     000266 automatic       pointer                  dcl 10-66 set ref 121* 136 136* 142 186 187 191 192
+                                                                                  193 194 197 202 204 206 207* 290
+prt_buffers                            based           structure                array level 1 dcl 10-79 set ref 227 231 427
+prt_conv_                       000010 constant        entry                    external dcl 73 ref 283
+prt_info                               based           structure                level 1 dcl 9-7
+prt_status_table_$prt_status_table_
+                                000042 external static fixed bin(17,0)          dcl 87 set ref 446 446
+prtdim_eurc_util$finish_abort   000026 constant        entry                    external dcl 80 ref 571
+prtdim_eurc_util$load_image     000030 constant        entry                    external dcl 81 ref 387 487
+prtdim_eurc_util$load_vfc       000032 constant        entry                    external dcl 82 ref 388 495
+quit                            000240 stack reference condition                dcl 95 ref 110 128 129 130 162 166 569 583 584 585
+                                                                                  598 602 621 630 631 632 640 644
+quit_pending                    000213 automatic       bit(1)                   dcl 48 set ref 108* 124 127* 164 165* 272* 567* 581
+                                                                                  582* 600 601* 619* 628 629* 642 643*
+rcode                           000100 automatic       fixed bin(35,0)          dcl 40 set ref 105* 131 146 169 172 172* 174* 307*
+                                                                                  308 313 326 328* 329 376* 377 378 422* 487* 488
+                                                                                  495* 496 566* 587 588* 618* 634 635*
+rcount                    0(30)        based           bit(6)                   level 2 packed unaligned dcl 7-7 ref 436
+rel                                                    builtin function         dcl 93 ref 292 307 307 431 688 688 690 695 706
+reload_vfc_train_after_special
+                        524            based           bit(1)                   level 2 dcl 10-12 set ref 386 389* 460*
+report_flag                            constant        bit(18)                  initial dcl 12-5 ref 451 457 463
+residue                         000361 automatic       fixed bin(17,0)          dcl 343 set ref 398* 436* 515 515 517* 517 520 520
+                                                                                  523 539 541 545 546
+run                       0(02) 000400 automatic       bit(1)                   level 3 in structure "l_istat" packed unaligned
+                                                                                  dcl 361 in procedure "stat_check" set ref 403
+run                             000371 automatic       bit(1)                   dcl 350 in procedure "stat_check" set ref 403* 407
+running                 422            based           bit(1)                   level 2 dcl 10-12 set ref 126 170 305 311* 324 417*
+                                                                                  579
+same_err_stat_count             000216 automatic       fixed bin(17,0)          dcl 52 set ref 117* 468* 472* 472 476 506*
+sb                              000446 automatic       pointer                  dcl 670 set ref 689* 690 691
+sdb                                    based           structure                level 1 dcl 10-12 set ref 703
+sdb_ptr                         000264 automatic       pointer                  dcl 10-10 set ref 99* 100 101 111 126 133 149 149
+                                                                                  151 151 151 151 153 168 168 170 170 170 170 184
+                                                                                  192 193 194 197 198 198 202 202 204 224 224 225
+                                                                                  225 225 225 225 227 227 228 228 231 231 231 233
+                                                                                  233 234 234 234 234 234 248 248 249 249 249 249
+                                                                                  249 249 253 253 253 253 255 255 259 259 259 261
+                                                                                  261 270 285 288 294 294 303 303 303 303 305 307
+                                                                                  307 307 307 307 307 309 310 310 311 324 328 328
+                                                                                  368 368 373 374 375 379 380 380 384 385 386 387*
+                                                                                  388* 389 396 416 417 418 419 427 427 427 441 442
+                                                                                  442 455 456 460 464 464 478 483 483 487* 495* 503
+                                                                                  504 505 505 512 515 517 520 526 528 528 532 532
+                                                                                  532 532 532 540 543 560* 561 562 570 571* 572 577
+                                                                                  579 593 593 593 595 595 595 596 596 612* 613 614
+                                                                                  622 626 626 626 639 653 695 696 703 704 713 714*
+                                                                                  715 733 734
+single_page             415            based           bit(1)                   level 3 packed unaligned dcl 10-12 ref 151
+sp                        4            based           pointer                  level 2 dcl 672 set ref 700*
+special_flag                    000375 automatic       bit(1)                   dcl 354 set ref 376* 377
+st                                     based           bit(1)                   level 3 in structure "istat" packed unaligned
+                                                                                  dcl 4-7 in procedure "prtdim_eurc_write" set ref
+                                                                                  416*
+st                              000400 automatic       bit(1)                   level 3 in structure "l_istat" packed unaligned
+                                                                                  dcl 361 in procedure "stat_check" set ref 400
+st                              000373 automatic       bit(1)                   dcl 352 in procedure "stat_check" set ref 400* 410
+stack_end_ptr            24            based           pointer                  level 2 dcl 11-26 ref 690
+stack_header                           based           structure                level 1 dcl 11-26
+stackbaseptr                                           builtin function         dcl 93 ref 689
+stackframeptr                                          builtin function         dcl 93 ref 688 688 700
+statp                           000256 automatic       pointer                  dcl 7-5 set ref 103* 364* 411* 426* 436 448 448 489*
+                                                                                  497* 549* 564* 616*
+status                                 based           structure                level 1 dcl 7-7
+status_ptr              527            based           pointer                  level 2 packed unaligned dcl 10-12 ref 396 416 695
+stop                    424            based           fixed bin(18,0)          level 2 dcl 10-12 set ref 192 248 249 253 255* 259
+                                                                                  261 294* 294 593*
+stop_counter            414            based           fixed bin(17,0)          level 2 dcl 10-12 set ref 149* 149 151 153*
+stop_every              413            based           fixed bin(17,0)          level 2 dcl 10-12 ref 151 151
+string                                                 builtin function         dcl 93 set ref 291*
+sub_err_                        000054 constant        entry                    external dcl 650 ref 658
+substr                                                 builtin function         dcl 93 set ref 119 725* 726*
+tally                     0(24)        based           bit(12)                  level 2 packed unaligned dcl 5-7 set ref 293*
+temp_iom_stat                   000376 automatic       bit(72)                  dcl 355 set ref 406* 426 440* 446* 466 467
+terminate_file_                 000060 constant        entry                    external dcl 682 ref 692 706
+time                      2            based           fixed bin(71,0)          level 2 dcl 672 set ref 699*
+time_out                  0(03) 000400 automatic       bit(1)                   level 3 in structure "l_istat" packed unaligned
+                                                                                  dcl 361 in procedure "stat_check" set ref 404
+time_out                        000370 automatic       bit(1)                   dcl 349 in procedure "stat_check" set ref 404* 420
+timer_manager_$alarm_wakeup     000036 constant        entry                    external dcl 84 ref 310 380 505
+timer_manager_$reset_alarm_wakeup
+                                000040 constant        entry                    external dcl 85 ref 375 419
+timer_rang                      000374 automatic       bit(1)                   dcl 353 set ref 368* 372* 412
+unclean                         000212 automatic       bit(1)                   dcl 47 set ref 97* 558* 610* 733
+unique_chars_                   000062 constant        entry                    external dcl 683 ref 685
+unspec                                                 builtin function         dcl 93 set ref 188* 725
+version                                based           fixed bin(71,0)          level 2 dcl 672 set ref 698*
+vfc_flag                               constant        bit(18)                  initial dcl 56 ref 494
+wait_flag               426            based           bit(1)                   level 2 dcl 10-12 set ref 270 303 373 385* 441* 478*
+                                                                                  483* 483 503 577* 713 715*
+wksp                                   based           char(1)                  unaligned dcl 71 set ref 119
+wkspptr                                parameter       pointer                  dcl 35 ref 31 119
+word_cnt                        000332 automatic       fixed bin(18,0)          dcl 280 set ref 284* 285 293 294
+wseg                                   based           bit(36)                  array dcl 10-78 set ref 261
+wsegp                   420            based           pointer                  level 2 dcl 10-12 ref 170 225 225 227 231 234 261
+                                                                                  303 307 307 427 595 626 696
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+ACTION_CAN_RESTART                     internal static bit(36)                  initial dcl 13-7
+ACTION_DEFAULT_RESTART                 internal static bit(36)                  initial dcl 13-7
+ACTION_QUIET_RESTART                   internal static bit(36)                  initial dcl 13-7
+ACTION_SUPPORT_SIGNAL                  internal static bit(36)                  initial dcl 13-7
+A_ACCESS                               internal static bit(3)                   initial unaligned dcl 1-11
+A_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+DIR_ACCESS_MODE_NAMES                  internal static char(4)                  initial array unaligned dcl 1-33
+E_ACCESS                               internal static bit(3)                   initial unaligned dcl 1-11
+E_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+IO_MARKER_INTERRUPT_LEVEL              internal static fixed bin(17,0)          initial dcl 3-10
+IO_SPECIAL_INTERRUPT_LEVEL             internal static fixed bin(17,0)          initial dcl 3-12
+IO_TERMINATE_INTERRUPT_LEVEL           internal static fixed bin(17,0)          initial dcl 3-8
+M_ACCESS                               internal static bit(3)                   initial unaligned dcl 1-11
+M_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+N_ACCESS                               internal static bit(3)                   initial unaligned dcl 1-11
+N_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+REW_ACCESS                             internal static bit(3)                   initial unaligned dcl 1-11
+REW_ACCESS_BIN                         internal static fixed bin(5,0)           initial dcl 1-36
+RE_ACCESS                              internal static bit(3)                   initial unaligned dcl 1-11
+RE_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 1-36
+RW_ACCESS                              internal static bit(3)                   initial unaligned dcl 1-11
+R_ACCESS                               internal static bit(3)                   initial unaligned dcl 1-11
+R_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+SA_ACCESS                              internal static bit(3)                   initial unaligned dcl 1-11
+SA_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 1-36
+SEG_ACCESS_MODE_NAMES                  internal static char(4)                  initial array unaligned dcl 1-30
+SMA_ACCESS                             internal static bit(3)                   initial unaligned dcl 1-11
+SMA_ACCESS_BIN                         internal static fixed bin(5,0)           initial dcl 1-36
+SM_ACCESS                              internal static bit(3)                   initial unaligned dcl 1-11
+SM_ACCESS_BIN                          internal static fixed bin(5,0)           initial dcl 1-36
+S_ACCESS                               internal static bit(3)                   initial unaligned dcl 1-11
+S_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+TERM_FILE_BC                           internal static bit(2)                   initial unaligned dcl 14-12
+TERM_FILE_DELETE                       internal static bit(5)                   initial unaligned dcl 14-17
+TERM_FILE_FORCE_WRITE                  internal static bit(4)                   initial unaligned dcl 14-16
+TERM_FILE_TERM                         internal static bit(3)                   initial unaligned dcl 14-14
+TERM_FILE_TRUNC                        internal static bit(1)                   initial unaligned dcl 14-11
+TERM_FILE_TRUNC_BC                     internal static bit(2)                   initial unaligned dcl 14-13
+W_ACCESS                               internal static bit(3)                   initial unaligned dcl 1-11
+W_ACCESS_BIN                           internal static fixed bin(5,0)           initial dcl 1-36
+based_word                             based           bit(36)                  dcl 70
+call_offset                            internal static fixed bin(17,0)          initial dcl 11-78
+entry_offset                           internal static fixed bin(17,0)          initial dcl 11-78
+event_call_info_ptr                    automatic       pointer                  dcl 2-5
+faultword                              based           structure                level 1 dcl 7-27
+hcs_$get_max_length_seg         000000 constant        entry                    external dcl 680
+imess                                  based           structure                level 1 dcl 4-21
+init_flag                              internal static bit(18)                  initial dcl 12-5
+pcw                                    based           structure                level 1 dcl 6-6
+pcwp                                   automatic       pointer                  dcl 6-4
+pp                                     automatic       pointer                  dcl 344
+prevb                                  automatic       fixed bin(17,0)          dcl 182
+push_offset                            internal static fixed bin(17,0)          initial dcl 11-78
+return_no_pop_offset                   internal static fixed bin(17,0)          initial dcl 11-78
+return_offset                          internal static fixed bin(17,0)          initial dcl 11-78
+sb                                     automatic       pointer                  dcl 11-24
+slew_error                             internal static bit(18)                  initial dcl 56
+special_status                         based           structure                level 1 dcl 7-35
+stack_header_overlay                   based           fixed bin(17,0)          array dcl 11-94
+stacq                                                  builtin function         dcl 93
+tdcw                                   based           structure                level 1 dcl 5-14
+tdcwp                                  automatic       pointer                  dcl 5-4
+terminate_file_switches                based           structure                level 1 packed unaligned dcl 14-4
+tv_offset                              internal static fixed bin(17,0)          initial dcl 11-72
+wordno                                                 builtin function         dcl 93
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+abort                           003740 constant        entry                    internal dcl 648 ref 184 186 198 202 228 236 285 305
+                                                                                  313 315 407 412 428 431 443 448 515 520 524 537
+close_buffer                    001533 constant        entry                    internal dcl 179 ref 125 133 140 152 160
+dump                            004135 constant        entry                    internal dcl 663 ref 652
+finish_abort                    004674 constant        entry                    internal dcl 710 ref 112 623 657 735
+get_buffer                      001710 constant        entry                    internal dcl 216 ref 136
+get_line_space                  002062 constant        entry                    internal dcl 246 ref 139 222
+process_quit                    002137 constant        entry                    internal dcl 267 ref 110 130 569 585 621 632
+prtdim_eurc_write               000425 constant        entry                    external dcl 31
+prtdim_resetwrite               001026 constant        entry                    external dcl 556 ref 714
+resetwrite_returns              001301 constant        label                    dcl 598 ref 574 589
+runout                          001313 constant        entry                    external dcl 608
+runout_returns                  001523 constant        label                    dcl 640 ref 624 636
+set_io                          002163 constant        entry                    internal dcl 278 ref 142
+set_status                      004735 constant        entry                    internal dcl 721 ref 106 154 172 174 573 588 635 716
+start_io                        002252 constant        entry                    internal dcl 301 ref 170 325
+stat_check                      002500 constant        entry                    internal dcl 338 ref 331
+tidy_up                         004752 constant        entry                    internal dcl 731 ref 109 568 620
+wait_io                         002443 constant        entry                    internal dcl 322 ref 126 144 580 627
+write_returns                   000735 constant        label                    dcl 162 ref 113 131 146 155
+
+NAMES DECLARED BY CONTEXT OR IMPLICATION.
+char                                                   builtin function         ref 313
+fixed                                                  builtin function         ref 307 307 688 688 690 695 706
+hbound                                                 builtin function         ref 193 540
+ltrim                                                  builtin function         ref 313
+size                                                   builtin function         ref 702 703
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      5470        5554    5047        5500
+Length      6316    5047        64         525     421           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+prtdim_eurc_write                   692 external procedure  is an external procedure.  
+on unit on line 109                  64 on unit               
+on unit on line 110                  64 on unit               
+on unit on line 130                  64 on unit               
+close_buffer                            internal procedure  shares stack frame of external procedure prtdim_eurc_write.  
+get_buffer                              internal procedure  shares stack frame of external procedure prtdim_eurc_write.  
+get_line_space                          internal procedure  shares stack frame of external procedure prtdim_eurc_write.  
+process_quit                         70 internal procedure  is called by several nonquick procedures.  
+set_io                                  internal procedure  shares stack frame of external procedure prtdim_eurc_write.  
+start_io                                internal procedure  shares stack frame of external procedure prtdim_eurc_write.  
+wait_io                                 internal procedure  shares stack frame of external procedure prtdim_eurc_write.  
+stat_check                              internal procedure  shares stack frame of external procedure prtdim_eurc_write.  
+on unit on line 568                  64 on unit               
+on unit on line 569                  64 on unit               
+on unit on line 585                  64 on unit               
+on unit on line 620                  64 on unit               
+on unit on line 621                  64 on unit               
+on unit on line 632                  64 on unit               
+abort                                   internal procedure  shares stack frame of external procedure prtdim_eurc_write.  
+dump                                    internal procedure  shares stack frame of external procedure prtdim_eurc_write.  
+finish_abort                         80 internal procedure  is called by several nonquick procedures.  
+set_status                           64 internal procedure  is called by several nonquick procedures.  
+tidy_up                              64 internal procedure  is called by several nonquick procedures.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+finish_abort             000100 old_wait_flag               finish_abort
+prtdim_eurc_write        000100 rcode                       prtdim_eurc_write
+                         000101 cur_page                    prtdim_eurc_write
+                         000102 linep                       prtdim_eurc_write
+                         000104 lth                         prtdim_eurc_write
+                         000106 inptr                       prtdim_eurc_write
+                         000110 errmess                     prtdim_eurc_write
+                         000211 n_dcws                      prtdim_eurc_write
+                         000212 unclean                     prtdim_eurc_write
+                         000213 quit_pending                prtdim_eurc_write
+                         000214 last_iom_stat               prtdim_eurc_write
+                         000216 same_err_stat_count         prtdim_eurc_write
+                         000220 l_event_call_info           prtdim_eurc_write
+                         000230 automagic                   prtdim_eurc_write
+                         000246 isp                         prtdim_eurc_write
+                         000250 imp                         prtdim_eurc_write
+                         000252 dcwp                        prtdim_eurc_write
+                         000254 idcwp                       prtdim_eurc_write
+                         000256 statp                       prtdim_eurc_write
+                         000260 pcip                        prtdim_eurc_write
+                         000262 pip                         prtdim_eurc_write
+                         000264 sdb_ptr                     prtdim_eurc_write
+                         000266 prt_bufferp                 prtdim_eurc_write
+                         000302 i                           close_buffer
+                         000312 n                           get_buffer
+                         000332 word_cnt                    set_io
+                         000333 char_cnt                    set_io
+                         000356 dcws_done                   stat_check
+                         000357 flags                       stat_check
+                         000360 i                           stat_check
+                         000361 residue                     stat_check
+                         000362 l_idcwp                     stat_check
+                         000364 l_prt_bufferp               stat_check
+                         000366 er                          stat_check
+                         000367 level                       stat_check
+                         000370 time_out                    stat_check
+                         000371 run                         stat_check
+                         000372 offset                      stat_check
+                         000373 st                          stat_check
+                         000374 timer_rang                  stat_check
+                         000375 special_flag                stat_check
+                         000376 temp_iom_stat               stat_check
+                         000400 l_istat                     stat_check
+                         000426 copy_length                 dump
+                         000427 name                        dump
+                         000440 d_stackp                    dump
+                         000442 d_wsegp                     dump
+                         000444 code                        dump
+                         000446 sb                          dump
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+r_ne_as             r_ge_a              alloc_char_temp     alloc_temp          cat_realloc_chars   call_ext_in
+call_ext_out_desc   call_ext_out        call_int_this       call_int_other      return_mac          mpfx2
+mdfx1               signal_op           enable_op           shorten_stack       ext_entry           int_entry
+divide_fx3          clock_mac
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+analyze_device_stat_$rs       analyze_system_fault_         com_err_                      continue_to_signal_
+hcs_$make_seg                 ioi_$connect                  ioi_$get_special_status       ipc_$block
+ipc_$drain_chn                prt_conv_                     prtdim_eurc_util$finish_abort prtdim_eurc_util$load_image
+prtdim_eurc_util$load_vfc     sub_err_                      terminate_file_               timer_manager_$alarm_wakeup
+timer_manager_$reset_alarm_wakeup                           unique_chars_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$data_loss        error_table_$net_timeout      error_table_$request_pending
+prt_status_table_$prt_status_table_
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     63 000414        31 000417        97 000436        98 000440        99 000444       100 000450       101 000452
+    102 000454       103 000456       104 000457       105 000460       106 000461       107 000472       108 000474
+    109 000475       110 000517       111 000541       112 000545       113 000551       116 000552       117 000554
+    118 000555       119 000560       120 000565       121 000566       123 000570       124 000572       125 000574
+    126 000577       127 000603       128 000604       129 000605       130 000610       131 000632       133 000634
+    135 000643       136 000646       139 000655       140 000657       142 000664       144 000672       146 000673
+    148 000675       149 000701       151 000703       152 000712       153 000715       154 000717       155 000730
+    158 000731       160 000732       162 000735       164 000736       165 000740       166 000741       168 000744
+    169 000755       170 000757       172 000776       173 001010       174 001011       175 001021       556 001022
+    558 001037       559 001041       560 001045       561 001051       562 001053       563 001055       564 001057
+    565 001060       566 001061       567 001062       568 001063       569 001105       570 001127       571 001133
+    572 001142       573 001146       574 001157       576 001160       577 001164       579 001165       580 001171
+    581 001172       582 001174       583 001175       584 001176       585 001201       587 001223       588 001225
+    589 001235       591 001236       593 001237       595 001243       596 001271       598 001301       600 001302
+    601 001304       602 001305       604 001310       608 001311       610 001324       611 001326       612 001332
+    613 001336       614 001340       615 001342       616 001344       617 001345       618 001346       619 001347
+    620 001350       621 001372       622 001414       623 001420       624 001424       626 001425       627 001443
+    628 001444       629 001446       630 001447       631 001450       632 001453       634 001475       635 001477
+    636 001507       638 001510       639 001511       640 001523       642 001524       643 001526       644 001527
+    646 001532       179 001533       184 001534       186 001551       187 001561       188 001564       189 001567
+    190 001571       191 001576       192 001603       193 001607       194 001623       195 001627       196 001631
+    197 001632       198 001644       200 001656       202 001657       204 001675       206 001703       207 001705
+    209 001707       216 001710       221 001712       222 001714       223 001722       224 001730       225 001744
+    227 001767       228 001773       231 002006       233 002011       234 002025       236 002052       237 002057
+    239 002061       246 002062       248 002064       249 002070       253 002112       255 002117       258 002121
+    259 002122       261 002132       267 002136       270 002144       272 002160       274 002162       278 002163
+    283 002164       284 002203       285 002207       287 002221       288 002225       289 002232       290 002233
+    291 002237       292 002240       293 002242       294 002247       295 002251       301 002252       303 002253
+    305 002272       307 002301       308 002335       309 002337       310 002344       311 002365       312 002370
+    313 002371       314 002433       315 002435       316 002442       322 002443       324 002444       325 002447
+    326 002450       328 002453       329 002473       331 002476       332 002477       338 002500       363 002501
+    364 002503       365 002504       367 002506       368 002512       370 002531       371 002532       372 002533
+    373 002534       374 002537       375 002542       376 002551       377 002571       378 002576       379 002600
+    380 002605       382 002626       384 002627       385 002633       386 002634       387 002636       388 002650
+    389 002662       391 002664       392 002666       395 002667       396 002671       397 002675       398 002676
+    400 002700       401 002703       402 002705       403 002711       404 002715       405 002721       406 002723
+    407 002725       410 002734       411 002736       412 002740       414 002750       416 002751       417 002755
+    418 002757       419 002762       420 002771       421 002773       422 003020       423 003023       426 003024
+    427 003026       428 003042       430 003052       431 003055       436 003071       438 003074       439 003076
+    440 003101       441 003116       442 003121       443 003122       444 003127       446 003130       448 003157
+    451 003173       455 003211       456 003214       457 003216       460 003220       463 003227       464 003233
+    466 003235       467 003241       468 003244       469 003246       470 003270       472 003271       476 003272
+    478 003301       479 003303       483 003325       486 003333       487 003337       488 003350       489 003352
+    490 003354       494 003355       495 003361       496 003372       497 003374       498 003376       503 003377
+    504 003402       505 003407       506 003430       507 003431       510 003456       512 003457       515 003461
+    517 003501       520 003514       523 003534       524 003540       526 003554       527 003560       528 003562
+    529 003604       530 003606       531 003610       532 003614       534 003643       535 003645       537 003646
+    539 003662       540 003667       541 003703       543 003713       544 003717       545 003721       546 003727
+    547 003734       549 003736       550 003737       648 003740       652 003742       653 003752       654 003755
+    655 004002       656 004035       657 004062       658 004066       660 004134       663 004135       685 004146
+    686 004213       687 004275       688 004301       689 004351       690 004353       691 004356       692 004403
+    693 004435       694 004516       695 004522       696 004533       697 004560       698 004565       699 004567
+    700 004571       701 004572       702 004600       703 004602       704 004604       705 004630       706 004635
+    707 004672       710 004673       713 004701       714 004705       715 004715       716 004721       718 004733
+    721 004734       725 004742       726 004745       728 004750       731 004751       733 004757       734 004766
+    735 004770       737 004775
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

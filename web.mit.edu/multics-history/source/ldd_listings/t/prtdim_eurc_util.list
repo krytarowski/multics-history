@@ -1,0 +1,896 @@
+	COMPILATION LISTING OF SEGMENT prtdim_eurc_util
+	Compiled by: Multics PL/I Compiler, Release 29, of July 28, 1986
+	Compiled at: Honeywell Bull, Phoenix AZ, SysM
+	Compiled on: 02/02/88  1646.9 mst Tue
+	    Options: optimize map
+
+        1 /* ******************************************************
+        2*   *                                                    *
+        3*   *                                                    *
+        4*   * Copyright (c) 1972 by Massachusetts Institute of   *
+        5*   * Technology and Honeywell Information Systems, Inc. *
+        6*   *                                                    *
+        7*   *                                                    *
+        8*   ****************************************************** */
+        9 
+       10 
+       11 /* format: style4 */
+       12 /* PRTDIM_UTIL - Utility Functions for the Multics printer DIM.
+       13*   coded 6/12/75 by Noel I. Morris			*/
+       14 /* modified for new DIM buffer strategy, 9/2/83, E. N. Kittlitz */
+       15 /* copied to prtdim_eurc_util for eurc/urmpc partitioning, 83-10-20, E. N. Kittlitz */
+       16 
+       17 prtdim_eurc_util$init: proc (sdb_ptr, rcode);
+       18 
+       19 dcl  rcode fixed bin (35);				/* error code */
+       20 
+       21 dcl  temp_iom_stat bit (72) aligned;			/* temp area to hold iom status */
+       22 dcl  load_proc entry (ptr, ptr, entry, fixed bin (35)) variable; /* procedure to load train or VFC image */
+       23 dcl  save_buffer (100) fixed bin (35);			/* holding buffer for workspace */
+       24 dcl  wseg_low (100) fixed bin (35) based (sdb.wsegp);	/* for saving and restoring workspace */
+       25 
+       26 dcl  1 l_event_call_info aligned like event_call_info;
+       27 
+       28 dcl  ipc_$block entry (ptr, ptr, fixed bin (35));
+       29 dcl  ioi_$connect entry (fixed bin, fixed bin (18), fixed bin (35));
+       30 dcl  ipc_$drain_chn entry (fixed bin (71), fixed bin (35));
+       31 dcl  init_printer_ entry (ptr, ptr, entry, fixed bin (35));
+       32 dcl  init_printer_$load_image entry (ptr, ptr, entry, fixed bin (35));
+       33 dcl  init_printer_$load_vfc entry (ptr, ptr, entry, fixed bin (35));
+       34 dcl  analyze_device_stat_ entry (char (*) aligned, ptr, bit (72) aligned, bit (18) aligned);
+       35 dcl  analyze_system_fault_ entry (char (*) aligned, bit (72) aligned);
+       36 dcl  timer_manager_$sleep entry (fixed bin (71), bit (2));
+       37 dcl  timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2), fixed bin (71));
+       38 dcl  timer_manager_$reset_alarm_wakeup entry (fixed bin (71));
+       39 
+       40 dcl  error_table_$net_timeout fixed bin (35) ext;
+       41 dcl  error_table_$no_operation fixed bin (35) ext;
+       42 dcl  error_table_$io_no_permission fixed bin (35) ext static;
+       43 dcl  prt_status_table_$prt_status_table_ ext;
+       44 
+       45 dcl  (addr, addrel, bit, rel, string) builtin;
+       46 
+       47 
+       48 	pip = addr (sdb.info);			/* Get pointer to printer info. */
+       49 	pcip = addr (sdb.conv_info);			/* Get pointer to conversion info. */
+       50 	if sdb.aborting then do;
+       51 	     rcode = error_table_$io_no_permission;
+       52 	     return;
+       53 	end;
+       54 	call init_printer_ (pip, pcip, sync_io, rcode);	/* Initialize the printer information. */
+       55 
+       56 	sdb.stop_every,
+       57 	     sdb.stop_counter = 0;			/* Initialize page stop counters. */
+       58 	sdb.mode = "0"b;				/* Clear all mode bits. */
+       59 
+       60 	return;
+       61 
+       62 
+       63 prtdim_eurc_util$load_image: entry (sdb_ptr, rcode);
+       64 
+       65 
+       66 	if sdb.aborting then do;
+       67 	     rcode = error_table_$io_no_permission;
+       68 	     return;
+       69 	end;
+       70 	load_proc = init_printer_$load_image;		/* Set procedure pointer. */
+       71 	go to load_join;				/* Join common code. */
+       72 
+       73 
+       74 
+       75 prtdim_eurc_util$load_vfc: entry (sdb_ptr, rcode);
+       76 
+       77 
+       78 	if sdb.aborting then do;
+       79 	     rcode = error_table_$io_no_permission;
+       80 	     return;
+       81 	end;
+       82 	load_proc = init_printer_$load_vfc;		/* Set procedure pointer. */
+       83 
+       84 load_join:
+       85 	pip = addr (sdb.info);			/* Get pointer to printer info. */
+       86 	pcip = addr (sdb.conv_info);			/* Get pointer to conversion info. */
+       87 
+       88 	save_buffer = wseg_low;			/* Save the contents of the workspace. */
+       89 
+       90 	call load_proc (pip, pcip, sync_io, rcode);	/* Call out to load the train or VFC image. */
+       91 
+       92 	wseg_low = save_buffer;			/* Restore the workspace. */
+       93 
+       94 	if rcode = 5 then				/* If invalid operation for thi model ... */
+       95 	     rcode = error_table_$no_operation;		/* Reflect appropriate error code. */
+       96 
+       97 	return;
+       98 
+       99 
+      100 /* finish_abort tries to quiesce the printer and obtain a known (idle) state.
+      101*   It does this by changing all print IDCWs to be reset-status (terminates).
+      102*   It also patches all DCWs to be 1 word IOTDs, with the target being
+      103*   the last word of data space. That word contains a null line (i.e.
+      104*   the prt_conv_ equivalent of a carriage return.  As a result, if the printer
+      105*   is running, it should stop pretty fast. After we have a terminate status,
+      106*   or our patience runs out, we try to do a reset status.
+      107**/
+      108 
+      109 prtdim_eurc_util$finish_abort: entry (sdb_ptr);
+      110 dcl  stop_tries fixed bin;
+      111 dcl  wait_count fixed bin;
+      112 dcl  abort_status bit (1) aligned;
+      113 
+      114 	pip = addr (sdb.info);			/* Get pointer to printer info. */
+      115 	pcip = addr (sdb.conv_info);			/* Get pointer to conversion info. */
+      116 	do stop_tries = 1 to 2;
+      117 	     prt_buffers (*).ddcw (*) = sdb.null_line_dcw;/* clobber dcws to null line */
+      118 	     prt_buffers (*).idcw = prt_info.term_idcw;
+      119 	     if sdb.running then
+      120 		do wait_count = 1 to 10 while (sdb.running); /* max of 63 lines at 10LPS should fit */
+      121 		call timer_manager_$sleep (1, "11"b);	/* 1 second */
+      122 		isp = sdb.status_ptr;
+      123 		statp = addr (istat.iom_stat);
+      124 		if istat.st & ^status.marker then	/* looks stopped to me, Ma */
+      125 		     sdb.running = "0"b;
+      126 	     end;					/* wait_count */
+      127 	     sdb.running = "0"b;			/* well, lie about it */
+      128 	     call sync_io (prt_info.term_idcw, "00"b, null (), 0, abort_status); /* see if it is */
+      129 	     if ^abort_status then do;		/* seems to have worked */
+      130 		call prtdim_eurc_util$initialize_workspace (sdb_ptr);
+      131 		sdb.aborting = "0"b;
+      132 		return;
+      133 	     end;
+      134 	     else sdb.running = "1"b;			/* try again */
+      135 	end;					/* tries */
+      136 	return;
+      137 
+      138 
+      139 prtdim_eurc_util$initialize_workspace: entry (sdb_ptr);
+      140 dcl  i fixed bin;
+      141 
+      142 	unspec (wseg) = ""b;
+      143 	do i = 0 to sdb.max_buffers - 1;
+      144 	     prt_buffers (i).busy = ""b;
+      145 	     prt_buffers (i).number = i;
+      146 	     prt_buffers (i).dcw_count = 0;
+      147 	end;
+      148 	wseg (sdb.data_end) = sdb.null_line_data;	/* that's it there, officer */
+      149 	return;
+      150 
+      151 
+      152 sync_io: proc (i, rw, d, l, e);			/* internal proc to do synchronous I/O */
+      153 
+      154 dcl  i bit (36) aligned;				/* IDCW */
+      155 dcl  rw bit (2) aligned;				/* RW bits */
+      156 dcl  d ptr;					/* pointer to data */
+      157 dcl  l fixed bin (12);				/* length of data */
+      158 dcl  e bit (1) aligned;				/* error flag */
+      159 
+      160 dcl  b bit (18) aligned;				/* status flags */
+      161 dcl  dp ptr;					/* pointer to place for data */
+      162 dcl  ecode fixed bin (35);				/* internal error code */
+      163 dcl  timer_rang bit (1) aligned;
+      164 
+      165 dcl  l_timer_message char (8) based;
+      166 dcl  sdata (l) fixed bin based;			/* for copying data */
+      167 
+      168 	if sdb.running then do;
+      169 	     e = "1"b;
+      170 	     return;
+      171 	end;
+      172 	idcwp = sdb.wsegp;				/* Get pointer to place for IDCW. */
+      173 	string (idcw) = i;				/* Copy the IDCW. */
+      174 	dcwp = addrel (idcwp, 1);			/* Get pointer to data xfer DCW. */
+      175 	dp = addrel (dcwp, 1);			/* Get pointer to place for data. */
+      176 
+      177 	string (dcw) = "0"b;			/* Clear the DCW. */
+      178 	dcw.address = rel (dp);			/* Insert address. */
+      179 	dcw.tally = bit (l);			/* And tally. */
+      180 
+      181 	if rw & "01"b then				/* If writing ... */
+      182 	     dp -> sdata = d -> sdata;		/* Copy the data in workspace segment. */
+      183 
+      184 redo_sync:
+      185 	call ipc_$drain_chn (sdb.evchan, ecode);	/* no leftover nonsense */
+      186 	if ecode ^= 0 then do;			/* shouldn't happen */
+      187 	     e = "1"b;
+      188 	     go to sync_io_return;
+      189 	end;
+      190 	call ioi_$connect (prt_info.devx, 0, ecode);	/* Fire up the IOM. */
+      191 	if ecode ^= 0 then do;			/* might be if we are aborting */
+      192 	     e = "1"b;
+      193 	     go to sync_io_return;
+      194 	end;
+      195 
+      196 timed_sync_wait:
+      197 	call timer_manager_$alarm_wakeup (30, "11"b, sdb.evchan); /* 30 seconds, more than enough... */
+      198 
+      199 sync_wait:
+      200 	call ipc_$block (addr (sdb.ev_list), addr (l_event_call_info), ecode);
+      201 	call timer_manager_$reset_alarm_wakeup (sdb.evchan); /* be sure it won't happen */
+      202 	if ecode ^= 0 then do;			/* Wait for I/O to complete. */
+      203 	     e = "1"b;
+      204 	     go to sync_io_return;
+      205 	end;
+      206 
+      207 	imp = addr (l_event_call_info.message);		/* get pointer to ioi event message */
+      208 	if imp -> l_timer_message = "alarm___" then timer_rang = "1"b;
+      209 	else do;
+      210 	     timer_rang = "0"b;
+      211 	     if imess.st &				/* IPC message looks like valid ioi wakeup */
+      212 		bin (imess.level) = IO_SPECIAL_INTERRUPT_LEVEL then go to redo_sync; /* if this is a special interupt */
+      213 	end;
+      214 	isp = sdb.status_ptr;
+      215 
+      216 	if istat.st then do;			/* if status is present */
+      217 	     if istat.time_out then do;		/* if timeout occured */
+      218 		e = "1"b;				/* error occured */
+      219 		ecode = error_table_$net_timeout;	/* caused by time out */
+      220 		go to sync_io_return;
+      221 	     end;
+      222 
+      223 	     temp_iom_stat = istat.iom_stat;		/* copy status to double word */
+      224 	     if istat.level = IO_TERMINATE_INTERRUPT_LEVEL then do; /* If termination ... */
+      225 		if istat.er then			/* If error ... */
+      226 		     call analyze_device_stat_ (prt_info.devname, addr (prt_status_table_$prt_status_table_),
+      227 			temp_iom_stat, b);
+      228 	     end;					/* Analyze the status. */
+      229 
+      230 	     else if istat.level = IO_SYSTEM_FAULT_INTERRUPT_LEVEL then /* If system fault ... */
+      231 		call analyze_system_fault_ (prt_info.devname, temp_iom_stat);
+      232 
+      233 	     if istat.er then go to sync_wait;		/* If error, wait for special. */
+      234 	end;
+      235 	else do;					/* no status found */
+      236 	     if timer_rang then do;
+      237 		e = "1"b;
+      238 		go to sync_io_return;
+      239 	     end;
+      240 	     go to timed_sync_wait;			/* bogus wakeup, but someone's alive. let's wait some more */
+      241 	end;
+      242 
+      243 	if rw & "10"b then				/* If reading ... */
+      244 	     d -> sdata = dp -> sdata;		/* Copy the data. */
+      245 
+      246 	e = "0"b;					/* Clear the error switch. */
+      247 
+      248 sync_io_return:
+      249 	sdb.status_ptr -> istat.st = "0"b;		/* flush workspace status */
+      250 	return;					/* Return to caller. */
+      251 
+      252      end sync_io;
+      253 
+      254 
+      255 
+      256 
+      257 /* format: off */
+      258  /* BEGIN INCLUDE FILE event_call_info.incl.pl1 */
+  1     2 
+  1     3 /* T. Casey, May 1978 */
+  1     4 
+  1     5 dcl  event_call_info_ptr ptr;
+  1     6 
+  1     7 dcl 1 event_call_info aligned based (event_call_info_ptr),	/* argument structure passed to event call procedure */
+  1     8     2 channel_id fixed bin (71),			/* event channel on which wakeup occurred */
+  1     9     2 message fixed bin (71),				/* 72 bits of information passed by sender of wakeup */
+  1    10     2 sender bit (36),				/* process id of sender */
+  1    11     2 origin,
+  1    12       3 dev_signal bit (18) unaligned,			/* "1"b if device signal */
+  1    13       3 ring fixed bin (17) unaligned,			/* ring from which sent */
+  1    14     2 data_ptr ptr;					/* ptr given to dcl_event_call_channel */
+  1    15 
+  1    16 /* END INCLUDE FILE event_call_info.incl.pl1 */
+      258 
+      259  /*  START OF:	interrupt_levels.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+  2     2 
+  2     3 /* Written 14 June 1982 by Chris Jones */
+  2     4 
+  2     5 /* format: style4,delnl,insnl,indattr,ifthen,declareind10,dclind10 */
+  2     6 dcl	IO_SYSTEM_FAULT_INTERRUPT_LEVEL
+  2     7 			   fixed bin internal static options (constant) init (1);
+  2     8 dcl	IO_TERMINATE_INTERRUPT_LEVEL
+  2     9 			   fixed bin internal static options (constant) init (3);
+  2    10 dcl	IO_MARKER_INTERRUPT_LEVEL
+  2    11 			   fixed bin internal static options (constant) init (5);
+  2    12 dcl	IO_SPECIAL_INTERRUPT_LEVEL
+  2    13 			   fixed bin internal static options (constant) init (7);
+  2    14 
+  2    15 /*  END OF:	interrupt_levels.incl.pl1		  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  */
+      259 
+      260  
+  3     2 /* Begin include file ...... ioi_stat.incl.pl1 */
+  3     3 /* Last modified 3/24/75 by Noel I. Morris */
+  3     4 
+  3     5 dcl  isp ptr;					/* pointer to status structure */
+  3     6 
+  3     7 dcl 1 istat based (isp) aligned,			/* I/O Interfacer status structure */
+  3     8     2 completion,					/* completion flags */
+  3     9      (3 st bit (1),					/* "1"b if status returned */
+  3    10       3 er bit (1),					/* "1"b if status indicates error condition */
+  3    11       3 run bit (1),				/* "1"b if channel still running */
+  3    12       3 time_out bit (1)) unal,			/* "1"b if time-out occurred */
+  3    13     2 level fixed bin (3),				/* IOM interrupt level */
+  3    14     2 offset fixed bin (18),				/* DCW list offset */
+  3    15     2 absaddr fixed bin (24),				/* absolute address of workspace */
+  3    16     2 iom_stat bit (72),				/* IOM status */
+  3    17     2 lpw bit (72);					/* LPW residue */
+  3    18 
+  3    19 dcl  imp ptr;					/* pointer to message structure */
+  3    20 
+  3    21 dcl 1 imess based (imp) aligned,			/* I/O Interfacer event message structure */
+  3    22    (2 completion like istat.completion,			/* completion flags */
+  3    23     2 pad bit (11),
+  3    24     2 level bit (3),				/* interrupt level */
+  3    25     2 offset bit (18),				/* DCW list offset */
+  3    26     2 status bit (36)) unal;				/* first 36 bits of status */
+  3    27 
+  3    28 /* End of include file ...... ioi_stat.incl.pl1 */
+  3    29 
+      260 
+      261  
+  4     2 /* Begin include file ...... iom_dcw.incl.pl1 */
+  4     3 
+  4     4 dcl  dcwp ptr,					/* pointer to DCW */
+  4     5      tdcwp ptr;					/* pointer to TDCW */
+  4     6 
+  4     7 dcl 1 dcw based (dcwp) aligned,			/* Data Control Word */
+  4     8      (2 address bit (18),				/* address for data transfer */
+  4     9       2 char_pos bit (3),				/* character position */
+  4    10       2 m64 bit (1),				/* non-zero for mod 64 address */
+  4    11       2 type bit (2),				/* DCW type */
+  4    12       2 tally bit (12)) unal;				/* tally for data transfer */
+  4    13 
+  4    14 dcl 1 tdcw based (tdcwp) aligned,			/* Transfer DCW */
+  4    15      (2 address bit (18),				/* address to transfer to */
+  4    16       2 mbz1 bit (4),
+  4    17       2 type bit (2),				/* should be "10"b for TDCW */
+  4    18       2 mbz2 bit (9),
+  4    19       2 ec bit (1),					/* non-zero to set LPW AE bit */
+  4    20       2 res bit (1),				/* non-zero to restrict further use of IDCW */
+  4    21       2 rel bit (1)) unal;				/* non-zero to set relative mode after transfer */
+  4    22 
+  4    23 /* End of include file ...... iom_dcw.incl.pl1 */
+  4    24 
+      261 
+      262  
+  5     2 /* Begin include file ...... iom_pcw.incl.pl1 */
+  5     3 
+  5     4 dcl  pcwp ptr;					/* pointer to PCW */
+  5     5 
+  5     6 dcl 1 pcw based (pcwp) aligned,			/* Peripheral Control Word */
+  5     7      (2 command bit (6),				/* device command */
+  5     8       2 device bit (6),				/* device code */
+  5     9       2 ext bit (6),				/* address extension */
+  5    10       2 code bit (3),				/* should be "111"b for PCW */
+  5    11       2 mask bit (1),				/* channel mask bit */
+  5    12       2 control bit (2),				/* terminate/proceed and marker control bits */
+  5    13       2 chan_cmd bit (6),				/* type of I/O operation */
+  5    14       2 count bit (6),				/* record count or control character */
+  5    15       2 mbz1 bit (3),
+  5    16       2 channel bit (6),				/* channel number */
+  5    17       2 mbz2 bit (27)) unal;
+  5    18 
+  5    19 dcl  idcwp ptr;					/* pointer to IDCW */
+  5    20 
+  5    21 dcl 1 idcw based (idcwp) aligned,			/* Instruction DCW */
+  5    22      (2 command bit (6),				/* device command */
+  5    23       2 device bit (6),				/* device code */
+  5    24       2 ext bit (6),				/* address extension */
+  5    25       2 code bit (3),				/* should be "111"b for PCW */
+  5    26       2 ext_ctl bit (1),				/* "1"b if address extension to be used */
+  5    27       2 control bit (2),				/* terminate/proceed and marker control bits */
+  5    28       2 chan_cmd bit (6),				/* type of I/O operation */
+  5    29       2 count bit (6)) unal;				/* record count or control character */
+  5    30 
+  5    31 /* End include file ...... iom_pcw.incl.pl1 */
+  5    32 
+      262 
+      263  
+  6     2 /* Begin include file ...... iom_stat.incl.pl1 */
+  6     3 /* Last modified on 10/31/74 by Noel I. Morris */
+  6     4 
+  6     5 dcl  statp ptr;					/* pointer to status */
+  6     6 
+  6     7 dcl 1 status based (statp) aligned,			/* IOM status information */
+  6     8      (2 t bit (1),					/* set to "1"b by IOM */
+  6     9       2 power bit (1),				/* non-zero if peripheral absent or power off */
+  6    10       2 major bit (4),				/* major status */
+  6    11       2 sub bit (6),				/* substatus */
+  6    12       2 eo bit (1),					/* even/odd bit */
+  6    13       2 marker bit (1),				/* non-zero if marker status */
+  6    14       2 soft bit (2),				/* software status */
+  6    15       2 initiate bit (1),				/* initiate bit */
+  6    16       2 abort bit (1),				/* software abort bit */
+  6    17       2 channel_stat bit (3),				/* IOM channel status */
+  6    18       2 central_stat bit (3),				/* IOM central status */
+  6    19       2 mbz bit (6),
+  6    20       2 rcount bit (6),				/* record count residue */
+  6    21       2 address bit (18),				/* DCW address residue */
+  6    22       2 char_pos bit (3),				/* character position residue */
+  6    23       2 r bit (1),					/* non-zero if reading */
+  6    24       2 type bit (2),				/* type of last DCW */
+  6    25       2 tally bit (12)) unal;				/* DCW tally residue */
+  6    26 
+  6    27 dcl 1 faultword based (statp) aligned,			/* system fault word */
+  6    28      (2 mbz1 bit (9),
+  6    29       2 channel bit (9),				/* channel number */
+  6    30       2 serv_req bit (5),				/* service request */
+  6    31       2 mbz2 bit (3),
+  6    32       2 controller_fault bit (4),			/* system controller fault code */
+  6    33       2 io_fault bit (6)) unal;			/* I/O fault code */
+  6    34 
+  6    35 dcl 1 special_status based (statp) aligned,		/* special status from PSIA */
+  6    36    (2 t bit (1),					/* entry present bit */
+  6    37     2 channel bit (8),				/* channel number */
+  6    38     2 pad1 bit (3),
+  6    39     2 device bit (6),				/* device address */
+  6    40     2 pad2 bit (1),
+  6    41     2 byte2 bit (8),				/* device dependent information */
+  6    42     2 pad3 bit (1),
+  6    43     2 byte3 bit (8)) unal;				/* device dependent information */
+  6    44 
+  6    45 /* End of include file iom_stat.incl.pl1 */
+  6    46 
+      263 
+      264  /* BEGIN INCLUDE FILE ... prt_sdb.incl.pl1 */
+  7     2 /* Note: there is a corresponding prt_sdb.incl.alm */
+  7     3 
+  7     4 /* Created 10/28/74 by Noel I. Morris	*/
+  7     5 /* Modified 3/15/77 by Noel I. Morris	*/
+  7     6 /* Modified 1/25/78 by J. C. Whitmore to merge prtdim and spooling_dim versions */
+  7     7 /* Modified: 27 November 1981 by G. Palter to add reload_vfc_train_after_special flag */
+  7     8 /* Modified: 16 August 1983 by E. N. Kittlitz for new printer dim */
+  7     9 
+  7    10 dcl  sdb_ptr ptr;					/* pointer to stream data block */
+  7    11 
+  7    12 dcl 1 sdb aligned based (sdb_ptr),			/* printer stream data block */
+  7    13     2 outer_module_name char (32) aligned,
+  7    14     2 device_name_list_ptr pointer,
+  7    15     2 device_name,
+  7    16       3 next_device_ptr pointer,
+  7    17       3 name_size fixed bin (17),
+  7    18       3 name char (32) aligned,
+  7    19     2 ev_list aligned,				/* Event list for ipc_ */
+  7    20       3 count fixed bin (17),				/* Event count = Always one */
+  7    21       3 evchan fixed bin (71),			/* Event channel name */
+  7    22     2 stream_name char (32),				/* stream name of this attachment */
+  7    23     2 areap ptr,					/* pointer to system free area */
+  7    24     2 info like prt_info aligned,			/* printer info */
+  7    25     2 conv_info like pci aligned,			/* conversion info */
+  7    26     2 chars_printed fixed bin (35),			/* input chars processed since "reset" */
+  7    27     2 stop_every fixed bin,				/* non-zero to stop after number of pages */
+  7    28     2 stop_counter fixed bin,				/* page stop counter */
+  7    29     2 mode,					/* additional modes */
+  7    30      (3 single_page bit (1),				/* "1"b to stop after each page */
+  7    31       3 noprint bit (1),				/* "1"b to suppress printing */
+  7    32       3 pad bit (34)) unal,
+  7    33     2 rcp_id bit (36),				/* RCP attachment ID */
+  7    34     2 wsegp ptr,					/* pointer to IOI working segment */
+  7    35     2 running bit (1),				/* "1"b if channel running */
+  7    36     2 bgin fixed bin (18),				/* index to oldest print line */
+  7    37     2 stop fixed bin (18),				/* index to next print line */
+  7    38     2 prev fixed bin (18),				/* index to previous print line */
+  7    39     2 wait_flag bit (1) aligned,			/* non-zero if waiting for special */
+  7    40     2 marker_count fixed bin,				/* counter for marker status insertion */
+  7    41     2 paper_low bit (1) aligned,			/* "1"b if paper low */
+  7    42     2 error_count fixed bin,				/* error counter */
+  7    43     2 buffer_ptr ptr,				/* pointer to output buffer (spooler) */
+  7    44     2 spool_info (56) fixed bin,			/* place to store spooling_info */
+  7    45     2 reload_vfc_train_after_special bit (1) aligned,	/* "1"b if VFC/train images should be reloaded after next
+  7    46*						   special interrupt */
+  7    47     2 max_dcw_size fixed bin (12) uns unal,		/* max wordcount of dcw */
+  7    48     2 max_dcws fixed bin (6) uns unal,			/* max dcws per idcw/buffer */
+  7    49     2 n_dcws fixed bin (6) uns unal,			/* current limit of dcws/buffer */
+  7    50     2 b_begin fixed bin (3) uns unal,			/* buffer index */
+  7    51     2 b_stop fixed bin (3) uns unal,			/* likewise */
+  7    52     2 max_buffers fixed bin (3) uns unal,		/* number of buffers allocated */
+  7    53     2 n_buffers fixed bin (3) uns unal,			/* number of buffers in use now */
+  7    54     2 data_begin fixed bin (18) uns unal,		/* first data word */
+  7    55     2 data_end fixed bin (18) uns unal,			/* size of working space in words */
+  7    56     2 status_ptr ptr unal,				/* ioi status area */
+  7    57     2 flags aligned,
+  7    58       3 aborting bit (1) unal,			/* next attempt to do i/o gets error and resets */
+  7    59       3 eurc bit (1) unal,				/* true if we know we are using EURC */
+  7    60       3 flags_pad bit (16) unal,
+  7    61     2 version fixed bin unal,      
+  7    62     2 status_table ptr unal,				/* for analyze_device_stat_ */
+  7    63     2 null_line_data bit (36) aligned,
+  7    64     2 null_line_dcw bit (36) aligned,
+  7    65     2 alarm_time fixed bin (71) unaligned;		/* current timer_manager_ limit */
+  7    66 dcl  prt_bufferp ptr;
+  7    67 
+  7    68 dcl 1 prt_buffer aligned based (prt_bufferp),
+  7    69     2 header,
+  7    70       3 number fixed bin (6) uns unal,
+  7    71       3 busy bit (1) unal,
+  7    72       3 pad bit (4) unal,
+  7    73       3 dcw_count fixed bin (7) uns unal,
+  7    74       3 data_ends fixed bin (18) uns unal,
+  7    75     2 idcw bit (36),
+  7    76     2 ddcw (sdb.max_dcws + 1) bit (36) aligned;
+  7    77 
+  7    78 dcl  wseg (0:sdb.data_end - 1) bit (36) aligned based (sdb.wsegp);	/* the IOI buffer segment */
+  7    79 dcl 1 prt_buffers (0:sdb.max_buffers - 1) aligned like prt_buffer based (sdb.wsegp);
+  7    80 
+  7    81 /* NOTE:	The Spooling_dim IO Module also uses this include file,
+  7    82*	as it uses the printer stream also. If changes are made to this include file,
+  7    83*	see to it that the changes are also reflected in the Spooling_dim procedures.
+  7    84*	The spooling_dim uses the standard printer_dim order and changemode procedures.
+  7    85*	JCW 1/25/78  */
+  7    86 
+  7    87 /* END INCLUDE FILE ... prt_sdb.incl.pl1 */
+      264 
+      265  
+  8     2 /* Begin include file ...... prt_info.incl.pl1 */
+  8     3 /* last modified 6/12/75 by Noel I. Morris	*/
+  8     4 
+  8     5 dcl  pip ptr;					/* pointer to printer info structure */
+  8     6 
+  8     7 dcl 1 prt_info based (pip) aligned,			/* printer info structure */
+  8     8     2 devname char (4),				/* name of device */
+  8     9     2 devx fixed bin,				/* device index */
+  8    10     2 model fixed bin,				/* printer model number */
+  8    11     2 type fixed bin,				/* printer type number */
+  8    12     2 train fixed bin,				/* print train ID */
+  8    13     2 line_length fixed bin,				/* max length of printed line */
+  8    14     2 print_idcw bit (36),				/* IDCW to print 1 line */
+  8    15     2 term_idcw bit (36);				/* IDCW to stop printer channel */
+  8    16 
+  8    17 /* End of include file ...... prt_info.incl.pl1 */
+  8    18 
+      265 
+      266  
+  9     2 /* BEGIN INCLUDE FILE ... prt_conv_info.incl.pl1 */
+  9     3 /* Modified: 12 September 1980 by G. Palter */
+  9     4 
+  9     5 
+  9     6 /****^  HISTORY COMMENTS:
+  9     7*  1) change(87-05-10,Gilcrease), approve(87-07-31,MCR7686),
+  9     8*     audit(88-02-01,Farley), install(88-02-02,MR12.2-1019):
+  9     9*     Add modes.line_nbrs, flags.(eol eof)  bits for eor -nb.
+  9    10*                                                   END HISTORY COMMENTS */
+  9    11 
+  9    12 
+  9    13 dcl  pcip ptr;					/* pointer to conversion info structure */
+  9    14 
+  9    15 dcl 1 pci based (pcip) aligned,			/* printer conversion info structure */
+  9    16     2 cv_proc ptr,					/* pointer to character conversion procedure */
+  9    17     2 lmarg fixed bin,				/* left margin indentation */
+  9    18     2 rmarg fixed bin,				/* right margin limit */
+  9    19     2 page_length fixed bin,				/* number of lines on page */
+  9    20     2 phys_line_length fixed bin,			/* physical width of paper */
+  9    21     2 phys_page_length fixed bin,			/* physical length of paper */
+  9    22     2 lpi fixed bin,				/* lines per inch */
+  9    23     2 sheets_per_page fixed bin,			/* sheets of paper per logical page */
+  9    24     2 line_count fixed bin,				/* count of converted lines */
+  9    25     2 page_count fixed bin,				/* count of converted pages */
+  9    26     2 func fixed bin,				/* special conversion function */
+  9    27 						/* 0 => normal conversion */
+  9    28 						/* 1 => change NL to FF */
+  9    29 						/* 2 => change NL to top inside page */
+  9    30 						/* 3 => change NL to end of page */
+  9    31                                                             /* 4 => change NL to top of outside page */
+  9    32     (2 modes,					/* conversion modes */
+  9    33      3 overflow_off bit (1),				/* "1"b to suppress end of page overflow */
+  9    34       3 single_space bit (1),				/* "1"b to change all forms advance chars to NL */
+  9    35       3 non_edited bit (1),				/* "1"b to print ASCII control chars */
+  9    36       3 truncate bit (1),				/* "1"b to truncate lines that are too long */
+  9    37       3 esc bit (1),				/* "1"b to process ESC character */
+  9    38       3 ctl_char bit (1),				/* "1"b to output control characters */
+  9    39       3 line_nbrs bit (1),				/* "1"b to output line numbers */
+  9    40       3 pci_pad bit (5),
+  9    41     2 flags,					/* flags internal to prt_conv_ */
+  9    42       3 ignore_next_ff bit (1),			/* ON => prt_conv_ just output a FF; ignore next character if
+  9    43*						   it's a FF */
+  9    44       3 eol bit (1),				/* "1"b = end-of-line encountered */
+  9    45       3 eof bit (1),				/* "1"b = end-of-segment encountered */
+  9    46       3 flags_pad bit (3),
+  9    47     2 coroutine_modes,
+  9    48       3 upper_case bit(1),				/* "1"b to convert to upper case */
+  9    49       3 ht bit(1),					/* "1"b to skip tab conversion */
+  9    50       3 coroutine_pad bit(13),
+  9    51       3 slew_table_idx bit(3) ) unal,			/* slew table index */
+  9    52     2 top_label_line char (136),			/* contains an optional top of page label */
+  9    53     2 bot_label_line char (136),			/* contains an optional bottom of page label */
+  9    54     2 top_label_length fixed bin,			/* length of top label line */
+  9    55     2 bot_label_length fixed bin,			/* length of bottom label line */
+  9    56     2 form_stops (256) unal,				/* logical form stops */
+  9    57       3 lbits bit (9),				/* leftmost bits */
+  9    58       3 rbits bit (9),				/* rightmost bits */
+  9    59 
+  9    60 /* The following items are for internal use by the print conversion procedure.
+  9    61*   They should be zeroed once and then never referenced again.		*/
+  9    62 
+  9    63     2 level fixed bin,				/* overstrike level */
+  9    64     2 pos fixed bin,				/* print position at end of incomplete line */
+  9    65     2 line fixed bin,				/* current line number */
+  9    66     2 slew_residue fixed bin,				/* number of lines remaining to be slewed */
+  9    67     2 label_nelem fixed bin,				/* characters remaining in label */
+  9    68     2 label_wksp ptr,				/* pointer to label being processed */
+  9    69     2 sav_pos fixed bin,				/* position saved during label processing */
+  9    70     2 esc_state fixed bin,				/* state of ESC processing */
+  9    71     2 esc_num fixed bin,				/* number following ESC sequence */
+  9    72     2 temp bit (36);				/* conversion proc temporary */
+  9    73 
+  9    74 /* End of include file ...... prt_conv_info.incl.pl1 */
+  9    75 
+      266 
+      267 
+      268      end prtdim_eurc_util$init;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    02/02/88  1541.5  prtdim_eurc_util.pl1              >special_ldd>install>MR12.2-1019>prtdim_eurc_util.pl1
+258          1    06/29/79  1728.0  event_call_info.incl.pl1          >ldd>include>event_call_info.incl.pl1
+259          2    12/01/82  1039.8  interrupt_levels.incl.pl1         >ldd>include>interrupt_levels.incl.pl1
+260          3    08/17/79  2215.0  ioi_stat.incl.pl1                 >ldd>include>ioi_stat.incl.pl1
+261          4    11/12/74  1550.1  iom_dcw.incl.pl1                  >ldd>include>iom_dcw.incl.pl1
+262          5    05/06/74  1742.1  iom_pcw.incl.pl1                  >ldd>include>iom_pcw.incl.pl1
+263          6    01/10/75  1343.6  iom_stat.incl.pl1                 >ldd>include>iom_stat.incl.pl1
+264          7    11/04/83  1107.6  prt_sdb.incl.pl1                  >ldd>include>prt_sdb.incl.pl1
+265          8    08/29/75  1310.5  prt_info.incl.pl1                 >ldd>include>prt_info.incl.pl1
+266          9    02/02/88  1529.2  prt_conv_info.incl.pl1            >special_ldd>install>MR12.2-1019>prt_conv_info.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+IO_SPECIAL_INTERRUPT_LEVEL             constant        fixed bin(17,0)          initial dcl 2-12 ref 211
+IO_SYSTEM_FAULT_INTERRUPT_LEVEL        constant        fixed bin(17,0)          initial dcl 2-6 ref 230
+IO_TERMINATE_INTERRUPT_LEVEL           constant        fixed bin(17,0)          initial dcl 2-8 ref 224
+abort_status                    000264 automatic       bit(1)                   dcl 112 set ref 128* 129
+aborting                530            based           bit(1)                   level 3 packed unaligned dcl 7-12 set ref 50 66 78
+                                                                                  131*
+addr                                                   builtin function         dcl 45 ref 48 49 84 86 114 115 123 199 199 199 199
+                                                                                  207 225 225
+addrel                                                 builtin function         dcl 45 ref 174 175
+address                                based           bit(18)                  level 2 packed unaligned dcl 4-7 set ref 178*
+analyze_device_stat_            000024 constant        entry                    external dcl 34 ref 225
+analyze_system_fault_           000026 constant        entry                    external dcl 35 ref 230
+b                               000100 automatic       bit(18)                  dcl 160 set ref 225*
+bit                                                    builtin function         dcl 45 ref 179
+busy                      0(06)        based           bit(1)                   array level 3 packed unaligned dcl 7-79 set ref 144*
+completion                             based           structure                level 2 in structure "imess" packed unaligned
+                                                                                  dcl 3-21 in procedure "prtdim_eurc_util$init"
+completion                             based           structure                level 2 in structure "istat" dcl 3-7 in procedure
+                                                                                  "prtdim_eurc_util$init"
+conv_info                54            based           structure                level 2 dcl 7-12 set ref 49 86 115
+d                                      parameter       pointer                  dcl 156 ref 152 181 243
+data_end                526(18)        based           fixed bin(18,0)          level 2 packed unsigned unaligned dcl 7-12 ref 142
+                                                                                  148
+dcw                                    based           structure                level 1 dcl 4-7 set ref 177*
+dcw_count                 0(11)        based           fixed bin(7,0)           array level 3 packed unsigned unaligned dcl 7-79 set
+                                                                                  ref 146*
+dcwp                            000272 automatic       pointer                  dcl 4-4 set ref 174* 175 177 178 179
+ddcw                      2            based           bit(36)                  array level 2 dcl 7-79 set ref 117*
+devname                                based           char(4)                  level 2 dcl 8-7 set ref 225* 230*
+devx                      1            based           fixed bin(17,0)          level 2 dcl 8-7 set ref 190*
+dp                              000102 automatic       pointer                  dcl 161 set ref 175* 178 181 243
+e                                      parameter       bit(1)                   dcl 158 set ref 152 169* 187* 192* 203* 218* 237*
+                                                                                  246*
+ecode                           000104 automatic       fixed bin(35,0)          dcl 162 set ref 184* 186 190* 191 199* 202 219*
+er                        0(01)        based           bit(1)                   level 3 packed unaligned dcl 3-7 ref 225 233
+error_table_$io_no_permission   000042 external static fixed bin(35,0)          dcl 42 ref 51 67 79
+error_table_$net_timeout        000036 external static fixed bin(35,0)          dcl 40 ref 219
+error_table_$no_operation       000040 external static fixed bin(35,0)          dcl 41 ref 94
+ev_list                  26            based           structure                level 2 dcl 7-12 set ref 199 199
+evchan                   30            based           fixed bin(71,0)          level 3 dcl 7-12 set ref 184* 196* 201*
+event_call_info                        based           structure                level 1 dcl 1-7
+flags                   530            based           structure                level 2 dcl 7-12
+header                                 based           structure                array level 2 dcl 7-79
+i                               000265 automatic       fixed bin(17,0)          dcl 140 in procedure "prtdim_eurc_util$init" set ref
+                                                                                  143* 144 145 145 146*
+i                                      parameter       bit(36)                  dcl 154 in procedure "sync_io" ref 152 173
+idcw                                   based           structure                level 1 dcl 5-21 in procedure
+                                                                                  "prtdim_eurc_util$init" set ref 173*
+idcw                      1            based           bit(36)                  array level 2 in structure "prt_buffers" dcl 7-79
+                                                                                  in procedure "prtdim_eurc_util$init" set ref 118*
+idcwp                           000274 automatic       pointer                  dcl 5-19 set ref 172* 173 174
+imess                                  based           structure                level 1 dcl 3-21
+imp                             000270 automatic       pointer                  dcl 3-19 set ref 207* 208 211 211
+info                     44            based           structure                level 2 dcl 7-12 set ref 48 84 114
+init_printer_                   000016 constant        entry                    external dcl 31 ref 54
+init_printer_$load_image        000020 constant        entry                    external dcl 32 ref 70
+init_printer_$load_vfc          000022 constant        entry                    external dcl 33 ref 82
+ioi_$connect                    000012 constant        entry                    external dcl 29 ref 190
+iom_stat                  4            based           bit(72)                  level 2 dcl 3-7 set ref 123 223
+ipc_$block                      000010 constant        entry                    external dcl 28 ref 199
+ipc_$drain_chn                  000014 constant        entry                    external dcl 30 ref 184
+isp                             000266 automatic       pointer                  dcl 3-5 set ref 122* 123 124 214* 216 217 223 224
+                                                                                  225 230 233
+istat                                  based           structure                level 1 dcl 3-7
+l                                      parameter       fixed bin(12,0)          dcl 157 ref 152 179 181 243
+l_event_call_info               000252 automatic       structure                level 1 dcl 26 set ref 199 199
+l_timer_message                        based           char(8)                  unaligned dcl 165 ref 208
+level                     1            based           fixed bin(3,0)           level 2 in structure "istat" dcl 3-7 in procedure
+                                                                                  "prtdim_eurc_util$init" ref 224 230
+level                     0(15)        based           bit(3)                   level 2 in structure "imess" packed unaligned
+                                                                                  dcl 3-21 in procedure "prtdim_eurc_util$init" ref
+                                                                                  211
+load_proc                       000102 automatic       entry variable           dcl 22 set ref 70* 82* 90
+marker                    0(13)        based           bit(1)                   level 2 packed unaligned dcl 6-7 ref 124
+max_buffers             525(30)        based           fixed bin(3,0)           level 2 packed unsigned unaligned dcl 7-12 ref 117
+                                                                                  118 143
+max_dcws                525(12)        based           fixed bin(6,0)           level 2 packed unsigned unaligned dcl 7-12 ref 117
+                                                                                  117 118 144 145 146
+message                   2     000252 automatic       fixed bin(71,0)          level 2 dcl 26 set ref 207
+mode                    415            based           structure                level 2 dcl 7-12 set ref 58*
+null_line_data          533            based           bit(36)                  level 2 dcl 7-12 ref 148
+null_line_dcw           534            based           bit(36)                  level 2 dcl 7-12 ref 117
+number                                 based           fixed bin(6,0)           array level 3 packed unsigned unaligned dcl 7-79 set
+                                                                                  ref 145*
+pci                                    based           structure                level 1 dcl 9-15
+pcip                            000302 automatic       pointer                  dcl 9-13 set ref 49* 54* 86* 90* 115*
+pip                             000300 automatic       pointer                  dcl 8-5 set ref 48* 54* 84* 90* 114* 118 128 190 225
+                                                                                  230
+prt_buffer                             based           structure                level 1 dcl 7-68
+prt_buffers                            based           structure                array level 1 dcl 7-79
+prt_info                               based           structure                level 1 dcl 8-7
+prt_status_table_$prt_status_table_
+                                000044 external static fixed bin(17,0)          dcl 43 set ref 225 225
+rcode                                  parameter       fixed bin(35,0)          dcl 19 set ref 17 51* 54* 63 67* 75 79* 90* 94 94*
+rel                                                    builtin function         dcl 45 ref 178
+running                 422            based           bit(1)                   level 2 dcl 7-12 set ref 119 119 124* 127* 134* 168
+rw                                     parameter       bit(2)                   dcl 155 ref 152 181 243
+save_buffer                     000106 automatic       fixed bin(35,0)          array dcl 23 set ref 88* 92
+sdata                                  based           fixed bin(17,0)          array dcl 166 set ref 181* 181 243* 243
+sdb                                    based           structure                level 1 dcl 7-12
+sdb_ptr                                parameter       pointer                  dcl 7-10 set ref 17 48 49 50 56 56 58 63 66 75 78 84
+                                                                                  86 88 92 109 114 115 117 117 117 117 117 118 118
+                                                                                  118 119 119 122 124 127 130* 131 134 139 142 142
+                                                                                  143 144 144 145 145 146 146 148 148 148 168 172
+                                                                                  184 196 199 199 201 214 248
+st                                     based           bit(1)                   level 3 in structure "istat" packed unaligned
+                                                                                  dcl 3-7 in procedure "prtdim_eurc_util$init" set
+                                                                                  ref 124 216 248*
+st                                     based           bit(1)                   level 3 in structure "imess" packed unaligned
+                                                                                  dcl 3-21 in procedure "prtdim_eurc_util$init" ref
+                                                                                  211
+statp                           000276 automatic       pointer                  dcl 6-5 set ref 123* 124
+status                                 based           structure                level 1 dcl 6-7
+status_ptr              527            based           pointer                  level 2 packed unaligned dcl 7-12 ref 122 214 248
+stop_counter            414            based           fixed bin(17,0)          level 2 dcl 7-12 set ref 56*
+stop_every              413            based           fixed bin(17,0)          level 2 dcl 7-12 set ref 56*
+stop_tries                      000262 automatic       fixed bin(17,0)          dcl 110 set ref 116*
+string                                                 builtin function         dcl 45 set ref 173* 177*
+tally                     0(24)        based           bit(12)                  level 2 packed unaligned dcl 4-7 set ref 179*
+temp_iom_stat                   000100 automatic       bit(72)                  dcl 21 set ref 223* 225* 230*
+term_idcw                 7            based           bit(36)                  level 2 dcl 8-7 set ref 118 128*
+time_out                  0(03)        based           bit(1)                   level 3 packed unaligned dcl 3-7 ref 217
+timer_manager_$alarm_wakeup     000032 constant        entry                    external dcl 37 ref 196
+timer_manager_$reset_alarm_wakeup
+                                000034 constant        entry                    external dcl 38 ref 201
+timer_manager_$sleep            000030 constant        entry                    external dcl 36 ref 121
+timer_rang                      000105 automatic       bit(1)                   dcl 163 set ref 208* 210* 236
+wait_count                      000263 automatic       fixed bin(17,0)          dcl 111 set ref 119*
+wseg                                   based           bit(36)                  array dcl 7-78 set ref 142* 148*
+wseg_low                               based           fixed bin(35,0)          array dcl 24 set ref 88 92*
+wsegp                   420            based           pointer                  level 2 dcl 7-12 ref 88 92 117 118 142 144 145 146
+                                                                                  148 172
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+IO_MARKER_INTERRUPT_LEVEL              internal static fixed bin(17,0)          initial dcl 2-10
+event_call_info_ptr                    automatic       pointer                  dcl 1-5
+faultword                              based           structure                level 1 dcl 6-27
+pcw                                    based           structure                level 1 dcl 5-6
+pcwp                                   automatic       pointer                  dcl 5-4
+prt_bufferp                            automatic       pointer                  dcl 7-66
+special_status                         based           structure                level 1 dcl 6-35
+tdcw                                   based           structure                level 1 dcl 4-14
+tdcwp                                  automatic       pointer                  dcl 4-4
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+load_join                       000160 constant        label                    dcl 84 ref 71
+prtdim_eurc_util$finish_abort   000232 constant        entry                    external dcl 109
+prtdim_eurc_util$init           000026 constant        entry                    external dcl 17
+prtdim_eurc_util$initialize_workspace
+                                000513 constant        entry                    external dcl 139 ref 130
+prtdim_eurc_util$load_image     000105 constant        entry                    external dcl 63
+prtdim_eurc_util$load_vfc       000134 constant        entry                    external dcl 75
+redo_sync                       000665 constant        label                    dcl 184 ref 211
+sync_io                         000607 constant        entry                    internal dcl 152 ref 54 54 90 90 128
+sync_io_return                  001206 constant        label                    dcl 248 ref 188 193 204 220 238
+sync_wait                       000757 constant        label                    dcl 199 ref 233
+timed_sync_wait                 000734 constant        label                    dcl 196 ref 240
+
+NAMES DECLARED BY CONTEXT OR IMPLICATION.
+bin                                                    builtin function         ref 211
+null                                                   builtin function         ref 128 128
+unspec                                                 builtin function         ref 142
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      1556        1624    1224        1566
+Length      2226    1224        46         366     332           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+prtdim_eurc_util$init               246 external procedure  is an external procedure.  
+sync_io                             108 internal procedure  is assigned to an entry variable.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+prtdim_eurc_util$init    000100 temp_iom_stat               prtdim_eurc_util$init
+                         000102 load_proc                   prtdim_eurc_util$init
+                         000106 save_buffer                 prtdim_eurc_util$init
+                         000252 l_event_call_info           prtdim_eurc_util$init
+                         000262 stop_tries                  prtdim_eurc_util$init
+                         000263 wait_count                  prtdim_eurc_util$init
+                         000264 abort_status                prtdim_eurc_util$init
+                         000265 i                           prtdim_eurc_util$init
+                         000266 isp                         prtdim_eurc_util$init
+                         000270 imp                         prtdim_eurc_util$init
+                         000272 dcwp                        prtdim_eurc_util$init
+                         000274 idcwp                       prtdim_eurc_util$init
+                         000276 statp                       prtdim_eurc_util$init
+                         000300 pip                         prtdim_eurc_util$init
+                         000302 pcip                        prtdim_eurc_util$init
+sync_io                  000100 b                           sync_io
+                         000102 dp                          sync_io
+                         000104 ecode                       sync_io
+                         000105 timer_rang                  sync_io
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+call_ent_var        call_ext_in         call_ext_out_desc   call_ext_out        call_int_this       return_mac
+ext_entry           int_entry
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+analyze_device_stat_          analyze_system_fault_         init_printer_                 init_printer_$load_image
+init_printer_$load_vfc        ioi_$connect                  ipc_$block                    ipc_$drain_chn
+timer_manager_$alarm_wakeup   timer_manager_$reset_alarm_wakeup                           timer_manager_$sleep
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$io_no_permission error_table_$net_timeout      error_table_$no_operation
+prt_status_table_$prt_status_table_
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     17 000022        48 000033        49 000040        50 000042        51 000045        52 000047        54 000050
+     56 000067        58 000074        60 000102        63 000103        66 000112        67 000120        68 000123
+     70 000124        71 000131        75 000132        78 000141        79 000147        80 000152        82 000153
+     84 000160        86 000164        88 000166        90 000172        92 000211        94 000220        97 000226
+    109 000227       114 000237       115 000244       116 000246       117 000253       118 000327       119 000356
+    121 000374       122 000411       123 000416       124 000420       126 000427       127 000431       128 000435
+    129 000461       130 000464       131 000473       132 000500       134 000501       135 000506       136 000510
+    139 000511       142 000520       143 000534       144 000545       145 000560       146 000564       147 000575
+    148 000577       149 000605       152 000606       168 000614       169 000622       170 000625       172 000626
+    173 000630       174 000633       175 000636       177 000640       178 000641       179 000644       181 000652
+    184 000665       186 000702       187 000704       188 000707       190 000710       191 000726       192 000730
+    193 000733       196 000734       199 000757       201 001002       202 001015       203 001017       204 001022
+    207 001023       208 001027       210 001036       211 001037       214 001052       216 001057       217 001062
+    218 001065       219 001070       220 001073       223 001074       224 001077       225 001102       228 001134
+    230 001135       233 001154       234 001160       236 001161       237 001163       238 001166       240 001167
+    243 001170       246 001205       248 001206       250 001215
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

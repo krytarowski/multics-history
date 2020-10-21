@@ -1,0 +1,761 @@
+	COMPILATION LISTING OF SEGMENT bj_adopt_txn
+	Compiled by: Multics PL/I Compiler, Release 28e, of February 14, 1985
+	Compiled at: Honeywell Multics Op. - System M
+	Compiled on: 03/05/85  0852.6 mst Tue
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1983 *
+        4*   *                                                         *
+        5*   *********************************************************** */
+        6 
+        7 /* DESCRIPTION:
+        8*
+        9*     bj_adopt_txn - procedure to change before journal transaction specific
+       10*   table entry which will allow a process other than the one that initiated
+       11*   a transaction to complete it.  It is assumed that this other process
+       12*   will be the data management daemon.
+       13*
+       14*   This procedure has four entrypoints:
+       15*
+       16*   adopt,      to adopt the transaction information for use by another project;
+       17*   abandon,    to restore the transaction information to the way it was 
+       18*               before the adoption (except for transaction ID after ABORT);
+       19*   force_abandon,
+       20*               to ignore all adoption errors and close adoption, this may
+       21*               leave the adoption state inconsistent, so should be used
+       22*               if all else fails;
+       23*   get_pf_oid, to generate a page file opening ID specific to this process
+       24*               and to save the OID for a close operation during the 
+       25*               abandon process.
+       26**/
+       27 
+       28 /*  HISTORY
+       29*Written by M. Pandolf, 08/30/82.
+       30*Modified:
+       31*08/15/82 by M. Pandolf: to use file_manager_ for manipulation of data
+       32*	  management system files.
+       33*12/21/82 by M. Pandolf:  to call bj_close_oid as part of abandoning.
+       34*01/13/83 by L. A. Newcomb:  to call file_manager_$open_by_uid_after_crash
+       35*	  if recovery is in progress.
+       36*01/18/83 by L. A. Newcomb:  to fix subscriptrange problem in abandon
+       37*	  in close_page_files loop and the adoption info structure.
+       38*01/27/83 by M. Pandolf:  to eliminate clearing of pf_uid_list, which caused
+       39*	  stringsize condition, and was not necessary anyway.
+       40*02/04/83 by M. Pandolf:  to save error codes from file_manager_ in
+       41*	  bjm_data_$bj_code.
+       42*03/04/83 by M. Pandolf:  to make adopt call abandon if an adoption
+       43*	  is still active and fix code to open_by_uid.
+       44*03/14/83 by M. Pandolf:  to not look at (zeroed) p_tid as an indication
+       45*	  of proper adoption during abandon.
+       46*03/16/83 by L. A. Newcomb:  to use dm_error_$not_daemon for privilege check.
+       47*05/13/83 by L. A. Newcomb:  Added pf_opening_error_code to internal hash table
+       48*            so we can return it if we match in the hash search.
+       49*12/06/83 by L. A. Newcomb:  Renamed before_journal_manager_static_ to
+       50*            bjm_data_ and moved some cells from dm_data_ to bjm_data_.
+       51*03/05/84 by L. A. Newcomb:  changed to use the include file dm_system_states
+       52*            (renamed from dm_statuses), and to use the new names therein.
+       53*04/06/84 by Lindsey L. Spratt:  Added shutdown_warning, user_shutdown, and
+       54*            system_shutdown to running as valid states to do fm_$open_by_uid.
+       55*09/10/84 by Lee A. Newcomb:  Changed to use the new system state constants and
+       56*            fixed to not have variables declared by context or implication.
+       57*11/30/84 by Maggie Sharpe:  to set/rest validation level around the calls to
+       58*	  file_manager_.
+       59**/
+       60 
+       61 /* format:  style4,indattr,ifthenstmt,ifthen,idind33,^indcomtxt */
+       62 
+       63 bj_adopt_txn$adopt:
+       64      proc (p_tix);
+       65 
+       66 /* START OF DECLARATIONS */
+       67 /* Parameter */
+       68 dcl  (
+       69      p_tix		        fixed bin,		/* index of transaction to be adopted */
+       70      p_tid		        bit (36) aligned,	/* UID of transaction to be adopted */
+       71      p_pf_uid		        bit (36) aligned,	/* UID of page file to be opened for rollback */
+       72      p_pf_oid		        bit (36) aligned	/* OID of page file just opened */
+       73      )			        parameter;
+       74 
+       75 /* Automatic */
+       76 dcl  (
+       77      tix			        fixed bin,		/* local copy of parameter */
+       78      tid			        bit (36) aligned,	/* local copy of parameter */
+       79      pf_uid		        bit (36) aligned,	/* local copy of parameter */
+       80      saved_level		        fixed bin,		/* caller's validation level */
+       81      code			        fixed bin (35),	/* standard system status code */
+       82      uid_ht_index		        fixed bin,		/* index into UID hash table */
+       83      curr_uid_list_index	        fixed bin,		/* index into UID list */
+       84      prev_uid_list_index	        fixed bin		/* to hold onto value of curr_uid_list_index */
+       85      )			        automatic;
+       86 
+       87 /* Based */
+       88 dcl
+       89      1 adoption_info	        aligned based (adoption_info_ptr),
+       90        2 target_txn		        aligned,
+       91          3 tix		        fixed bin,
+       92          3 tid		        bit (36),
+       93          3 process_id	        bit (36),
+       94          3 bj_oid		        bit (36),
+       95          3 ppte_ptr		        pointer,
+       96        2 last_used_uid_list_entry     fixed bin,
+       97        2 pf_uid_ht		        dimension (0:511) fixed bin,
+       98        2 pf_uid_list	        dimension (0 refer (adoption_info.last_used_uid_list_entry)) aligned,
+       99          3 next		        fixed bin,		/* next entry in this uid list */
+      100          3 pf_uid		        bit (36),
+      101          3 pf_oid		        bit (36),
+      102          3 pf_opening_error_code      fixed bin (35);
+      103 
+      104 /* Builtin */
+      105 dcl  (
+      106      addr, binary, null, substr,
+      107      unspec
+      108      )			        builtin;
+      109 
+      110 /* Condition */
+      111 
+      112 dcl  cleanup		        condition;
+      113 
+      114 /* Constant */
+      115 dcl  (
+      116      myname		        char (32) init ("bj_adopt_txn")
+      117      )			        int static options (constant);
+      118 
+      119 /* Entry */
+      120 dcl
+      121      get_process_id_	        entry () returns (bit (36)),
+      122      bj_report_err		        entry (fixed bin (35), char (*)),
+      123      get_temp_segment_	        entry (char (*), ptr, fixed bin (35)),
+      124      bj_oid_util$get_ptr	        entry (bit (36) aligned) returns (ptr),
+      125      bj_open_by_uid		        entry (bit (36) aligned, bit (36) aligned),
+      126      bj_close_oid		        entry (bit (36) aligned),
+      127      bj_pst_lock		        entry (),
+      128      get_ring_		        entry () returns (fixed bin (3)),
+      129      cu_$level_set		        entry (fixed bin),
+      130      cu_$level_get		        entry (fixed bin),
+      131      bj_pst_lock$unlock	        entry (),
+      132      file_manager_$close	        entry (bit (36) aligned, fixed bin (35)),
+      133      file_manager_$open_by_uid        entry (bit (36) aligned, bit (36) aligned, fixed bin (35)),
+      134      file_manager_$open_by_uid_after_crash
+      135 			        entry (bit (36) aligned, bit (36) aligned, fixed bin (35));
+      136 
+      137 /* External */
+      138 dcl  (
+      139      dm_data_$bj_txt_ptr	        ptr,
+      140      (dm_error_$not_daemon,				/* DM error codes */
+      141      dm_error_$bj_not_adopting,
+      142      dm_error_$bj_this_not_adopted
+      143      )			        fixed bin (35),
+      144      dm_system_data_$initializer_processid bit (36),
+      145      dm_system_data_$current_dm_state char (4) aligned
+      146      )			        external static;
+      147 
+      148 /* Static */
+      149 dcl  (
+      150      adoption_info_ptr	        ptr init (null ())
+      151      )			        internal static;
+      152 
+      153 /* bj_adopt_txn$adopt:		*/
+      154 /*     proc (p_tix);		*/
+      155 
+      156 	tix = p_tix;
+      157 
+      158 /* only the data management daemon should get past this next check */
+      159 
+      160 	if dm_system_data_$initializer_processid ^= get_process_id_ ()
+      161 	then do;
+      162 	     call bj_report_err (dm_error_$not_daemon, myname);
+      163 	     return;
+      164 	end;
+      165 
+      166 /* see if we have to get space for the adoption information */
+      167 
+      168 	if adoption_info_ptr = null ()
+      169 	then do;
+      170 	     call get_temp_segment_ (myname, adoption_info_ptr, code);
+      171 	     if adoption_info_ptr = null ()
+      172 	     then do;
+      173 		call bj_report_err (code, myname);
+      174 		return;
+      175 	     end;
+      176 	     unspec (adoption_info) = "0"b;
+      177 	end;
+      178 
+      179 /* see if an adoption is currently in progress */
+      180 
+      181 	if adoption_info.tix ^= 0
+      182 	     then call abandon (adoption_info.tix, adoption_info.tid);
+      183 
+      184 /* TXTE assumed verified by bjm primitive, so copy pertinent data */
+      185 
+      186 	bj_txte_ptr = addr (dm_data_$bj_txt_ptr -> bj_txt.entry (tix));
+      187 
+      188 	adoption_info.target_txn.tid = bj_txte.tid;
+      189 	adoption_info.target_txn.process_id = bj_txte.operator_info.process_id;
+      190 	adoption_info.target_txn.bj_oid = bj_txte.operator_info.bj_oid;
+      191 	adoption_info.target_txn.ppte_ptr = bj_txte.operator_info.ppte_ptr;
+      192 	unspec (adoption_info.pf_uid_ht) = "0"b;
+      193 	adoption_info.last_used_uid_list_entry = 0;
+      194 
+      195 /* set operator_info in TXTE to values for this process */
+      196 
+      197 	call bj_open_by_uid (bj_txte.bj_uid, bj_txte.operator_info.bj_oid);
+      198 	bj_txte.operator_info.ppte_ptr = bj_oid_util$get_ptr (bj_txte.operator_info.bj_oid);
+      199 	bj_txte.operator_info.process_id = dm_system_data_$initializer_processid;
+      200 
+      201 /* setting the TIX validates the adoption information */
+      202 
+      203 	adoption_info.target_txn.tix = tix;
+      204 
+      205 /* transaction is adopted from the point of view of before journal manager */
+      206 
+      207 	return;
+      208 
+      209 /*   end adopt; */
+      210 
+      211 abandon:
+      212      entry (p_tix, p_tid);
+      213 
+      214 	tix = p_tix;
+      215 	tid = p_tid;
+      216 	call cu_$level_get (saved_level);
+      217 
+      218 	on cleanup begin;
+      219 	     call cu_$level_set (saved_level);
+      220 	end;
+      221 
+      222 /* have we adopted a transaction? */
+      223 
+      224 	if adoption_info_ptr = null ()		/* surely not! */
+      225 	then do;
+      226 	     call bj_report_err (dm_error_$bj_not_adopting, myname);
+      227 	     return;
+      228 	end;
+      229 
+      230 	if adoption_info.target_txn.tix = 0
+      231 	then do;
+      232 	     call bj_report_err (dm_error_$bj_not_adopting, myname);
+      233 	     return;
+      234 	end;
+      235 
+      236 	bj_txte_ptr = addr (dm_data_$bj_txt_ptr -> bj_txt.entry (adoption_info.target_txn.tix));
+      237 
+      238 	if adoption_info.target_txn.tix ^= tix | bj_txte.tid ^= tid
+      239 	then do;
+      240 	     call bj_report_err (dm_error_$bj_this_not_adopted, myname);
+      241 	     return;
+      242 	end;
+      243 
+      244 /* close all page files that were opened during the adoption */
+      245 
+      246 	call cu_$level_set (get_ring_ ());
+      247 
+      248 CLOSE_PAGE_FILES:
+      249 	do curr_uid_list_index = 1 to adoption_info.last_used_uid_list_entry;
+      250 
+      251 	     if adoption_info.pf_uid_list (curr_uid_list_index).pf_oid ^= (36)"0"b
+      252 		then call file_manager_$close (adoption_info.pf_uid_list (curr_uid_list_index).pf_oid, code);
+      253 
+      254 	end CLOSE_PAGE_FILES;
+      255 
+      256 	call cu_$level_set (saved_level);
+      257 
+      258 	unspec (adoption_info.pf_uid_ht) = "0"b;
+      259 
+      260 /* close the before journal */
+      261 
+      262 	call bj_pst_lock ();
+      263 
+      264 	call bj_close_oid (bj_txte.operator_info.bj_oid);
+      265 
+      266 	call bj_pst_lock$unlock ();
+      267 
+      268 /* set the ppte in the txte to null:  better to hit a brick wall than to fall into a wormhole... */
+      269 
+      270 	bj_txte.operator_info.ppte_ptr = null ();
+      271 
+      272 /* setting the TIX completes the abandoning.  note that this is also a back door */
+      273 
+      274 force_abandon:
+      275      entry ();
+      276 	if adoption_info_ptr ^= null ()
+      277 	     then adoption_info.tix = 0;
+      278 
+      279 /* finished */
+      280 
+      281 	return;
+      282 
+      283 get_pf_oid:
+      284      entry (p_pf_uid, p_pf_oid);
+      285 
+      286 	pf_uid = p_pf_uid;
+      287 	p_pf_oid = (36)"0"b;
+      288 	call cu_$level_get (saved_level);
+      289 
+      290 	on cleanup begin;
+      291 	     call cu_$level_set (saved_level);
+      292 	end;
+      293 
+      294 /* have we adopted a transaction? */
+      295 
+      296 	if adoption_info_ptr = null ()		/* nope! */
+      297 	then do;
+      298 	     call bj_report_err (dm_error_$bj_not_adopting, myname);
+      299 	     return;
+      300 	end;
+      301 
+      302 	if adoption_info.target_txn.tix = 0
+      303 	then do;
+      304 	     call bj_report_err (dm_error_$bj_not_adopting, myname);
+      305 	     return;
+      306 	end;
+      307 
+      308 /* find beginning of list that includes the desired UID */
+      309 
+      310 	uid_ht_index = binary (substr (pf_uid, 28, 9));
+      311 
+      312 /* we walk the pf_uid_list looking for pf_uid */
+      313 
+      314 	prev_uid_list_index = 0;
+      315 
+      316 SEARCH_FOR_UID:
+      317 	do curr_uid_list_index = adoption_info.pf_uid_ht (uid_ht_index)
+      318 	     repeat (adoption_info.pf_uid_list (curr_uid_list_index).next)
+      319 	     while (curr_uid_list_index ^= 0);
+      320 
+      321 	     if adoption_info.pf_uid_list (curr_uid_list_index).pf_uid = pf_uid
+      322 	     then do;
+      323 		p_pf_oid = adoption_info.pf_uid_list (curr_uid_list_index).pf_oid;
+      324 		bjm_data_$bj_code =
+      325 		     adoption_info.pf_uid_list (curr_uid_list_index).pf_opening_error_code;
+      326 		return;			/* short cut */
+      327 	     end;
+      328 
+      329 	     prev_uid_list_index = curr_uid_list_index;
+      330 
+      331 	end SEARCH_FOR_UID;
+      332 
+      333 /* if we made it here, then UID was not in the list */
+      334 
+      335 	call ALLOC_UID (pf_uid, curr_uid_list_index);
+      336 
+      337 	if prev_uid_list_index = 0			/* pf_uid_ht for this uid was empty */
+      338 	     then adoption_info.pf_uid_ht (uid_ht_index) = curr_uid_list_index;
+      339 	else adoption_info.pf_uid_list (prev_uid_list_index).next = curr_uid_list_index;
+      340 
+      341 	call cu_$level_set (get_ring_ ());
+      342 	if dm_system_data_$current_dm_state = DM_SYSTEM_STATE_RUNNING
+      343 	     | dm_system_data_$current_dm_state = DM_SYSTEM_STATE_SHUTDOWN_BEGUN
+      344 	     | dm_system_data_$current_dm_state = DM_SYSTEM_STATE_SHUTDOWN_BUMP_USERS
+      345 	     then
+      346 	     call file_manager_$open_by_uid (pf_uid, adoption_info.pf_uid_list (curr_uid_list_index).pf_oid,
+      347 		adoption_info.pf_uid_list (curr_uid_list_index).pf_opening_error_code);
+      348 	else call file_manager_$open_by_uid_after_crash (pf_uid, adoption_info.pf_uid_list (curr_uid_list_index).pf_oid,
+      349 		adoption_info.pf_uid_list (curr_uid_list_index).pf_opening_error_code);
+      350 						/* don't check the code, because reporting */
+      351 						/* an error would cause the whole rollback to */
+      352 						/* be aborted.  if the code is not 0, then */
+      353 						/* p_pf_oid will remain zero for the return */
+      354 						/* and the non-zero code will be in static storage */
+      355 
+      356 	call cu_$level_set (saved_level);
+      357 
+      358 	p_pf_oid = adoption_info.pf_uid_list (curr_uid_list_index).pf_oid;
+      359 	bjm_data_$bj_code = adoption_info.pf_uid_list (curr_uid_list_index).pf_opening_error_code;
+      360 	call cu_$level_set (saved_level);
+      361 
+      362 	return;
+      363 
+      364 ALLOC_UID:
+      365      proc (p_uid, p_index);
+      366 
+      367 /* Internal Declarations */
+      368 
+      369 dcl  p_uid		        bit (36) aligned parameter; /* UID which needs a slot in table */
+      370 dcl  p_index		        fixed bin (17) aligned parameter; /* slot number into which we put UID */
+      371 
+      372 	p_index,
+      373 	     adoption_info.last_used_uid_list_entry =
+      374 	     adoption_info.last_used_uid_list_entry + 1;
+      375 
+      376 	adoption_info.pf_uid_list (adoption_info.last_used_uid_list_entry).pf_uid = p_uid;
+      377 	adoption_info.pf_uid_list (adoption_info.last_used_uid_list_entry).next = 0;
+      378 
+      379 	return;
+      380 
+      381      end ALLOC_UID;
+      382 
+      383 
+      384  	/* BEGIN dm_bj_static.incl.pl1 */
+  1     2 /*
+  1     3*Modified: 
+  1     4*10/04/82 by Lee A. Newcomb:  To change from internal static to external
+  1     5*	  static.
+  1     6**/
+  1     7 
+  1     8 dcl dm_system_data_$bj_max_n_journals		fixed bin ext static;
+  1     9 dcl dm_system_data_$bj_max_n_processes		fixed bin ext static;
+  1    10 dcl dm_system_data_$max_n_transactions     fixed bin ext static;
+  1    11 
+  1    12 	/* END dm_bj_static.incl.pl1 */
+  1    13 
+      384 
+      385  /* BEGIN INCLUDE FILE:	dm_bj_txt.incl.pl1	*/
+  2     2 /* 
+  2     3*dm_bj_txt - before journal per-system transaction table.
+  2     4*
+  2     5*Designed by A. Bensoussan
+  2     6*Written  by M. Pandolf 06/02/82
+  2     7*Modified:
+  2     8*10/01/82 by Lee A. Newcomb:  To use dm_system_data_ for dimension attributes
+  2     9*	  and specify alignment on level one.
+  2    10*08feb83  by M. Pandolf:      To restructure the TXT and TXTE.
+  2    11*30mar83  by M. Pandolf:      To add last_completed_operation and ok_to_write.
+  2    12**/
+  2    13 /* format: style4,indattr,idind33,^indcomtxt */
+  2    14 
+  2    15 dcl  BJ_TXT_VERSION_1	        fixed bin int static options (constant) init (1);
+  2    16 
+  2    17 dcl  bj_txt_ptr		        ptr;		/* pointer to transaction table */
+  2    18 dcl  bj_txte_ptr		        ptr;		/* pointer to transaction table element */
+  2    19 
+  2    20 dcl  1 bj_txt		        aligned based (bj_txt_ptr), /* transaction table */
+  2    21        2 version		        fixed bin,		/* should be BJ_TXT_VERSION_1 */
+  2    22        2 max_n_entries	        fixed bin,
+  2    23        2 n_entries_used	        fixed bin,		/* assumed contiguous */
+  2    24        2 pad_header_to_32_words       bit (36) dim (29),	/* to mod32 align bj_txt.entry */
+  2    25        2 entry		        dim (dm_system_data_$max_n_transactions refer (bj_txt.max_n_entries))
+  2    26 			        like bj_txte;
+  2    27 
+  2    28 dcl  1 bj_txte		        based (bj_txte_ptr) aligned, /* single entry, must be mod32 word aligned */
+  2    29        2 tid		        bit (36),		/* transaction id if this or last txn */
+  2    30        2 bj_uid		        bit (36),		/* UID of before journal chosen at begin mark */
+  2    31        2 entry_state aligned,
+  2    32          3 last_completed_operation   char (4),		/* to prevent multiple abort and commit */
+  2    33          3 ok_to_write                bit (1),		/* basically validates using this entry */
+  2    34        2 owner_info aligned,				/* info about creation of txte */
+  2    35          3 process_id	        bit (36),		/* of process that wrote begin mark */
+  2    36        2 operator_info aligned,			/* of process that is currently using this txte */
+  2    37          3 process_id	        bit (36),		/* of process that shall write subsequent marks */
+  2    38          3 ppte_ptr		        ptr,		/* pointer to PPTE for this transaction */
+  2    39          3 bj_oid		        bit (36),		/* before journal opening ID for operator */
+  2    40        2 records_info aligned,			/* grouped to be saved and restored as one unit */
+  2    41          3 curr_checkpoint_rec_id     bit (36),		/* ident of checkpoint record if doing a rollback, */
+  2    42 						/* else, this value must be zero. */
+  2    43          3 first_bj_rec_id	        bit (36),		/* ident of first mark for this transaction */
+  2    44          3 last_bj_rec_id	        bit (36),		/* ident of current mark for this transaction */
+  2    45          3 n_rec_written	        fixed bin (35),	/* count of marks written for this transaction */
+  2    46          3 n_bytes_written	        fixed bin (35),	/* count of total bytes written to journal */
+  2    47          3 last_fm_postcommit_handler_rec_id
+  2    48 			        bit (36),		/* ident of last special handler in list */
+  2    49        2 append_state aligned,			/* the first two members define the state of this */
+  2    50          3 current_operation	        char (4),		/* transaction and its interaction with bj_storage: */
+  2    51          3 pending_bj_rec_id	        bit (36),		/* operation  rec_id  state */
+  2    52 						/*   *null*    XXX    quiesed */
+  2    53 						/*   ^null     "0"b   write pending */
+  2    54 						/*   ^null     ^"0"b  write completed, needs flushing */
+  2    55 						/* */
+  2    56          3 pending_n_rec_written      fixed bin (35),	/* copy to n_rec_written before flush */
+  2    57          3 pending_n_bytes_written    fixed bin (35),	/* copy to n_bytes_written before flush */
+  2    58        2 pad_entry_to_32_words        bit (36) dim (13);	/* make any part of table 32 words long */
+  2    59 
+  2    60 /* END INCLUDE FILE:	dm_bj_txt_ptr	*/
+      385 
+      386  /* BEGIN INCLUDE FILE - dm_system_states.incl.pl1 */
+  3     2 
+  3     3 /* DESCRIPTION:
+  3     4*
+  3     5*	This include file gives all defined values that
+  3     6*     dm_system_data_$current_dm_state may have.
+  3     7**/
+  3     8 
+  3     9 /* HISTORY:
+  3    10*Written by Lee A. Newcomb, CISL, 11/04/82
+  3    11*Modified:
+  3    12*03/02/84 by Lee A. Newcomb:  added DM_SYSTEM_STATE_SHUTDOWN_WARNING and
+  3    13*	  DM_SYSTEM_STATE_USER_SHUTDOWN; also renamed from dm_statuses to
+  3    14*	  dm_system_states.incl.pl1.
+  3    15*04/06/84 by Lindsey Spratt:  Added DM_SYSTEM_STATE_SYSTEM_SHUTDOWN.
+  3    16*09/05/84 by Lee A. Newcomb:  renamed DM_SYSTEM_STATE_SHUTDOWN_WARNING do
+  3    17*            ...SHUTDOWN_BEGUN and ...SYSTEM_SHUTDOWN to
+  3    18*            ...SHUTDOWN_BUMP_USERS; deleted ...USER_SHUTDOWN.
+  3    19**/
+  3    20 /* format:  style2,^inddcls,linecom,ifthendo,ifthen,^indnoniterdo,dclind5,idind35 */
+  3    21 
+  3    22 dcl  (						/* valid statuses of data management */
+  3    23 						/* ordered to expected sequence of use */
+  3    24      DM_SYSTEM_STATE_UNDEFINED	init ("undf"),	/* found in a template dm_system_data_ */
+  3    25      DM_SYSTEM_STATE_INITIALIZING	init ("init"),
+  3    26      DM_SYSTEM_STATE_RECOVERING	init ("rcov"),
+  3    27      DM_SYSTEM_STATE_RUNNING		init ("run "),
+  3    28      DM_SYSTEM_STATE_SHUTDOWN_BEGUN	init ("sbgn"),
+  3    29      DM_SYSTEM_STATE_SHUTDOWN_BUMP_USERS
+  3    30 				init ("sbmp"),
+  3    31      DM_SYSTEM_STATE_NORMAL_SHUTDOWN	init ("shut")
+  3    32      )				char (4) aligned int static options (constant);
+  3    33 
+  3    34 /* END INCLUDE FILE - dm_system_states.incl.pl1 */
+      386 
+      387  /* BEGIN INCLUDE FILE dm_bj_global_error_info.incl.pl1 */
+  4     2 
+  4     3 /* Originally found in before journal primitives written by */
+  4     4 /* A. Bensoussan.  Gathered into an include file for ease of use. */
+  4     5 /* See the bjm_data_.alm source for details of use. */
+  4     6 
+  4     7 /* HISTORY:
+  4     8*Written by Mike Pandolf, 07/14/82.
+  4     9*Modified:
+  4    10*12/06/83 by L. A. Newcomb:  Renamed before_journal_manager_static_ to
+  4    11*            bjm_data_ and moved some cells from dm_data_ to bjm_data_.
+  4    12**/
+  4    13 
+  4    14 /* format: style4,indattr,ifthenstmt,ifthen,^indcomtxt,idind33 */
+  4    15 dcl  bjm_data_$bj_operation	        char (32) external static;
+  4    16 
+  4    17 dcl  bjm_data_$bj_exit_err	        label variable external;
+  4    18 
+  4    19 dcl  bjm_data_$bj_code	        fixed bin (35) external;
+  4    20 
+  4    21 dcl  bjm_data_$bj_default_error_label label external static;
+  4    22 
+  4    23 
+  4    24 /* END INCLUDE FILE dm_bj_global_error_info.incl.pl1 */
+      387 
+      388 
+      389 
+      390      end bj_adopt_txn$adopt;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    03/05/85  0757.6  bj_adopt_txn.pl1                  >spec>on>7138.pbf>bj_adopt_txn.pl1
+384          1    01/07/85  0857.8  dm_bj_static.incl.pl1             >ldd>include>dm_bj_static.incl.pl1
+385          2    01/07/85  0858.0  dm_bj_txt.incl.pl1                >ldd>include>dm_bj_txt.incl.pl1
+386          3    01/07/85  0900.0  dm_system_states.incl.pl1         >ldd>include>dm_system_states.incl.pl1
+387          4    01/07/85  0857.3  dm_bj_global_error_info.incl.pl1  >ldd>include>dm_bj_global_error_info.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+DM_SYSTEM_STATE_RUNNING         000002 constant        char(4)                  initial dcl 3-22 ref 342
+DM_SYSTEM_STATE_SHUTDOWN_BEGUN  000001 constant        char(4)                  initial dcl 3-22 ref 342
+DM_SYSTEM_STATE_SHUTDOWN_BUMP_USERS
+                                000000 constant        char(4)                  initial dcl 3-22 ref 342
+addr                                                   builtin function         dcl 105 ref 186 236
+adoption_info                          based           structure                level 1 dcl 88 set ref 176*
+adoption_info_ptr               000010 internal static pointer                  initial dcl 149 set ref 168 170* 171 176 181 181 181
+                                                                                  188 189 190 191 192 193 203 224 230 236 238 248
+                                                                                  251 251 258 276 276 296 302 316 321 323 324 331
+                                                                                  337 339 342 342 348 348 358 359 372 372 376 376
+                                                                                  377 377
+binary                                                 builtin function         dcl 105 ref 310
+bj_close_oid                    000024 constant        entry                    external dcl 120 ref 264
+bj_oid                    3            based           bit(36)                  level 3 in structure "adoption_info" dcl 88
+                                                                                  in procedure "bj_adopt_txn$adopt" set ref 190*
+bj_oid                   12            based           bit(36)                  level 3 in structure "bj_txte" dcl 2-28 in procedure
+                                                                                  "bj_adopt_txn$adopt" set ref 190 197* 198* 264*
+bj_oid_util$get_ptr             000020 constant        entry                    external dcl 120 ref 198
+bj_open_by_uid                  000022 constant        entry                    external dcl 120 ref 197
+bj_pst_lock                     000026 constant        entry                    external dcl 120 ref 262
+bj_pst_lock$unlock              000036 constant        entry                    external dcl 120 ref 266
+bj_report_err                   000014 constant        entry                    external dcl 120 ref 162 173 226 232 240 298 304
+bj_txt                                 based           structure                level 1 dcl 2-20
+bj_txte                                based           structure                level 1 dcl 2-28
+bj_txte_ptr                     000116 automatic       pointer                  dcl 2-18 set ref 186* 188 189 190 191 197 197 198
+                                                                                  198 199 236* 238 264 270
+bj_uid                    1            based           bit(36)                  level 2 dcl 2-28 set ref 197*
+bjm_data_$bj_code               000062 external static fixed bin(35,0)          dcl 4-19 set ref 324* 359*
+cleanup                         000110 stack reference condition                dcl 112 ref 218 290
+code                            000104 automatic       fixed bin(35,0)          dcl 76 set ref 170* 173* 251*
+cu_$level_get                   000034 constant        entry                    external dcl 120 ref 216 288
+cu_$level_set                   000032 constant        entry                    external dcl 120 ref 219 246 256 291 341 356 360
+curr_uid_list_index             000106 automatic       fixed bin(17,0)          dcl 76 set ref 248* 251 251* 316* 316* 321 323 324
+                                                                                  329* 331 335* 337 339 342 342 348 348 358 359
+dm_data_$bj_txt_ptr             000046 external static pointer                  dcl 138 ref 186 236
+dm_error_$bj_not_adopting       000052 external static fixed bin(35,0)          dcl 138 set ref 226* 232* 298* 304*
+dm_error_$bj_this_not_adopted   000054 external static fixed bin(35,0)          dcl 138 set ref 240*
+dm_error_$not_daemon            000050 external static fixed bin(35,0)          dcl 138 set ref 162*
+dm_system_data_$current_dm_state
+                                000060 external static char(4)                  dcl 138 ref 342 342 342
+dm_system_data_$initializer_processid
+                                000056 external static bit(36)                  unaligned dcl 138 ref 160 199
+entry                    40            based           structure                array level 2 dcl 2-20 set ref 186 236
+file_manager_$close             000040 constant        entry                    external dcl 120 ref 251
+file_manager_$open_by_uid       000042 constant        entry                    external dcl 120 ref 342
+file_manager_$open_by_uid_after_crash
+                                000044 constant        entry                    external dcl 120 ref 348
+get_process_id_                 000012 constant        entry                    external dcl 120 ref 160
+get_ring_                       000030 constant        entry                    external dcl 120 ref 246 246 341 341
+get_temp_segment_               000016 constant        entry                    external dcl 120 ref 170
+last_used_uid_list_entry
+                          6            based           fixed bin(17,0)          level 2 dcl 88 set ref 176 193* 248 372 372* 376 377
+myname                          000003 constant        char(32)                 initial unaligned dcl 115 set ref 162* 170* 173*
+                                                                                  226* 232* 240* 298* 304*
+next                   1007            based           fixed bin(17,0)          array level 3 dcl 88 set ref 331 339* 377*
+null                                                   builtin function         dcl 105 ref 168 171 224 270 276 296
+operator_info             6            based           structure                level 2 dcl 2-28
+p_index                                parameter       fixed bin(17,0)          dcl 370 set ref 364 372*
+p_pf_oid                               parameter       bit(36)                  dcl 68 set ref 283 287* 323* 358*
+p_pf_uid                               parameter       bit(36)                  dcl 68 ref 283 286
+p_tid                                  parameter       bit(36)                  dcl 68 ref 211 215
+p_tix                                  parameter       fixed bin(17,0)          dcl 68 ref 63 156 211 214
+p_uid                                  parameter       bit(36)                  dcl 369 ref 364 376
+pf_oid                 1011            based           bit(36)                  array level 3 dcl 88 set ref 251 251* 323 342* 348*
+                                                                                  358
+pf_opening_error_code
+                       1012            based           fixed bin(35,0)          array level 3 dcl 88 set ref 324 342* 348* 359
+pf_uid                          000102 automatic       bit(36)                  dcl 76 in procedure "bj_adopt_txn$adopt" set ref
+                                                                                  286* 310 321 335* 342* 348*
+pf_uid                 1010            based           bit(36)                  array level 3 in structure "adoption_info" dcl 88
+                                                                                  in procedure "bj_adopt_txn$adopt" set ref 321 376*
+pf_uid_ht                 7            based           fixed bin(17,0)          array level 2 dcl 88 set ref 192* 258* 316 337*
+pf_uid_list            1007            based           structure                array level 2 dcl 88
+ppte_ptr                 10            based           pointer                  level 3 in structure "bj_txte" dcl 2-28 in procedure
+                                                                                  "bj_adopt_txn$adopt" set ref 191 198* 270*
+ppte_ptr                  4            based           pointer                  level 3 in structure "adoption_info" dcl 88
+                                                                                  in procedure "bj_adopt_txn$adopt" set ref 191*
+prev_uid_list_index             000107 automatic       fixed bin(17,0)          dcl 76 set ref 314* 329* 337 339
+process_id                2            based           bit(36)                  level 3 in structure "adoption_info" dcl 88
+                                                                                  in procedure "bj_adopt_txn$adopt" set ref 189*
+process_id                6            based           bit(36)                  level 3 in structure "bj_txte" dcl 2-28 in procedure
+                                                                                  "bj_adopt_txn$adopt" set ref 189 199*
+saved_level                     000103 automatic       fixed bin(17,0)          dcl 76 set ref 216* 219* 256* 288* 291* 356* 360*
+substr                                                 builtin function         dcl 105 ref 310
+target_txn                             based           structure                level 2 dcl 88
+tid                                    based           bit(36)                  level 2 in structure "bj_txte" dcl 2-28 in procedure
+                                                                                  "bj_adopt_txn$adopt" ref 188 238
+tid                             000101 automatic       bit(36)                  dcl 76 in procedure "bj_adopt_txn$adopt" set ref
+                                                                                  215* 238
+tid                       1            based           bit(36)                  level 3 in structure "adoption_info" dcl 88
+                                                                                  in procedure "bj_adopt_txn$adopt" set ref 181*
+                                                                                  188*
+tix                                    based           fixed bin(17,0)          level 3 in structure "adoption_info" dcl 88
+                                                                                  in procedure "bj_adopt_txn$adopt" set ref 181 181*
+                                                                                  203* 230 236 238 276* 302
+tix                             000100 automatic       fixed bin(17,0)          dcl 76 in procedure "bj_adopt_txn$adopt" set ref
+                                                                                  156* 186 203 214* 238
+uid_ht_index                    000105 automatic       fixed bin(17,0)          dcl 76 set ref 310* 316 337
+unspec                                                 builtin function         dcl 105 set ref 176* 192* 258*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+BJ_TXT_VERSION_1                       internal static fixed bin(17,0)          initial dcl 2-15
+DM_SYSTEM_STATE_INITIALIZING           internal static char(4)                  initial dcl 3-22
+DM_SYSTEM_STATE_NORMAL_SHUTDOWN        internal static char(4)                  initial dcl 3-22
+DM_SYSTEM_STATE_RECOVERING             internal static char(4)                  initial dcl 3-22
+DM_SYSTEM_STATE_UNDEFINED              internal static char(4)                  initial dcl 3-22
+bj_txt_ptr                             automatic       pointer                  dcl 2-17
+bjm_data_$bj_default_error_label       external static label variable           dcl 4-21
+bjm_data_$bj_exit_err                  external static label variable           dcl 4-17
+bjm_data_$bj_operation                 external static char(32)                 unaligned dcl 4-15
+dm_system_data_$bj_max_n_journals      external static fixed bin(17,0)          dcl 1-8
+dm_system_data_$bj_max_n_processes     external static fixed bin(17,0)          dcl 1-9
+dm_system_data_$max_n_transactions     external static fixed bin(17,0)          dcl 1-10
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+ALLOC_UID                       001026 constant        entry                    internal dcl 364 ref 335
+CLOSE_PAGE_FILES                000422 constant        label                    dcl 248
+SEARCH_FOR_UID                  000645 constant        label                    dcl 316
+abandon                         000245 constant        entry                    external dcl 211 ref 181
+bj_adopt_txn$adopt              000031 constant        entry                    external dcl 63
+force_abandon                   000514 constant        entry                    external dcl 274
+get_pf_oid                      000534 constant        entry                    external dcl 283
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      1410        1474    1052        1420
+Length      2020    1052        64         310     335           2
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+bj_adopt_txn$adopt                  118 external procedure  is an external procedure.  
+on unit on line 218                  68 on unit               
+on unit on line 290                  68 on unit               
+ALLOC_UID                               internal procedure  shares stack frame of external procedure bj_adopt_txn$adopt.  
+
+STORAGE FOR INTERNAL STATIC VARIABLES.
+
+   LOC IDENTIFIER                  BLOCK NAME
+000010 adoption_info_ptr           bj_adopt_txn$adopt
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+bj_adopt_txn$adopt       000100 tix                         bj_adopt_txn$adopt
+                         000101 tid                         bj_adopt_txn$adopt
+                         000102 pf_uid                      bj_adopt_txn$adopt
+                         000103 saved_level                 bj_adopt_txn$adopt
+                         000104 code                        bj_adopt_txn$adopt
+                         000105 uid_ht_index                bj_adopt_txn$adopt
+                         000106 curr_uid_list_index         bj_adopt_txn$adopt
+                         000107 prev_uid_list_index         bj_adopt_txn$adopt
+                         000116 bj_txte_ptr                 bj_adopt_txn$adopt
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+call_ext_in         call_ext_out_desc   call_ext_out        return              enable              ext_entry
+int_entry
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+bj_close_oid                  bj_oid_util$get_ptr           bj_open_by_uid                bj_pst_lock
+bj_pst_lock$unlock            bj_report_err                 cu_$level_get                 cu_$level_set
+file_manager_$close           file_manager_$open_by_uid     file_manager_$open_by_uid_after_crash
+get_process_id_               get_ring_                     get_temp_segment_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+bjm_data_$bj_code             dm_data_$bj_txt_ptr           dm_error_$bj_not_adopting     dm_error_$bj_this_not_adopted
+dm_error_$not_daemon          dm_system_data_$current_dm_state
+dm_system_data_$initializer_processid
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     63 000026       156 000036       160 000041       162 000053       163 000067       168 000070       170 000074
+    171 000114       173 000121       174 000135       176 000136       181 000150       186 000163       188 000172
+    189 000175       190 000177       191 000201       192 000203       193 000207       197 000210       198 000220
+    199 000232       203 000236       207 000240       211 000241       214 000252       215 000255       216 000257
+    218 000266       219 000302       220 000311       224 000312       226 000317       227 000333       230 000334
+    232 000336       233 000352       236 000353       238 000360       240 000366       241 000402       246 000403
+    248 000422       251 000433       254 000450       256 000452       258 000461       262 000466       264 000472
+    266 000502       270 000507       274 000512       276 000521       281 000527       283 000530       286 000541
+    287 000544       288 000545       290 000554       291 000570       292 000577       296 000600       298 000605
+    299 000621       302 000622       304 000624       305 000640       310 000641       314 000644       316 000645
+    321 000652       323 000661       324 000664       326 000666       329 000667       331 000671       335 000675
+    337 000677       339 000707       341 000715       342 000734       348 000762       356 000777       358 001006
+    359 001015       360 001017       362 001025       364 001026       372 001030       376 001036       377 001041
+    379 001042
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

@@ -1,0 +1,991 @@
+	COMPILATION LISTING OF SEGMENT apl_random_
+	Compiled by: Multics PL/I Compiler, Release 28d, of October 4, 1983
+	Compiled at: Honeywell LCPD Phoenix, System M
+	Compiled on: 11/29/83  1615.0 mst Tue
+	    Options: optimize map
+
+        1 /* ******************************************************
+        2*   *                                                    *
+        3*   *                                                    *
+        4*   * Copyright (c) 1972 by Massachusetts Institute of   *
+        5*   * Technology and Honeywell Information Systems, Inc. *
+        6*   *                                                    *
+        7*   *                                                    *
+        8*   ****************************************************** */
+        9 
+       10 apl_random_:
+       11      procedure (operators_argument);
+       12 
+       13 /*
+       14* * this routine contains the monadic and dyadic ? operators (roll and deal)
+       15* * written 73.9.13 by DAM
+       16* * Modified 2 January 1974 by PG to try to speed up big dealer.
+       17*   Modified 790312 by Willaim M. York to double-word align all value_beads (bug 278).
+       18*   Modified 790329 by PG to stop signalling apl_operator_error_ (the last refuge!), and to clean up the source.
+       19*   Modified 790815 by PG to fix 414 (deal returned garbage for result of 4?204 because memory string overlaid result).
+       20*
+       21* * The same sequence of random numbers is generated as by APL/360 XM6
+       22* * except in the case where the range is more than 2**31-1, where
+       23* * APL/360's algorithm is highly machine-dependent.  We have not attempted
+       24* * to duplicate it.
+       25* */
+       26 
+       27 /* automatic */
+       28 
+       29 dcl	memory_ptr	ptr,
+       30 	rn		fixed bin (31),
+       31 	(right_vb, left_vb, right, result_vb, result)
+       32 			unaligned pointer,
+       33 	data_elements	fixed bin (21),
+       34 	n_words		fixed bin (19),
+       35 	(elem, other)	fixed bin (21),
+       36 	(number, choose, from, range)
+       37 			fixed bin (35),
+       38 	X		float,
+       39 	float_temp	float,
+       40 	frange		float,
+       41 	frn		float;
+       42 
+       43 /* based */
+       44 
+       45 dcl	memory		dimension (0:range - 1) bit (1) unaligned based (memory_ptr);
+       46 
+       47 /* builtins */
+       48 
+       49 dcl	(abs, addr, addrel, floor, fixed, rel, substr, string, size, float, multiply, divide, mod, null, unspec)
+       50 			builtin;
+       51 
+       52 /* entries */
+       53 
+       54 declare	apl_iota_appendage_ entry (float, float, fixed bin, ptr);
+       55 
+       56 /* external static */
+       57 
+       58 dcl	(apl_error_table_$domain, apl_error_table_$rank)
+       59 			fixed bin (35) external;
+       60 
+       61 /* internal static */
+       62 
+       63 dcl	P		fixed bin (31) static init (16807),
+       64 						/* 7**5 */
+       65 	Q		fixed bin (31) static init (2147483647),
+       66 						/* 2**31 - 1 */
+       67 	Biggest_Fixed_Range float static init (2147483647.0e0),
+       68 	Two_to_31		fixed bin (32) static init (1f31b),
+       69 						/* 2**31 */
+       70 	Two_to_minus_31	fixed bin (31, 31) static initial (1f-31b),
+       71 						/* 2**(-31) */
+       72 	Biggest_bit_string	fixed bin (35) static initial (9400320),
+       73 						/* 36*261120 */
+       74 	Biggest_vector_size fixed bin static initial (130557);
+       75 						/* derived from value bead with max vector */
+       76 
+       77 /* program */
+       78 
+       79 /* pick up arguments, make some checks, determine monadic or dyadic */
+       80 
+       81 	right_vb = operands (2).value;
+       82 	if ^right_vb -> value_bead.data_type.numeric_value
+       83 	then go to domain_error_right;
+       84 	right = right_vb -> value_bead.data_pointer;
+       85 
+       86 	left_vb = operands (1).value;
+       87 	if left_vb = null
+       88 	then go to roll;				/* monadic case */
+       89 
+       90 	if ^left_vb -> value_bead.data_type.numeric_value
+       91 	then go to domain_error_left;
+       92 
+       93 /* pick up args for deal, set 'choose' and 'from' */
+       94 
+       95 	if right_vb -> value_bead.total_data_elements ^= 1
+       96 	then go to rank_error_right;			/* must be scalar */
+       97 	if left_vb -> value_bead.total_data_elements ^= 1
+       98 	then go to rank_error_left;			/* .. */
+       99 
+      100 	float_temp = floor (left_vb -> value_bead.data_pointer -> numeric_datum (0) + 0.5);
+      101 	if abs (float_temp - left_vb -> value_bead.data_pointer -> numeric_datum (0)) > integer_fuzz
+      102 	then go to domain_error_left;
+      103 	if float_temp < 0
+      104 	then go to domain_error_left;
+      105 	if float_temp >= 1e21b
+      106 	then go to domain_error_left;
+      107 	choose = fixed (float_temp);
+      108 
+      109 /* check for 'frandom' case, where range > Biggest_Fixed_Range; if so go to floating_dealer */
+      110 
+      111 	if right -> numeric_datum (0) > Biggest_Fixed_Range
+      112 	then go to floating_dealer;
+      113 
+      114 	float_temp = floor (right -> numeric_datum (0) + 0.5);
+      115 	if abs (float_temp - right -> numeric_datum (0)) > integer_fuzz
+      116 	then go to domain_error_right;
+      117 	if float_temp < 0
+      118 	then go to domain_error_right;
+      119 	from = fixed (float_temp);
+      120 
+      121 /* throw away the arguments */
+      122 
+      123 	if operands (2).on_stack
+      124 	then value_stack_ptr = right_vb;
+      125 	else if operands (1).on_stack
+      126 	then value_stack_ptr = left_vb;
+      127 
+      128 /*	if choose < 0 then go to domain_error_left;	ALREADY CHECKED FOR */
+      129 	if choose > from
+      130 	then go to domain_error_right;
+      131 
+      132 /* DEAL.
+      133*
+      134*   Return vector of 'choose' elements taken from iota 'from', without replacement. */
+      135 
+      136 	if choose = 0				/* return iota 0 */
+      137 	then go to small_deal;
+      138 
+      139 	if from = choose				/* a permutation.  This algorithm will */
+      140 	then go to big_deal;			/* always work...or get a ws full error for
+      141*						   trying to create too big a permutation. */
+      142 
+      143 	if from <= Biggest_vector_size		/* if we can create (iota from) */
+      144 	then if choose > divide (from, 16, 35, 0)	/* and it seems to be worth it */
+      145 	     then go to big_deal;			/* use permutation algorithm */
+      146 	     else ;				/* use fast dealer */
+      147 	else if from > Biggest_bit_string		/* if we can't use fast dealer */
+      148 	then go to really_big_deal;			/* use slow dealer */
+      149 
+      150 	range = from;				/* initialize range of random numbers */
+      151 
+      152 	data_elements = choose;			/* allocate result first */
+      153 	call deal_push;
+      154 
+      155 	n_words = size (memory);			/* allocate a big bit string to remember duplicates */
+      156 	memory_ptr = apl_push_stack_ (n_words);
+      157 	string (memory) = ""b;			/* initialize it */
+      158 
+      159 	do elem = 0 by 1 while (elem < choose);
+      160 try_again:
+      161 	     call random_in_range;			/* get an integer random number */
+      162 	     number = rn + index_origin;
+      163 	     if memory (number) = "1"b		/* been here already, try again */
+      164 	     then go to try_again;
+      165 
+      166 	     memory (number) = "1"b;
+      167 	     result -> numeric_datum (elem) = float (number);
+      168 						/* good value, use it */
+      169 	end;
+      170 
+      171 	string (memory) = ""b;			/* zero the storage now, to lessen the chance of
+      172*						   a record_quota_overflow on the process directory. */
+      173 
+      174 	go to deal_fin;
+      175 
+      176 really_big_deal:					/* choose ? from */
+      177 small_deal:					/* 0 ? from */
+      178 	range = from;
+      179 
+      180 	data_elements = choose;
+      181 	call deal_push;
+      182 
+      183 /* fill in elements of result with random numbers, checking each time
+      184*	   for duplication */
+      185 
+      186 	do elem = 0 by 1 while (elem < choose);
+      187 rn_dup:
+      188 	     call random_in_range;
+      189 	     X = float (rn + index_origin);
+      190 	     do other = 0 by 1 while (other < elem);
+      191 		if result -> numeric_datum (other) = X
+      192 		then go to rn_dup;
+      193 	     end;
+      194 	     result -> numeric_datum (elem) = X;
+      195 	end;
+      196 
+      197 	go to deal_fin;
+      198 
+      199 big_deal:
+      200 	data_elements = from;			/* make iota, shuffle, truncate */
+      201 	call deal_push;
+      202 
+      203 /* construct "iota from" - for TSO compatibility uses a backwards iota */
+      204 
+      205 /* Negative quantities tell apl_iota_appendage_ to construct backwards iota. */
+      206 
+      207 	call apl_iota_appendage_ (float_index_origin, -1e0, -from, (result));
+      208 
+      209 /* now do exchanges on this to bring random elements to the top */
+      210 
+      211 	do elem = 0 by 1 while (elem < from);
+      212 	     range = from - elem;			/* choose from remaining slots */
+      213 	     call random_in_range;
+      214 	     X = result -> numeric_datum (elem);
+      215 	     result -> numeric_datum (elem) = result -> numeric_datum (elem + rn);
+      216 	     result -> numeric_datum (elem + rn) = X;
+      217 	end;
+      218 
+      219 	go to deal_fin;
+      220 
+      221 /* routine to deal from floating point numbers (when range is too big for fixed point) */
+      222 
+      223 floating_dealer:
+      224 	frange = floor (right -> numeric_datum (0) + 0.5);
+      225 	if abs (frange - right -> numeric_datum (0)) > integer_fuzz
+      226 	then go to domain_error_right;
+      227 
+      228 	if choose < 0
+      229 	then go to domain_error_left;
+      230 
+      231 	if choose > Biggest_Fixed_Range
+      232 	then go to domain_error_right;		/* (??) */
+      233 
+      234 /* don't forget to throw away the arguments */
+      235 
+      236 	if operands (2).on_stack
+      237 	then value_stack_ptr = right_vb;
+      238 	else if operands (1).on_stack
+      239 	then value_stack_ptr = left_vb;
+      240 
+      241 	data_elements = choose;
+      242 	call deal_push;
+      243 
+      244 /* fill in the result, acting similarly to small_deal */
+      245 
+      246 	do elem = 0 by 1 while (elem < choose);
+      247 frn_dup:
+      248 	     call frandom;
+      249 	     X = frn + float_index_origin;
+      250 	     do other = 0 by 1 while (other < elem);
+      251 		if result -> numeric_datum (other) = X
+      252 		then go to frn_dup;
+      253 	     end;
+      254 	     result -> numeric_datum (elem) = X;
+      255 	end;
+      256 
+      257 deal_fin:
+      258 	data_elements = choose;
+      259 	ws_info.value_stack_ptr = addrel (result, size (numeric_datum));
+      260 	return;
+      261 
+      262 /* ROLL.
+      263*
+      264*   A scalar function that returns a random number between the index origin and the argument.
+      265*   Result is overlaid on operand, and so argument is copied onto stack if necessary. */
+      266 
+      267 roll:
+      268 	if ^operands (2).on_stack
+      269 	then do;					/* Copy right_vb onto the value stack */
+      270 
+      271 		data_elements = right_vb -> value_bead.total_data_elements;
+      272 		number_of_dimensions = right_vb -> value_bead.rhorho;
+      273 
+      274 /* Allocate the space on the value stack */
+      275 
+      276 		n_words = size (value_bead) + size (numeric_datum) + 1;
+      277 		result_vb = apl_push_stack_ (n_words);
+      278 
+      279 /* Copy the value_bead header info */
+      280 
+      281 		result_vb -> value_bead = right_vb -> value_bead;
+      282 
+      283 /* Get pointer to the new data area */
+      284 
+      285 		result = addrel (result_vb, size (value_bead));
+      286 		if substr (rel (result), 18, 1)
+      287 		then result = addrel (result, 1);
+      288 		result_vb -> value_bead.data_pointer = result;
+      289 
+      290 /* Copy the data */
+      291 
+      292 		result -> numeric_datum (*) = right -> numeric_datum (*);
+      293 
+      294 /* Make this the new right_vb */
+      295 
+      296 		right_vb = result_vb;
+      297 		right = result;
+      298 
+      299 	     end;
+      300 
+      301 /* check that argument is composed of integers */
+      302 
+      303 	if ^right_vb -> value_bead.data_type.integral_value
+      304 	then do elem = 0 by 1 while (elem < right_vb -> value_bead.total_data_elements);
+      305 		frange = floor (right -> numeric_datum (elem) + 0.5);
+      306 		if frange <= 0
+      307 		then go to domain_error_right;
+      308 		if abs (frange - right -> numeric_datum (elem)) > integer_fuzz
+      309 		then go to domain_error_right;
+      310 
+      311 		right -> numeric_datum (elem) = frange; /* make exact integer for later use */
+      312 	     end;
+      313 
+      314 	string (right_vb -> value_bead.type) = integral_value_type;
+      315 
+      316 /* generate the random numbers, each organized to scale of corresponding
+      317*   element of the operand */
+      318 
+      319 	do elem = 0 by 1 while (elem < right_vb -> value_bead.total_data_elements);
+      320 	     frange = right -> numeric_datum (elem);
+      321 	     if frange <= 0
+      322 	     then go to domain_error_right;
+      323 	     if frange <= Biggest_Fixed_Range
+      324 	     then do;				/* will fit in fixed point */
+      325 		     range = fixed (floor (frange), 35);
+      326 		     call random_in_range;
+      327 		     right -> numeric_datum (elem) = float (rn + index_origin);
+      328 		end;
+      329 	     else do;				/* need to go to floating point */
+      330 		     string (right_vb -> value_bead.type) = numeric_value_type;
+      331 						/* reset integer bit because is */
+      332 		     call frandom;			/* too big for fixing */
+      333 		     right -> numeric_datum (elem) = frn + float_index_origin;
+      334 		end;
+      335 	end;
+      336 
+      337 	operators_argument.result = right_vb;
+      338 	return;
+      339 
+      340 domain_error_left:
+      341 	operators_argument.where_error = operators_argument.where_error + 2;
+      342 
+      343 domain_error_right:
+      344 	operators_argument.where_error = operators_argument.where_error - 1;
+      345 	operators_argument.error_code = apl_error_table_$domain;
+      346 	return;
+      347 
+      348 rank_error_left:
+      349 	operators_argument.where_error = operators_argument.where_error + 2;
+      350 
+      351 rank_error_right:
+      352 	operators_argument.where_error = operators_argument.where_error - 1;
+      353 	operators_argument.error_code = apl_error_table_$rank;
+      354 	return;
+      355 
+      356 /* INTERNAL PROCEDURES */
+      357 
+      358 /* internal proc to generate next random number.
+      359*   It is normalized to [0:range-1], and returned in rn. */
+      360 
+      361 random_in_range:
+      362      proc;
+      363 
+      364 	if random_link <= 0
+      365 	then random_link = P;
+      366 	random_link = mod (multiply (random_link, P, 63, 0), Q);
+      367 
+      368 /* treat random_link as a 31 bit fraction between 0 and 1. */
+      369 
+      370 	rn = multiply (random_link, range, 63, -31) * Two_to_minus_31;
+      371 
+      372      end random_in_range;
+      373 
+      374 frandom:
+      375      proc;
+      376 
+      377 /* floating-point version of random_in_range.  used by roll with big argument */
+      378 
+      379 dcl	orn		fixed bin (31);
+      380 
+      381 	range = Two_to_31;				/* just return raw random numbers */
+      382 	call random_in_range;
+      383 	orn = rn;					/* save first random number */
+      384 	call random_in_range;			/* so can get two */
+      385 
+      386 	frn = 0.95;				/* set exponent for making a fraction, 0 to 1 */
+      387 	unspec (frn) =
+      388 	     substr (unspec (frn), 1, 9) || /* construct floating-point fraction */ substr (unspec (orn), 6, 31)
+      389 	     || /* (this is a machine-dependent kludge) */ substr (unspec (rn), 6, 31) || "0"b;
+      390 	frn = floor (frn * frange);			/* multiply random fraction by range to get answer */
+      391      end;
+      392 
+      393 deal_push:
+      394      proc;
+      395 
+      396 	number_of_dimensions = 1;
+      397 	n_words = size (value_bead) + size (numeric_datum) + 1;
+      398 	result_vb = apl_push_stack_ (n_words);
+      399 	operators_argument.result = result_vb;
+      400 	string (result_vb -> value_bead.type) = integral_value_type;
+      401 	result_vb -> value_bead.rhorho = 1;
+      402 	result_vb -> value_bead.total_data_elements, result_vb -> value_bead.rho (1) = choose;
+      403 	result = addr (result_vb -> value_bead.rho (2));
+      404 	if substr (rel (result), 18, 1)
+      405 	then result = addrel (result, 1);
+      406 	result_vb -> value_bead.data_pointer = result;
+      407      end;
+      408 
+  1     1 /* ====== BEGIN INCLUDE SEGMENT	apl_push_stack_fcn.incl.pl1 =============================== */
+  1     2 
+  1     3 /* format: style3 */
+  1     4 apl_push_stack_:
+  1     5      procedure (P_n_words) returns (ptr);
+  1     6 
+  1     7 /* Function to (1) double-word align ws_info.value_stack_ptr, and
+  1     8*   (2) make sure allocation request will fit on current value stack.
+  1     9*
+  1    10*   Written 770413 by PG
+  1    11*   Modified 780210 by PG to round allocations up to an even number of words.
+  1    12**/
+  1    13 
+  1    14 /* parameters */
+  1    15 
+  1    16 declare	P_n_words		fixed bin (19) parameter;
+  1    17 
+  1    18 /* automatic */
+  1    19 
+  1    20 declare	block_ptr		ptr,
+  1    21 	num_words		fixed bin (19);
+  1    22 
+  1    23 /* builtins */
+  1    24 
+  1    25 declare	(addrel, binary, rel, substr, unspec)
+  1    26 			builtin;
+  1    27 
+  1    28 /* entries */
+  1    29 
+  1    30 declare	apl_get_value_stack_
+  1    31 			entry (fixed bin (19));
+  1    32 
+  1    33 /* program */
+  1    34 
+  1    35 	num_words = P_n_words;
+  1    36 
+  1    37 	if substr (unspec (num_words), 36, 1) = "1"b	/* num_words odd */
+  1    38 	then num_words = num_words + 1;
+  1    39 
+  1    40 	if binary (rel (ws_info.value_stack_ptr), 18) + num_words > ws_info.maximum_value_stack_size
+  1    41 	then call apl_get_value_stack_ (num_words);
+  1    42 
+  1    43 	block_ptr = ws_info.value_stack_ptr;
+  1    44 	ws_info.value_stack_ptr = addrel (ws_info.value_stack_ptr, num_words);
+  1    45 	return (block_ptr);
+  1    46 
+  1    47      end apl_push_stack_;
+  1    48 
+  1    49 /* ------ END INCLUDE SEGMENT		apl_push_stack_fcn.incl.pl1 ------------------------------- */
+      409 
+      410 
+      411 /* include files */
+      412 
+  2     1 /* ====== BEGIN INCLUDE SEGMENT	apl_number_data.incl.pl1 ================================== */
+  2     2 
+  2     3 /*
+  2     4*   This include file contains information about the machine representation of numbers.
+  2     5*   In all programs numbers should simply be declared 'float'.
+  2     6*   All default statements should be in this include file.
+  2     7*
+  2     8*   This is the binary version.  The manifest constant Binary should be used by programs
+  2     9*   that need to know whether we are using binary or decimal.
+  2    10* */
+  2    11 
+  2    12 /* format: style3,initlm0,idind30 */
+  2    13 
+  2    14 default (float & ^decimal & ^binary & ^precision & ^constant) float binary (63);
+  2    15 
+  2    16 declare	(
+  2    17 	TheBiggestNumberWeveGot	float initial (0.1701411834604692317e+39),
+  2    18 	TheSmallestNumberWeveGot	float initial (.1469367938527859385e-38),
+  2    19 	Binary			bit (1) aligned initial ("1"b)
+  2    20 	)			internal static options (constant);
+  2    21 
+  2    22 /* Number of characters in a number datum entry; used for copying float number arrays as strings.
+  2    23*   (Obsolete! use array copies!) */
+  2    24 
+  2    25 declare	NumberSize		fixed binary precision (4) internal static initial (8);
+  2    26 
+  2    27 /* ------ END INCLUDE SEGMENT		apl_number_data.incl.pl1 ---------------------------------- */
+      413 
+  3     1 /* ====== BEGIN INCLUDE SEGMENT	apl_ws_info.incl.pl1 ====================================== */
+  3     2 
+  3     3 /* This structure contains all of the global data (or pointers to it) for the APL subsystem */
+  3     4 
+  3     5 /* automatic */
+  3     6 
+  3     7 declare	ws_info_ptr ptr initial (apl_static_$ws_info_ptr.static_ws_info_ptr);
+  3     8 
+  3     9 /* external static */
+  3    10 
+  3    11 declare	1 apl_static_$ws_info_ptr	external static aligned structure,
+  3    12 	  2 static_ws_info_ptr	unaligned pointer;
+  3    13 
+  3    14 /* based */
+  3    15 
+  3    16 declare	1 ws_info			aligned based (ws_info_ptr),
+  3    17 	  2 version_number		fixed bin,	/* version of this structure (3) */
+  3    18 	  2 switches		unaligned,	/* mainly ws parameters */
+  3    19 	    3 long_error_mode	bit,		/* if 1, long Multics format, else APL/360 format */
+  3    20 	    3 debug_mode		bit,		/* if 1, system error causes escape to command level */
+  3    21 	    3 canonicalize_mode	bit,		/* if 1, the editor canonicalizes user input */
+  3    22 	    3 restrict_exec_command	bit,		/* if 1, the )EXEC command may not be used */
+  3    23 	    3 restrict_debug_command	bit,		/* if 1, the )DEBUG command may not be used */
+  3    24 	    3 restrict_external_functions
+  3    25 				bit,		/* if 1, the )ZFN, )MFN, and )DFN commands may not be used */
+  3    26 	    3 restrict_load		bit,		/* if 1, the )LOAD and )COPY commands may not be used */
+  3    27 	    3 restrict_load_directory	bit,		/* if 1, no directory allowed in )LOAD or )COPY pathnames */
+  3    28 	    3 restrict_save		bit,		/* if 1, the )SAVE command may not be used */
+  3    29 	    3 restrict_save_directory	bit,		/* if 1, no directory allowed in )SAVE pathnames */
+  3    30 	    3 off_hold		bit,		/* if 1, )OFF HOLD was typed, else just )OFF */
+  3    31 	    3 transparent_to_signals	bit,		/* if 1, any conditions slip right past APL */
+  3    32 	    3 meter_mode		bit,		/* if 1, metering may be done, else speed is all-important */
+  3    33 	    3 restrict_msg_command	bit,		/* if 1, the )MSG command may not be used. */
+  3    34 	    3 compatibility_check_mode
+  3    35 				bit,		/* if 1, check for incompatible operators */
+  3    36 	    3 no_quit_handler	bit,		/* if 1, do not trap QUITs. */
+  3    37 						/* remaining 20 bits not presently used */
+  3    38 
+  3    39 	  2 values,				/* attributes of the workspace */
+  3    40 	    3 digits		fixed bin,	/* number of digits of precision printed on output */
+  3    41 	    3 width		fixed bin,	/* line length for formatted output */
+  3    42 	    3 index_origin		fixed bin,	/* the index origin (0 or 1) */
+  3    43 	    3 random_link		fixed bin(35),	/* seed for random number generator */
+  3    44 	    3 fuzz		float,		/* comparison tolerance (relative fuzz) */
+  3    45 	    3 float_index_origin	float,		/* the index origin	in floating point */
+  3    46 	    3 number_of_symbols	fixed bin,	/* the number of symbol_beads currently in existence */
+  3    47 	    3 maximum_value_stack_size
+  3    48 				fixed bin (18),	/* maximum number of words in one segment of value stack */
+  3    49 
+  3    50 	  2 pointers,				/* pointers to various internal tables */
+  3    51 	    3 symbol_table_ptr	unaligned pointer,	/* -> symbol_table (apl_symbol_table.incl.pl1) */
+  3    52 	    3 current_parse_frame_ptr	unaligned pointer,	/* -> topmost parse frame */
+  3    53 	    3 value_stack_ptr	unaligned pointer,	/* -> next free location on value stack */
+  3    54 	    3 alloc_free_info_ptr	unaligned pointer,	/* -> apl_storage_mngr_ data (apl_storage_system_data.incl.pl1) */
+  3    55 
+  3    56 	  2 time_invoked		fixed bin(71),	/* clock time that APL was entered */
+  3    57 	  2 integer_fuzz		float,		/* the absolute fuzz used in checking for integers */
+  3    58 	  2 user_number		fixed bin(35),	/* number under which the user is signed on */
+  3    59 	  2 latent_expression	unaligned pointer,	/* -> value_bead for QuadLX */
+  3    60 	  2 lock			char(32),		/* the lock currently set on this workspace (password) */
+  3    61 	  2 wsid			char(100),	/* the workspace identification: name, number name, or clear ws */
+  3    62 	  2 last_error_code		fixed bin(35),	/* last code passed to apl_error_ */
+  3    63 	  2 signoff_lock		character (32),
+  3    64 
+  3    65 	  2 interrupt_info		aligned,		/* bits used by apl_interpreter_ to tell when to abort */
+  3    66 	    3 dont_interrupt_parse	bit,		/* if 1, don't do a dirty stop because the parser is running */
+  3    67 	    3 dont_interrupt_operator	bit,		/* if 1, don't do a dirty stop because an operator is running */
+  3    68 	    3 dont_interrupt_storage_manager		/* if 1, don't stop because apl_storage_mngr_ is */
+  3    69 				bit,		/*       munging his tables */
+  3    70 	    3 unused_interrupt_bit	bit,		/* not presently used */
+  3    71 	    3 dont_interrupt_command	bit,
+  3    72 	    3 can_be_interrupted	bit,		/* if 1, OK to do a clean stop (we are between lines, reading) */
+  3    73 	    3 clean_interrupt_pending	bit,		/* interrupt occured, break cleanly (between lines) */
+  3    74 	    3 dirty_interrupt_pending	bit,		/* interrupt occured, break as soon as not inhibited */
+  3    75 
+  3    76 	  2 user_name		char (32),	/* process group id of user */
+  3    77 	  2 immediate_input_prompt	char (32) varying,	/* normal input */
+  3    78 	  2 evaluated_input_prompt	char (32) varying,	/* quad input */
+  3    79 	  2 character_input_prompt	char (32) varying,	/* quad-quote input */
+  3    80 	  2 vcpu_time		aligned,
+  3    81 	    3 total		fixed bin (71),
+  3    82 	    3 setup		fixed bin (71),
+  3    83 	    3 parse		fixed bin (71),
+  3    84 	    3 lex			fixed bin (71),
+  3    85 	    3 operator		fixed bin (71),
+  3    86 	    3 storage_manager	fixed bin (71),
+  3    87 	  2 output_info		aligned,		/* data pertaining to output buffer */
+  3    88 	    3 output_buffer_ptr	unal ptr,		/* ptr to output buffer */
+  3    89 	    3 output_buffer_len	fixed bin (21),	/* length (bytes) of output buffer */
+  3    90 	    3 output_buffer_pos	fixed bin (21),	/* index of next byte to write in */
+  3    91 	    3 output_buffer_ll	fixed bin (21),	/* print positions used up so far */
+  3    92 	  2 tab_width		fixed bin (21);	/* number of columns a tabs moves cursor */
+  3    93 
+  3    94 declare	output_buffer char (ws_info.output_buffer_len) based (ws_info.output_buffer_ptr);
+  3    95 
+  3    96 /* internal static */
+  3    97 
+  3    98 declare	max_parse_stack_depth fixed bin int static init(64536);
+  3    99 
+  3   100 /* ------ END INCLUDE SEGMENT		apl_ws_info.incl.pl1 -------------------------------------- */
+      414 
+  4     1 /* ====== BEGIN INCLUDE SEGEMENT	apl_operators_argument.incl.pl1 =========================== */
+  4     2 
+  4     3 declare	1 operators_argument	aligned,
+  4     4 	  2 operands (2)		aligned,		/* these are the operands to the operator to be executed.
+  4     5*						   if operand (1).value is null, operator is monadic */
+  4     6 	    3 value		pointer unaligned,	/* a pointer to the value bead for this operand */
+  4     7 	    3 on_stack		bit (1) aligned,	/* ON if this value resides on the value stack */
+  4     8 	  2 operator		aligned,		/* information about the operator to be executed */
+  4     9 	    3 dimension		fixed bin,	/* (optional) dimension along which to operate */
+  4    10 	    3 padding		bit (18) unaligned,	/* unused part of operator bead */
+  4    11 	    3 op2			fixed bin (8) unal,	/* a modifier for op1, or a 2nd operator if inner product */
+  4    12 	    3 op1			fixed bin (8) unal,	/* code for the actual operator to be executed */
+  4    13 	  2 result		pointer unal,	/* (output) set by operator to point to result bead in stack */
+  4    14 	  2 error_code		fixed bin (35),	/* (output) set before signaling apl_operator_error_ */
+  4    15 	  2 where_error		fixed bin;	/* parseme index of where error was - parse sets to operator */
+  4    16 
+  4    17 /* ------ END INCLUDE SEGMENT		apl_operators_argument.incl.pl1 --------------------------- */
+      415 
+  5     1 /* ====== BEGIN INCLUDE SEGMENT	apl_bead_format.incl.pl1 ================================== */
+  5     2 
+  5     3 declare 1 general_bead  		aligned based,	/* The Venerable Bead		*/
+  5     4 	2 type 			unaligned,
+  5     5 	  3 bead_type		unaligned,
+  5     6 	    4 operator		bit (1),		/* ON if operator bead		*/
+  5     7 	    4 symbol		bit (1),		/* ON if symbol bead		*/
+  5     8 	    4 value		bit (1),		/* ON if value bead			*/
+  5     9 	    4 function		bit (1),		/* ON if function bead		*/
+  5    10 	    4 group		bit (1),		/* ON if group bead			*/
+  5    11 	    4 label		bit (1),		/* ON if label bead			*/
+  5    12 	    4 shared_variable	bit (1),		/* ON if shared variable bead 	*/
+  5    13 	    4 lexed_function	bit (1),		/* ON if lexed function bead  	*/
+  5    14 	  3 data_type		unaligned,
+  5    15 	    4 list_value		bit (1),		/* ON if a list value bead		*/
+  5    16 	    4 character_value	bit (1),		/* ON if a character value bead	*/
+  5    17 	    4 numeric_value		bit (1),		/* ON if a numeric value bead		*/
+  5    18 	    4 integral_value	bit (1),		/* ON if an integral value bead	*/
+  5    19 	    4 zero_or_one_value	bit (1),		/* ON if a boolean value bead		*/
+  5    20 	    4 complex_value		bit (1),		/* ON if a complex, numeric value bead   */
+  5    21 	  3 unused_bits		bit (4) unaligned,	/* pad to 18 bits (for future use)	*/
+  5    22 	2 size			bit (18) unaligned,	/* Number of words this bead occupies
+  5    23*						   (used by bead storage manager)	*/
+  5    24 	2 reference_count 		fixed binary (29);	/* Number of pointers which point
+  5    25*						   to this bead (used by bead manager)	*/
+  5    26 
+  5    27 
+  5    28 /* constant strings for initing type field in various beads */
+  5    29 
+  5    30 declare (
+  5    31 	operator_type		init("100000000000000000"b),
+  5    32 	symbol_type		init("010000000000000000"b),
+  5    33     	value_type		init("001000000000000000"b),
+  5    34 	function_type		init("000100000000000000"b),
+  5    35 	group_type		init("000010000000000000"b),
+  5    36 	label_type		init("001001000011000000"b),
+  5    37 	shared_variable_type	init("001000100000000000"b),
+  5    38 	lexed_function_type		init("000000010000000000"b),
+  5    39 
+  5    40 	list_value_type		init("000000001000000000"b),
+  5    41 	character_value_type 	init("001000000100000000"b),
+  5    42 	numeric_value_type		init("001000000010000000"b),
+  5    43 	integral_value_type		init("001000000011000000"b),
+  5    44 	zero_or_one_value_type	init("001000000011100000"b),
+  5    45 	complex_value_type		init("001000000000010000"b),
+  5    46 
+  5    47 	not_integer_mask		init("111111111110011111"b),		/* to clear integral, zero_or_one bits */
+  5    48 	not_zero_or_one_mask	init("111111111111011111"b)		/* to clear zero_or_one bit */
+  5    49         ) bit(18) internal static;
+  5    50 
+  5    51 /* ------ END INCLUDE SEGMENT		apl_bead_format.incl.pl1 ---------------------------------- */
+      416 
+  6     1 /* ====== BEGIN INCLUDE SEGMENT	apl_value_bead.incl.pl1 =================================== */
+  6     2 
+  6     3 declare
+  6     4 	number_of_dimensions fixed bin,
+  6     5 
+  6     6 	1 value_bead		aligned based,
+  6     7 	2 header			aligned like general_bead,
+  6     8 	2 total_data_elements	fixed binary (21),	/* length of ,[value] in APL		*/
+  6     9 	2 rhorho			fixed binary,	/* number of dimensions of value	*/
+  6    10 	2 data_pointer		pointer unaligned,	/* packed pointer to the data in value	*/
+  6    11 	2 rho			fixed binary (21) dimension (number_of_dimensions refer (value_bead.rhorho));
+  6    12 						/* dimensions of value (zero-origin)	*/
+  6    13 
+  6    14 
+  6    15 declare 1 character_data_structure	aligned based,	/* alignment trick for PL/I compiler	*/
+  6    16 	2 character_datum		character (1) unaligned dimension (0:data_elements - 1);
+  6    17 						/* actual elements of character array	*/
+  6    18 
+  6    19 declare   character_string_overlay	character (data_elements) aligned based;
+  6    20 						/* to overlay on above structure	 */
+  6    21 
+  6    22 
+  6    23 declare   numeric_datum		float aligned dimension (0:data_elements - 1) based;
+  6    24 						/* actual elements of numeric array	*/
+  6    25 
+  6    26 declare	complex_datum		complex float aligned dimension (0:data_elements -1) based;
+  6    27 
+  6    28 declare	MAX_VALUE_BEAD_SIZE		fixed bin (19) init (261120) int static options (constant);
+  6    29 
+  6    30 /* ------ END INCLUDE SEGMENT		apl_value_bead.incl.pl1 ----------------------------------- */
+      417 
+      418      end;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    11/29/83  1347.0  apl_random_.pl1                   >special_ldd>on>apl.1129>apl_random_.pl1
+409          1    03/27/82  0429.8  apl_push_stack_fcn.incl.pl1       >ldd>include>apl_push_stack_fcn.incl.pl1
+413          2    03/27/82  0429.8  apl_number_data.incl.pl1          >ldd>include>apl_number_data.incl.pl1
+414          3    03/27/82  0439.2  apl_ws_info.incl.pl1              >ldd>include>apl_ws_info.incl.pl1
+415          4    03/27/82  0439.0  apl_operators_argument.incl.pl1   >ldd>include>apl_operators_argument.incl.pl1
+416          5    03/27/82  0438.5  apl_bead_format.incl.pl1          >ldd>include>apl_bead_format.incl.pl1
+417          6    03/27/82  0439.2  apl_value_bead.incl.pl1           >ldd>include>apl_value_bead.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+Biggest_Fixed_Range             000002 constant        float bin(63)            initial dcl 63 ref 111 231 323
+Biggest_bit_string              000000 constant        fixed bin(35,0)          initial dcl 63 ref 147
+Biggest_vector_size                    constant        fixed bin(17,0)          initial dcl 63 ref 143
+P                                      constant        fixed bin(31,0)          initial dcl 63 ref 364 366
+P_n_words                              parameter       fixed bin(19,0)          dcl 1-16 ref 1-4 1-35
+Q                               000004 constant        fixed bin(31,0)          initial dcl 63 ref 366
+Two_to_31                              constant        fixed bin(32,0)          initial dcl 63 ref 381
+Two_to_minus_31                        constant        fixed bin(31,31)         initial dcl 63 ref 370
+X                               000120 automatic       float bin(63)            dcl 29 set ref 189* 191 194 214* 216 249* 251 254
+abs                                                    builtin function         dcl 49 ref 101 115 225 308
+addr                                                   builtin function         dcl 49 ref 403
+addrel                                                 builtin function         dcl 1-25 in procedure "apl_push_stack_" ref 1-44
+addrel                                                 builtin function         dcl 49 in procedure "apl_random_" ref 259 285 286
+                                                                                  404
+apl_error_table_$domain         000012 external static fixed bin(35,0)          dcl 58 ref 345
+apl_error_table_$rank           000014 external static fixed bin(35,0)          dcl 58 ref 353
+apl_get_value_stack_            000020 constant        entry                    external dcl 1-30 ref 1-40
+apl_iota_appendage_             000010 constant        entry                    external dcl 54 ref 207
+apl_static_$ws_info_ptr         000016 external static structure                level 1 dcl 3-11
+binary                                                 builtin function         dcl 1-25 ref 1-40
+block_ptr                       000166 automatic       pointer                  dcl 1-20 set ref 1-43* 1-45
+choose                          000115 automatic       fixed bin(35,0)          dcl 29 set ref 107* 129 136 139 143 152 159 180 186
+                                                                                  228 231 241 246 257 402
+data_elements                   000110 automatic       fixed bin(21,0)          dcl 29 set ref 152* 180* 199* 241* 257* 259 271* 276
+                                                                                  292 397
+data_pointer              4            based           pointer                  level 2 packed unaligned dcl 6-3 set ref 84 100 101
+                                                                                  288* 406*
+data_type                 0(08)        based           structure                level 4 packed unaligned dcl 6-3
+divide                                                 builtin function         dcl 49 ref 143
+elem                            000112 automatic       fixed bin(21,0)          dcl 29 set ref 159* 159* 167* 186* 186* 190 194*
+                                                                                  211* 211* 212 214 215 215 216* 246* 246* 250 254*
+                                                                                  303* 303* 305 308 311* 319* 319* 320 327 333*
+error_code                7            parameter       fixed bin(35,0)          level 2 dcl 4-3 set ref 345* 353*
+fixed                                                  builtin function         dcl 49 ref 107 119 325
+float                                                  builtin function         dcl 49 ref 167 189 327
+float_index_origin       10            based           float bin(63)            level 3 dcl 3-16 set ref 207* 249 333
+float_temp                      000122 automatic       float bin(63)            dcl 29 set ref 100* 101 103 105 107 114* 115 117 119
+floor                                                  builtin function         dcl 49 ref 100 114 223 305 325 390
+frange                          000124 automatic       float bin(63)            dcl 29 set ref 223* 225 305* 306 308 311 320* 321
+                                                                                  323 325 390
+frn                             000126 automatic       float bin(63)            dcl 29 set ref 249 333 386* 387* 387 390* 390
+from                            000116 automatic       fixed bin(35,0)          dcl 29 set ref 119* 129 139 143 143 147 150 176 199
+                                                                                  207 211 212
+general_bead                           based           structure                level 1 dcl 5-3
+header                                 based           structure                level 2 dcl 6-3
+index_origin              4            based           fixed bin(17,0)          level 3 dcl 3-16 ref 162 189 327
+integer_fuzz             22            based           float bin(63)            level 2 dcl 3-16 ref 101 115 225 308
+integral_value            0(11)        based           bit(1)                   level 5 packed unaligned dcl 6-3 set ref 303
+integral_value_type                    constant        bit(18)                  initial unaligned dcl 5-30 ref 314 400
+left_vb                         000104 automatic       pointer                  unaligned dcl 29 set ref 86* 87 90 97 100 101 125
+                                                                                  238
+maximum_value_stack_size
+                         13            based           fixed bin(18,0)          level 3 dcl 3-16 ref 1-40
+memory                                 based           bit(1)                   array unaligned dcl 45 set ref 155 157* 163 166*
+                                                                                  171*
+memory_ptr                      000100 automatic       pointer                  dcl 29 set ref 155 156* 157 163 166 171
+mod                                                    builtin function         dcl 49 ref 366
+multiply                                               builtin function         dcl 49 ref 366 370
+n_words                         000111 automatic       fixed bin(19,0)          dcl 29 set ref 155* 156* 276* 277* 397* 398*
+null                                                   builtin function         dcl 49 ref 87
+num_words                       000170 automatic       fixed bin(19,0)          dcl 1-20 set ref 1-35* 1-37 1-37* 1-37 1-40 1-40*
+                                                                                  1-44
+number                          000114 automatic       fixed bin(35,0)          dcl 29 set ref 162* 163 166 167
+number_of_dimensions            000132 automatic       fixed bin(17,0)          dcl 6-3 set ref 272* 276 285 396* 397
+numeric_datum                          based           float bin(63)            array dcl 6-23 set ref 100 101 111 114 115 167* 191
+                                                                                  194* 214 215* 215 216* 223 225 251 254* 259 276
+                                                                                  292* 292 305 308 311* 320 327* 333* 397
+numeric_value             0(10)        based           bit(1)                   level 5 packed unaligned dcl 6-3 set ref 82 90
+numeric_value_type                     constant        bit(18)                  initial unaligned dcl 5-30 ref 330
+on_stack                  1            parameter       bit(1)                   array level 3 dcl 4-3 ref 123 125 236 238 267
+operands                               parameter       structure                array level 2 dcl 4-3
+operators_argument                     parameter       structure                level 1 dcl 4-3 set ref 10
+orn                             000150 automatic       fixed bin(31,0)          dcl 379 set ref 383* 387
+other                           000113 automatic       fixed bin(21,0)          dcl 29 set ref 190* 190* 191* 250* 250* 251*
+pointers                 14            based           structure                level 2 dcl 3-16
+random_link               5            based           fixed bin(35,0)          level 3 dcl 3-16 set ref 364 364* 366* 366 370
+range                           000117 automatic       fixed bin(35,0)          dcl 29 set ref 150* 155 157 171 176* 212* 325* 370
+                                                                                  381*
+rel                                                    builtin function         dcl 49 in procedure "apl_random_" ref 286 404
+rel                                                    builtin function         dcl 1-25 in procedure "apl_push_stack_" ref 1-40
+result                          000107 automatic       pointer                  unaligned dcl 29 in procedure "apl_random_" set ref
+                                                                                  167 191 194 207 214 215 215 216 251 254 259 285*
+                                                                                  286 286* 286 288 292 297 403* 404 404* 404 406
+result                    6            parameter       pointer                  level 2 in structure "operators_argument" packed
+                                                                                  unaligned dcl 4-3 in procedure "apl_random_" set
+                                                                                  ref 337* 399*
+result_vb                       000106 automatic       pointer                  unaligned dcl 29 set ref 277* 281 285 288 296 398*
+                                                                                  399 400 401 402 402 403 406
+rho                       5            based           fixed bin(21,0)          array level 2 dcl 6-3 set ref 402* 403
+rhorho                    3            based           fixed bin(17,0)          level 2 dcl 6-3 set ref 272 281 401*
+right                           000105 automatic       pointer                  unaligned dcl 29 set ref 84* 111 114 115 223 225 292
+                                                                                  297* 305 308 311 320 327 333
+right_vb                        000103 automatic       pointer                  unaligned dcl 29 set ref 81* 82 84 95 123 236 271
+                                                                                  272 281 296* 303 303 314 319 330 337
+rn                              000102 automatic       fixed bin(31,0)          dcl 29 set ref 162 189 215 216 327 370* 383 387
+size                                                   builtin function         dcl 49 ref 155 259 276 276 285 397 397
+static_ws_info_ptr              000016 external static pointer                  level 2 packed unaligned dcl 3-11 ref 3-7
+string                                                 builtin function         dcl 49 set ref 157* 171* 314* 330* 400*
+substr                                                 builtin function         dcl 49 in procedure "apl_random_" ref 286 387 387
+                                                                                  387 404
+substr                                                 builtin function         dcl 1-25 in procedure "apl_push_stack_" ref 1-37
+total_data_elements       2            based           fixed bin(21,0)          level 2 dcl 6-3 set ref 95 97 271 303 319 402*
+type                                   based           structure                level 3 packed unaligned dcl 6-3 set ref 314* 330*
+                                                                                  400*
+unspec                                                 builtin function         dcl 1-25 in procedure "apl_push_stack_" ref 1-37
+unspec                                                 builtin function         dcl 49 in procedure "apl_random_" set ref 387* 387
+                                                                                  387 387
+value                                  parameter       pointer                  array level 3 packed unaligned dcl 4-3 ref 81 86
+value_bead                             based           structure                level 1 dcl 6-3 set ref 276 281* 281 285 397
+value_stack_ptr          16            based           pointer                  level 3 packed unaligned dcl 3-16 set ref 123* 125*
+                                                                                  236* 238* 259* 1-40 1-43 1-44* 1-44
+values                    2            based           structure                level 2 dcl 3-16
+where_error              10            parameter       fixed bin(17,0)          level 2 dcl 4-3 set ref 340* 340 343* 343 348* 348
+                                                                                  351* 351
+ws_info                                based           structure                level 1 dcl 3-16
+ws_info_ptr                     000130 automatic       pointer                  initial dcl 3-7 set ref 101 115 123 125 162 189 207
+                                                                                  225 236 238 249 259 308 327 333 3-7* 364 364 366
+                                                                                  366 370 1-40 1-40 1-43 1-44 1-44
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+Binary                                 internal static bit(1)                   initial dcl 2-16
+MAX_VALUE_BEAD_SIZE                    internal static fixed bin(19,0)          initial dcl 6-28
+NumberSize                             internal static fixed bin(4,0)           initial dcl 2-25
+TheBiggestNumberWeveGot                internal static float bin(63)            initial dcl 2-16
+TheSmallestNumberWeveGot               internal static float bin(63)            initial dcl 2-16
+character_data_structure               based           structure                level 1 dcl 6-15
+character_string_overlay               based           char                     dcl 6-19
+character_value_type                   internal static bit(18)                  initial unaligned dcl 5-30
+complex_datum                          based           complex float bin(63)    array dcl 6-26
+complex_value_type                     internal static bit(18)                  initial unaligned dcl 5-30
+function_type                          internal static bit(18)                  initial unaligned dcl 5-30
+group_type                             internal static bit(18)                  initial unaligned dcl 5-30
+label_type                             internal static bit(18)                  initial unaligned dcl 5-30
+lexed_function_type                    internal static bit(18)                  initial unaligned dcl 5-30
+list_value_type                        internal static bit(18)                  initial unaligned dcl 5-30
+max_parse_stack_depth                  internal static fixed bin(17,0)          initial dcl 3-98
+not_integer_mask                       internal static bit(18)                  initial unaligned dcl 5-30
+not_zero_or_one_mask                   internal static bit(18)                  initial unaligned dcl 5-30
+operator_type                          internal static bit(18)                  initial unaligned dcl 5-30
+output_buffer                          based           char                     unaligned dcl 3-94
+shared_variable_type                   internal static bit(18)                  initial unaligned dcl 5-30
+symbol_type                            internal static bit(18)                  initial unaligned dcl 5-30
+value_type                             internal static bit(18)                  initial unaligned dcl 5-30
+zero_or_one_value_type                 internal static bit(18)                  initial unaligned dcl 5-30
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+apl_push_stack_                 001127 constant        entry                    internal dcl 1-4 ref 156 277 398
+apl_random_                     000046 constant        entry                    external dcl 10
+big_deal                        000345 constant        label                    dcl 199 ref 139 143
+deal_fin                        000522 constant        label                    dcl 257 ref 174 197 219
+deal_push                       001052 constant        entry                    internal dcl 393 ref 153 181 201 242
+domain_error_left               000742 constant        label                    dcl 340 ref 90 101 103 105 228
+domain_error_right              000745 constant        label                    dcl 343 ref 82 115 117 129 225 231 306 308 321
+floating_dealer                 000431 constant        label                    dcl 223 ref 111
+frandom                         001010 constant        entry                    internal dcl 374 ref 247 332
+frn_dup                         000471 constant        label                    dcl 247 ref 251
+random_in_range                 000764 constant        entry                    internal dcl 361 ref 160 187 213 326 382 384
+rank_error_left                 000755 constant        label                    dcl 348 ref 97
+rank_error_right                000757 constant        label                    dcl 351 ref 95
+really_big_deal                 000301 constant        label                    dcl 176 ref 147
+rn_dup                          000313 constant        label                    dcl 187 ref 191
+roll                            000533 constant        label                    dcl 267 ref 87
+small_deal                      000301 constant        label                    dcl 176 ref 136
+try_again                       000245 constant        label                    dcl 160 ref 163
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      1314        1336    1217        1324
+Length      1632    1217        22         257      75           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+apl_random_                         170 external procedure  is an external procedure.  
+random_in_range                         internal procedure  shares stack frame of external procedure apl_random_.  
+frandom                                 internal procedure  shares stack frame of external procedure apl_random_.  
+deal_push                               internal procedure  shares stack frame of external procedure apl_random_.  
+apl_push_stack_                         internal procedure  shares stack frame of external procedure apl_random_.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+apl_random_              000100 memory_ptr                  apl_random_
+                         000102 rn                          apl_random_
+                         000103 right_vb                    apl_random_
+                         000104 left_vb                     apl_random_
+                         000105 right                       apl_random_
+                         000106 result_vb                   apl_random_
+                         000107 result                      apl_random_
+                         000110 data_elements               apl_random_
+                         000111 n_words                     apl_random_
+                         000112 elem                        apl_random_
+                         000113 other                       apl_random_
+                         000114 number                      apl_random_
+                         000115 choose                      apl_random_
+                         000116 from                        apl_random_
+                         000117 range                       apl_random_
+                         000120 X                           apl_random_
+                         000122 float_temp                  apl_random_
+                         000124 frange                      apl_random_
+                         000126 frn                         apl_random_
+                         000130 ws_info_ptr                 apl_random_
+                         000132 number_of_dimensions        apl_random_
+                         000150 orn                         frandom
+                         000166 block_ptr                   apl_push_stack_
+                         000170 num_words                   apl_push_stack_
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+fx1_to_fl2          call_ext_out        return              fl2_to_fx1          fl2_to_fx2          mpfx2
+mod_fx3             ext_entry           trunc_fx2           floor_fl
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+apl_get_value_stack_          apl_iota_appendage_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+apl_error_table_$domain       apl_error_table_$rank         apl_static_$ws_info_ptr
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     10 000043    3    7 000053        81 000055        82 000061        84 000065        86 000067        87 000071
+     90 000074        95 000101        97 000104       100 000107       101 000114       103 000122       105 000124
+    107 000127       111 000132       114 000137       115 000142       117 000147       119 000151       123 000153
+    125 000163       129 000171       136 000174       139 000176       143 000200       146 000206       147 000207
+    150 000211       152 000213       153 000215       155 000216       156 000231       157 000233       159 000240
+    160 000245       162 000246       163 000252       166 000257       167 000262       169 000271       171 000273
+    174 000300       176 000301       180 000303       181 000305       186 000306       187 000313       189 000314
+    190 000321       191 000325       193 000332       194 000334       195 000342       197 000344       199 000345
+    201 000347       207 000350       211 000374       212 000401       213 000407       214 000410       215 000416
+    216 000424       217 000426       219 000430       223 000431       225 000434       228 000441       231 000443
+    236 000446       238 000455       241 000462       242 000464       246 000465       247 000471       249 000472
+    250 000476       251 000503       253 000510       254 000512       255 000520       257 000522       259 000524
+    260 000532       267 000533       271 000536       272 000540       276 000542       277 000552       281 000556
+    285 000566       286 000573       288 000610       292 000612       296 000621       297 000623       303 000625
+    305 000636       306 000645       308 000646       311 000655       312 000657       314 000661       319 000664
+    320 000673       321 000677       323 000700       325 000702       326 000705       327 000706       328 000717
+    330 000720       332 000722       333 000723       335 000733       337 000735       338 000741       340 000742
+    343 000745       345 000751       346 000754       348 000755       351 000757       353 000761       354 000763
+    361 000764       364 000765       366 000772       370 000777       372 001007       374 001010       381 001011
+    382 001013       383 001014       384 001016       386 001017       387 001021       390 001045       391 001051
+    393 001052       396 001053       397 001055       398 001065       399 001071       400 001075       401 001100
+    402 001102       403 001105       404 001107       406 001124       407 001126    1    4 001127    1   35 001131
+ 1   37 001133    1   40 001140    1   43 001155    1   44 001160    1   45 001167
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

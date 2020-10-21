@@ -1,0 +1,4428 @@
+
+
+
+
+		    heals_collect_data_.pl1         09/27/84  0748.5rew 09/27/84  0744.1      123813
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+/* This routine copies selected syserr_log messages
+   into the Heals log.  Record selection is based upon
+   a time range, as well as a data type.
+   Coded by A. Downing Feb. 1976.
+*/
+/* Modified Feb. 1979 by A. Downing in preparation
+   of MR7.0; several bug fixes and some code clarification made.
+*/
+heals_collect_data_: proc (datap, code);
+%include heals_arg_info;
+%include heals_message;
+%include heals_state;
+%include syserr_message;
+%include iocb;
+dcl 1 arg_info like heals_arg_info based (datap);
+dcl  datap ptr;
+dcl  qip ptr;
+dcl 1 query_info aligned,
+    2 version fixed bin init (1),
+    2 yes_or_no_sw bit (1) unal init ("1"b),		/* Require "yes" or "no" answer. */
+    2 suppress_name_sw bit (1) unal init ("0"b),		/* Print name with question. */
+    2 status_code fixed bin (35),			/* Set to code of error prompting question. */
+    2 query_code fixed bin (35) init (0);
+dcl  sysmsgp ptr;
+dcl  code fixed bin (35);
+dcl  i fixed bin (21);
+dcl  log_code fixed bin (35);				/* code for syserr_log_util_ calls. */
+dcl  no_of_recs_copied fixed bin (35) init (0);
+dcl  answer char (8) init ("");
+dcl (error_table_$no_record, error_table_$key_duplication, error_table_$key_order) ext static fixed bin (35);
+dcl  error_table_$bad_arg ext static fixed bin (35);
+dcl  error_table_$file_busy ext static fixed bin (35);
+dcl (error_table_$not_open, error_table_$not_closed, error_table_$not_attached)
+     ext static fixed bin (35);
+dcl  error_table_$end_of_info ext static fixed bin (35);
+dcl  last_msg_tallied fixed bin (35);
+dcl  last_msg_tallied_time fixed bin (71);
+dcl  m_len fixed bin (21);
+dcl  input_record char (2048) init ("");
+dcl  output_record char (2048) init ("");
+dcl  io_data bit (1) unal defined arg_info.info_selection pos (1);
+dcl  mpc_data bit (1) unal defined arg_info.info_selection pos (2);
+dcl  cpu_data bit (1) unal defined arg_info.info_selection pos (3);
+dcl  mos_edac_data bit (1) unal defined arg_info.info_selection pos (4);
+dcl  sorted_io_data bit (1) unal defined arg_info.info_selection pos (5);
+dcl  disk_data bit (1) unal defined arg_info.info_selection pos (6);
+dcl  bulk_data bit (1) unal defined arg_info.info_selection pos (7);
+dcl  command_query_ entry options (variable);
+dcl (com_err_, ioa_) entry options (variable);
+dcl  hcs_$initiate entry (char (*), char (*), char (*),
+     fixed bin (1), fixed bin (2), ptr, fixed bin (35));
+dcl  syserr_log_util_$status entry (ptr, fixed bin (35));
+dcl  syserr_log_util_$read entry (ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+dcl  syserr_log_util_$close entry (fixed bin (35));
+dcl  syserr_log_util_$search entry (fixed bin (71), fixed bin (71), fixed bin (35), fixed bin (35));
+dcl  syserr_log_util_$open entry (bit (36) aligned, fixed bin (35));
+dcl  syserr_log_util_$position entry (fixed bin (24), fixed bin (71), fixed bin (35), fixed bin (35));
+dcl  buffering bit (1) aligned init ("0"b);
+dcl  first_record bit (1) init ("1"b);
+dcl (ioi_type, rcp_type, cpu_type, mos_type, disk_type,
+     dn355_type, iom_type, bulk_type) bit (1) aligned;
+dcl  keyed_sequential_output fixed bin int static init (9); /* iox value */
+dcl  last_message_copied bit (1) init ("0"b) aligned;
+dcl (cleanup, record_quota_overflow) condition;
+dcl (addr, bin, index, null, reverse, substr) builtin;
+dcl  slu_statusp ptr;
+dcl 1 slu_status aligned,
+    2 version fixed bin;				/* thats it for now */
+dcl  open_status bit (36) aligned;
+dcl (search_time, rtime) fixed bin (71);
+dcl  rseq fixed bin (35);
+
+	arg_info.err_nb = -1;			/* if we abort without satisfaction */
+	qip = addr (query_info);
+	i = index (reverse (arg_info.heals_log_path_name), ">");
+	i = length (arg_info.heals_log_path_name) - i;
+	call hcs_$initiate
+	  (substr (arg_info.heals_log_path_name, 1, i), "heals_log_info", "",
+	  0, 0, heals_state_p, code);
+	if heals_state_p = null () then signal cleanup;
+	code = 0;
+	log_code = 0;
+	if arg_info.from_time > arg_info.to_time then do;
+	  code = error_table_$bad_arg;
+	  call com_err_ (code, "heals_collect_data_", "the time range for data processing is incompatible.");
+	  return;
+	end;
+	slu_statusp = addr (slu_status);
+	call syserr_log_util_$status (slu_statusp, log_code);
+	if log_code ^= 0 then do;
+	  call com_err_ (log_code, "heals_collect_data_", "error while obtaining syserr_log status.");
+	  code = error_table_$not_attached;
+	  return;
+	end;
+	syserr_msgp = addr (input_record);
+	heals_message_p = addr (output_record);
+	on condition (record_quota_overflow) begin;
+	  call com_err_ (0, "heals_collect_data_",
+	    "There is not enough quota on the directory containing the heals log to permit its extention.");
+	  call syserr_log_util_$close (log_code);
+	  arg_info.err_nb = -1;
+	  go to ret;
+	end;
+
+open_syserr_log:
+	call syserr_log_util_$open (open_status, log_code);
+	if log_code ^= 0 then do;
+	  if log_code = error_table_$not_closed then do;
+	    call syserr_log_util_$close (log_code);
+	    go to open_syserr_log;
+	  end;
+	  if open_status = "0"b then
+	    call com_err_ (log_code, "heals_collect_data_", "error while opening syserr_log");
+	  else go to syserr_log_is_open;		/* we have something */
+	  go to early_return;
+	end;
+syserr_log_is_open:
+	if substr (open_status, 1, 2) ^= "11"b then
+	  call com_err_ (0, "heals_collect_data_",
+	  "part of the syserr_log is unavailable, processing will continue with the available part.");
+	call syserr_log_util_$search
+	  (arg_info.from_time, rtime, rseq, log_code);
+	if log_code ^= 0 then do;
+	  call com_err_ (log_code, "heals_collect_data_", "could not read syserr_log.");
+early_return:
+	  arg_info.err_nb = 1;
+	  call syserr_log_util_$close (log_code);
+	  code = log_code;
+	  return;
+	end;
+
+	if rseq < heals_state.last_message_seq_num |
+	rtime < heals_state.last_message_time then do;
+	  query_info.status_code = 0;			/* init */
+get_answer: call command_query_ (qip, answer, "heals_collect_data_",
+	    "The syserr_log may have been reinitialized,
+   do you want to continue copying messages?	");
+	  if substr (answer, 1, 3) = "yes" then go to continue_to_copy;
+	  else go to early_return;
+	end;
+
+	if rseq < heals_state.last_message_seq_num then
+	  call ioa_
+	  ("the syserr_log may have been reinitialized after seq_num ^d; copying continues.",
+	  last_message_seq_num);
+
+continue_to_copy:
+	call datap -> arg_info.iocbp -> iocb.open (
+	  datap -> arg_info.iocbp, (keyed_sequential_output), "0"b, code);
+	if code ^= 0 then
+	  if code = error_table_$file_busy then do;
+	    call com_err_ (code, "heals_collect_data_", "The permanent heals log is being updated.");
+	    call syserr_log_util_$close (log_code);
+	    return;
+	  end;
+	  else do;
+	    call syserr_log_util_$close (log_code);
+	    return;
+	  end;
+
+
+copy_data: begin;
+%include io_syserr_msg;
+dcl  message_length fixed bin (21);
+dcl  copy_this_one bit (1) aligned;
+copy_loop:  do while ("1"b);
+	    call syserr_log_util_$read
+	      (addr (input_record), size (input_record), message_length, log_code);
+	    if log_code ^= 0 then
+	      if log_code ^= error_table_$end_of_info then do;
+	        call com_err_ (log_code, "heals_collect_data_", "error while reading syserr_log.");
+	        call syserr_log_util_$close (code);
+	        return;
+	      end;
+	      else go to finish;
+	    else;
+	    if syserr_msg.time > arg_info.to_time then go to finish;
+	    if syserr_msg.time >= arg_info.from_time then do;
+	      copy_this_one, ioi_type, disk_type, rcp_type,
+	        bulk_type, mos_type, cpu_type, dn355_type, iom_type = "0"b;
+	      if io_data | sorted_io_data then do;
+	        if index (syserr_msg.text, "RCP:") > 0 then rcp_type = "1"b;
+	        else if index (syserr_msg.text, "dn355:") > 0 then dn355_type = "1"b;
+	        else if index (syserr_msg.text, "iom_manager:") > 0 then iom_type = "1"b;
+	        else if index (syserr_msg.text, "ioi_") > 0 then ioi_type = "1"b;
+	        else if index (syserr_msg.text, "ocdcm_:") > 0 then ioi_type = "1"b;
+	        io_msgp = addr (syserr_msg.data (1));
+	      end;
+	      if cpu_data then
+	        if index (syserr_msg.text, "hardware_fault:") > 0 then do;
+		cpu_type = "1"b;			/* a cpu record of some sort */
+	        end;
+	      if mos_edac_data then
+	        if index (syserr_msg.text, "mos_memory_check:") > 0 then do;
+		mos_type = "1"b;
+	        end;
+	      if disk_data then
+	        if index (syserr_msg.text, "disk_control") > 0 then do;
+		disk_type = "1"b;
+	        end;
+	      if bulk_data then
+	        if index (syserr_msg.text, "bulk_store_control:") > 0 then do;
+		bulk_type = "1"b;
+	        end;
+
+have_rec_type:
+	      if first_record then do;
+	        first_record = "0"b;
+	        buffering = "0"b;
+	        last_message_copied = "0"b;
+
+/* initialize this first heals_message for later comparison with syserr_msg values */
+	        heals_message.data_size = syserr_msg.data_size;
+	        heals_message.text_len = syserr_msg.text_len;
+	        unspec (heals_message.rest_of_record) = ""b; /* zero every field out */
+	        heals_message.text = "";
+	        heals_message.data (*) = ""b;
+	        heals_message.tally = 0;
+	        m_len = message_length * 4 +4;
+	      end;
+	      if cpu_type | ioi_type | bulk_type | disk_type | dn355_type | mos_type | iom_type | rcp_type
+	      then copy_this_one = "1"b;
+	      if copy_this_one then
+	        if last_message_copied then do;
+
+
+/* check for message tallying */
+		if syserr_msg.text = heals_message.text then
+		  if syserr_msg.data_size = heals_message.data_size then do;
+		    if ioi_type then
+		      if (substr (unspec (heals_message.data), 1, 30) ||
+		      substr (unspec (heals_message.data), 37, 72)) =
+		      (substr (unspec (syserr_msg.data), 1, 30) ||
+		      substr (unspec (syserr_msg.data), 37, 72)) then do;
+		        heals_message.tally =
+			heals_message.tally + bin (count, 6, 0) + 1;
+		        go to keep_text;
+		      end;
+		      else;
+		    else if unspec (heals_message.data) =
+		    unspec (syserr_msg.data) then do;	/* compare octal data for similarity */
+		      heals_message.tally = heals_message.tally + 1;
+		      go to keep_text;
+		    end;
+		  end;
+		  else;
+		else;
+
+/* must not be similar to last record */
+		if buffering then call copy_message;	/* write old rec */
+		if ioi_type then heals_message.tally =
+		  bin (count, 6, 0) + 1;
+		else heals_message.tally = 1;
+		m_len = message_length * 4 +4;
+		heals_message.seq_num = syserr_msg.seq_num;
+		heals_message.time = syserr_msg.time;
+		heals_message.code = syserr_msg.code;
+		heals_message.data_size = syserr_msg.data_size;
+		heals_message.text_len = syserr_msg.text_len;
+		heals_message.data (*) = syserr_msg.data (*);
+		heals_message.text = syserr_msg.text;
+keep_text:
+		buffering = "1"b;
+		last_message_copied = "1"b;
+		last_msg_tallied = syserr_msg.seq_num;
+		last_msg_tallied_time = syserr_msg.time;
+	        end;				/* end of last_message_copied being true */
+	        else do;				/* last_message_copied was false */
+		if buffering then
+		  call copy_message;
+		buffering = "1"b;
+		heals_message.data_size = syserr_msg.data_size; /* because of refer option */
+		heals_message.text_len = syserr_msg.text_len; /* because of refer option */
+		heals_message.rest_of_record = syserr_msg;
+		m_len = message_length * 4 +4;
+		if ioi_type then heals_message.tally = bin (count, 6, 0) + 1;
+		else heals_message.tally = 1;
+		last_message_copied = "1"b;
+	        end;				/* end of last_message_copied being false */
+	      else do;				/* copy_this_one is false */
+	        last_message_copied = "0"b;
+	        last_msg_tallied = syserr_msg.seq_num;
+	        last_msg_tallied_time = syserr_msg.time;
+	        if buffering then do;
+		call copy_message;
+		buffering = "0"b;
+	        end;
+	      end;
+	    end;
+	  end copy_loop;
+	end copy_data;
+finish:
+	if arg_info.err_nb = 0 then
+	  if buffering then
+	    call copy_message;
+	if no_of_recs_copied > 0 then
+	  call ioa_
+	  ("^5x^d message^v(s^) copied into:^/^a",
+	  no_of_recs_copied, bin (no_of_recs_copied > 1, 1, 0),
+	  before (arg_info.heals_log_path_name, " "));
+	call datap -> arg_info.iocbp -> iocb.close (
+	  datap -> arg_info.iocbp, code);
+	call syserr_log_util_$close (code);
+	if code ^= 0 then
+ret:	  return;
+	arg_info.err_nb = 0;			/* indicate satisfactory return */
+	return;
+
+/* proc to copy heals messages. */
+copy_message: proc;
+dcl  based_key char (8) based (addr (heals_message.time));
+dcl  key char (256) varying;
+	  key = based_key;				/* for seek_key operation */
+	  call arg_info.iocbp -> iocb.seek_key
+	    (arg_info.iocbp, key, 0, code);
+	  if code = error_table_$no_record then do;
+	    call arg_info.iocbp -> iocb.write_record (arg_info.iocbp,
+	      heals_message_p, m_len, code);
+	    if code = 0 then do;
+	      no_of_recs_copied = no_of_recs_copied + 1;
+	      heals_state.last_message_seq_num = last_msg_tallied;
+	      heals_state.last_message_time = last_msg_tallied_time;
+	    end;
+	    else do;
+	      call com_err_
+	        (code, "heals_collect_data_",
+	        "error writing record ^d into heals_log.", heals_message.seq_num);
+copy_error:
+	      arg_info.err_nb = -1;
+	      go to finish;
+	    end;
+	  end;
+	  else if code ^= error_table_$key_order
+	  then do;				/* bad code from seek_key operation above. */
+	    call com_err_ (code, "heals_collect_data_", "could not create a key for message ^d.",
+	      heals_message.seq_num);
+	    go to copy_error;
+	  end;
+	  heals_message.tally = 0;			/* reset it */
+	  if heals_message.data_size > 0 then
+	    heals_message.data (*) = "0"b;
+	  return;
+	end copy_message;
+        end heals_collect_data_;
+   
+
+
+
+		    heals_cpu_reports_.pl1          09/27/84  0748.5rew 09/27/84  0745.2       60345
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+
+/* Coded March 1976 by A. Downing.
+   This routine is responsible for printing heals cpu error messages that
+   are found in the heals log. */
+/* Modified 11-82 by F. W. Martinson to fix bugs in report column alignment
+   and pointer register reporting */
+heals_cpu_reports_: proc (datap, code);
+%include heals_arg_info;
+%include syserr_message;
+%include heals_message;
+%include mc;/*mc for machine conditions.*/
+dcl  datap ptr;
+dcl  code fixed bin (35);
+dcl  bin_clock fixed bin (71) init (clock_ ());
+dcl  runtime char (16) init ("");
+dcl						/* declare temporary registers */
+     index_regs (0:7) bit (36) aligned,			/* actually each index fits in right half */
+     exponent_register bit (36) aligned,		/* put in right end of word */
+     timer_register bit (36) aligned,			/* put in right end */
+     fault_reg bit (36) aligned,
+     ralr bit (36) aligned;				/* 3 last bits for ring alarm reg */
+dcl  hist_reg (0:127) bit (36) aligned based (hist_reg_ptr);
+dcl (i, j) fixed bin;
+dcl  hist_reg_ptr ptr init (null ());
+dcl 1 arg_info aligned based (datap) like heals_arg_info;
+dcl  error_table_$end_of_info ext static fixed bin (35);
+dcl  error_table_$long_record ext static fixed bin (35);
+dcl  title char (132) varying int static aligned init
+    ("^-cpu_error report for Multics system ^a.");
+dcl (time1, time2) char (16);
+dcl  dummy_p (8) ptr aligned,
+     even_word_buf fixed bin (71) aligned dim (8) based;
+dcl  buffer char (2048) aligned;
+dcl  buf_p ptr init (null ());
+dcl  buf_len fixed bin (21);
+dcl  act_len fixed bin (21);
+dcl  clock_ entry returns (fixed bin (71));
+dcl  date_time_ entry (fixed bin (71), char (*));
+dcl  com_err_ entry options (variable);
+dcl  ioa_$ioa_switch entry options (variable);
+dcl  iox_$attach_ioname entry (char (*), ptr, char (*), fixed bin (35));
+dcl  iox_$open entry (ptr, fixed bin, bit (1) aligned, fixed bin (35));
+dcl  iox_$read_record entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+dcl  iox_$close entry (ptr, fixed bin (35));
+dcl  iox_$detach_iocb entry (ptr, fixed bin (35));
+dcl  hran_$hranl entry (ptr, ptr, bit (1));
+dcl  hran_$hrlgnd entry (ptr);
+dcl (addr, addrel, index, null) builtin;
+dcl  cleanup condition;
+dcl  cpu_fault_count fixed bin (21) init (0);
+
+	call date_time_ (bin_clock, runtime);
+	buf_p, heals_message_p = addr (buffer);
+	buf_len = length (buffer);
+	syserr_msgp = addr (heals_message.rest_of_record);
+	arg_info.err_nb = 0;
+	on cleanup begin;
+	     arg_info.err_nb = -1;
+	     call clean_up;
+	end;
+	if arg_info.report_iocbp = null () then do;
+	     arg_info.err_nb = -1;
+	     call com_err_ (0, "heals_cpu_reports_",
+		"the report stream is not open.");
+	     return;
+	end;
+	call date_time_ ((arg_info.from_time), time1);
+	call date_time_ ((arg_info.to_time), time2);
+	call ioa_$ioa_switch (arg_info.report_iocbp,
+	     "^|CPU_ERROR_REPORT:^8xfrom^x^16a^7xto^x^16a
+HEALS RUN OF ^16a ON SYSTEM ^a^3/",
+	     time1, time2, runtime, arg_info.system_id);
+	do while ("1"b);
+	     call iox_$read_record (arg_info.iocbp,
+		buf_p, buf_len, act_len, code);
+	     if code ^= 0 then
+		if code = error_table_$end_of_info then go to copying_done;
+		else do;
+		     if code = error_table_$long_record then
+			arg_info.err_nb = 16;
+		     else arg_info.err_nb = -1;
+		     call clean_up;
+		     return;
+		end;
+	     else;
+	     if heals_message.time > arg_info.to_time then go to copying_done; /* finished */
+	     if index (heals_message.text, "hardware_fault:") > 0 then do;
+		unspec (addr (dummy_p) -> even_word_buf) = unspec (heals_message.data);
+		mcp = addr (heals_message.data (1));
+		hist_reg_ptr = addrel (mcp, size (mc)); /* point at history register data */
+		if cpu_fault_count = 0 then
+		     call hran_$hrlgnd (arg_info.report_iocbp);
+		call date_time_ ((heals_message.time), time1);
+		call ioa_$ioa_switch (arg_info.report_iocbp,
+		     "^|syserr sequence #^d, at ^a;", heals_message.seq_num, time1);
+		call ioa_$ioa_switch (arg_info.report_iocbp,
+		     "syserr_log text: ^a", heals_message.text);
+		call ioa_$ioa_switch (arg_info.report_iocbp,
+		     "^/scu_data:^2-^x^2(^4(^w^x^)^/^2-^x^)", mc.scu);
+		call ioa_$ioa_switch (arg_info.report_iocbp,
+		     "pointer registers:^1-^x^2(^4(^12p^2x^)^/^2-^x^)", dummy_p);
+
+/* copy register data into aligned fields */
+		index_regs (*) = ""b;
+		exponent_register, timer_register, ralr = ""b;
+		substr (index_regs (*), 19, 18) = mc.x (*); /* copy */
+		substr (exponent_register, 29, 8) = mc.e; /* copy */
+		substr (timer_register, 10, 27) = mc.t; /* copy */
+		substr (ralr, 34, 3) = mc.ralr;	/* copy */
+		fault_reg = mc.fault_reg;		/* copy */
+						/* data copied into aligned fields for ioa_ */
+
+		call ioa_$ioa_switch (arg_info.report_iocbp,
+		     "index registers:^1-^x^2(^4(^6w^x^)^/^2-^x^)", index_regs);
+		call ioa_$ioa_switch (arg_info.report_iocbp,
+		     "^/a: ^w q: ^w  exp: ^3w timer: ^9w ring_alarm: ^1w",
+		     mc.a, mc.q, exponent_register, timer_register, ralr);
+		call ioa_$ioa_switch (arg_info.report_iocbp,
+		     "^/eis_info:^2-^x^2(^4(^w^x^)^/^2-^x^)", mc.eis_info);
+		call ioa_$ioa_switch (arg_info.report_iocbp,
+		     "fault register:^1-^1x^w", fault_reg);
+		call ioa_$ioa_switch (arg_info.report_iocbp, "^/NUM^-OU registers^2-^7xCU registers");
+		j = 0;
+		do i = 0 by 2 to 30;
+		     j = j+1;
+		     call ioa_$ioa_switch (arg_info.report_iocbp, "^o^-^w ^w^12x^w ^w",
+			j, hist_reg (i), hist_reg (i+1),
+			hist_reg (i+32), hist_reg (i+33));
+		end;
+		call ioa_$ioa_switch (arg_info.report_iocbp, "^/NUM^-DU registers^3-AU registers");
+		do i = 64 by 2 to 94;
+		     j = j+1;
+		     call ioa_$ioa_switch (arg_info.report_iocbp, "^o^-^w ^w^12x^w ^w",
+			j-16, hist_reg (i), hist_reg (i+1),
+			hist_reg (i+32), hist_reg (i+33));
+		end;
+		call ioa_$ioa_switch (arg_info.report_iocbp, "");
+		call hran_$hranl (hist_reg_ptr, arg_info.report_iocbp, "0"b);
+		cpu_fault_count = cpu_fault_count + 1;
+	     end;					/* end of copying onc fault record */
+	end;					/* end of while loop */
+copying_done:
+	arg_info.err_nb = 0;
+	if cpu_fault_count = 0 then
+	     call ioa_$ioa_switch (arg_info.report_iocbp,
+	     "^/^-NO CPU FAULTS FOUND DURING SPECIFIED TIME RANGE.");
+	call ioa_$ioa_switch (arg_info.report_iocbp,
+	     "^/END: CPU_ERROR_REPORT");
+	call clean_up;
+
+clean_up:	proc;
+	     if arg_info.iocbp ^= null () then
+		call iox_$close (arg_info.iocbp, code);
+	     return;
+	end clean_up;
+	return;
+     end heals_cpu_reports_;
+   
+
+
+
+		    heals_gen_ioerr_log_.pl1        09/27/84  0748.5rew 09/27/84  0744.1      295911
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+heals_gen_ioerr_log_: proc (heals_arg_info_p, heals_ior_args_p, r_code);
+
+/* ******************************************************************************
+   *								*
+   *  Comments:							*
+   *								*
+   *	Written by RH Morrison  Nov. 19, 1976	 			*
+   *	Last modified by A. Downing 01/14/77
+   *								*
+   ****************************************************************************** */
+/* FF */
+/* ********	DECLARATIONS	******** */
+
+/* ****	PROCEDURE ARGUMENTS   **** */
+dcl  heals_arg_info_p ptr;
+dcl  heals_ior_args_p ptr;
+dcl  r_code fixed bin (35);
+
+/* ****	EXTERNAL STATIC	**** */
+dcl  error_table_$end_of_info ext static fixed bin (35);
+
+/* ****	ENTRIES		**** */
+dcl  ioa_ entry options (variable);
+dcl  com_err_ entry options (variable);
+dcl  clock_ entry returns (fixed bin (71));
+dcl  date_time_ entry (fixed bin (71), char (*));
+dcl  cv_oct_ entry (char (*)) returns (fixed bin (35));
+dcl  ioa_$rsnnl entry options (variable);
+dcl  iox_$attach_ioname entry (char (*), ptr, char (*), fixed bin (35));
+dcl  iox_$close entry (ptr, fixed bin (35));
+dcl  iox_$detach_iocb entry (ptr, fixed bin (35));
+dcl  iox_$open entry (ptr, fixed bin, bit (1) aligned, fixed bin (35));
+dcl  iox_$read_record entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+dcl  iox_$write_record entry (ptr, ptr, fixed bin (21), fixed bin (35));
+dcl  vfile_$vfile_attach entry (ptr, (*) char (*) varying, bit (1) aligned, fixed bin (35));
+
+/* ****	POINTERS		**** */
+dcl  flags_p ptr init (null);
+dcl  work_p1 ptr init (null);
+dcl  outsw_p ptr init (null);
+dcl  sortsw_p ptr init (null);
+dcl  inbuf_p ptr init (null);
+dcl  sort_desc_p (3) ptr init (null, null, null);
+dcl  tape_nfo_p ptr init (null);
+dcl  sort_data_p ptr init (null);
+dcl  syserr_nfo_p ptr init (null);
+dcl  dev_data_p ptr init (null);
+						/*   Arguments  */
+dcl  insw_p ptr init (null);
+
+
+/* pointers declared in include files:
+*/
+
+/* ****	CHARACTER STRING VARIABLES    **** */
+dcl  rprt_from_time char (16);
+dcl  rprt_to_time char (16);
+dcl  work_time char (16);
+dcl  ascii_status char (12);
+dcl  record_name char (13);
+dcl  work_ch1 char (1);
+dcl  inbuf char (inbuf_len) aligned;
+dcl  ioi_buf char (outbuf_len) aligned;
+dcl  bad_rec_buf char (outbuf_len) aligned;
+dcl  disk_buf char (outbuf_len) aligned;
+dcl  misc_buf char (outbuf_len) aligned;
+dcl  pic_w pic "99";
+dcl  bad_name char (7);
+dcl  dev_nm_chk char (4);
+dcl  dev_data_space char (1540);
+dcl  n_a char (3) init ("N/A");
+dcl  date_time char (16);
+dcl  date char (8);
+dcl  time char (6);
+
+/*   Arguments  */
+dcl  whoami char (20) init ("heals_gen_ioerr_log_");
+dcl  version_date char (8) init ("12/15/76");
+dcl  vfile_info (1) char (168) varying;
+
+/* ****	ARITHMETIC VARIABLES    **** */
+dcl  dev_data_stopper fixed bin based (dev_data_p);
+dcl  inbuf_len fixed bin (21) int static init (1024);
+dcl  outbuf_len fixed bin (21) int static init (1024);
+dcl  stream_in fixed bin init (1);
+dcl  stream_out fixed bin init (2);
+dcl  seq_in fixed bin init (4);
+dcl  seq_out fixed bin init (5);
+dcl  status_nb fixed bin (35);
+dcl  i_code fixed bin (35);
+dcl  nb_ioerr_recs fixed bin;
+dcl  ioerr_rec_min_len fixed bin (21);
+dcl  dev_data_size fixed bin;
+dcl (i, j, k, l) fixed bin;
+dcl  ndx fixed bin (24);
+dcl  offs_ndx fixed bin;
+dcl  ss fixed bin;
+dcl  page_nb fixed bin;
+dcl  iom_nb_chk fixed bin (3);
+dcl  ch_nb_chk fixed bin (6);
+dcl  dev_nb_chk fixed bin (6);
+dcl  fake_data_size fixed bin;
+dcl  save_size fixed bin;
+
+/*   Arguments  */
+dcl  code fixed bin (35);
+dcl  inrec_len fixed bin (21);
+dcl  outrec_len fixed bin (21);
+
+dcl  version_nb fixed bin init (1);
+dcl  clock_time fixed bin (71);
+
+/* ****	BIT STRING VARIABLES    **** */
+/*   Working  */
+dcl  unused bit (1) aligned init ("0"b);
+dcl  flags_word bit (36) aligned init ("0"b);
+dcl  found bit (1) aligned;
+dcl  rec_hdr bit (180) based;
+
+/* ****	ARRAY VARIABLES		**** */
+dcl  ntrpt_nm_list (0:7) char (1) aligned init (
+     "", "o", "x", "t", "x", "m", "x", "s");
+
+dcl 1 tape_nfo_ar (1:max_iom_nb_a) aligned,
+    2 tape_entry (0:max_tape_nb_a) like tape_nfo;
+
+dcl  fake_data (2) bit (36) aligned init (
+    (36)"0"b,
+    (36)"0"b);
+
+
+/* ***	BASED VARIABLES   *** */
+dcl 1 flags aligned based (flags_p),
+    (2 trace bit (1),
+    2 db bit (1),
+    2 io_error bit (1),
+    2 sorted_io_error bit (1),
+    2 hdrs bit (1),
+    2 msg bit (1),
+    2 disk_hold bit (1),
+    2 disk_addr bit (1)
+     ) unal;
+
+dcl 1 tape_nfo aligned based (tape_nfo_p),
+    (2 rsn char (7),
+    2 dens char (4),
+    2 tracks char (2),
+    2 ring char (2))unal;
+
+dcl 1 dev_data aligned based (dev_data_p),
+    2 dev_name char (4) aligned,
+    2 used bit (1) aligned,
+    2 ch_nmbr fixed bin (6) aligned,
+    (2 fill1 bit (11),
+    2 dev_nmbr fixed bin (6),
+    2 fill2 bit (14),
+    2 iom_nmbr fixed bin (3)) unal,
+    2 saved_data (2) bit (36) aligned;
+
+dcl 1 ch_nfo_ar (1:max_iom_nb_a) aligned based (ch_nfo_ar_p),
+    2 ch_entry (0:max_ch_nb_a) like ch_nfo;
+
+/*   Arguments  */
+dcl 1 arg_info like heals_arg_info aligned based (heals_arg_info_p);
+
+/* ****	MISC. DECLARATIONS		**** */
+dcl (addr, addrel, index, null, search, size, substr, unspec, verify) builtin;
+dcl  cleanup condition;
+dcl  conversion condition;
+
+/* FF */
+/* ****	INCLUDE FILES	**** */
+%include heals_arg_info;
+%include heals_io_report_args;
+%include heals_ioerr_rec;
+%include heals_message;
+%include io_syserr_msg;
+%include iom_stat;
+%include iocb;
+/* *******	END OF DECLARATIONS	******* */
+/* FF */
+/* ********	PROCEDURE		******** */
+
+/* ****	Procedure Initialization	**** */
+
+	on cleanup call clean_up;
+
+/*  Init returns.  */
+	r_code = 0;
+
+/*  Init pointers.  */
+	flags_p = addr (flags_word);
+	insw_p = arg_info.iocbp;
+	inbuf_p = addr (inbuf);
+	outsw_p = ioerr_log_sw_p;
+	heals_message_p = addr (inbuf);
+
+/*  Init procedure constants.  */
+	ioerr_rec_min_len = size (ioerr_rec) * 4;	/* ioerr_rec is output record */
+	dev_data_size = size (dev_data);		/* size of entry for saving binary data */
+	fake_data_size = size (fake_data);		/* fake data is used when no real data exists */
+
+/*  Init all else.  */
+	code = 0;
+	arg_info.err_nb = 0;
+	call date_time_ (arg_info.from_time, rprt_from_time); /* args to heals_report */
+	call date_time_ (arg_info.to_time, rprt_to_time);
+	nb_ioerr_recs = 0;				/* init output record count */
+
+	ioerr_rec_p = addr (bad_rec_buf);		/* init ioerr_rec buffers */
+	ioerr_rec.data_size = 0;
+	rprt_flags = "0"b;
+	ioerr_rec_p = addr (disk_buf);
+	ioerr_rec.data_size = 0;
+	rprt_flags = "0"b;
+	ioerr_rec_p = addr (ioi_buf);
+	ioerr_rec.data_size = 0;
+	rprt_flags = "0"b;
+	ioerr_rec_p = addr (misc_buf);
+	ioerr_rec.data_size = 0;
+	rprt_flags = "0"b;
+
+	dev_data_p = addr (dev_data_space);		/* init saved data array */
+	dev_data_stopper = -1;			/* set stopper in first entry */
+	dev_data.used = "0"b;			/* set first entry unused */
+	dev_data_p = addrel (dev_data_p, 64*dev_data_size); /* bump pointer to end of dev_data_space */
+	dev_data_stopper = -1;			/* set stopper at end of dev_data_space */
+
+	do i = 1 to max_iom_nb_a;			/* init tape_nfo_ar */
+	  do j = 0 to max_tape_nb_a;
+	    tape_nfo_p = addr (tape_nfo_ar.tape_entry (i, j));
+	    tape_nfo = ".";				/* init data */
+	  end;
+	end;
+
+
+/* ****	End Procedure Initialization    **** */
+
+/*  Run information.  */
+	clock_time = clock_ ();
+	call date_time_ (clock_time, date_time);
+	date = substr (date_time, 1, 8);
+	time = substr (date_time, 11, 6);
+	if flags.trace
+	| ior_flags.trace
+	then call ioa_ ("^a run info: date ^a, time ^a, version ^d of ^a.",
+	  whoami, date, time, version_nb, version_date);
+
+/* ****	Build ioerr_rec and write it to heals_ioerr_log.  **** */
+
+/*  Open heals_ioerr_log file (output).  */
+	call iox_$open (outsw_p, seq_out, unused, code);
+	if code ^= 0 then call proc_err (13);
+
+	on conversion begin;			/* report error on output report */
+	  ioerr_rec_p = addr (bad_rec_buf);		/* assign output buffer */
+	  msg_len = 72;
+	  call ioa_$rsnnl (
+	    "HEALS: conversion condition raised while processing this ^a record.",
+	    ioerr_rec.msg, i, record_name);
+	  msg_len = i;
+	  flags.msg = "1"b;
+	  rprt_flags.msg = "1"b;
+	  call write_ioerr_rec;
+	  go to next_log_rec;			/* keep going */
+	end;
+
+/*  Read first heals_log record.  */
+	call iox_$read_record (insw_p, inbuf_p, inbuf_len, inrec_len, code);
+	if code ^= 0
+	then if code = error_table_$end_of_info
+	  then goto ineof_1;
+	  else call proc_err (17);
+	goto rec_id;
+
+/* **	Record processing loop.	** */
+next_log_rec:
+	call iox_$read_record (insw_p, inbuf_p, inbuf_len, inrec_len, code);
+	if code ^= 0
+	then if code = error_table_$end_of_info		/* normal loop exit, case 1 */
+	  then goto ineof_1;
+	  else call proc_err (14);
+
+/*  Identify record type.  */
+rec_id:
+	record_name = "next";			/* reset record name */
+	if heals_message.time > arg_info.to_time then goto ineof_1; /* exit, case 2 */
+	if substr (heals_message.text, 1, 4) = "RCP:" then goto rcp_rec;
+	if substr (heals_message.text, 1, 8) = "ioi_mask" then goto ioi_rec;
+	if substr (heals_message.text, 1, 7) = "ocdcm_:" then goto ioi_rec;
+	if substr (heals_message.text, 1, 12) = "disk_control" then goto disk_rec;
+	if substr (heals_message.text, 1, 4) = "bulk" then goto bulk_rec;
+	if substr (heals_message.text, 1, 6) = "dn355:" then goto dn355_rec;
+	goto next_log_rec;				/* no record of interest */
+
+/* ****	Process "RCP": records.   * *** */
+rcp_rec:
+	record_name = "RCP:";
+	iom_nb_chk = 1;				/* arbitrary since not included in RCP: records */
+	if index (heals_message.text, " tap") > 0 then
+	  go to tape_recs;
+	goto next_log_rec;				/* all other RCP: records */
+
+tape_recs:
+	offs_ndx = index (heals_message.text, " tap") + 6;	/* get  tape number from text */
+	dev_nb_chk = bin (substr (heals_message.text, offs_ndx, 2), 6, 0);
+	if dev_nb_chk < 0 | dev_nb_chk > max_tape_nb_a	/* within tape_nfo_ar bounds */
+	then do; bad_name = "device";			/* nope */
+	  goto bad_rcp_rec;
+	end;
+	tape_nfo_p = addr (tape_nfo_ar.tape_entry (iom_nb_chk, dev_nb_chk)); /* set entry pointer */
+
+	if index (heals_message.text, "Attached tap") ^= 0 then goto attach_rec;
+	if index (heals_message.text, "Note (tap") ^= 0 then goto note_rec;
+	if index (heals_message.text, "Mount Reel") ^= 0 then goto mount_rec;
+	if index (heals_message.text, "Remount Reel") ^= 0 then goto mount_rec;
+	goto next_log_rec;				/* all other tape records */
+
+attach_rec:
+	tape_nfo = "?";				/* overwrite old values */
+	goto next_log_rec;
+
+note_rec:
+	ndx = index (heals_message.text, "den=");	/* determine density */
+	if ndx ^= 0
+	then do; work_ch1 = substr (heals_message.text, ndx + 7, 1);
+	  i = verify (work_ch1, "0123456789");
+	  if i = 0
+	  then tape_nfo.dens = substr (heals_message.text, ndx + 4, 4);
+	  else tape_nfo.dens = substr (heals_message.text, ndx + 4, 3);
+	end;
+	else tape_nfo.dens = "dflt";			/* density not specified */
+
+	if index (heals_message.text, "7track") ^= 0	/* determine number of tracks */
+	then tape_nfo.tracks = " 7";
+	else if index (heals_message.text, "9track") ^= 0
+	then tape_nfo.tracks = " 9";
+	else tape_nfo.tracks = "df";			/* tracks not specified */
+	goto next_log_rec;
+
+mount_rec:
+	if index (heals_message.text, "without") ^= 0	/* determine if write ring */
+	then tape_nfo.ring = "no";
+	else if index (heals_message.text, "with") ^= 0
+	then tape_nfo.ring = "ys";
+	else tape_nfo.ring = "df";			/* ring not specified */
+
+	ndx = index (heals_message.text, "Reel") + 5;	/* tape serial number or name */
+	offs_ndx = index (substr (heals_message.text, ndx), " ");
+	if offs_ndx ^> 1
+	then do; bad_name = "text";			/* something is wrong */
+	  goto bad_rcp_rec;
+	end;
+	if offs_ndx > 8
+	then tape_nfo.rsn = substr (heals_message.text, ndx, 7);
+	else tape_nfo.rsn = substr (heals_message.text, ndx, offs_ndx - 1);
+
+	if tape_nfo.dens = "?" then tape_nfo.dens = "dflt"; /* if no Note recored */
+	if tape_nfo.tracks = "?" then tape_nfo.tracks = "df"; /* ditto */
+	goto next_log_rec;
+
+bad_rcp_rec:
+	ioerr_rec_p = addr (bad_rec_buf);
+	ioerr_rec.data_size = 0;			/* force use of fake data */
+	call load_sort_data;
+	dev_nm_chk = dev_nm;
+	call get_iom_ch_nb;
+	dev_nb = dev_nb_chk;
+	goto bad_rec;
+
+
+/* ****	Process "ioi_interrupt" records.	**** */
+ioi_rec:
+	record_name = "ioi_";
+	io_msgp = addr (heals_message.data);		/* records have binary data */
+	call convert_channame_kludge (io_msg.channel, iom_nb_chk, ch_nb_chk);
+	if iom_nb_chk < 1 | iom_nb_chk > max_iom_nb_a	/* within bounds */
+	then do; bad_name = "iom";			/* nope */
+	  dev_nm_chk = "????";			/* fake it */
+	  goto bad_ioi_rec;
+	end;
+	if ch_nb_chk < 0 | ch_nb_chk > max_ch_nb_a
+	then do; bad_name = "channel";
+	  dev_nm_chk = "????";
+	  goto bad_ioi_rec;
+	end;
+	if io_msg.time_out
+	then dev_nm_chk = "chnl";
+	else do;
+	  ch_nfo_p = addr (ch_nfo_ar.ch_entry (iom_nb_chk, ch_nb_chk));
+	  if heals_message.data_size = 3
+	  then dev_nm_chk = devname;
+	  else if ch_nfo.i_set
+	  then dev_nm_chk = ch_nfo.dev_nam;
+	  else do; bad_name = "ch_unkn";		/* usually if system was reconfigured */
+	    dev_nm_chk = "????";			/* ^ between time of error and time of HEALS run */
+	    goto bad_ioi_rec;
+	  end;
+	end;
+	if substr (dev_nm_chk, 1, 3) = "tap" then do;
+	  dev_nb_chk = bin (io_msg.device, 6, 0);
+	  if dev_nb_chk < 0 | dev_nb_chk > max_tape_nb_a
+	  then do; bad_name = "device";
+	    goto bad_ioi_rec;
+	  end;
+	end;
+	ioerr_rec_p = addr (ioi_buf);			/* looks good - assign output buffer */
+	call move_syserr_nfo;			/* move info from heals_log record to ioerr_rec */
+	call load_sort_data;			/* fill in ioerr_rec.sort_data from binary data */
+
+/* Specific device info.  */
+
+/* Channel timeout. */
+	if io_msg.time_out
+	then do; dev_nm = "chnl";			/* as good a name as any */
+	  dev_model = 9999;				/* dummy model number */
+	  ioerr_rec.tape_disk_nfo = "";		/* null tape,disk info fields */
+	  tapno_diskad = "timeout";			/* use this column to say what happened */
+	  goto write_ioi_rec;
+	end;
+
+/* All other devices. */
+	dev_nm = dev_nm_chk;
+	if ch_nfo.i_set
+	then dev_model = ch_nfo.model;
+	else dev_model = 9999;
+	if substr (dev_nm, 1, 3) = "tap" then
+	  goto tape_err;
+	if substr (dev_nm, 1, 3) = "prt" then goto ur_err;
+	if substr (dev_nm, 1, 3) = "rdr" then goto ur_err;
+	if substr (dev_nm, 1, 3) = "pun" then goto ur_err;
+	if substr (dev_nm, 1, 3) = "dsk" then goto disk_err;
+	if substr (dev_nm, 1, 3) = "opc" then goto ur_err;
+	bad_name = "dv_unkn";			/* just in case */
+	dev_nm_chk = dev_nm;			/* report what it was */
+	goto bad_ioi_rec;
+
+tape_err:
+	tape_nfo_p = addr (tape_nfo_ar.tape_entry (iom_nb, dev_nb));
+	tapno_diskad = tape_nfo.rsn;			/* retrieve data from RCP: records */
+	dens_cyl = tape_nfo.dens;
+	tracks_sector = tape_nfo.tracks;
+	ring_head = tape_nfo.ring;
+	goto write_ioi_rec;
+
+disk_err:
+	ioerr_rec.tape_disk_nfo = "";			/* null until more info is logged */
+	tapno_diskad = "disk IO";			/* note it is user IO, not disk_control: */
+	goto write_ioi_rec;
+
+ur_err:
+	ioerr_rec.tape_disk_nfo = "";
+	tapno_diskad = n_a;				/* say it is not applicable */
+	goto write_ioi_rec;
+
+write_ioi_rec:
+	rprt_flags.ioerr = "1"b;
+	call write_ioerr_rec;
+	goto next_log_rec;
+
+bad_ioi_rec:
+	ioerr_rec_p = addr (bad_rec_buf);
+	ioerr_rec.data_size = heals_message.data_size;	/* use binary data in ioi_interrupt records */
+	call load_sort_data;
+	goto bad_rec;
+
+/* ****	Process "disk_control:" records.   * *** */
+disk_rec:
+	record_name = "disk_control:";
+	ioerr_rec_p = addr (disk_buf);
+	if index (heals_message.text, "Lost IOM") ^= 0 then goto iom_rec;
+	if index (heals_message.text, "Unex") ^= 0 then goto iom_rec;
+	if index (heals_message.text, "(iom") ^= 0 then goto disk_stat_rtrn;
+	if index (heals_message.text, "detail") ^= 0 then goto disk_detail;
+	if index (heals_message.text, "sect=") ^= 0 then goto disk_addr;
+	goto next_log_rec;
+
+iom_rec:
+	ndx = index (heals_message.text, "iom");
+	iom_nb_chk = bin (substr (heals_message.text, ndx + 4, 1)); /* get iom number */
+	ndx = index (heals_message.text, "dsk");
+	dev_nm_chk = substr (heals_message.text, ndx, 4); /* get device name */
+	offs_ndx = index (substr (heals_message.text, ndx + 5), " ");
+	if offs_ndx > 1
+	then dev_nb_chk = bin (substr (heals_message.text, ndx + 5, offs_ndx - 1)); /* device number */
+	else do; dev_nb_chk = 0;			/* something is wrong */
+	  goto bad_disk_rec;
+	end;
+	ndx = index (heals_message.text, "chan");
+	offs_ndx = index (substr (heals_message.text, ndx +5), ")");
+	if offs_ndx = 2
+	then ch_nb_chk = bin (substr (heals_message.text, ndx+5, 1)); /* single digit number */
+	else if offs_ndx = 3
+	then ch_nb_chk = bin (substr (heals_message.text, ndx+6, 1)) +
+	  bin (substr (heals_message.text, ndx+5, 1))*8;	/* change from octal to decimal */
+	else goto bad_disk_rec;
+	if flags.disk_hold				/* if holding data in buffer */
+	then do; call save_data;			/* then save it */
+	  flags.disk_hold = "0"b;			/* reset flag */
+	end;
+	call move_syserr_nfo;			/* build ioerr_rec */
+	call load_sort_data;
+	iom_nb = iom_nb_chk;
+	ch_nb = ch_nb_chk;
+	dev_nb = dev_nb_chk;
+	dev_nm = dev_nm_chk;
+	tape_disk_nfo = "";
+	msg_len = 38;
+	ndx = index (heals_message.text, "Lost");
+	if ndx ^= 0 then ioerr_rec.msg = substr (heals_message.text, ndx, 18);
+	else do; ndx = index (heals_message.text, "IOM");
+	  if ndx ^= 0 then ioerr_rec.msg = substr (heals_message.text, ndx, 35);
+	  else ioerr_rec.msg = "";
+	end;
+	flags.msg = "1"b;
+	rprt_flags.iom_rec = "1"b;			/* set format flag */
+	goto write_disk_rec;			/* write the ioerr_rec record */
+
+disk_stat_rtrn:
+	if flags.disk_hold
+	then call save_data;			/* save the data being held */
+	else flags.disk_hold = "1"b;			/* hold the new data */
+	call move_syserr_nfo;			/* build ioerr_rec */
+	call load_sort_data;
+	if heals_message.data_size = 3
+	then dev_nm = devname;
+	else do; ndx = index (heals_message.text, "dsk");
+	  dev_nm = substr (heals_message.text, ndx, 4);
+	end;
+	if index (heals_message.text, "sect=") = 0
+	then tape_disk_nfo = "";
+	else do;
+	  flags.disk_hold = "0"b;
+	  ndx = index (heals_message.text, "sect=");	/* get continuous address */
+	  offs_ndx = index (substr (heals_message.text, ndx), ",");
+	  if offs_ndx ^> 6 then goto bad_disk_rec;
+	  tapno_diskad = substr (heals_message.text, ndx + 5, offs_ndx - 6); /* number in ascii */
+	  do while (search (tapno_diskad, " ") > 0);
+	    tapno_diskad = "0" || tapno_diskad;		/* Eliminate blanks */
+	  end;
+	  i = bin (substr (heals_message.text, ndx + 5, offs_ndx - 6)); /* number in binary */
+
+	  ndx = index (heals_message.text, "cyl=");	/* get cylinder number */
+	  offs_ndx = index (substr (heals_message.text, ndx), ",");
+	  if offs_ndx ^> 5 then goto bad_disk_rec;
+	  dens_cyl = substr (heals_message.text, ndx +4, offs_ndx - 5);
+	  j = bin (substr (heals_message.text, ndx + 4, offs_ndx - 5));
+
+	  ndx = index (heals_message.text, "hd=");	/* get head number */
+	  offs_ndx = index (substr (heals_message.text, ndx), ",");
+	  if offs_ndx ^> 4 then goto bad_disk_rec;
+	  ring_head = substr (heals_message.text, ndx +3, offs_ndx -4);
+	  k = bin (substr (heals_message.text, ndx + 3, offs_ndx -4));
+
+	  l = i - j*760 - k*40;			/* get sector number */
+	  pic_w = l;
+	  tracks_sector = pic_w;
+	end;
+
+	if index (heals_message.text, "detail") = 0
+	then rprt_flags.ioerr = "1"b;			/* set the format flag */
+	else do;
+	  ndx = index (heals_message.text, "status:") + 8; /* get extended status text */
+	  msg_len = text_len - ndx +12;
+	  ioerr_rec.msg = "extended: (" || substr (heals_message.text, ndx, text_len-ndx) || ")";
+						/* reformat it */
+	  flags.msg = "1"b;				/* ioerr_rec contains a message */
+	  rprt_flags.diskerr = "1"b;			/* report line format */
+	end;
+
+	goto write_disk_rec;
+
+disk_detail:
+	ndx = index (heals_message.text, "dsk");
+	dev_nm_chk = substr (heals_message.text, ndx, 4);
+	offs_ndx = index (substr (heals_message.text, ndx + 5), " ");
+	if offs_ndx > 1
+	then dev_nb_chk = bin (substr (heals_message.text, ndx + 5, offs_ndx - 1));
+	else do; dev_nb_chk = 0;			/* something is wrong */
+	  goto bad_disk_rec;
+	end;
+	call move_syserr_nfo;			/* does not change dev_nb, dev_nm, or binary data */
+	ioerr_rec.data_size = save_size;		/* restore previous size */
+	if dev_nm ^= dev_nm_chk | dev_nb ^= dev_nb_chk | dev_cmnd = "000000"b
+	then do;					/* data in buffer not for this device */
+	  if flags.disk_hold then call save_data;	/* save the binary data */
+	  call retrieve_data;
+	  if i_code = 0 then dev_data.used = "0"b;	/* reset so that space can be re-used */
+	  call load_sort_data;
+	  if i_code ^= 0				/* fake data was used */
+	  then do; call get_iom_ch_nb;
+	    dev_nb = dev_nb_chk;			/* overwrite fake_data */
+	  end;
+	  dev_nm = dev_nm_chk;
+	end;
+	flags.disk_hold = "0"b;			/* reset flag */
+	ndx = index (heals_message.text, "status:") + 8;	/* get extended status text */
+	msg_len = text_len - ndx +12;
+	ioerr_rec.msg = "extended: (" || substr (heals_message.text, ndx, text_len-ndx) || ")";
+						/* reformat it */
+	flags.msg = "1"b;				/* ioerr_rec contains a message */
+	rprt_flags.ext_stat = "1"b;			/* report line format */
+	goto write_disk_rec;
+
+disk_addr:
+	ndx = index (heals_message.text, "dsk");
+	dev_nm_chk = substr (heals_message.text, ndx, 4);
+	offs_ndx = index (substr (heals_message.text, ndx + 5), " ");
+	if offs_ndx > 1
+	then dev_nb_chk = bin (substr (heals_message.text, ndx + 5, offs_ndx - 1));
+	else do; dev_nb_chk = 0;			/* something is wrong */
+	  goto bad_disk_rec;
+	end;
+	call move_syserr_nfo;			/* does not change dev_nb, dev_nm, or binary data */
+	ioerr_rec.data_size = save_size;		/* restore previous size */
+	if dev_nm ^= dev_nm_chk | dev_nb ^= dev_nb_chk | dev_cmnd = "000000"b
+	then do;					/* data in buffer not for this device */
+	  if flags.disk_hold
+	  then do; flags.disk_hold = "0"b;
+	    call save_data;
+	  end;
+	  call retrieve_data;
+	  call load_sort_data;
+	  if i_code ^= 0				/* fake data was used */
+	  then do; call get_iom_ch_nb;
+	    dev_nb = dev_nb_chk;			/* overwrite fake_data */
+	  end;
+	  dev_nm = dev_nm_chk;
+	end;
+	ndx = index (heals_message.text, "sect=");	/* get continuous address */
+	offs_ndx = index (substr (heals_message.text, ndx), ",");
+	if offs_ndx ^> 6 then goto bad_disk_rec;
+	tapno_diskad = substr (heals_message.text, ndx + 5, offs_ndx - 6);
+	do while (search (tapno_diskad, " ") > 0);
+	  tapno_diskad = "0" || tapno_diskad;		/* Eliminate blanks */
+	end;
+	i = bin (substr (heals_message.text, ndx + 5, offs_ndx - 6));
+
+	ndx = index (heals_message.text, "cyl=");	/* get cylinder number */
+	offs_ndx = index (substr (heals_message.text, ndx), ",");
+	if offs_ndx ^> 5 then goto bad_disk_rec;
+	dens_cyl = substr (heals_message.text, ndx +4, offs_ndx - 5);
+	j = bin (substr (heals_message.text, ndx + 4, offs_ndx - 5));
+
+	ndx = index (heals_message.text, "hd=");	/* get head number */
+	offs_ndx = index (substr (heals_message.text, ndx), ",");
+	if offs_ndx ^> 4 then goto bad_disk_rec;
+	ring_head = substr (heals_message.text, ndx +3, offs_ndx -4);
+	k = bin (substr (heals_message.text, ndx + 3, offs_ndx -4));
+
+	l = i - j*760 - k*40;			/* get sector number */
+	pic_w = l;
+	tracks_sector = pic_w;
+	rprt_flags.disk_addr = "1"b;			/* report line format */
+	goto write_disk_rec;
+
+write_disk_rec:
+	call write_ioerr_rec;
+	goto next_log_rec;
+
+bad_disk_rec:
+	ioerr_rec_p = addr (bad_rec_buf);
+	bad_name = "text";
+	ioerr_rec.data_size = 0;			/* force fake data */
+	call load_sort_data;
+	call get_iom_ch_nb;
+	goto bad_rec;
+
+/* ****	Process miscellaneous record types.	* *** */
+
+bulk_rec:						/* not an IO error, but nowhere else to put it */
+	record_name = "bulk";
+	ioerr_rec_p = addr (misc_buf);		/* assign output buffer */
+	call move_syserr_nfo;
+	call load_sort_data;
+	dev_nb = bulk_port;				/* port number is  used for device number */
+	dev_nm = "bulk";
+	ioerr_rec.msg_len = heals_message.text_len;
+	ioerr_rec.msg = heals_message.text;		/* print the syserr_log text */
+	flags.msg = "1"b;
+	rprt_flags.bulk = "1"b;
+	call write_ioerr_rec;
+	goto next_log_rec;
+
+dn355_rec:
+	if index (heals_message.text, "status") = 0 then goto next_log_rec;
+	record_name = "dn355";
+	ioerr_rec_p = addr (misc_buf);
+	call move_syserr_nfo;
+	ndx = index (heals_message.text, ":");
+	dev_nm = "355" || substr (heals_message.text, ndx +6, 1);
+	ioerr_rec.data_size = 2;
+	ioerr_rec.data = fake_data;
+	ndx = index (heals_message.text, "status");
+	ascii_status = substr (heals_message.text, ndx +7, 6)
+	  || substr (heals_message.text, ndx +14, 6);
+	status_nb = cv_oct_ (ascii_status);
+	ioerr_rec.data (2) = unspec (status_nb);
+	call load_sort_data;
+	dev_nm_chk = dev_nm;
+	call get_iom_ch_nb;
+	dev_nb = 1;
+	ioerr_rec.tape_disk_nfo = "";
+	tapno_diskad = n_a;
+	rprt_flags.ioerr = "1"b;
+	call write_ioerr_rec;
+	goto next_log_rec;
+
+bad_rec:
+	call move_syserr_nfo;			/* build ioerr_rec */
+	if ioerr_rec.data_size = 0
+	then ioerr_rec.data_size = save_size;		/* restore previous size */
+	dev_nm = dev_nm_chk;
+	msg_len = 38;
+	if bad_name = "text"			/* something wrong in extracting from text */
+	then call ioa_$rsnnl (
+	  "HEALS: error in extracting from text",
+	  ioerr_rec.msg, i);
+	else if bad_name = "ch_unkn" | bad_name = "dv_unkn" /* probably config change */
+	then do; if bad_name = "ch_unkn"
+	  then bad_name = "channel";
+	  else bad_name = "device";
+	  call ioa_$rsnnl (
+	    "HEALS: ^a not in config_table.",
+	    ioerr_rec.msg, i, bad_name);
+	end;
+	else call ioa_$rsnnl (
+	  "HEALS: ^a number is out of range.",
+	  ioerr_rec.msg, i, bad_name);		/* out of array bounds */
+	msg_len = i;
+	flags.msg = "1"b;
+	rprt_flags.bad_rec = "1"b;
+	call write_ioerr_rec;
+	goto next_log_rec;
+
+ineof_1:						/* end of file on heals_log */
+	revert conversion;
+	if nb_ioerr_recs = 0 then do; ior_flags.no_recs = "1"b; /* possibly there are no error recs */
+	end;
+	call iox_$close (ioerr_log_sw_p, code);
+	if code ^= 0 then call proc_err (7);
+
+/*  Writing of heals_ioerr_log file completed.  */
+
+/* FF  */
+
+
+	/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+	/*									*/
+	/* The following procedure is a no-no.  Ideally, there would be a system procedure to do	*/
+	/* what it does, or heals should just use the string provided in io_msg.  What it does	*/
+	/* is take a string and convert it to iom number and channel number.  If the string is	*/
+	/* unconvertible, it sets these values to -1.  It is up to the caller to detect this	*/
+	/* problem.								*/
+	/*									*/
+	/*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * */
+
+convert_channame_kludge: proc (chanid, iom, chan);
+
+   dcl chanid char (8) aligned;
+   dcl iom fixed bin (3);
+   dcl chan fixed bin (6);
+
+     iom = index ("ABCD", substr (chanid, 1, 1));
+     if iom < 1 then goto bad_name;
+     if verify (rtrim (substr (chanid, 2)), "0123456789") ^= 0 then goto bad_name;
+     chan = binary (substr (chanid, 2), 7);
+     return;
+
+bad_name:
+     iom, chan = -1;				/* assume failure */
+     return;
+
+     end convert_channame_kludge;
+
+write_ioerr_rec: proc;
+	  if initiate				/* initiate interrupt */
+	  then do;				/* get rid of flags */
+	    if tapno_diskad = "?" then tapno_diskad = "";
+	    if ring_head = "?" then ring_head = "";
+	    if dens_cyl = "?" then dens_cyl = "";
+	    if tracks_sector = "?" then tracks_sector = "";
+	  end;
+
+	  nb_ioerr_recs = nb_ioerr_recs + 1;		/* keep count of records written */
+	  outrec_len = ioerr_rec_min_len + ioerr_rec.data_size * 4; /* account for data size */
+	  if flags.msg then outrec_len = outrec_len + msg_len; /* account for message length */
+	  call iox_$write_record (outsw_p, ioerr_rec_p, outrec_len, code);
+	  if code ^= 0 then call proc_err (15);
+	  flags.msg = "0"b;				/* reset flags */
+	  rprt_flags = "0"b;
+	  return;
+	end write_ioerr_rec;
+
+
+	return;
+
+move_syserr_nfo: proc;
+	  syserr_nfo_p = addr (ioerr_rec.syserr_nfo);	/* set pointer into current buffer */
+	  save_size = ioerr_rec.data_size;		/* save the data size in order to reload it */
+	  syserr_nfo_p -> rec_hdr = heals_message_p -> rec_hdr; /* move data from heals_log record */
+	  ioerr_rec.msg_len = 0;			/* usually no message in ioerr_rec */
+	  if ioerr_rec.data_size ^= 0			/* now equal to heals_message.data_size */
+	  then ioerr_rec.data = heals_message.data;	/* move the new data */
+
+	  call date_time_ ((heals_message.time), work_time); /* convert syserr_log time */
+	  sort_date = substr (work_time, 1, 8);		/* fill in ioerr_rec.sort_rec */
+	  log_time = substr (work_time, 11, 6);
+	  return;
+	end move_syserr_nfo;
+
+load_sort_data: proc;
+	  i_code = 0;
+	  if ioerr_rec.data_size = 0			/* if no data */
+	  then do; ioerr_rec.data_size = fake_data_size;	/* then fake it */
+	    ioerr_rec.data = fake_data;
+	    i_code = 1;				/* fake data used  */
+	  end;
+
+	  io_msgp = addr (ioerr_rec.data);		/* fill in ioerr_rec.sort_rec */
+	  statp = addr (io_msg.status);
+	  call convert_channame_kludge (io_msg.channel, iom_nb_chk, ch_nb_chk);
+	  iom_nb = iom_nb_chk;
+	  ch_nb = ch_nb_chk;
+	  dev_nb = bin (io_msg.device);
+	  dev_cmnd = io_msg.command;
+	  ss = bin (io_msg.level);
+	  ntrpt_nm = ntrpt_nm_list (ss);
+
+	  power_off = power;
+	  maj_st = "00"b || major;
+	  sub_st = sub;
+	  ntrpt_no = initiate;			/* initiate interrupt */
+	  if initiate then ntrpt_nm = "i";
+	  iom_st = channel_stat || central_stat;
+	  rec_cnt_res = rcount;
+	  return;
+	end load_sort_data;
+
+get_iom_ch_nb: proc;				/* get iom and channel number for device name */
+	  i_code = 0;
+	  found = "0"b;
+	  do i = 1 to max_iom_nb_a while (^found);
+	    do j = 0 to max_ch_nb_a while (^found);
+	      if ch_nfo_ar.ch_entry.dev_nam (i, j) = dev_nm_chk
+	      then do;
+	        iom_nb = i;
+	        ch_nb = j;
+	        found = "1"b;
+	      end;
+	    end;
+	  end;
+
+	  if ^found then i_code = 1;			/* did not find entry for device name */
+	  return;
+	end get_iom_ch_nb;
+
+save_data: proc;					/* save ioerr_rec data for future use */
+	  i_code = 0;
+	  found = "0"b;
+	  if ioerr_rec.data_size = 0			/* should not happen */
+	  then do; i_code = 1;
+	    return;
+	  end;
+	  if ioerr_rec.data_size ^= 2 then ioerr_rec.data_size = 2;
+
+/* Search for entry by device address to overwrite unused old data. */
+	  dev_data_p = addr (dev_data_space);
+	  do while (dev_data_stopper ^= -1 & ^found);
+	    if ch_nb = ch_nmbr
+	    then if dev_nb = dev_nmbr
+	      then if iom_nb = iom_nmbr
+	        then do;				/* matched with old entry */
+		saved_data = ioerr_rec.data;
+		dev_name = dev_nm;
+		dev_data.used = "1"b;
+		found = "1"b;
+	        end;
+	    if ^found then dev_data_p = addrel (dev_data_p, dev_data_size); /* to next entry */
+	  end;
+
+/* Search for unused entry. */
+	  if ^found then do;
+	    dev_data_p = addr (dev_data_space);
+	    i = 0;				/* initialize count */
+	    do while (dev_data_stopper ^= -1 & ^found);
+	      i = i +1;				/* count number of entries */
+	      if ^dev_data.used then found = "1"b;;	/* found one */
+	      if ^found then dev_data_p = addrel (dev_data_p, dev_data_size); /* to next entry */
+	    end;					/* didn't find one */
+	  end;
+
+	  if ^found then if i <= 64			/* do not go beyond assigned space */
+	    then do;
+	      work_p1 = addrel (dev_data_p, dev_data_size); /* set stopper in next entry */
+	      work_p1 -> dev_data_stopper = -1;
+	      found = "1"b;
+	    end;
+	    else i_code = 1;			/* data not saved  */
+
+	  if found then do;				/* unused or new entry */
+	    ch_nmbr = ch_nb;
+	    dev_nmbr = dev_nb;
+	    iom_nmbr = iom_nb;
+	    dev_name = dev_nm;
+	    saved_data = ioerr_rec.data;
+	    dev_data.used = "1"b;
+	  end;
+	  return;
+	end save_data;
+
+retrieve_data: proc;				/* retrive previously saved data */
+	  i_code = 0;
+	  dev_data_p = addr (dev_data_space);		/* initialize pointer */
+	  found = "0"b;
+	  do while (dev_data_stopper ^= -1 & ^found);
+	    if dev_nm_chk = dev_name			/* search by device name and number */
+	    then if dev_nb_chk = dev_nmbr
+	      then do;
+	        iom_nb = iom_nmbr;			/* move info to ioerr_rec */
+	        ch_nb = ch_nmbr;
+	        ioerr_rec.data_size = 2;
+	        ioerr_rec.data = saved_data;
+	        found = "1"b;
+	      end;
+	    if ^found then dev_data_p = addrel (dev_data_p, dev_data_size); /* to next entry */
+	  end;
+	  if ^found then do; i_code = 1;		/* no entry found */
+	    ioerr_rec.data_size = 0;			/* set data size to 0 as a flag */
+	  end;
+	  return;
+	end retrieve_data;
+
+/* FF */
+proc_err:	proc (proc_err_nb);
+dcl  proc_err_nb fixed bin;
+	  r_code = code;
+	  call com_err_ (code, whoami, "Procedure error number = ^d.", proc_err_nb);
+	  call clean_up;
+	  goto err_return;
+	end proc_err;
+
+clean_up:	proc;
+	  if sortsw_p ^= null ()
+	  then do; if sortsw_p -> iocb.open_descrip_ptr ^= null ()
+	    then call sortsw_p -> iocb.close (sortsw_p, code);
+	    if sortsw_p -> iocb.attach_descrip_ptr ^= null ()
+	    then call sortsw_p -> iocb.detach_iocb (sortsw_p, code);
+	  end;
+	  return;
+	end clean_up;
+
+err_return: return;
+
+
+        end heals_gen_ioerr_log_;
+ 
+
+
+
+		    heals_io_report_gen_.pl1        09/27/84  0748.5rew 09/27/84  0745.2       76743
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+heals_io_report_gen_: proc (heals_arg_info_p, heals_ior_args_p, r_code);
+
+/* ******************************************************************************
+   *								*
+   *  Comments:							*
+   *								*
+   *	Written by RH Morrison  Dec. 1, 1976	 			*
+   *	Last modified by RH Morrison  01/03/77				*
+   *								*
+   ****************************************************************************** */
+
+/* FF */
+/* ********	DECLARATIONS	******** */
+
+/* ****	PROCEDURE ARGUMENTS   **** */
+
+dcl  heals_arg_info_p ptr;
+dcl  heals_ior_args_p ptr;
+dcl  r_code fixed bin (35);
+
+/* ****	EXTERNAL STATIC	**** */
+
+dcl  error_table_$end_of_info ext static fixed bin (35);
+
+/* ****	ENTRIES		**** */
+
+dcl  ioa_ entry options (variable);
+dcl  ioa_$ioa_switch entry options (variable);
+dcl  clock_ entry returns (fixed bin (71));
+dcl  com_err_ entry options (variable);
+dcl  date_time_ entry (fixed bin (71), char (*));
+dcl  iox_$close entry (ptr, fixed bin (35));
+dcl  iox_$open entry (ptr, fixed bin, bit (1) aligned, fixed bin (35));
+dcl  iox_$read_record entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+
+/* ****	POINTERS		**** */
+dcl  flags_p ptr init (null);
+dcl  work_p1 ptr init (null);
+
+/*   Arguments  */
+dcl  inbuf_p ptr init (null);
+dcl  insw_p ptr init (null);
+dcl  outsw_p ptr init (null);
+
+/* Pointers declared elsewhere:
+   ior_flags_p
+   ior_parms_p
+   ch_nfo_p
+   ior_avars_p
+   ioerr_rec_p
+   io_msgp
+   statp
+   */
+
+/* ****	CHARACTER STRING VARIABLES    **** */
+dcl  inbuf char (inbuf_len) aligned;
+dcl  rprt_from_time char (16);
+dcl  rprt_to_time char (16);
+dcl  old_date char (8);
+dcl  date char (8);
+dcl  time char (6);
+dcl  date_time char (16);
+dcl  ch_nr pic "99";
+dcl  dev_nr pic "99";
+
+/*   Arguments  */
+dcl  whoami char (20) init ("heals_io_report_gen_");
+dcl  version_date char (8) init ("12/15/76");
+
+/* ****	ARITHMETIC VARIABLES    **** */
+dcl  clock_time fixed bin (71);
+dcl  line_cnt fixed bin;
+dcl  max_line_cnt fixed bin;
+dcl  page_nb fixed bin;
+
+/*   Arguments  */
+dcl  code fixed bin (35);
+dcl  version_nb fixed bin init (1);
+dcl  inrec_len fixed bin (21);
+dcl  inbuf_len fixed bin (21) int static init (1024);
+dcl  seq_in fixed bin int static init (4);
+
+/* ****	BIT STRING VARIABLES    **** */
+dcl  flags_word bit (36) aligned;
+dcl  eof bit (1) aligned;
+
+/*   Arguments  */
+dcl  unused bit (1) aligned int static init ("0"b);
+
+/* ****	BASED VARIABLES   **** */
+dcl 1 flags aligned based (flags_p),
+    (2 trace bit (1),
+    2 db bit (1),
+    2 hdrs bit (1),
+    2 no_recs bit (1),
+    2 fill (1)
+     ) unal;
+
+dcl 1 arg_info like heals_arg_info aligned based (heals_arg_info_p);
+
+/* ****	MISC. DECLARATIONS		**** */
+
+dcl (addr, fixed, null, substr) builtin;
+dcl  cleanup condition;
+
+/* FF */
+/* ****	INCLUDE FILES	**** */
+%include heals_arg_info;
+%include heals_io_report_args;
+%include heals_ioerr_rec;
+%include io_syserr_msg;
+%include iom_stat;
+/* ****	END OF DECLARATIONS   **** */
+/* FF */
+/* ********	PROCEDURE		******** */
+
+/* ****	Procedure Initialization	**** */
+
+	on cleanup call clean_up;
+
+/*  Init returns.  */
+	r_code = 0;
+	arg_info.err_nb = 0;
+
+/*  Init pointers.  */
+	flags_p = addr (flags_word);
+	insw_p = ioerr_log_sw_p;
+	outsw_p = arg_info.report_iocbp;
+	inbuf_p = addr (inbuf);
+	ioerr_rec_p = addr (inbuf);
+	io_msgp = addr (ioerr_rec.data);
+	statp = addr (io_msg.status);
+
+/*  Init control flags.  */
+	flags_word = "0"b;
+	flags.hdrs = "1"b;
+	flags.no_recs = ior_flags.no_recs;
+	eof = "0"b;
+
+/*  Init all else.  */
+
+	code = 0;
+	old_date = "";
+	page_nb = 0;
+	line_cnt = 0;
+	max_line_cnt = max_line_cnt_a;
+	call date_time_ (arg_info.from_time, rprt_from_time);
+	call date_time_ (arg_info.to_time, rprt_to_time);
+
+/* ****	End Procedure Initialization    **** */
+
+/*  Run information.  */
+	clock_time = clock_ ();
+	call date_time_ (clock_time, date_time);
+	date = substr (date_time, 1, 8);
+	time = substr (date_time, 11, 6);
+	if flags.trace
+	| ior_flags.trace
+	then call ioa_ ("^a run info: date ^a, time ^a, version ^d of ^a.",
+	  whoami, date, time, version_nb, version_date);
+
+/*  Open heals_ioerr_log file and read first record.  */
+	if ^flags.no_recs
+	then do;
+	  call iox_$open (insw_p, seq_in, unused, code);
+	  if code ^= 0 then call proc_err (30);
+	  call iox_$read_record (insw_p, inbuf_p, inbuf_len, inrec_len, code);
+	  if code ^= 0
+	  then if code = error_table_$end_of_info
+	    then flags.no_recs = "1"b;
+	    else call proc_err (35);
+	end;
+
+/*  Record processing loop.  */
+io_report_line_loop:
+	do while (^eof);
+	  if flags.hdrs
+	  then do; page_nb = page_nb + 1;
+	    line_cnt = 5;
+	    call ioa_$ioa_switch (outsw_p,
+	      "^|IO_ERROR_REPORT:^x^a^xTO^x^a^12xPAGE^x^2d^/",
+	      rprt_from_time, rprt_to_time, page_nb);
+
+	    call ioa_$ioa_switch (outsw_p,
+	      "S_Y_S_E_R_R_____L_O_G_^3x_____D_E_V_I_C_E_____^3xS_T_A_T_U_S__^3xTLY^3xTAPE_NO^2xSTATUS_RETURN
+TIME   NUMBER^3xNAME I-CC-DD CM^3xMJ-SB-I^9xDISK_AD");
+
+	    if flags.no_recs then eof = "1"b;
+	  end;
+
+/* Write date line. */
+	  if ^eof
+	  then do; if sort_date ^= old_date | flags.hdrs	/* write date line after headers */
+	    then do; old_date = sort_date;
+	      flags.hdrs = "0"b;
+	      line_cnt = line_cnt + 4;
+	      call ioa_$ioa_switch (outsw_p, "^/^72(_^)^/DATE:^x^a^vxDATE:^x^a^/",
+	        sort_date, 44, sort_date);
+	    end;
+
+	    ch_nr = fixed (ch_nb);			/* pad one digit numbers on left */
+	    dev_nr = fixed (dev_nb);
+
+/*  Write io_error report line.  */
+	    line_cnt = line_cnt + 1;
+
+	    if rprt_flags.ioerr
+	    then call ioa_$ioa_switch (outsw_p,
+	      "^6a^x^6d^3x^4a^x^1d-^2a-^2a^x^2.3b^3x^2.3b-^2.3b-^1a^3x^3d^3x^7a^3x^w",
+	      log_time, seq_nb, dev_nm, iom_nb, ch_nr, dev_nr, dev_cmnd, maj_st, sub_st, ntrpt_nm,
+	      tally_nb, tapno_diskad, io_msg.status);
+
+	    else if rprt_flags.diskerr
+	    then do; call ioa_$ioa_switch (outsw_p,
+	        "^6a^x^6d^3x^4a^x^1d-^2a-^2a^x^2.3b^3x^2.3b-^2.3b-^1a^3x^3d^3x^7a^3x^w^/^34x^a",
+	        log_time, seq_nb, dev_nm, iom_nb, ch_nr, dev_nr, dev_cmnd, maj_st, sub_st, ntrpt_nm,
+	        tally_nb, tapno_diskad, io_msg.status, ioerr_rec.msg);
+	      line_cnt = line_cnt + 1;
+	    end;
+
+	    else if rprt_flags.disk_addr
+	    then call ioa_$ioa_switch (outsw_p,
+	      "^6a^x^6d^3x^4a^x^1d-^2a-^2a^x^2.3b^19x^7a",
+	      log_time, seq_nb, dev_nm, iom_nb, ch_nr, dev_nr, dev_cmnd, tapno_diskad);
+
+	    else if rprt_flags.ext_stat | rprt_flags.iom_rec
+	    then call ioa_$ioa_switch (outsw_p,
+	      "^6a^x^6d^3x^4a^x^1d-^2a-^2a^x^2.3b^3x^a",
+	      log_time, seq_nb, dev_nm, iom_nb, ch_nr, dev_nr, dev_cmnd, ioerr_rec.msg);
+
+	    else if rprt_flags.msg
+	    then call ioa_$ioa_switch (outsw_p, "^a", ioerr_rec.msg);
+
+	    else if rprt_flags.bulk
+	    then call ioa_$ioa_switch (outsw_p,
+	      "^6a^x^6d^3x^a",
+	      log_time, seq_nb, ioerr_rec.msg);
+
+	    else if rprt_flags.bad_rec
+	    then call ioa_$ioa_switch (outsw_p,
+	      "^6a^x^6d^3x^4a^x^1d-^2a-^2a^6x^a",
+	      log_time, seq_nb, dev_nm, iom_nb, ch_nr, dev_nr, ioerr_rec.msg);
+
+/* Read next ioerr_log record. */
+	    call iox_$read_record (insw_p, inbuf_p, inbuf_len, inrec_len, code);
+	    if code ^= 0
+	    then if code = error_table_$end_of_info
+	      then eof = "1"b;
+	      else call proc_err (32);
+
+/*  Date change.  */
+	    if sort_date ^= old_date
+	    then if line_cnt > max_line_cnt - 10	/* too near bottom of page */
+	      then flags.hdrs = "1"b;			/* so start new page */
+
+	  end;
+
+	  if line_cnt > max_line_cnt
+	  then flags.hdrs = "1"b;
+	end io_report_line_loop;
+
+/* end of file on heals_ioerr_log */
+	if flags.no_recs
+	then call ioa_$ioa_switch (outsw_p,
+	  "^/^11xThere were no io_errors during the report period.");
+	call ioa_$ioa_switch (outsw_p,
+	  "^/END: IO_ERROR_REPORT");
+	if ^flags.no_recs
+	then do; call iox_$close (ioerr_log_sw_p, code);
+	  if code ^= 0 then call proc_err (33);
+	end;
+	return;
+
+/* FF */
+proc_err:	proc (proc_err_nb);
+dcl  proc_err_nb fixed bin;
+	  r_code = code;
+	  arg_info.err_nb = proc_err_nb;
+	  call com_err_ (code, whoami, "Procedure error number = ^d.", proc_err_nb);
+	  call clean_up;
+	  goto err_return;
+	end proc_err;
+
+clean_up:	proc;
+	  call iox_$close (ioerr_log_sw_p, code);
+	  return;
+	end clean_up;
+
+err_return: return;
+
+        end heals_io_report_gen_;
+ 
+
+
+
+		    heals_io_reports_.pl1           09/27/84  0748.5rew 09/27/84  0745.2       89199
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+heals_io_reports_: proc (heals_arg_info_p, r_code);	/* (ptr, fixed bin (35)) */
+
+/* ******************************************************************************
+   *								*
+   *  This procedure processes syserr_log messages for HEALS and generates	*
+   *  one or more of the following HEALS reports:				*
+   *  	io_error_report						*
+   *	sorted_io_error_report					*
+   *								*
+   *  The procedure reads  heals_log records (which are selected and modified	*
+   *  syserr_log records), converts binary data to ascii, processes the data,	*
+   *  and writes the processed records to heals_ioerr_log.			*
+   *								*
+   *  For each report type, the heals_ioerr_log records are read, sorted,	*
+   *  summmarized, and the report formatted and written to a print file.	*
+   *								*
+   *	Written by RH Morrison  Feb. 18, 1976	 			*
+   *	Last modified by RH Morrison  01/03/77				*
+   *								*
+   ****************************************************************************** */
+
+/* FF  */
+/* ********	DECLARATIONS	******** */
+
+
+/* ****	PROCEDURE ARGUMENTS   **** */
+dcl  heals_arg_info_p pointer;
+dcl  r_code fixed bin (35);
+
+
+/* ****	EXTERNAL STATIC	**** */
+dcl  error_table_$noarg ext static fixed bin (35);
+
+
+/* ****	ENTRIES		**** */
+dcl  ioa_ entry options (variable);
+dcl  ioa_$ioa_switch entry options (variable);
+dcl  iox_$attach_ioname entry (char (*), ptr, char (*), fixed bin (35));
+dcl  iox_$detach_iocb entry (ptr, fixed bin (35));
+dcl  delete_$path entry (char (*), char (*), bit (6), char (*), fixed bin (35));
+dcl  iox_$close entry (ptr, fixed bin (35));
+dcl  get_pdir_ entry returns (char (168));
+dcl  heals_scan_config_ entry (ptr, fixed bin (35));
+dcl  heals_gen_ioerr_log_ entry (ptr, ptr, fixed bin (35));
+dcl  com_err_ entry options (variable);
+dcl  date_time_ entry (fixed bin (71), char (*));
+dcl  clock_ entry returns (fixed bin (71));
+dcl  heals_io_report_gen_ entry (ptr, ptr, fixed bin (35));
+dcl  heals_sorted_report_gen_ entry (ptr, ptr, fixed bin (35));
+dcl  heals_media_sort_gen_ entry (ptr, ptr, fixed bin (35));
+
+
+/* ****	POINTERS		**** */
+dcl  flags_p ptr init (null);
+
+/*   Arguments  */
+dcl  heals_ior_args_p ptr init (null);
+dcl  ch_nfo_ar_p ptr init (null);
+dcl  outsw_p ptr init (null);
+dcl 1 real_p aligned like ior_ptrs;
+
+/* pointers declared elsewhere:
+   heals_arg_info_p
+   ior_flags_p
+   ior_prms_p
+   ch-nfo_ar_p
+   ioerr_log_sw_p
+   ch_nf_p
+*/
+
+
+/* ****	CONTROL VARIABLES   **** */
+/*  Parameters  */
+dcl  whoami char (17) int static init ("heals_io_reports_");
+dcl  version_date char (8) init ("12/15/76");
+dcl  version_nb fixed bin init (2);
+dcl  max_iom_nb fixed bin int static init (4);
+dcl  max_ch_nb fixed bin int static init (63);
+dcl  max_tape_nb fixed bin int static init (16);
+dcl  max_line_cnt fixed bin int static init (58);
+
+/*  Flags  */
+dcl 1 flags aligned based (flags_p),
+    (2 trace bit (1),
+    2 db bit (1),
+    2 io_error bit (1),
+    2 sorted_io_error bit (1),
+    2 media_rprt bit (1),
+    2 fill bit (1)
+     ) unal;
+
+dcl  io_rprt bit (1) unal defined arg_info.info_selection pos (1);
+dcl  mpc_data bit (1) unal defined arg_info.info_selection pos (2);
+dcl  cpu_data bit (1) unal defined arg_info.info_selection pos (3);
+dcl  mos_edac_data bit (1) unal defined arg_info.info_selection pos (4);
+dcl  sorted_io_rprt bit (1) unal defined arg_info.info_selection pos (5);
+dcl  media_data bit (1) unal defined arg_info.info_selection pos (8);
+
+/*  Arguments  */
+dcl 1 real_ior_prms aligned like ior_prms;
+
+
+/* ****	CHARACTER STRING VARIABLES    **** */
+dcl  date char (8);
+dcl  time char (6);
+
+/*   Arguments  */
+dcl  date_time char (16);
+dcl  ioerr_log_sw char (12) int static init ("ioerr_log_sw");
+
+
+/* ****	ARITHMETIC VARIABLES    **** */
+dcl  ch_nr pic "99";
+dcl (i, j) fixed bin;
+
+/*   Arguments  */
+dcl  code fixed bin (35);
+dcl  clock_time fixed bin (71);
+dcl 1 real_ior_avars aligned like ior_avars;
+
+
+/* ****	BIT STRING VARIABLES    **** */
+dcl  flags_word bit (36) aligned init ("0"b);
+
+/*   Arguments  */
+dcl  dl_sws bit (6) int static init ("100100"b);
+dcl  ior_flags_word bit (36) aligned;
+
+
+/* ****	ARRAY VARIABLES		**** */
+dcl 1 ch_nfo_ar (1:max_iom_nb) aligned,
+    2 ch_entry (0:max_ch_nb) like ch_nfo;
+
+
+/* ****	BASED   **** */
+
+/*   Arguments  */
+dcl 1 arg_info like heals_arg_info aligned based (heals_arg_info_p);
+
+
+/* ****	MISC. DECLARATIONS		**** */
+dcl (addr, before, null, substr) builtin;
+dcl  cleanup condition;
+
+/* FF */
+
+/* ****	INCLUDE FILES	**** */
+%include heals_arg_info;
+%include heals_io_report_args;
+%include iocb;
+
+/* ********	END OF DECLARATIONS 	******** */
+
+/* FF */
+/* ********	PROCEDURE		******** */
+
+/* ****	Procedure Initialization	**** */
+
+	on cleanup call clean_up;
+
+/*  Init returns.  */
+	r_code = 0;
+
+/*  Init pointers.  */
+	flags_p = addr (flags_word);
+	heals_ior_args_p = addr (real_p);
+
+/*  Init heals_ior_args pointers.  */
+	real_p.ior_flags_p = addr (ior_flags_word);
+	real_p.ior_prms_p = addr (real_ior_prms);
+	real_p.ch_nfo_ar_p = addr (ch_nfo_ar);
+	real_p.ioerr_log_sw_p = null ();
+	real_p.ior_avars_p = addr (real_ior_avars);
+
+/*  Init flags.  */
+	ior_flags_word = "0"b;
+	if io_rprt then flags.io_error = "1"b;		/* flag for io_error_report */
+	if sorted_io_rprt then flags.sorted_io_error = "1"b; /* flag for sorted_io_error_report */
+	if media_data then flags.media_rprt = "1"b;
+	if ^flags.io_error & ^flags.sorted_io_error & ^flags.media_rprt
+	then do;					/* then return with error code */
+	  arg_info.err_nb = 11;
+	  r_code = error_table_$noarg;
+	  return;
+	end;
+	if trace_sw then flags.trace = "1"b;
+	else flags.trace = "0"b;
+	ior_flags.trace = flags.trace;
+
+/*  Init heals_ior_args parameters.  */
+	ior_prms.max_iom_nb_a = max_iom_nb;
+	ior_prms.max_ch_nb_a = max_ch_nb;
+	ior_prms.max_tape_nb_a = max_tape_nb;
+	ior_prms.max_line_cnt_a = max_line_cnt;
+
+/*  Init all else.  */
+	arg_info.err_nb = 0;
+
+/* ****	End Procedure Initialization    **** */
+
+/*  Run information.  */
+	clock_time = clock_ ();
+	call date_time_ (clock_time, date_time);
+	date = substr (date_time, 1, 8);
+	time = substr (date_time, 11, 6);
+	if flags.trace
+	then call ioa_ ("^a run info: date ^a, time ^a, version ^d of ^a.",
+	  whoami, date, time, version_nb, version_date);
+
+/*  Set iom, channel, and device data.  */
+	call heals_scan_config_ (heals_ior_args_p, code);
+	if code ^= 0 then call proc_err (19);
+
+/* ****	Generate HEALS io reports.   * *** */
+
+/*  Attach heals_ioerr_log file  */
+	call iox_$attach_ioname (ioerr_log_sw, real_p.ioerr_log_sw_p, "vfile_ " ||
+	  before (get_pdir_ (), " ") || ">heals_ioerr_log", code);
+	if code ^= 0 then call proc_err (12);
+
+	call heals_gen_ioerr_log_ (heals_arg_info_p, heals_ior_args_p, code);
+	if code ^= 0 then call proc_err (18);
+
+/*  Set output switch pointer to heals_reports switch pointer.  */
+	if arg_info.report_iocbp = null () then call proc_err (21);
+	outsw_p = arg_info.report_iocbp;
+
+/*  Print configuration table.  */
+	if ^ior_flags.no_recs
+	then do;
+	  call ioa_$ioa_switch (outsw_p,
+	    "^vxCHANNEL ASSIGNMENT TABLE AT TIME OF HEALS RUN
+^vxRUN DATE: ^a^vxRUN TIME: ^a,
+^vxSYSTEM_ID:^x^13a^2xSITE_ID:^x^a^/",
+	    13, 13, date, 1, time,
+	    13, arg_info.system_id, arg_info.installation_id);
+
+	  call ioa_$ioa_switch (outsw_p,
+	    "^13xIOM^8xCHNL^9xDEVICE^10xMODEL
+^13xNUM^9xNUM^11xNAME^9xNUMBER^/");
+
+	  do i = 1 to max_iom_nb;			/* run through ch_nfo_ar */
+	    do j = 0 to max_ch_nb;
+	      ch_nfo_p = addr (ch_nfo_ar.ch_entry (i, j));
+	      if ch_nfo.i_set
+	      then do; ch_nr = j;
+	        if ch_nfo.model = 9999		/* dummy model number */
+	        then call ioa_$ioa_switch (outsw_p,
+		"^15x^1d^10x^2a^11x^4a",
+		i, ch_nr, ch_nfo.dev_nam);
+	        else call ioa_$ioa_switch (outsw_p,
+		"^15x^1d^10x^2a^11x^4a^11x^d",
+		i, ch_nr, ch_nfo.dev_nam, ch_nfo.model);
+	      end;
+	    end;
+	  end;
+	  call ioa_$ioa_switch (outsw_p, "^|");
+	end;
+
+/*  Select reports.  */
+	if flags.io_error
+	then call heals_io_report_gen_ (heals_arg_info_p, heals_ior_args_p, code);
+	if code ^= 0 then call proc_err (29);
+	if flags.sorted_io_error
+	then call heals_sorted_report_gen_ (heals_arg_info_p, heals_ior_args_p, code);
+	if code ^= 0 then call proc_err (28);
+	if flags.media_rprt
+	then call heals_media_sort_gen_ (heals_arg_info_p, heals_ior_args_p, code);
+						/*  Clean up and return to heals_report.  */
+	call clean_up;
+	return;					/* all done, normal return */
+
+/* FF  */
+proc_err:	proc (proc_err_nb);
+dcl  proc_err_nb fixed bin;
+	  r_code = code;				/* return error code */
+	  arg_info.err_nb = proc_err_nb;		/* return unique proc_err number */
+	  call com_err_ (code, whoami, "Procedure error number = ^d.", proc_err_nb);
+	  call clean_up;
+	  goto err_return;
+	end proc_err;
+
+clean_up:	proc;
+	  if code ^= 0 then call iox_$close (arg_info.iocbp, code); /* close heals_log file */
+	  if real_p.ioerr_log_sw_p ^= null ()
+	  then do; if real_p.ioerr_log_sw_p -> iocb.open_descrip_ptr ^= null ()
+	    then call real_p.ioerr_log_sw_p -> iocb.close (real_p.ioerr_log_sw_p, code);
+	    if real_p.ioerr_log_sw_p -> iocb.attach_descrip_ptr ^= null ()
+	    then call real_p.ioerr_log_sw_p -> iocb.detach_iocb (real_p.ioerr_log_sw_p, code);
+	  end;
+	  call delete_$path (get_pdir_ (), "heals_ioerr_log", dl_sws, whoami, code);
+	  call delete_$path (get_pdir_ (), "heals_sort_log", dl_sws, whoami, code);
+	  return;
+	end clean_up;
+
+err_return:
+	return;
+
+trace: tr: entry;
+dcl  trace_sw bit (1) aligned int static init ("0"b);
+dcl  trace_state char (3);
+
+	trace_sw = ^trace_sw;
+	if trace_sw
+	then trace_state = "on";
+	else trace_state = "off";
+	call ioa_ ("Trace state is ^a.", trace_state);
+	return;
+
+        end heals_io_reports_;
+ 
+
+
+
+		    heals_media_sort_gen_.pl1       09/27/84  0748.5rew 09/27/84  0745.2       98784
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+heals_media_sort_gen_: proc (heals_arg_info_p, heals_ior_args_p, r_code);
+
+/* ******************************************************************************
+   *								*
+   *  Comments:							*
+   *								*
+   * 	 Evolved from heals_sorted_report_gen_ by A. R. Downing May 1977	 			*
+   *	Last modified by RH Morrison  01/03/77				*
+   *								*
+   ****************************************************************************** */
+
+/* FF */
+/* ********	DECLARATIONS	******** */
+
+/* ****	PROCEDURE ARGUMENTS   **** */
+
+dcl  heals_arg_info_p ptr;
+dcl  heals_ior_args_p ptr;
+dcl  r_code fixed bin (35);
+
+/* ****	EXTERNAL STATIC	**** */
+
+dcl  error_table_$end_of_info ext static fixed bin (35);
+
+/* ****	ENTRIES		**** */
+dcl  sort_ entry ((*)char (*), char (*), (*)ptr, char (*), char (*), float bin (27),
+     fixed bin (35));
+dcl  clock_ entry returns (fixed bin (71));
+dcl  get_pdir_ entry returns (char (168));
+dcl  ioa_ entry options (variable);
+dcl  ioa_$ioa_switch entry options (variable);
+dcl  com_err_ entry options (variable);
+dcl  date_time_ entry (fixed bin (71), char (*));
+dcl  iox_$attach_ioname entry (char (*), ptr, char (*), fixed bin (35));
+dcl  iox_$detach_iocb entry (ptr, fixed bin (35));
+dcl  iox_$close entry (ptr, fixed bin (35));
+dcl  iox_$open entry (ptr, fixed bin, bit (1) aligned, fixed bin (35));
+dcl  iox_$read_record entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+
+/* ****	POINTERS		**** */
+dcl  flags_p ptr init (null);
+dcl  work_p1 ptr init (null);
+
+/*  Arguments  */
+dcl  sortsw_p ptr init (null);
+dcl  sort_data_p ptr init (null);
+dcl  sort_desc_p (3) ptr init (null, null, null);
+dcl  inbuf_p ptr init (null);
+dcl  insw_p ptr init (null);
+dcl  outsw_p ptr init (null);
+
+/* Pointers declared in include files:
+   ior_flags_p
+   ior_prms_p
+   ch_nfo_p
+   heals_ior_avars_p
+   ioerr_rec_p
+   statp
+   iocbp
+   io_msgp
+   */
+
+/* ****	CHARACTER STRING VARIABLES    **** */
+dcl  old_name char (4);
+dcl  whoami char (24) int static init ("heals_media_sort_gen_");
+dcl  inbuf char (inbuf_len) aligned;
+dcl  rprt_from_time char (16);
+dcl  rprt_to_time char (16);
+dcl  old_date char (8);
+dcl  date char (8);
+dcl  time char (6);
+dcl  date_time char (16);
+dcl  ch_nr pic "99";
+dcl  dev_nr pic "99";
+
+/*  Arguments  */
+dcl  version_date char (8) init ("12/15/76");
+
+/* ****	ARITHMETIC VARIABLES    **** */
+dcl  clock_time fixed bin (71);
+dcl  line_cnt fixed bin;
+dcl  max_line_cnt fixed bin;
+dcl  page_nb fixed bin;
+
+/*  Arguments  */
+dcl  version_nb fixed bin init (1);
+dcl  code fixed bin (35);
+dcl  inrec_len fixed bin (21);
+dcl  inbuf_len fixed bin (21) int static init (1024);
+dcl  seq_in fixed bin int static init (4);
+
+/* ****	BIT STRING VARIABLES    **** */
+dcl  flags_word bit (36) aligned;
+dcl  eof bit (1) aligned;
+
+/*  Arguments  */
+dcl  unused bit (1) aligned init ("0"b);
+
+/* ****	BASED VARIABLES		**** */
+dcl 1 arg_info like heals_arg_info aligned based (heals_arg_info_p);
+dcl 1 flags aligned based (flags_p),
+    (2 trace bit (1),
+    2 db bit (1),
+    2 hdrs bit (1),
+    2 no_recs bit (1),
+    2 fill bit (1)
+     ) unal;
+
+/* ****	SORT DECLARATIONS   **** */
+dcl  sort_file_size float bin (27);
+dcl  sort_out_file char (168);
+dcl  sort_temp_dir char (168);
+dcl  sort_user_out_sw char (32);
+dcl  sortsw char (6) int static init ("sortsw");
+dcl  sort_in_file (1) char (168);
+dcl  user_keys_number int static init (3);
+dcl 1 keys,
+    2 version fixed bin init (1),
+    2 number fixed bin,
+    2 key_desc (user_keys_number),
+      3 datatype char (8),
+      3 size fixed bin (24),
+      3 word_offset fixed bin (18),
+      3 bit_offset fixed bin (6),
+      3 desc char (3);
+
+/* ****	MISC. DECLARATIONS		**** */
+
+dcl (addr, addrel, before, fixed, null) builtin;
+dcl  cleanup condition;
+
+/* FF */
+/* ****	INCLUDE FILES	**** */
+%include heals_arg_info;
+%include heals_io_report_args;
+%include heals_ioerr_rec;
+%include io_syserr_msg;
+%include iom_stat;
+/* ****	END OF DECLARATIONS   **** */
+/* FF */
+/* ********	PROCEDURE		******** */
+
+/* ****	Procedure Initialization	**** */
+
+	on cleanup call clean_up;
+
+/*  Init returns.  */
+	r_code = 0;
+	arg_info.err_nb = 0;
+
+/*  Init pointers.  */
+	flags_p = addr (flags_word);
+	insw_p = ioerr_log_sw_p;
+	outsw_p = arg_info.report_iocbp;
+	inbuf_p = addr (inbuf);
+	ioerr_rec_p = addr (inbuf);
+	io_msgp = addr (ioerr_rec.data);
+	statp = addr (io_msg.status);
+
+/* Init control flags.  */
+	flags_word = "0"b;
+	flags.hdrs = "1"b;
+	flags.no_recs = ior_flags.no_recs;
+	eof = "0"b;
+
+/*  Init all else.  */
+
+	code = 0;
+	old_date = "";
+	page_nb = 0;
+	line_cnt = 0;
+	max_line_cnt = max_line_cnt_a;
+	call date_time_ (arg_info.from_time, rprt_from_time);
+	call date_time_ (arg_info.to_time, rprt_to_time);
+
+/*  Initialize for sort.  */
+	sort_in_file = "-if "||before (get_pdir_ (), " ") ||">heals_ioerr_log";
+	sort_out_file = "-of " || before (get_pdir_ (), " ") || ">heals_sort_log";
+	sort_desc_p (1) = addr (keys);
+	sort_desc_p (2) = null;
+	sort_desc_p (3) = null;
+	sort_file_size = 0;
+	sort_temp_dir = "";
+	sort_user_out_sw = "";
+
+	keys.number = user_keys_number;
+
+	key_desc.datatype (1) = "char";
+	key_desc.size (1) = 8;
+	key_desc.word_offset (1) = 0;
+	key_desc.bit_offset (1) = 0;
+	key_desc.desc (1) = "";
+
+	key_desc.datatype (2) = "char";
+	key_desc.size (2) = 7;
+	key_desc.word_offset (2) = 8;
+	key_desc.bit_offset (2) = 0;
+	key_desc.desc (2) = "";
+
+
+	key_desc.datatype (3) = "bit";
+	key_desc.size (3) = 44;
+	key_desc.word_offset (3) = 2;
+	key_desc.bit_offset (3) = 0;
+	key_desc.desc (3) = "";
+
+/* ****	End Procedure Initialization    **** */
+
+/*  Run information.  */
+	clock_time = clock_ ();
+	call date_time_ (clock_time, date_time);
+	date = substr (date_time, 1, 8);
+	time = substr (date_time, 11, 6);
+	if flags.trace
+	| ior_flags.trace
+	then call ioa_ ("^a run info: date ^a, time ^a, version ^d of ^a.",
+	  whoami, date, time, version_nb, version_date);
+
+/*  Sort heals_ioerr_log for the media_error report.  */
+	call sort_ (sort_in_file, sort_out_file, sort_desc_p,
+	  sort_temp_dir, "", 0, code);
+	if code ^= 0 then call proc_err (45);
+
+/* ****	Write media__error report.   **** */
+
+/*  Attach and open heals_sort_log file.  */
+	if ^flags.no_recs
+	then do;
+	  call iox_$attach_ioname (sortsw, sortsw_p, "vfile_ " || before (
+	    get_pdir_ (), " ") || ">heals_sort_log", code);
+	  if code ^= 0 then call proc_err (22);
+	  call iox_$open (sortsw_p, seq_in, unused, code);
+	  if code ^= 0 then call proc_err (40);
+
+/*  Read first record.  */
+	  call iox_$read_record (sortsw_p, inbuf_p, inbuf_len, inrec_len, code);
+	  if code ^= 0 then if code = error_table_$end_of_info
+	    then flags.no_recs = "1"b;
+	    else call proc_err (41);
+	  old_name = dev_nm;			/* initialize from first record */
+	end;
+
+/* Record processing loop. */
+media_report_line_loop:
+	do while (^eof);
+	  if flags.hdrs
+	  then do; page_nb = page_nb + 1;
+	    line_cnt = 5;
+	    call ioa_$ioa_switch (outsw_p,
+	      "^|MEDIA_IO_ERROR_REPORT:^x^a^xto^x^a^5xPAGE^x^2d^/",
+	      rprt_from_time, rprt_to_time, page_nb);
+
+	    call ioa_$ioa_switch (outsw_p,
+	      "_____D_E_V_I_C_E_____^3xS_T_A_T_U_S__^2xTLY^4xTAPE_NO^1xDENS^xRING^1xTRK^4xS_Y_S_E_R_R_____L_O_G_
+I-CC-DD NAME CM^3xMJ-SB-I^9xDISK_AD^2xCYL^xHEAD^1xSEC^4xTIME^3xNUMBER");
+
+	    if flags.no_recs then eof = "1"b;
+	  end;
+
+/* Write date line. */
+	  if ^eof
+	  then do; if sort_date ^= old_date | flags.hdrs
+	    then do; old_date = sort_date;
+	      flags.hdrs = "0"b;
+	      line_cnt = line_cnt +4;
+	      call ioa_$ioa_switch (outsw_p, "^/^72(_^)^/DATE:^x^a^vxDATE:^x^a^/",
+	        sort_date, 44, sort_date);
+	    end;
+
+	    ch_nr = fixed (ch_nb);
+	    dev_nr = fixed (dev_nb);
+
+/*  Write media_error report line.  */
+	    if substr (dev_nm, 1, 3) ^= "tap" &
+	    substr (dev_nm, 1, 3) ^= "dsk" then go to read_next_log_rec;
+	    line_cnt = line_cnt + 1;
+
+	    if rprt_flags.ioerr
+	    then call ioa_$ioa_switch (outsw_p,
+	      "^1d-^2a-^2a^x^4a^x^2.3b^3x^2.3b-^2.3b-^1a^2x^3d^4x^7a^1x^4a^3x^2a^2x^2a^4x^6a^x^6d",
+	      iom_nb, ch_nr, dev_nr, dev_nm, dev_cmnd, maj_st, sub_st, ntrpt_nm, tally_nb,
+	      tapno_diskad, dens_cyl, ring_head, tracks_sector,
+	      log_time, seq_nb);
+
+	    else if rprt_flags.diskerr
+	    then do; call ioa_$ioa_switch (outsw_p,
+	        "^1d-^2a-^2a^x^4a^x^2.3b^3x^2.3b-^2.3b-^1a^2x^3d^4x^7a^1x^4a^3x^2a^2x^2a^4x^6a^x^6d^/^18x^a",
+	        iom_nb, ch_nr, dev_nr, dev_nm, dev_cmnd, maj_st, sub_st, ntrpt_nm, tally_nb,
+	        tapno_diskad, dens_cyl, ring_head, tracks_sector,
+	        log_time, seq_nb, ioerr_rec.msg);
+	      line_cnt = line_cnt + 1;
+	    end;
+
+	    else if rprt_flags.disk_addr
+	    then call ioa_$ioa_switch (outsw_p,
+	      "^1d-^2a-^2a^x^4a^x^2.3b^19x^7a^1x^4a^3x^2a^2x^2a^4x^6a^x^6d",
+	      iom_nb, ch_nr, dev_nr, dev_nm, dev_cmnd,
+	      tapno_diskad, dens_cyl, ring_head, tracks_sector, log_time, seq_nb);
+
+	    else if rprt_flags.ext_stat | rprt_flags.iom_rec
+	    then call ioa_$ioa_switch (outsw_p,
+	      "^1d-^2a-^2a^x^4a^x^2.3b^3x^38a^3x^6a^x^6d",
+	      iom_nb, ch_nr, dev_nr, dev_nm, dev_cmnd, ioerr_rec.msg, log_time, seq_nb);
+
+	    else if rprt_flags.msg
+	    then call ioa_$ioa_switch (outsw_p, "^a", ioerr_rec.msg);
+
+	    else if rprt_flags.bulk
+	    then call ioa_$ioa_switch (outsw_p,
+	      "^8x^50a^x^6a^x^6d",
+	      ioerr_rec.msg, log_time, seq_nb);
+
+/*  Read next heals_sort_log record.  */
+read_next_log_rec:
+	    call iox_$read_record (sortsw_p, inbuf_p, inbuf_len, inrec_len, code);
+	    if code ^= 0
+	    then if code = error_table_$end_of_info
+	      then eof = "1"b;
+	      else call proc_err (42);
+
+
+/*  Date change.  */
+	    if sort_date ^= old_date
+	    then if line_cnt > max_line_cnt - 10
+	      then flags.hdrs = "1"b;
+	  end;
+
+	  if line_cnt > max_line_cnt
+	  then flags.hdrs = "1"b;
+	end media_report_line_loop;
+
+/*  End of file on heals_sort_log.  */
+	if flags.no_recs
+	then call ioa_$ioa_switch (outsw_p,
+	  "^/^11xThere were no io_errors during the report period.");
+	call ioa_$ioa_switch (outsw_p,
+	  "^/END: MEDIA_IO_ERROR_REPORT");
+	if ^flags.no_recs
+	then do; call iox_$close (sortsw_p, code);
+	  if code ^= 0 then call proc_err (43);
+	  call iox_$detach_iocb (sortsw_p, code);
+	  if code ^= 0 then call proc_err (27);
+	end;
+	return;
+
+/* FF */
+proc_err:	proc (proc_err_nb);
+dcl  proc_err_nb fixed bin;
+	  r_code = code;
+	  arg_info.err_nb = proc_err_nb;
+	  call com_err_ (code, whoami, "Procedure error number = ^d.", proc_err_nb);
+	  call clean_up;
+	  goto err_return;
+	end proc_err;
+
+clean_up:	proc;
+	  if sortsw_p ^= null () then do;
+	    call iox_$close (sortsw_p, code);
+	    call iox_$detach_iocb (sortsw_p, code);
+	  end;
+	  return;
+	end clean_up;
+
+err_return: return;
+
+        end heals_media_sort_gen_;
+
+
+
+
+		    heals_mos_edac_reports_.pl1     12/01/87  0811.5rew 11/30/87  1323.6       83142
+
+
+
+/****^  ***********************************************************
+        *                                                         *
+        * Copyright, (C) Honeywell Bull Inc., 1987                *
+        *                                                         *
+        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        *                                                         *
+        *********************************************************** */
+
+
+/****^  HISTORY COMMENTS:
+  1) change(87-10-21,Martinson), approve(87-10-21,MCR7751),
+     audit(87-11-20,Fawcett), install(87-11-30,MR12.2-1006):
+     Fix size condition error in heals_report mos_edac_error.
+                                                   END HISTORY COMMENTS */
+
+
+/* heals_mos_edac_reports_ produces the edac error
+   report using edit_mos_rscr_ for formating purposes.
+   Coded by A. Downing July 1976. */
+/* Modified 12/26/76 by A. Downing to change error header. */
+/* Modified Feb. 1979 by A. Downing for
+   several bug fixes and code cleaning for MR7.0 */
+
+heals_mos_edac_reports_: proc (datap, code);
+%include heals_arg_info;
+dcl  datap ptr;
+dcl 1 arg_info like heals_arg_info aligned based (datap);
+dcl  code fixed bin (35);
+dcl  act_len fixed bin (21);
+dcl  error_table_$end_of_info ext static fixed bin (35);
+dcl  error_rate pic "zzzzz9v.99" aligned init (5.0);
+dcl  descrip char (100) varying;
+dcl  buffer char (2048) aligned;
+dcl  buf_p ptr init (null ());
+dcl  clock_ entry returns (fixed bin (71));
+dcl (ioa_$ioa_switch, com_err_) entry options (variable);
+dcl  edit_mos_rscr_ entry (ptr, char (*) varying);
+dcl  date_time_ entry (fixed bin (71), char (*));
+dcl  hphcs_$set_mos_polling_time entry (fixed bin);
+dcl  iox_$close entry (ptr, fixed bin (35));
+dcl  iox_$read_record entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+dcl (t1, t2, runtime) char (16) init ("");
+dcl  bin_clock fixed bin (71) init (clock_ ());
+dcl  one_hour fixed bin (71) int static init (3600000000);	/* in micro seconds */
+dcl  size condition;
+dcl  alloc_count fixed bin init (0);
+dcl  msg_count fixed bin (21) init (0);
+dcl  first_data_line fixed bin init (7);
+dcl  line_count fixed bin init (0);
+dcl  max_lines fixed bin init (50);
+dcl  polling_interval fixed bin init (0);
+dcl  bit_default_polling_interval int static bit(36) init ("101"b);
+dcl  default_polling_interval int static fixed bin init (5);
+dcl  read_polling_interval bit (1) init ("0"b);
+dcl  use_equals bit (1) aligned init ("0"b);
+dcl (p, first_info_p, refer_p, thread_end_p) ptr init (null ());
+dcl 1 counter_info based (p),
+    2 descrip char (40) varying,
+    2 time fixed bin (71),
+    2 seq_num fixed bin (35),
+    2 count fixed bin (35),
+    2 error_average fixed dec (8, 2),
+    2 next_info_p ptr,
+    2 data dim (heals_message.data_size) bit (36) aligned;
+dcl  counter_area area (16384);
+dcl  cleanup condition;
+dcl  area condition;
+dcl  linkage_error condition;
+dcl (addr, after, before, bin, empty, index, length, null) builtin;
+
+	call date_time_ (bin_clock, runtime);
+	call date_time_ ((arg_info.from_time), t1);
+	call date_time_ ((arg_info.to_time), t2);
+	arg_info.err_nb = -1;
+	counter_area = empty ();			/* reset it for allocations */
+	buf_p = addr (buffer);
+	on cleanup call clean_up;
+	on area begin;
+dcl  error_table_$noalloc ext static fixed bin (35);
+	  call com_err_ (error_table_$noalloc, "heals_mos_edac_reports_",
+	    "internal area overflow:
+run mos_edac_error report for a shorter time period for complete error listing.");
+	  go to done;				/* print what we got anyway */
+	end;
+
+	if arg_info.report_iocbp = null () then do;
+	  call com_err_ (0, "heals_mos_edac_reports_",
+	    "report stream is not open.");
+	  arg_info.err_nb = -1;
+	  go to done;
+	end;
+	call iox_$read_record (arg_info.iocbp, addr (buffer), length (buffer), act_len, code);
+	if code ^= 0 then
+	  if code ^= error_table_$end_of_info then do;
+read_error:
+	    call com_err_ (code, "heals_mos_edac_reports_", "error reading heals_log.");
+	    call clean_up;
+	    return;
+	  end;
+	  else go to done;
+	else;
+	heals_message_p = addr (buffer);
+scan_loop: do while ("1"b);
+	  if index (heals_message.text, "mos_memory_check") > 0 |
+	  (use_equals & heals_message.text = "=") then
+use_message:  do;
+	    use_equals = "1"b;			/* still process = records */
+	    if index (heals_message.text, "MOS polling") > 0 then do;
+	      read_polling_interval = "1"b;		/* we have the interval record */
+	      on size begin;
+	        call com_err_ (0, "heals_mos_edac_reports_",
+		"heals_log message #^d has an invalid time interval value, ^d is assumed.",
+		heals_message.seq_num, default_polling_interval);
+	        heals_message.data (1) = bit_default_polling_interval;
+	        polling_interval = default_polling_interval;
+	      end;
+(size):	      polling_interval = bin (before (after (heals_message.text, "MOS polling time "), " minutes"));
+	      revert size;
+	      go to message_used;
+	    end;
+	    if ^read_polling_interval then do;
+	      polling_interval = -1;			/* for reading interval */
+	      on linkage_error go to skip_hphcs_call;	/* incase not enough access */
+	      call hphcs_$set_mos_polling_time (polling_interval);
+skip_hphcs_call:
+	      revert linkage_error;			/* reset */
+	    end;
+	    if polling_interval < 1 then polling_interval = default_polling_interval;
+	    p, refer_p = null ();
+check_allocations:
+	    do p = first_info_p repeat (p -> next_info_p) while (p ^= null ());
+	      if heals_message.data (1) = p -> counter_info.data (1) &
+	      heals_message.data (2) = p -> counter_info.data (2) then
+	        if after (heals_message.text, "mos_memory_check:") = p -> counter_info.descrip then
+		if heals_message.time - one_hour <= p -> counter_info.time then do;
+		  p -> count =
+		    p -> count + heals_message.tally;
+		  p -> counter_info.time = heals_message.time;
+		  p -> counter_info.seq_num = heals_message.seq_num;
+		  p -> error_average = p -> error_average +
+		    (polling_interval * heals_message.tally);
+		  go to was_allocated;
+		end;
+	      thread_end_p = p;
+	    end;
+						/* if we are here, must allocate new counter */
+	    allocate counter_info in (counter_area) set (p);
+	    if first_info_p = null () then do;
+	      first_info_p = p;
+	      thread_end_p = p;
+	    end;
+	    else thread_end_p -> next_info_p = p;	/* link chain */
+	    alloc_count = alloc_count + 1;
+(stringsize):
+	    p -> counter_info.descrip =
+	      after (heals_message.text, "mos_memory_check:");
+	    p -> counter_info.data = heals_message.data;
+	    p -> count = heals_message.tally;
+	    p -> counter_info.time = heals_message.time;
+	    p -> counter_info.seq_num = heals_message.seq_num;
+	    p -> error_average =
+	      p -> count * polling_interval;
+	    p -> next_info_p = null ();
+was_allocated:
+message_used:
+	  end use_message;
+	  else use_equals = "0"b;
+	  call iox_$read_record (arg_info.iocbp, addr (buffer), length (buffer), act_len, code);
+	  if code ^= 0 then
+	    if code ^= error_table_$end_of_info then go to read_error;
+	    else go to done;
+	  else;
+	  if heals_message.time > arg_info.to_time then go to done;
+get_record:
+end_scan_loop: end scan_loop;
+done:
+	if alloc_count = 0 then
+	  call ioa_$ioa_switch (arg_info.report_iocbp,
+	  "^|MOS_EDAC_ERROR_REPORT:^5xfrom^x^16a^5xto^x^16a
+HEALS RUN OF ^16a^xON^xSYSTEM^x^a^/
+^- There were no mos_edac errors during the report period.",
+	  t1, t2, runtime, arg_info.system_id);
+
+	do p = first_info_p repeat (p -> next_info_p) while (p ^= null ());
+	  if p -> counter_info.count > 1 then
+	    p -> counter_info.error_average =
+	    p -> counter_info.error_average / p -> counter_info.count;
+	  error_rate = p -> counter_info.error_average;	/* to get as picture */
+	  call edit_mos_rscr_ (addr (p -> counter_info.data (1)), descrip);
+	  call print_msg;				/* to actually print out the messages */
+	end;
+	arg_info.err_nb = 0;
+	call ioa_$ioa_switch (arg_info.report_iocbp, "^/END: MOS_EDAC_ERROR_REPORT");
+	call clean_up;
+clean_up:	proc;
+	  if arg_info.iocbp ^= null () then
+	    call iox_$close (arg_info.iocbp, code);
+	  counter_area = empty ();
+	  return;
+	end clean_up;
+	return;
+						/*  */
+print_msg: proc;					/* procedure to write edac messages to report. */
+	  if msg_count = 0 | line_count >= max_lines then do;
+	    call ioa_$ioa_switch (arg_info.report_iocbp,
+	      "^|MOS_EDAC_ERROR_REPORT:^5xfrom^x^16a^5xto^x^16a
+HEALS RUN OF ^16a^xON^xSYSTEM^x^a^/",
+	      t1, t2, runtime, arg_info.system_id);
+	    call ioa_$ioa_switch (arg_info.report_iocbp,
+	      "^7xLAST ERROR^11xTALLY^2xAVERAGE^4xSYSTEM CONTROLLER REGISTER
+LOG_NUM^xDATE^8xTIME^11xMINUTES
+^36x/ERROR^/");
+	    line_count = first_data_line;
+	  end;
+	  call date_time_ (p -> counter_info.time, t1);
+	  call ioa_$ioa_switch (arg_info.report_iocbp,
+	    "^x^6d^x^16a^4x^5d^9a^5x^w^x^w",
+	    p -> counter_info.seq_num, t1, p -> counter_info.count,
+	    error_rate, p -> counter_info.data (1), p -> counter_info.data (2));
+	  call ioa_$ioa_switch
+	    (arg_info.report_iocbp, "^4x^a^x^a^/",
+	    p -> counter_info.descrip, descrip);
+	  msg_count = msg_count + 1;
+	  line_count = line_count + 3;
+	  return;
+	end print_msg;
+
+/* 
+   include files
+*/
+
+%include scr;
+%include heals_message;
+        end heals_mos_edac_reports_;
+  
+
+
+
+		    heals_report.pl1                08/05/87  0756.4r   08/04/87  1540.9      179694
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+/* heals_report is the command program for
+   the generation of heals reports.  Calls are made to specific
+   report generators depending upon the requested reports */
+/* Coded by A. Downing March 1976,
+   modified by A. Downing 10/76 for release mr5.0 */
+/* Modified by A. Downing July 1977 for MR6 */
+
+heals_report: hr: proc;
+dcl  upper_case char (26) int static init
+    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+dcl  lower_case char (26) int static init
+    ("abcdefghijklmnopqrstuvwxyz");
+dcl  numbers char (10) int static init
+    ("1234567890");
+dcl  other_chars char (21) int static init
+    (" ,.<>#;:*+-_/?!$%'()&");
+dcl  hcs_$initiate entry (char (*), char (*), char (*),
+     fixed bin (1), fixed bin (2), ptr, fixed bin (35));
+dcl  heals_io_reports_ entry (ptr, fixed bin (35));
+dcl  heals_cpu_reports_ entry (ptr, fixed bin (35));
+dcl  heals_mos_edac_reports_ entry (ptr, fixed bin (35));
+dcl  iox_$attach_ioname entry (char (*), ptr, char (*), fixed bin (35));
+dcl  iox_$detach_iocb entry (ptr, fixed bin (35));
+dcl  iox_$open entry (ptr, fixed bin, bit (1) aligned, fixed bin (35));
+dcl  iox_$position entry (ptr, fixed bin, fixed bin (21), fixed bin (35));
+dcl  iox_$read_record entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+dcl  iox_$close entry (ptr, fixed bin (35));
+dcl  expand_path_ entry (ptr, fixed bin, ptr, ptr, fixed bin (35));
+dcl  delete_$path entry
+    (char (*), char (*), bit (6), char (*), fixed bin (35));
+dcl  get_pdir_ entry returns (char (168));
+dcl  get_wdir_ entry returns (char (168));
+dcl  command_query_ entry options (variable);
+dcl (com_err_, ioa_) entry options (variable);
+dcl  date_time_ entry (fixed bin (71), char (*));
+dcl  clock_ entry returns (fixed bin (71));
+dcl  convert_date_to_binary_ entry (char (*), fixed bin (71), fixed bin (35));
+dcl  convert_date_to_binary_$relative entry (char (*), fixed bin (71), fixed bin (71), fixed bin (35));
+dcl  cu_$arg_list_ptr entry returns (ptr);
+dcl  cu_$arg_count entry returns (fixed bin);
+dcl  report_file char (168) aligned init
+    (before (get_wdir_ (), " ") || ">heals_reports");
+dcl  buffer char (1024) aligned;
+dcl  rec_len fixed bin (21);
+dcl (ip, whoptr) ptr init (null ());
+dcl  qip ptr;
+dcl 1 query_info aligned,
+    2 version fixed bin init (1),
+    2 yes_or_no_sw bit (1) unal init ("1"b),		/* Require "yes" or "no" answer. */
+    2 suppress_name_sw bit (1) unal init ("0"b),		/* Print name with question. */
+    2 status_code fixed bin (35),			/* Set to code of error prompting question. */
+    2 query_code fixed bin (35) init (0);
+dcl  answer char (32) init ("");
+dcl  i fixed bin;
+dcl  code fixed bin (35);
+dcl  log_path char (168) ext static aligned init (">system_control_1>heals_dir>heals_log");
+dcl  error_table_$noentry ext static fixed bin (35);
+dcl (error_table_$not_attached, error_table_$not_open) ext static fixed bin (35);
+dcl  error_table_$not_closed ext static fixed bin (35);
+dcl  error_table_$end_of_info ext static fixed bin (35);
+dcl  error_table_$badopt ext static fixed bin (35);
+dcl  error_table_$noarg ext static fixed bin (35);
+dcl  one_day fixed bin (71);
+dcl  io_data bit (1) unal defined heals_arg_info.info_selection pos (1);
+dcl  mpc_data bit (1) unal defined heals_arg_info.info_selection pos (2);
+dcl  cpu_data bit (1) unal defined heals_arg_info.info_selection pos (3);
+dcl  mos_edac_data bit (1) unal defined heals_arg_info.info_selection pos (4);
+dcl  sorted_io_data bit (1) unal defined heals_arg_info.info_selection pos (5);
+dcl  disk_data bit (1) unal defined heals_arg_info.info_selection pos (6);
+dcl  bulk_data bit (1) unal defined heals_arg_info.info_selection pos (7);
+dcl  media_data bit (1) unal defined heals_arg_info.info_selection pos (8);
+dcl (addr, before, null, verify) builtin;
+dcl  cleanup condition;
+dcl  record_quota_overflow condition;
+
+	if cu_$arg_count () < 1 then do;
+	  call com_err_ (error_table_$noarg, "heals_report",
+	    "
+Usage: heals_report REPORT_NAME -CONTROL_ARGS-");
+	  return;
+	end;
+
+	code = 0;
+	heals_message_p = null ();
+	heals_state_p = null ();
+	heals_message_p = addr (buffer);
+	qip = addr (query_info);
+	heals_arg_info.heals_log_path_name = log_path;
+	i = index (reverse (heals_log_path_name), ">");
+	i = length (heals_log_path_name) - i ;
+	call hcs_$initiate
+	  (substr (heals_log_path_name, 1, i), "heals_log_info", "", 0, 0, heals_state_p, code);
+	if heals_state_p = null () then do;
+	  call com_err_ (code, "heals_report", "could not initiate heals_log_info");
+	  return;
+	end;
+	one_day = 24 * 60 * 60 * 1000000;		/* one day of micro-seconds */
+	heals_arg_info.iocbp = null ();
+	heals_arg_info.report_iocbp = null ();
+	heals_arg_info.to_time = clock_ ();
+	heals_arg_info.from_time = heals_arg_info.to_time - one_day;
+	heals_arg_info.from_seq = 0;
+	heals_arg_info.to_seq = heals_state.last_message_seq_num;
+	heals_arg_info.info_selection = "0"b;		/* init off */
+	err_nb = 0;
+	report_name = "";
+	call heals_arg_parser_ (cu_$arg_list_ptr (), cu_$arg_count (), code);
+	if code = 0 then do;			/* try to generate a report */
+	  call hcs_$initiate
+	    (">sc1", "whotab", "", 0, 0, whoptr, code);
+	  heals_arg_info.system_id =
+	    before (whoptr -> whotab.sysid, " ");
+	  call hcs_$initiate (">sc1", "installation_parms", "",
+	    0, 0, ip, code);
+	  heals_arg_info.installation_id =
+	    before (ip -> installation_parms.installation_id, " ");
+	  if verify (heals_arg_info.installation_id,
+	  lower_case || upper_case || numbers || other_chars)
+	  > 0 then
+	    heals_arg_info.installation_id = "";
+	  on cleanup call clean_up;
+	  call iox_$attach_ioname
+	    ("heals_report_stream", report_iocbp, "vfile_ " ||
+	    before (report_file, " ") || " -extend", code);
+	  if code ^= 0 then do;
+	    call com_err_ (code, "heals_report", "could not attach to the report file.");
+	    call clean_up;
+	    return;
+	  end;
+	  else call iox_$open (report_iocbp, 2 /* stream_output */, "0"b, code);
+	  if code ^= 0 then do;
+	    call com_err_ (code, "heals_report", "could not open the report file.");
+	    call clean_up;
+	    return;
+	  end;
+	  call iox_$attach_ioname ("heals_io", heals_arg_info.iocbp,
+	    "vfile_ " ||
+	    before (heals_arg_info.heals_log_path_name, " "), code);
+	  if code ^= 0 then do;
+	    call com_err_ (code, "heals_report", "could not attach to ^a.",
+	      heals_arg_info.heals_log_path_name);
+	    call clean_up;
+	    return;
+	  end;
+	  call iox_$open (heals_arg_info.iocbp, 8 /* keyed_seq in */, "0"b, code);
+	  if code ^= 0 then do;
+	    call com_err_ (code, "heals_report",
+	      "unable to open ^a.", heals_arg_info.heals_log_path_name);
+	    call clean_up;
+	    return;
+	  end;
+pos_at_beginning:
+	  if ^(io_data | sorted_io_data | media_data | cpu_data | mos_edac_data)
+	  then go to done;				/* reports all generated */
+	  on record_quota_overflow begin;
+	    call com_err_ (0, "heals_report",
+	      "There is insufficient quota to produce the specified reports.");
+	    call clean_up;
+	    go to done;
+	  end;
+	  if heals_arg_info.iocbp -> iocb.attach_descrip_ptr ^= null () then
+	    if heals_arg_info.iocbp -> iocb.open_descrip_ptr = null () then do;
+	      call iox_$open (heals_arg_info.iocbp, 8 /* keyed seq in */, "0"b, 0);
+	      if code ^= 0 then
+	        if code ^= error_table_$not_attached &
+	        code ^= error_table_$not_closed then go to pos_error;
+	        else;
+	      else;
+	    end;
+	  call iox_$position (heals_arg_info.iocbp, -1, 0, code);
+	  call iox_$read_record (heals_arg_info.iocbp,
+	    heals_message_p, length (buffer), rec_len, code);
+	  if code ^= 0 then do;
+pos_error:    call com_err_ (code, "heals_report",
+	      "error while positioning to proper record in heals_log.");
+	    call clean_up;
+	    return;
+	  end;
+	  do while ((heals_message.time < heals_arg_info.from_time) &
+	      (heals_message.time < heals_arg_info.to_time));
+	    call iox_$read_record (heals_arg_info.iocbp,
+	      heals_message_p, length (buffer), rec_len, code);
+	    if code ^= 0 then
+	      if code ^= error_table_$end_of_info then go to pos_error;
+	      else go to at_proper_record;
+	    else;
+	  end;					/* end of while loop */
+at_proper_record:
+	  if heals_message.time ^= heals_arg_info.from_time then do;
+	    call iox_$position (heals_arg_info.iocbp, 0, -1, code);
+	    if code ^= 0 then go to pos_error;
+	  end;
+	  if io_data then do;
+	    report_name = "io_error";
+	    call heals_io_reports_ (addr (heals_arg_info), code);
+	    if code ^= 0 then do;			/* something went wrong */
+	      call com_err_
+	        (code, "heals_report", "abnormal termination of ^a report generator.", report_name);
+	      if heals_arg_info.err_nb > 0 then
+	        call com_err_ (0, "heals_report",
+	        "heals internal error #^d was returned by the ^a report generator,
+contact Multics heals programming team for instructions.",
+	        heals_arg_info.err_nb, report_name);
+	      call clean_up;
+	      return;
+	    end;
+	    if heals_arg_info.err_nb = 0 then
+	      call ioa_
+	      ("^v(^4xio_error report generated^/^)^v(^4xsorted_io_error report generated^/^)^v(^4xmedia_error report generated^/^)",
+	      bin (io_data, 1, 0), bin (sorted_io_data, 1, 0), bin (media_data, 1, 0));
+	    else call ioa_ ("^a report's may be incomplete.", report_name);
+	    io_data, sorted_io_data, media_data = "0"b;
+	    go to pos_at_beginning;
+	  end;
+	  if sorted_io_data then do;
+	    report_name = "sorted_io_error";
+	    call heals_io_reports_ (addr (heals_arg_info), code);
+	    if code ^= 0 then do;			/* something went wrong */
+	      call com_err_
+	        (code, "heals_report", "abnormal termination of ^a report generator.", report_name);
+	      if heals_arg_info.err_nb > 0 then
+	        call com_err_ (0, "heals_report",
+	        "heals internal error #^d was returned by the ^a report generator,
+contact Multics heals programming team for instructions.",
+	        heals_arg_info.err_nb, report_name);
+	      call clean_up;
+	      return;
+	    end;
+	    if heals_arg_info.err_nb = 0 then
+	      call ioa_
+	      ("^v(^4xio_error report generated^/^)^v(^4xsorted_io_error report generated^/^)^v(^4xmedia_error report generated^/^)",
+	      bin (io_data, 1, 0), bin (sorted_io_data, 1, 0), bin (media_data, 1, 0));
+	    else call ioa_ ("^a report may be incomplete.", report_name);
+	    sorted_io_data, media_data = "0"b;		/* report generated */
+	    go to pos_at_beginning;
+	  end;
+	  if media_data then do;
+	    report_name = "media_error";
+	    call heals_io_reports_ (addr (heals_arg_info), code);
+	    if code ^= 0 then do;			/* something went wrong */
+	      call com_err_
+	        (code, "heals_report", "abnormal termination of ^a report generator.", report_name);
+	      if heals_arg_info.err_nb > 0 then
+	        call com_err_ (0, "heals_report",
+	        "heals internal error #^d was returned by the ^a report generator,
+contact Multics heals programming team for instructions.",
+	        heals_arg_info.err_nb, report_name);
+	      call clean_up;
+	      return;
+	    end;
+	    if heals_arg_info.err_nb = 0 then
+	      call ioa_
+	      ("^v(^4xio_error report generated^/^)^v(^4xsorted_io_error report generated^/^)^v(^4xmedia_error report generated^/^)",
+	      bin (io_data, 1, 0), bin (sorted_io_data, 1, 0), bin (media_data, 1, 0));
+	    else call ioa_ ("^a report may be incomplete.", report_name);
+	    media_data = "0"b;			/* report generated */
+	    go to pos_at_beginning;
+	  end;
+	  if cpu_data then do;
+	    report_name = "cpu_error";
+	    call heals_cpu_reports_ (addr (heals_arg_info), code);
+	    if code ^= 0 then do;			/* something went wrong */
+	      call com_err_
+	        (code, "heals_report", "abnormal termination of ^a report generator.", report_name);
+	      if heals_arg_info.err_nb > 0 then
+	        call com_err_ (0, "heals_report",
+	        "heals internal error #^d was returned by the ^a report generator,
+contact Multics heals programming team for instructions.",
+	        heals_arg_info.err_nb, report_name);
+	      call clean_up;
+	      return;
+	    end;
+	    cpu_data = "0"b;			/* report generated */
+	    if heals_arg_info.err_nb = 0 then
+	      call ioa_ ("^4x^a report generated.", report_name);
+	    else call ioa_ ("^a report may be incomplete.", report_name);
+	    go to pos_at_beginning;
+	  end;
+	  if mos_edac_data then do;
+	    report_name = "mos_edac_error";
+	    call heals_mos_edac_reports_ (addr (heals_arg_info), code);
+	    if code ^= 0 then do;			/* something went wrong */
+	      call com_err_
+	        (code, "heals_report", "abnormal termination of ^a report generator.", report_name);
+	      if heals_arg_info.err_nb > 0 then
+	        call com_err_ (0, "heals_report",
+	        "heals internal error #^d was returned by the ^a report generator,
+contact Multics heals programming team for instructions.",
+	        heals_arg_info.err_nb, report_name);
+	      call clean_up;
+	      return;
+	    end;
+	    mos_edac_data = "0"b;			/* report generated */
+	    if heals_arg_info.err_nb = 0 then
+	      call ioa_ ("^4x^a report generated.", report_name);
+	    else call ioa_ ("^a report may be incomplete.", report_name);
+	    go to pos_at_beginning;
+	  end;
+	  if heals_arg_info.err_nb > 0 then do;		/* heals private error */
+	    call com_err_ (0, "heals_report",
+	      "heals internal error #^d was returned by the ^a report generator,
+contact Multics heals programming team for instructions.",
+	      heals_arg_info.err_nb, report_name);
+	    go to pos_at_beginning;
+	  end;
+else done:
+	  if heals_arg_info.iocbp ^= null () then do;
+	    call iox_$close (heals_arg_info.iocbp, code);
+	    call iox_$detach_iocb (heals_arg_info.iocbp, code);
+	    heals_arg_info.iocbp = null ();
+	  end;
+	  if heals_arg_info.report_iocbp ^= null () then do;
+	    call iox_$close (heals_arg_info.report_iocbp, code);
+	    call iox_$detach_iocb (heals_arg_info.report_iocbp, code);
+	    heals_arg_info.report_iocbp = null ();
+	  end;
+	end;
+	else do;
+	  call com_err_ (0, "heals_report",
+	    "no reports generated");
+	  return;
+	end;					/* end of argument parsing error */
+	return;
+
+/*  */
+heals_arg_parser_: proc (ap, ac, code);
+dcl  ap ptr;					/* ptr to arg list */
+dcl  ac fixed bin;					/* arg count */
+dcl  code fixed bin (35);				/* error code */
+dcl  from bit (1) init ("0"b);
+dcl  arg char (arg_len) based (argp);
+dcl  argp ptr;					/* ptr to specific arg */
+dcl  arg_len fixed bin;				/* length of specific arg */
+dcl  cu_$arg_ptr_rel entry (fixed bin, ptr, fixed bin, fixed bin (35), ptr);
+dcl  i fixed bin;
+
+	  i = 1;
+	  call cu_$arg_ptr_rel (1, argp, arg_len, code, ap);
+	  if code ^= 0 then do;
+	    call com_err_ (code, "heals_arg_parser_", "could not obtain report name.");
+	    return;
+	  end;
+	  do while (code = 0 & substr (arg, 1, 1) ^= "-");
+	    if arg = "io_error" then io_data = "1"b;
+	    else if arg = "sorted_io_error" then sorted_io_data = "1"b;
+	    else if arg = "media_error" | arg = "media_io_error" then
+	      media_data = "1"b;
+	    else if arg = "cpu_error" then cpu_data = "1"b;
+	    else if arg = "mos_edac_error" then mos_edac_data = "1"b;
+	    else if arg = "disk_error" then disk_data = "1"b;
+	    else if arg = "bulk_error" then bulk_data = "1"b;
+	    else do;
+	      call com_err_ (0, "heals_arg_parser_", "report ^a is not available.", arg);
+	      code = error_table_$badopt;
+	      return;
+	    end;
+	    i = i + 1;
+	    call cu_$arg_ptr_rel (i, argp, arg_len, code, ap);
+	  end;
+	  if i > 1 then code = 0;
+	  do while (i <= ac);
+	    call cu_$arg_ptr_rel (i, argp, arg_len, code, ap);
+	    if code ^= 0 then do;
+	      call com_err_ (code, "heals_arg_parser_", "error while parsing arguments.");
+	      return;
+	    end;
+	    i = i + 1;				/* increment arg index */
+	    if arg = "-from" | arg = "-fm" then do;	/* from time */
+	      call cu_$arg_ptr_rel (i, argp, arg_len, code, ap);
+	      if code ^= 0 then do;
+	        call com_err_ (code, "heals_arg_parser_", "could not obtain beginning time.");
+	        return;
+	      end;
+	      i = i + 1;
+	      call convert_date_to_binary_ (arg, heals_arg_info.from_time, code);
+	      if code ^= 0 then do;
+	        call com_err_ (code, "heals_arg_parser_", "error while obtaining beginning time.");
+	        return;
+	      end;
+	      from = "1"b;
+	    end;
+	    else if arg = "-from_seq" | arg = "-fm_seq" then do; /* from seq */
+	      call cu_$arg_ptr_rel (i, argp, arg_len, code, ap);
+	      if code ^= 0 then do;
+	        call com_err_ (code, "heals_arg_parser_", "could not obtain beginning seq.");
+	        return;
+	      end;
+	      heals_arg_info.from_seq = convert (from_seq, arg);
+	      i = i + 1;
+	      from = "1"b;
+	    end;
+	    else if arg = "-to" then do;		/* to time */
+	      call cu_$arg_ptr_rel (i, argp, arg_len, code, ap);
+	      if code ^= 0 then do;
+	        call com_err_ (code, "heals_arg_parser_", "could not obtain termination time.");
+	        return;
+	      end;
+	      i = i + 1;
+	      call convert_date_to_binary_ (arg, heals_arg_info.to_time, code);
+	      if code ^= 0 then do;
+	        call com_err_ (code, "heals_arg_parser_", "error while obtaining termination time.");
+	        return;
+	      end;
+	    end;
+	    else if arg = "-to_seq" then do;		/* to seq */
+	      call cu_$arg_ptr_rel (i, argp, arg_len, code, ap);
+	      if code ^= 0 then do;
+	        call com_err_ (code, "heals_arg_parser_", "could not obtain beginning seq.");
+	        return;
+	      end;
+	      heals_arg_info.to_seq = convert (to_seq, arg);
+	      i = i + 1;
+	    end;
+	    else if arg = "-dp" | arg = "-dprint" then do;
+						/* for now, do not implement this one */
+	      code = error_table_$badopt;
+	      call com_err_ (code, "heals_arg_parser_", "^a", arg);
+	      return;
+	    end;
+	    else if arg = "-of" | arg = "-output_file" then do;
+	      call cu_$arg_ptr_rel (i, argp, arg_len, code, ap);
+	      if code ^= 0 then do;
+	        call com_err_ (code, "heals_arg_parser_", "could not obtain report file.");
+	        return;
+	      end;
+	      i = i + 1;
+	      call expand_path_ (addr (arg), (arg_len), addr (report_file), null (), code);
+	      if code ^= 0 then do;
+	        call com_err_ ("heals_arg_partser_", "^a", arg);
+	        return;
+	      end;
+	    end;
+	    else if arg = "-a" | arg = "-all" then do;
+	      io_data, media_data, sorted_io_data, cpu_data,
+	        mos_edac_data = "1"b;
+	    end;
+	    else do;				/* not a valid control arg */
+	      code = error_table_$badopt ;
+	      call com_err_ (code, "heals_arg_parser_", "^a", arg);
+	      return;
+	    end;
+	  end;
+	  if ^from then
+	    heals_arg_info.from_time = heals_arg_info.to_time - one_day;
+	  return;
+	end heals_arg_parser_;
+clean_up:	proc;
+	  if report_iocbp ^= null () then do;
+	    call iox_$close (report_iocbp, code);
+	    call iox_$detach_iocb (report_iocbp, code);
+	    report_iocbp = null ();
+	  end;
+	  if heals_arg_info.iocbp ^= null () then do;
+	    call iox_$close (heals_arg_info.iocbp, code);
+	    call iox_$detach_iocb (heals_arg_info.iocbp, code);
+	    heals_arg_info.iocbp = null ();
+	  end;
+	  call command_query_ (qip, answer, "heals_report",
+	    "The report file may be incomplete due to premature termination,
+do you wish to delete it?");
+	  if substr (answer, 1, 3) = "yes" then do;
+	    call delete_$path (reverse (after (reverse (report_file), ">")),
+	      reverse (before (reverse (report_file), ">")),
+	      "111111"b, "heals_report", code);
+	    if code ^= 0 then
+	      if code ^= error_table_$noentry then
+	        call com_err_ (code, "heals_report", "Did not delete heals_reports.");
+	      else;
+	    else;
+	  end;
+	  return;
+	end clean_up;
+						/* 
+						   include files */
+%include heals_arg_info;
+%include installation_parms;
+%include whotab;
+%include heals_message;
+%include heals_state;
+%include iocb;
+        end heals_report;
+  
+
+
+
+		    heals_scan_config_.pl1          09/27/84  0748.5rew 09/27/84  0745.3       63090
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+heals_scan_config_: proc (heals_ior_args_p, r_code);
+
+/* ******************************************************************************
+   *								*
+   *  Comments:							*
+   *								*
+   *	Written by RH Morrison  Nov. 19, 1976	 			*
+   *	Last modified by C. Hornig, October 1982
+   *								*
+   ****************************************************************************** */
+
+/* FF */
+/* ********	DECLARATIONS	******** */
+
+/* ****	PROCEDURE ARGUMENTS   **** */
+dcl  heals_ior_args_p ptr;
+dcl  r_code fixed bin (35);
+
+
+/* ****	EXTERNAL STATIC	**** */
+dcl  config_deck$ ext;
+
+/* ****	ENTRIES		**** */
+dcl  ioa_ entry options (variable);
+dcl  clock_ entry returns (fixed bin (71));
+dcl  date_time_ entry (fixed bin (71), char (*));
+
+/* ****	POINTERS		**** */
+dcl  ch_data_p ptr;					/* Pointer to channel data */
+dcl  config_deck_p ptr;				/* Pointer to config deck */
+dcl  flags_p ptr init (null);
+
+/* pointers declared elsewhere:
+   ior_flags_p
+   ior_parms_p
+   ior_avars_p
+   ch_nfo_p
+*/
+
+
+/* ****	CHARACTER STRING VARIABLES    **** */
+dcl  date_time char (16);
+dcl  date char (8);
+dcl  time char (6);
+
+/*  Arguments  */
+dcl  whoami char (18) init ("heals_scan_config_");
+dcl  version_date char (8) init ("12/15/76");
+
+/* ****	ARITHMETIC VARIABLES    **** */
+dcl  code fixed bin (35);
+dcl  deck_stopper fixed bin based (config_deck_p);	/* flag at end of deck */
+dcl  ch_data_stop fixed bin based (ch_data_p);		/* flag at end of channel data */
+dcl  nb_ch fixed bin (6);
+dcl  clock_time fixed bin (71);
+dcl (i, j) fixed bin;
+dcl  bulk_port fixed bin;
+
+/*  Arguments  */
+dcl  version_nb fixed bin init (1);
+
+/* ****	BIT STRING VARIABLES    **** */
+dcl  flags_word bit (36) aligned;
+
+/* ****	ARRAY VARIABLES		**** */
+dcl  tag_ar (0:8) char (1) init ("", "a", "b", "c", "d", "e", "f", "g", "h");
+
+/* ****	BASED VARIABLES   **** */
+dcl 1 flags aligned based (flags_p),
+    (2 trace bit (1),
+    2 db bit (1),
+    2 fill bit (1)
+     ) unal;
+
+dcl 1 ch_nfo_ar (1:max_iom_nb_a) aligned based (ch_nfo_ar_p),
+    2 ch_entry (0:max_ch_nb_a) like ch_nfo;
+
+/*  Declarations of config deck cards.  */
+dcl 1 prph aligned based (config_deck_p),		/* A prph card */
+    2 word char (4),				/* The word "prph" */
+    2 name char (4),				/* Name of device */
+    2 iom fixed bin (3),				/* Iom number */
+    2 chan fixed bin (6),				/* Channel number */
+    2 model fixed bin,				/* Model number */
+    2 nchan fixed bin (6);				/* Number of channels available */
+
+dcl 1 dsk_prph aligned based (config_deck_p),		/* A disk subsystem prph card */
+    2 word char (4),
+    2 name char (4),
+    2 iom fixed bin (3),
+    2 chan fixed bin (6),
+    2 nchan fixed bin (6),
+    2 model fixed bin;
+
+dcl 1 fnp aligned based (config_deck_p),		/* A d355 card */
+    2 word char (4),
+    2 tag fixed bin,
+    2 chan fixed bin (6),
+    2 iom fixed bin (3);
+
+dcl 1 bulk_card aligned based (config_deck_p),		/* A bulk store card */
+    2 word char (4),
+    2 frec fixed bin,
+    2 nrec fixed bin,
+    2 port fixed bin,
+    2 int0 fixed bin;
+
+dcl 1 chan_card aligned based (config_deck_p),		/* A chnl card */
+    2 word char (4),
+    2 name char (4),
+    2 ch_entry like ch_data;
+
+dcl 1 ch_data aligned based (ch_data_p),		/* channel data on a chnl card */
+    2 iom fixed bin (3),
+    2 chan fixed bin (6),
+    2 nchan fixed bin (6);
+
+/* ****	MISC. DECLARATIONS		**** */
+
+dcl (addr, addrel, null, substr) builtin;
+dcl  cleanup condition;
+
+/* FF */
+/* ****	INCLUDE FILES	**** */
+%include heals_io_report_args;
+/* ****	END OF DECLARATIONS   **** */
+/* FF */
+/* ********	PROCEDURE		******** */
+
+/* ****	Procedure Initialization	**** */
+
+	on cleanup call clean_up;
+
+/*  Init returns.  */
+	r_code = 0;
+
+/*  Init pointers.  */
+	flags_p = addr (flags_word);
+
+/*  Init procedure constants.  */
+
+/* Init control flags.  */
+	flags_word = "0"b;
+
+/*  Init all else.  */
+	code = 0;
+
+	do i = 1 to max_iom_nb_a;			/* init ch_nfo_ar */
+	     do j = 0 to max_ch_nb_a;
+		ch_nfo_ar.ch_entry.i_set (i, j) = "0"b; /* if used, set to 1 by scan_config */
+	     end;
+	end;
+
+
+/* ****	End Procedure Initialization    **** */
+
+/* Run information.  */
+	clock_time = clock_ ();
+	call date_time_ (clock_time, date_time);
+	date = substr (date_time, 1, 8);
+	time = substr (date_time, 11, 6);
+	if flags.trace
+	| ior_flags.trace
+	then call ioa_ ("^a run info: date ^a, time ^a, version ^d of ^a.",
+	     whoami, date, time, version_nb, version_date);
+
+/*  Scan the config deck and put peripheral info in ch_nfo_ar.  */
+
+	config_deck_p = addr (config_deck$);		/* Start in beginning */
+	do while (deck_stopper ^= -1);		/* And scan til end */
+	     if prph.word = "prph"
+	     then do; ch_nfo_p = addr (ch_nfo_ar.ch_entry (prph.iom, prph.chan)); /* set pointer to array entry */
+		ch_nfo.i_set = "1"b;		/* mark entry as initialized */
+		ch_nfo.dev_nam = prph.name;		/* fill in values from config_deck */
+		ch_nfo.lchan = prph.chan;
+		ch_nfo.uchan = prph.chan;
+		if substr (prph.name, 1, 3) = "tap" |
+		substr (prph.name, 1, 3) = "dsk" /* multiple channels */ then do;
+		     nb_ch = dsk_prph.nchan;
+		     ch_nfo.uchan = ch_nfo.lchan + nb_ch -1;
+		     ch_nfo.model = dsk_prph.model;
+		     if nb_ch >1			/* copy data to other channels */
+		     then do i = 1 to nb_ch-1;
+			ch_nfo_ar.ch_entry (prph.iom, prph.chan+i) = ch_nfo_ar.ch_entry (prph.iom, prph.chan);
+		     end;
+		end;
+		else ch_nfo.model = prph.model;
+		if ch_nfo.model > 9999 then ch_nfo.model = 9999; /* dummy model number */
+	     end;
+	     else if chan_card.word = "chnl"
+	     then do; ch_data_p = addrel (config_deck_p, 2);
+		do while (ch_data_stop ^= -1);
+		     ch_nfo_p = addr (ch_nfo_ar.ch_entry (ch_data.iom, ch_data.chan));
+		     ch_nfo.i_set = "1"b;
+		     ch_nfo.dev_nam = chan_card.name;
+		     ch_nfo.model = 9999;
+		     ch_nfo.lchan = ch_data.chan;
+		     ch_nfo.uchan = ch_data.chan + ch_data.nchan -1;
+		     if ch_data.nchan > 1
+		     then do i = 1 to ch_data.nchan -1;
+			ch_nfo_ar.ch_entry (ch_data.iom, ch_data.chan + i)
+			     = ch_nfo_ar.ch_entry (ch_data.iom, ch_data.chan);
+		     end;
+		     ch_data_p = addrel (ch_data_p, 3);
+		end;
+	     end;
+	     else if fnp.word = "d355"		/* datanet */
+	     then do; ch_nfo_p = addr (ch_nfo_ar.ch_entry (fnp.iom, fnp.chan));
+		ch_nfo.i_set = "1"b;
+		if fnp.tag < 0 | fnp.tag > 8 then fnp.tag = 0;
+		ch_nfo.dev_nam = "355" || tag_ar (fnp.tag); /* use character tag */
+		ch_nfo.lchan = fnp.chan;
+		ch_nfo.uchan = fnp.chan;
+		ch_nfo.model = 9999;
+	     end;
+	     else if bulk_card.word = "bulk" then bulk_port = bulk_card.port;
+
+	     config_deck_p = addrel (config_deck_p, 16);	/* To next card */
+	end;
+	return;
+
+/* FF  */
+clean_up:	proc;
+	     return;
+	end clean_up;
+
+err_return: return;
+
+
+     end heals_scan_config_;
+  
+
+
+
+		    heals_sorted_report_gen_.pl1    09/27/84  0748.5rew 09/27/84  0745.3       99846
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+heals_sorted_report_gen_: proc (heals_arg_info_p, heals_ior_args_p, r_code);
+
+/* ******************************************************************************
+   *								*
+   *  Comments:							*
+   *								*
+   *	Written by RH Morrison  Dec. 1, 1976	 			*
+   *	Last modified by RH Morrison  01/03/77				*
+   *								*
+   ****************************************************************************** */
+
+/* FF */
+/* ********	DECLARATIONS	******** */
+
+/* ****	PROCEDURE ARGUMENTS   **** */
+
+dcl  heals_arg_info_p ptr;
+dcl  heals_ior_args_p ptr;
+dcl  r_code fixed bin (35);
+
+/* ****	EXTERNAL STATIC	**** */
+
+dcl  error_table_$end_of_info ext static fixed bin (35);
+
+/* ****	ENTRIES		**** */
+dcl  sort_ entry ((*)char (*), char (*), (*)ptr, char (*), char (*), float bin (27),
+     fixed bin (35));
+dcl  clock_ entry returns (fixed bin (71));
+dcl  get_pdir_ entry returns (char (168));
+dcl  ioa_ entry options (variable);
+dcl  ioa_$ioa_switch entry options (variable);
+dcl  com_err_ entry options (variable);
+dcl  date_time_ entry (fixed bin (71), char (*));
+dcl  iox_$attach_ioname entry (char (*), ptr, char (*), fixed bin (35));
+dcl  iox_$detach_iocb entry (ptr, fixed bin (35));
+dcl  iox_$close entry (ptr, fixed bin (35));
+dcl  iox_$open entry (ptr, fixed bin, bit (1) aligned, fixed bin (35));
+dcl  iox_$read_record entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+
+/* ****	POINTERS		**** */
+dcl  flags_p ptr init (null);
+dcl  work_p1 ptr init (null);
+
+/*  Arguments  */
+dcl  sortsw_p ptr init (null);
+dcl  sort_data_p ptr init (null);
+dcl  sort_desc_p (3) ptr init (null, null, null);
+dcl  inbuf_p ptr init (null);
+dcl  insw_p ptr init (null);
+dcl  outsw_p ptr init (null);
+
+/* Pointers declared in include files:
+   ior_flags_p
+   ior_prms_p
+   ch_nfo_p
+   heals_ior_avars_p
+   ioerr_rec_p
+   statp
+   iocbp
+   io_msgp
+   */
+
+/* ****	CHARACTER STRING VARIABLES    **** */
+dcl  old_name char (4);
+dcl  whoami char (24) int static init ("heals_sorted_report_gen_");
+dcl  inbuf char (inbuf_len) aligned;
+dcl  rprt_from_time char (16);
+dcl  rprt_to_time char (16);
+dcl  old_date char (8);
+dcl  date char (8);
+dcl  time char (6);
+dcl  date_time char (16);
+dcl  ch_nr pic "99";
+dcl  dev_nr pic "99";
+
+/*  Arguments  */
+dcl  version_date char (8) init ("12/15/76");
+
+/* ****	ARITHMETIC VARIABLES    **** */
+dcl  clock_time fixed bin (71);
+dcl  line_cnt fixed bin;
+dcl  max_line_cnt fixed bin;
+dcl  page_nb fixed bin;
+
+/*  Arguments  */
+dcl  version_nb fixed bin init (1);
+dcl  code fixed bin (35);
+dcl  inrec_len fixed bin (21);
+dcl  inbuf_len fixed bin (21) int static init (1024);
+dcl  seq_in fixed bin int static init (4);
+
+/* ****	BIT STRING VARIABLES    **** */
+dcl  flags_word bit (36) aligned;
+dcl  eof bit (1) aligned;
+
+/*  Arguments  */
+dcl  unused bit (1) aligned init ("0"b);
+
+/* ****	BASED VARIABLES		**** */
+dcl 1 arg_info like heals_arg_info aligned based (heals_arg_info_p);
+dcl 1 flags aligned based (flags_p),
+   (2 trace bit (1),
+    2 db bit (1),
+    2 hdrs bit (1),
+    2 no_recs bit (1),
+    2 fill bit (1)
+     ) unal;
+
+/* ****	SORT DECLARATIONS   **** */
+dcl  sort_file_size float bin (27);
+dcl  sort_out_file char (168);
+dcl  sort_temp_dir char (168);
+dcl  sort_user_out_sw char (32);
+dcl  sortsw char (6) int static init ("sortsw");
+dcl  sort_in_file (1) char (168);
+dcl  user_keys_number int static init (2);
+dcl 1 keys,
+    2 version fixed bin init (1),
+    2 number fixed bin,
+    2 key_desc (user_keys_number),
+      3 datatype char (8),
+      3 size fixed bin (24),
+      3 word_offset fixed bin (18),
+      3 bit_offset fixed bin (6),
+      3 desc char (3);
+
+/* ****	MISC. DECLARATIONS		**** */
+
+dcl (addr, addrel, before, fixed, null) builtin;
+dcl  cleanup condition;
+
+/* FF */
+/* ****	INCLUDE FILES	**** */
+%include heals_arg_info;
+%include heals_io_report_args;
+%include heals_ioerr_rec;
+%include io_syserr_msg;
+%include iom_stat;
+%include iocb;
+/* ****	END OF DECLARATIONS   **** */
+/* FF */
+/* ********	PROCEDURE		******** */
+
+/* ****	Procedure Initialization	**** */
+
+	on cleanup call clean_up;
+
+/*  Init returns.  */
+	r_code = 0;
+	arg_info.err_nb = 0;
+
+/*  Init pointers.  */
+	flags_p = addr (flags_word);
+	insw_p = ioerr_log_sw_p;
+	outsw_p = arg_info.report_iocbp;
+	inbuf_p = addr (inbuf);
+	ioerr_rec_p = addr (inbuf);
+	io_msgp = addr (ioerr_rec.data);
+	statp = addr (io_msg.status);
+
+/* Init control flags.  */
+	flags_word = "0"b;
+	flags.hdrs = "1"b;
+	flags.no_recs = ior_flags.no_recs;
+	eof = "0"b;
+
+/*  Init all else.  */
+
+	code = 0;
+	old_date = "";
+	page_nb = 0;
+	line_cnt = 0;
+	max_line_cnt = max_line_cnt_a;
+	call date_time_ (arg_info.from_time, rprt_from_time);
+	call date_time_ (arg_info.to_time, rprt_to_time);
+
+/*  Initialize for sort.  */
+	sort_in_file = "-if "||before (get_pdir_ (), " ") ||">heals_ioerr_log";
+	sort_out_file = "-of " || before (get_pdir_ (), " ") || ">heals_sort_log";
+	sort_desc_p (1) = addr (keys);
+	sort_desc_p (2) = null;
+	sort_desc_p (3) = null;
+	sort_file_size = 0;
+	sort_temp_dir = "";
+	sort_user_out_sw = "";
+
+	keys.number = user_keys_number;
+
+	key_desc.datatype (1) = "char";
+	key_desc.size (1) = 8;
+	key_desc.word_offset (1) = 0;
+	key_desc.bit_offset (1) = 0;
+	key_desc.desc (1) = "";
+
+	key_desc.datatype (2) = "bit";
+	key_desc.size (2) = 44;
+	key_desc.word_offset (2) = 2;
+	key_desc.bit_offset (2) = 0;
+	key_desc.desc (2) = "";
+
+/* ****	End Procedure Initialization    **** */
+
+/*  Run information.  */
+	clock_time = clock_ ();
+	call date_time_ (clock_time, date_time);
+	date = substr (date_time, 1, 8);
+	time = substr (date_time, 11, 6);
+	if flags.trace
+	| ior_flags.trace
+	then call ioa_ ("^a run info: date ^a, time ^a, version ^d of ^a.",
+	  whoami, date, time, version_nb, version_date);
+
+/*  Sort heals_ioerr_log for the sorted_io_error report.  */
+	call sort_ (sort_in_file, sort_out_file, sort_desc_p,
+	  sort_temp_dir, "", 0, code);
+	if code ^= 0 then call proc_err (45);
+
+/* ****	Write sorted_io_error report.   **** */
+
+/*  Attach and open heals_sort_log file.  */
+	if ^flags.no_recs
+	then do;
+	  call iox_$attach_ioname (sortsw, sortsw_p, "vfile_ " || before (
+	    get_pdir_ (), " ") || ">heals_sort_log", code);
+	  if code ^= 0 then call proc_err (22);
+	  call iox_$open (sortsw_p, seq_in, unused, code);
+	  if code ^= 0 then call proc_err (40);
+
+/*  Read first record.  */
+	  call iox_$read_record (sortsw_p, inbuf_p, inbuf_len, inrec_len, code);
+	  if code ^= 0 then if code = error_table_$end_of_info
+	    then flags.no_recs = "1"b;
+	    else call proc_err (41);
+	  old_name = dev_nm;			/* initialize from first record */
+	end;
+
+/* Record processing loop. */
+sorted_report_line_loop:
+	do while (^eof);
+	  if flags.hdrs
+	  then do; page_nb = page_nb + 1;
+	    line_cnt = 5;
+	    call ioa_$ioa_switch (outsw_p,
+	      "^|SORTED_IO_ERROR_REPORT:^x^a^xto^x^a^5xPAGE^x^2d^/",
+	      rprt_from_time, rprt_to_time, page_nb);
+
+	    call ioa_$ioa_switch (outsw_p,
+	      "_____D_E_V_I_C_E_____^3xS_T_A_T_U_S__^2xTLY^4xTAPE_NO^1xDENS^xRING^1xTRK^4xS_Y_S_E_R_R_____L_O_G_
+I-CC-DD NAME CM^3xMJ-SB-I^9xDISK_AD^2xCYL^xHEAD^1xSEC^4xTIME^3xNUMBER");
+
+	    if flags.no_recs then eof = "1"b;
+	  end;
+
+/* Write date line. */
+	  if ^eof
+	  then do; if sort_date ^= old_date | flags.hdrs
+	    then do; old_date = sort_date;
+	      flags.hdrs = "0"b;
+	      line_cnt = line_cnt +4;
+	      call ioa_$ioa_switch (outsw_p, "^/^72(_^)^/DATE:^x^a^vxDATE:^x^a^/",
+	        sort_date, 44, sort_date);
+	    end;
+
+	    ch_nr = fixed (ch_nb);
+	    dev_nr = fixed (dev_nb);
+
+/*  Write sorted_io_error report line.  */
+	    line_cnt = line_cnt + 1;
+
+	    if rprt_flags.ioerr
+	    then call ioa_$ioa_switch (outsw_p,
+	      "^1d-^2a-^2a^x^4a^x^2.3b^3x^2.3b-^2.3b-^1a^2x^3d^4x^7a^1x^4a^3x^2a^2x^2a^4x^6a^x^6d",
+	      iom_nb, ch_nr, dev_nr, dev_nm, dev_cmnd, maj_st, sub_st, ntrpt_nm, tally_nb,
+	      tapno_diskad, dens_cyl, ring_head, tracks_sector,
+	      log_time, seq_nb);
+
+	    else if rprt_flags.diskerr
+	    then do; call ioa_$ioa_switch (outsw_p,
+	        "^1d-^2a-^2a^x^4a^x^2.3b^3x^2.3b-^2.3b-^1a^2x^3d^4x^7a^1x^4a^3x^2a^2x^2a^4x^6a^x^6d^/^18x^a",
+	        iom_nb, ch_nr, dev_nr, dev_nm, dev_cmnd, maj_st, sub_st, ntrpt_nm, tally_nb,
+	        tapno_diskad, dens_cyl, ring_head, tracks_sector,
+	        log_time, seq_nb, ioerr_rec.msg);
+	      line_cnt = line_cnt + 1;
+	    end;
+
+	    else if rprt_flags.disk_addr
+	    then call ioa_$ioa_switch (outsw_p,
+	      "^1d-^2a-^2a^x^4a^x^2.3b^19x^7a^1x^4a^3x^2a^2x^2a^4x^6a^x^6d",
+	      iom_nb, ch_nr, dev_nr, dev_nm, dev_cmnd,
+	      tapno_diskad, dens_cyl, ring_head, tracks_sector, log_time, seq_nb);
+
+	    else if rprt_flags.ext_stat | rprt_flags.iom_rec
+	    then call ioa_$ioa_switch (outsw_p,
+	      "^1d-^2a-^2a^x^4a^x^2.3b^3x^38a^3x^6a^x^6d",
+	      iom_nb, ch_nr, dev_nr, dev_nm, dev_cmnd, ioerr_rec.msg, log_time, seq_nb);
+
+	    else if rprt_flags.msg
+	    then call ioa_$ioa_switch (outsw_p, "^a", ioerr_rec.msg);
+
+	    else if rprt_flags.bulk
+	    then call ioa_$ioa_switch (outsw_p,
+	      "^8x^50a^x^6a^x^6d",
+	      ioerr_rec.msg, log_time, seq_nb);
+
+/*  Read next heals_sort_log record.  */
+	    call iox_$read_record (sortsw_p, inbuf_p, inbuf_len, inrec_len, code);
+	    if code ^= 0
+	    then if code = error_table_$end_of_info
+	      then eof = "1"b;
+	      else call proc_err (42);
+
+/* Write end of dev_nm errors line. */
+	    if dev_nm ^= old_name | sort_date ^= old_date
+	    then do; line_cnt = line_cnt + 2;
+	      if line_cnt > max_line_cnt -4
+	      then flags.hdrs = "1"b;
+	      call ioa_$ioa_switch (outsw_p,
+	        "end: ^a errors^/", old_name);
+	      old_name = dev_nm;
+	    end;
+
+/*  Date change.  */
+	    if sort_date ^= old_date
+	    then if line_cnt > max_line_cnt - 10
+	      then flags.hdrs = "1"b;
+	  end;
+
+	  if line_cnt > max_line_cnt
+	  then flags.hdrs = "1"b;
+	end sorted_report_line_loop;
+
+/*  End of file on heals_sort_log.  */
+	if flags.no_recs
+	then call ioa_$ioa_switch (outsw_p,
+	  "^/^11xThere were no io_errors during the report period.");
+	else call ioa_$ioa_switch (outsw_p,
+	  "end: ^a errors", old_name);
+	call ioa_$ioa_switch (outsw_p,
+	  "^/END: SORTED_IO_ERROR_REPORT");
+	if ^flags.no_recs
+	then do; call iox_$close (sortsw_p, code);
+	  if code ^= 0 then call proc_err (43);
+	  call iox_$detach_iocb (sortsw_p, code);
+	  if code ^= 0 then call proc_err (27);
+	end;
+	return;
+
+/* FF */
+proc_err:	proc (proc_err_nb);
+dcl  proc_err_nb fixed bin;
+	  r_code = code;
+	  arg_info.err_nb = proc_err_nb;
+	  call com_err_ (code, whoami, "Procedure error number = ^d.", proc_err_nb);
+	  call clean_up;
+	  goto err_return;
+	end proc_err;
+
+clean_up:	proc;
+	  if sortsw_p ^= null () then do;
+	    call iox_$close (sortsw_p, code);
+	    call iox_$detach_iocb (sortsw_p, code);
+	  end;
+	  return;
+	end clean_up;
+
+err_return: return;
+
+        end heals_sorted_report_gen_;
+  
+
+
+
+		    print_heals_message.pl1         09/27/84  0748.5rew 09/27/84  0745.3       66645
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+/* Coded by A. Downing July 1976.
+   Modified by A. Downing 02/07/77 to report un-implemented arguments.
+   print_heals_message is a utility for inspecting and/or modifying messages in
+   the perminent heals log */
+phm: print_heals_message: proc;
+%include heals_arg_info;
+%include heals_state;
+%include heals_message;
+dcl  buffer char (2048) aligned;
+dcl  match_sw bit (1) init ("0"b);
+dcl  update_sw bit (1) init ("0"b);
+dcl  match_string char (64) varying init ("");
+dcl  mt fixed bin (71) init (0);
+dcl  m_time char (16) init ("");
+dcl  sn fixed bin (35) init (0);
+dcl (div_part, remainder, skip) fixed bin;
+dcl  args fixed bin;
+dcl  arg char (arg_len) based (arg_p);
+dcl  arg_len fixed bin;
+dcl  arg_p ptr init (null ());
+dcl  i fixed bin;
+dcl  act_len fixed bin (21);
+dcl  command char (16) varying init ("");
+dcl  code fixed bin (35);
+dcl  iocbp ptr init (null ());
+dcl  hcs_$initiate entry (char (*), char (*), char (*),
+     fixed bin (1), fixed bin (2), ptr, fixed bin (35));
+dcl  cu_$arg_count entry returns (fixed bin);
+dcl  cu_$arg_ptr entry (fixed bin, ptr, fixed bin, fixed bin (35));
+dcl  date_time_ entry (fixed bin (71), char (*));
+dcl  convert_date_to_binary_ entry (char (*), fixed bin (71), fixed bin (35));
+dcl  read_list_$prompt entry options (variable);
+dcl (ioa_, com_err_) entry options (variable);
+dcl (iox_$close, iox_$detach_iocb) entry (ptr, fixed bin (35));
+dcl  iox_$read_record entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+dcl  iox_$delete_record entry (ptr, fixed bin (35));
+dcl  iox_$open entry (ptr, fixed bin, bit (1) aligned, fixed bin (35));
+dcl  iox_$attach_ioname entry (char (*), ptr, char (*), fixed bin (35));
+dcl  log_path char (168) ext static aligned init (">system_control_1>heals_dir>heals_log"); /* default log */
+dcl  error_table_$end_of_info ext static fixed bin (35);
+dcl  error_table_$badopt ext static fixed bin (35);
+dcl  error_table_$noarg ext static fixed bin (35);
+dcl  error_table_$file_busy ext static fixed bin (35);
+dcl  cleanup condition;
+
+	heals_log_path_name = log_path;
+	i = index (reverse (heals_log_path_name), ">");
+	i = length (heals_log_path_name) - i;
+	call hcs_$initiate
+	  (substr (heals_log_path_name, 1, i),
+	  "heals_log_info", "", 0, 0, heals_state_p, code);
+	args = cu_$arg_count ();
+	if args < 2 then do;
+	  call com_err_ (error_table_$noarg, "print_heals_message", "at least two arguments are required.");
+	  go to finished;
+	end;
+	i = 1;
+	do while (i <= args);
+	  call cu_$arg_ptr (i, arg_p, arg_len, code);
+	  if code ^= 0 then do;
+	    call com_err_ (code, "print_heals_message");
+	    go to finished;
+	  end;
+	  if arg = "-seq_num" then do;
+	    i = i + 1;
+	    call cu_$arg_ptr (i, arg_p, arg_len, code);
+	    if code ^= 0 then do;
+	      call com_err_ (code, "print_heals_message");
+	      go to finished;
+	    end;
+	    sn = convert (sn, arg);
+	  end;
+	  else if arg = "-match" then do;
+	    i = i + 1;
+	    call cu_$arg_ptr (i, arg_p, arg_len, code);
+	    if code ^= 0 then do;
+	      call com_err_ (code, "print_heals_message");
+	      go to finished;
+	    end;
+	    match_string = arg;
+	    match_sw = "1"b;
+	  end;
+	  else if arg = "-time" then do;
+	    i = i + 1;
+	    call cu_$arg_ptr (i, arg_p, arg_len, code);
+	    if code ^= 0 then do;
+	      call com_err_ (code, "print_heals_message");
+	      go to finished;
+	    end;
+	    call convert_date_to_binary_ (arg, mt, code);
+	    if code ^= 0 then do;
+	      call com_err_ (code, "print_heals_message", "error converting message time ^a", arg);
+	      go to finished;
+	    end;
+	  end;
+	  else if arg = "-update" then
+	    update_sw = "1"b;
+	  else do;
+	    call com_err_ (error_table_$badopt, "print_heals_message",
+	      "^a", arg);
+	    go to finished;
+	  end;
+	  i = i + 1;
+	end;					/* end of arg loop */
+	heals_message_p = addr (buffer);
+	on cleanup call terminate;
+	if ^update_sw then
+	  call iox_$attach_ioname ("heals_io", iocbp,
+	  "vfile_ " || before (heals_log_path_name, " "), code);
+	else call iox_$attach_ioname ("heals_io", iocbp,
+	  "vfile_ " || before (heals_log_path_name, " ") ||
+	  " -extend", code);
+	if code ^= 0 then do;
+iox_error:
+	  call com_err_ (code, "print_heals_message");
+	  go to finished;
+	end;
+	if ^update_sw then
+	  call iox_$open (iocbp, 4 /* seq in */, "0"b, code);
+	else call iox_$open (iocbp, 10 /* keyed_seq update */, "0"b, code);
+	if code ^= 0 then go to iox_error;
+
+	call iox_$read_record (iocbp, heals_message_p, length (buffer), act_len, code);
+	if code ^= 0 then do;
+read_error:
+	  call com_err_ (code, "print_heals_message", "error reading from heals_log.");
+	  go to iox_error;
+	end;
+	call read_log;				/* get started with 1st msg */
+read_loop: do while ("1"b);
+	  if heals_message.time >= mt then do;
+	    do while (heals_message.seq_num < sn);
+	      call read_log;
+	    end;
+	    if match_sw then
+	      do while (index (heals_message.text, match_string) = 0);
+	      call read_log;
+	    end;
+	    call date_time_ ((heals_message.time), m_time);
+	    call ioa_ ("seq_num ^d at ^a tally of ^d; ^/text: ^a.",
+	      heals_message.seq_num, m_time, heals_message.tally, heals_message.text);
+	    if update_sw then
+command_loop:   do while ("1"b);
+	      call get_command;
+	      if command = "delete" then do;
+	        call iox_$delete_record (iocbp, code);
+	        if code ^= 0 then do;
+		call com_err_ (code, "print_heals_message",
+		  "could not delete the record.");
+		go to finished;
+	        end;
+	      end;
+	      else if command = "next" then go to next_msg;
+	      else if command = "data" |
+	      command = "display_data" then do;
+	        div_part = divide (heals_message.data_size, 8, 17, 0);
+	        remainder = mod (heals_message.data_size, 8);
+	        skip = bin (remainder > 0, 17, 0);
+	        call ioa_ (
+		"octal data:^v(^/^w ^w ^w ^w ^w ^w ^w ^w^)^v(^/^)^v(^w ^)",
+		div_part, skip, remainder, heals_message.data);
+	      end;
+	      else if command = "quit" |
+	      command = "q" |
+	      command = "stop" |
+	      command = "s" then
+	        go to finished;
+	    end command_loop;
+	  end;
+next_msg:
+	  call read_log;
+	end read_loop;
+
+finished:	call terminate;
+	return;
+
+terminate: proc;					/* for preparing to return to command level */
+	  if iocbp ^= null () then
+	    call iox_$close (iocbp, code);
+	  if iocbp ^= null () then
+	    call iox_$detach_iocb (iocbp, code);
+	  iocbp = null ();
+	  return;
+	end terminate;
+
+read_log:	proc;					/* for getting heals_log messages */
+	  call iox_$read_record (iocbp, heals_message_p, length (buffer), act_len, code);
+	  if code ^= 0 then
+	    if code ^= error_table_$end_of_info then go to read_error;
+	    else go to finished;
+	  else;
+	  return;
+	end read_log;
+get_command: proc;
+
+queery:
+	  call read_list_$prompt ("enter command	", command);
+	  if command ^= "delete" &
+	  command ^= "next" &
+	  command ^= "data" &
+	  command ^= "display_data" &
+	  command ^= "quit" &
+	  command ^= "q" &
+	  command ^= "s" &
+	  command ^= "stop" then do;
+bad_command:
+	    call ioa_ ("^a is not a valid command.", command);
+	    go to queery;
+	  end;
+	  return;
+	end get_command;
+        end print_heals_message;
+   
+
+
+
+		    update_heals_log.pl1            09/27/84  0748.5rew 09/27/84  0745.3       98280
+
+
+
+/* ***********************************************************
+   *                                                         *
+   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+   *                                                         *
+   *********************************************************** */
+
+/* update_heals_log copies messages from the syserr_log
+   into the heals_log.  Coded by A. Downing 09/76 as part of
+   Multics HEALS */
+/* Modified by A. Downing March 1978 to
+   repair cleanup handling */
+/* Modified by A. Downing Dec. 1978 to make several
+   minor bug fixes. */
+/* Modified by F. W. Martinson 10/82 to correct bugs and add standard
+   locking strategy. */
+update_heals_log: proc;
+%include heals_arg_info;
+%include heals_state;
+%include heals_message;
+dcl  hcs_$make_seg entry (char (*), char (*), char (*),
+     fixed bin (5), ptr, fixed bin (35));
+dcl  hcs_$status_minf entry
+    (char (*), char (*), fixed bin (1), fixed bin (2), fixed bin (24), fixed bin (35));
+dcl  hcs_$initiate entry (char (*), char (*), char (*),
+     fixed bin (1), fixed bin (2), ptr, fixed bin (35));
+dcl  convert_date_to_binary_ entry (char (*), fixed bin (71), fixed bin (35));
+dcl  clock_ entry returns (fixed bin (71));
+dcl  get_pdir_ entry returns (char (168));
+dcl  heals_collect_data_ entry (ptr, fixed bin (35));
+dcl (com_err_, ioa_) entry options (variable);
+dcl (iox_$close, iox_$detach_iocb) entry (ptr, fixed bin (35));
+dcl  iox_$position entry (ptr, fixed bin, fixed bin (21), fixed bin (35));
+dcl  iox_$read_record entry (ptr, ptr, fixed bin (21), fixed bin (21), fixed bin (35));
+dcl  iox_$delete_record entry (ptr, fixed bin (35));
+dcl  iox_$open entry (ptr, fixed bin, bit (1) aligned, fixed bin (35));
+dcl  iox_$attach_ioname entry (char (*), ptr, char (*), fixed bin (35));
+dcl  set_lock_$lock entry (bit (36) aligned, fixed bin, fixed bin (35));
+dcl  set_lock_$unlock entry (bit (36) aligned, fixed bin (35));
+dcl  log_path char (168) ext static aligned init (">system_control_1>heals_dir>heals_log"); /* default log */
+dcl  error_table_$noentry ext static fixed bin (35);
+dcl  error_table_$lock_wait_time_exceeded ext static fixed bin (35);
+dcl  error_table_$end_of_info ext static fixed bin (35);
+dcl  code fixed bin (35);
+dcl  ind fixed bin;
+dcl  temp_date_time fixed bin (71);
+dcl  one_day fixed bin (71) int static init (86400000000);	/* one day of micro/sec */
+dcl  chase fixed bin (1) init (1);
+dcl  type fixed bin (2);
+dcl  bit_count fixed bin (24);
+dcl  save_seq_num fixed bin (35);
+dcl  cleanup condition;
+dcl  me char (32) varying;
+dcl (abs, addr, before, bin, null, verify) builtin;
+
+	me = "update_heals_log";
+	heals_arg_info.iocbp = null ();
+	heals_arg_info.heals_log_path_name = log_path;
+	ind = index (reverse (heals_log_path_name), ">");
+	ind = length (heals_log_path_name) - ind ;
+	call hcs_$initiate
+	     (substr (heals_log_path_name, 1, ind),
+	     "heals_log_info", "", 0, 0, heals_state_p, code);
+	if heals_state_p = null () then do;
+	     call hcs_$make_seg
+		(substr (heals_log_path_name, 1, ind),
+		"heals_log_info", "", 01010b, heals_state_p, code);
+	     if heals_state_p = null () then do;
+		call com_err_ (code, me, "could not initiate heals_log_info.");
+		return;
+	     end;
+	end;
+	call set_lock_$lock (heals_state.busy, 0, code);
+	if code = error_table_$lock_wait_time_exceeded then do;
+	     call com_err_ (code, me, "heals log busy");
+	     call clean_up;
+	     return;
+	end;
+
+	on cleanup call clean_up;
+	save_seq_num = last_message_seq_num;
+	call hcs_$status_minf
+	     (substr (heals_log_path_name, 1, ind),
+	     substr (heals_log_path_name, ind +2),
+	     chase, type, bit_count, code);
+	if code = error_table_$noentry |
+	type ^= 2 then do;				/* must create */
+	     call ioa_ ("^a: Creating heals_log^/^a", me, heals_log_path_name);
+	     call iox_$attach_ioname ("heals_io", heals_arg_info.iocbp,
+		"vfile_ " || before (heals_log_path_name, " "), code);
+	     if code ^= 0 then do;
+		call com_err_ (code, me, "could not create ^a.", heals_log_path_name);
+		call clean_up;
+		return;
+	     end;
+	end;
+	else do;					/* heals log exists ok */
+	     call iox_$attach_ioname ("heals_io", heals_arg_info.iocbp,
+		"vfile_ " || before (heals_log_path_name, " ") || " -extend", code);
+	     if code ^= 0 then do;
+		call com_err_ (code, me, "could not attach to heals_io stream.");
+		call clean_up;
+		return;
+	     end;
+	end;
+
+	from_time = last_message_time+1;
+	to_time = clock_ ();
+	info_selection = "0"b;			/* init */
+	substr (info_selection, 1, 7) = (7)"1"b;
+	call heals_collect_data_ (addr (heals_arg_info), code);
+	if heals_arg_info.err_nb ^= 0 | code ^= 0 then do;
+	     call com_err_ (code, me, "heals_log could not be completely updated.");
+	     call clean_up;
+	     return;
+	end;
+	call ioa_ (
+	     "^5x^d message^v(s^) processed,^/^5xsyserr seq_num ^d through^/^5xsyserr seq_num ^d.",
+	     abs (last_message_seq_num - save_seq_num), bin (abs (last_message_seq_num - save_seq_num) ^= 1, 17),
+	     save_seq_num, last_message_seq_num);
+
+	call clean_up;
+	return;
+						/*  */
+						/* truncate_heals_log truncates messages from the
+						   heals_log */
+truncate_heals_log: entry;
+dcl  reset_last_msg bit (1) init ("0"b);
+dcl  no_deleted fixed bin (35) init (0);
+dcl  error_table_$badopt ext static fixed bin (35);
+dcl  i fixed bin init (1);
+dcl  buffer char (2048) aligned;
+dcl  length builtin;
+dcl  act_len fixed bin (21);
+dcl  cu_$arg_count entry returns (fixed bin);
+dcl  cu_$arg_ptr entry (fixed bin, ptr, fixed bin, fixed bin (35));
+dcl  arg char (arg_len) based (arg_p);
+dcl  arg_len fixed bin;
+dcl  arg_p ptr;
+	me = "truncate_heals_log";
+	heals_arg_info.iocbp = null ();
+	heals_arg_info.heals_log_path_name = log_path;
+	ind = index (reverse (heals_log_path_name), ">");
+	ind = length (heals_log_path_name) - ind ;
+	call hcs_$initiate
+	     (substr (heals_log_path_name, 1, ind),
+	     "heals_log_info", "", 0, 0, heals_state_p, code);
+	if heals_state_p = null () then do;
+	     call com_err_ (code, me, "could not initiate heals_log_info");
+	     return;
+	end;
+
+	call set_lock_$lock (heals_state.busy, 0, code);
+	if code = error_table_$lock_wait_time_exceeded then do;
+	     call com_err_ (code, me, "heals log busy");
+	     call clean_up;
+	     return;
+	end;
+	heals_message_p = addr (buffer);
+	heals_state.busy = "1"b;
+	on cleanup call clean_up;
+	to_time = clock_ ();
+	from_time = 0;
+	if cu_$arg_count () < 1 then do;
+	     call com_err_ (0, me, "Usage:
+truncate_heals_log -from TIME -to TIME |
+truncate_heals_log Ndays");
+	     call clean_up;
+	     return;
+	end;
+	else do while (i <= cu_$arg_count ());
+	     call cu_$arg_ptr (i, arg_p, arg_len, code);
+	     if code ^= 0 then go to arg_error;
+	     if arg = "-from" | arg = "-fm" then do;
+		i = i + 1;
+		call cu_$arg_ptr (i, arg_p, arg_len, code);
+		if code ^= 0 then do;
+arg_error:	     call com_err_ (code, me, "error while analyzing argument ^d.", i);
+		     call clean_up;
+		     return;
+		end;
+		call convert_date_to_binary_ (arg, temp_date_time, code);
+		if code ^= 0 then go to arg_error;
+		else from_time = temp_date_time;
+	     end;
+	     else if arg = "-to" then do;
+		i = i + 1;
+		call cu_$arg_ptr (i, arg_p, arg_len, code);
+		if code ^= 0 then go to arg_error;
+		call convert_date_to_binary_ (arg, temp_date_time, code);
+		if code ^= 0 then go to arg_error;
+		else to_time = temp_date_time;
+	     end;
+	     else if verify (arg, "0123456789") = 0 then do; /* number of days */
+		from_time = 0;
+		to_time = clock_ () - (bin (arg, 17) * one_day);
+	     end;
+	     else do;				/* bad_arg */
+		call com_err_ (error_table_$badopt, me, "^a.", arg);
+		call clean_up;
+		return;
+	     end;
+	     i = i + 1;
+	end;					/* end of argument parsing loop */
+	call iox_$attach_ioname
+	     ("heals_io", iocbp,
+	     "vfile_ " || before (heals_log_path_name, " ") || " -extend", code);
+	if code ^= 0 then do;
+could_not_truncate:
+	     call com_err_ (code, me,
+		"could not truncate ^a as requested.",
+		before (heals_log_path_name, " "));
+	     call clean_up;
+	     return;
+	end;
+	call iox_$open (iocbp, 7 /* seq update */, "0"b, code);
+	if code ^= 0 then go to could_not_truncate;
+	call iox_$read_record (iocbp, heals_message_p, length (buffer), act_len, code);
+	if code ^= 0 then do;
+	     call com_err_ (code, me, "error while positioning heals_io.");
+	     call clean_up;
+	     return;
+	end;
+	do while (code = 0 & heals_message.time < from_time);
+	     call iox_$read_record (iocbp, heals_message_p, length (buffer), act_len, code);
+	     if code ^= 0 then
+		if code ^= error_table_$end_of_info then
+		     go to could_not_truncate;
+		else call clean_up;
+	     return;
+	end;
+deletion_loop:
+	do while (code = 0 & heals_message.time < to_time);
+	     if last_message_time = heals_message.time then
+		reset_last_msg = "1"b;
+	     call iox_$delete_record (iocbp, code);
+	     if code = 0 then
+		no_deleted = no_deleted + 1;
+	     call iox_$read_record (iocbp, heals_message_p,
+		length (buffer), act_len, code);
+	end;
+	if no_deleted > 0 then
+	     call ioa_ ("^4x^d record^v(s^) deleted from:^/^a.",
+	     no_deleted, bin (no_deleted > 1, 1, 0),
+	     before (heals_log_path_name, " "));
+	else call ioa_ ("^4xNo records were deleted from:^/^a.",
+	     before (heals_log_path_name, " "));
+	if reset_last_msg | code = error_table_$end_of_info then do;
+	     call iox_$position (iocbp, 1, 0, code);
+	     call iox_$position (iocbp, 0, -1, code);
+	     if code = error_table_$end_of_info then do;
+		last_message_seq_num = 0;
+		last_message_time = 0;
+	     end;
+	     else do;
+		call iox_$read_record (iocbp, heals_message_p,
+		     length (buffer), act_len, code);
+		last_message_seq_num = heals_message.seq_num;
+		last_message_time = heals_message.time;
+	     end;
+	     code = 0;
+	     reset_last_msg = "0"b;
+	end;
+	if code ^= 0 then call com_err_ (me, code);
+	call clean_up;
+	return;
+						/*  */
+clean_up:	proc;
+	     if iocbp ^= null () then do;
+		call iox_$close (iocbp, code);
+		call iox_$detach_iocb (iocbp, code);
+	     end;
+	     call set_lock_$unlock (heals_state.busy, code);
+	     return;
+	end clean_up;
+						/* 
+						   The test entry sets the value of log_path to allow the use of
+						   several different heals logs.
+						   Added Nov. 1976 by A. Downing. */
+test:	entry;
+dcl  expand_path_ entry (ptr, fixed bin, ptr, ptr, fixed bin (35));
+	if cu_$arg_count () = 0 then do;
+	     log_path = ">system_control_1>heals_dir>heals_log"; /* default value */
+	     call ioa_
+		("Resetting heals_log path to:^/^168a",
+		before (log_path, " "));
+	end;
+	else do;					/* get path name from argument list */
+	     call cu_$arg_ptr (1, arg_p, arg_len, code);
+	     call expand_path_ (arg_p, (arg_len), addr (log_path), null (), code);
+	     if code ^= 0 then do;
+		call com_err_ (code, "update_heals_log", "could not assign log path name ^a", arg);
+		return;
+	     end;
+	     else call ioa_ ("Setting heals_log path to:^/^168a", log_path);
+	end;
+	return;
+
+     end update_heals_log;
+
+
+
+		    bull_copyright_notice.txt       08/30/05  1008.4r   08/30/05  1007.3    00020025
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group Bull including Bull HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell Bull Inc., Groupe Bull
+and Bull HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato.Users consider that Multics provided the best software architecture for 
+managing computer hardware properly and for executing programs. Many subsequent operating systems
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, Bull or Bull HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by Bull HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

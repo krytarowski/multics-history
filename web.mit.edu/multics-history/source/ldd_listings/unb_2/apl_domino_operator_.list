@@ -1,0 +1,1063 @@
+	COMPILATION LISTING OF SEGMENT apl_domino_operator_
+	Compiled by: Multics PL/I Compiler, Release 28d, of October 4, 1983
+	Compiled at: Honeywell LCPD Phoenix, System M
+	Compiled on: 11/29/83  1602.0 mst Tue
+	    Options: optimize map
+
+        1 /* ******************************************************
+        2*   *                                                    *
+        3*   *                                                    *
+        4*   * Copyright (c) 1972 by Massachusetts Institute of   *
+        5*   * Technology and Honeywell Information Systems, Inc. *
+        6*   *                                                    *
+        7*   *                                                    *
+        8*   ****************************************************** */
+        9 
+       10 apl_domino_operator_:
+       11 	procedure (operators_argument);
+       12 
+       13 /*
+       14* * this routine performs the monadic and dyadic domino (matrix-invert, least squares).
+       15* *
+       16* * written 73.9.11 by DAM based on a procedure by Max Smith
+       17* * completely rewritten 73.10.8 by DAM to use LU decomposition
+       18* * Modified 741015 by PG to reduce precision of subscripts to get better code.
+       19* * Modified 750326 by PG to fix bug 209 causing random WS FULL errors.
+       20* * Modified 760903 by PG to fix bug 227 causing domino to return incorrect numbers.
+       21* * Modified 760905 by PG to fix bug that caused dyadic usage to fail if the equations were permuted.
+       22* * Modified 770303 by PG to fix bug 269 (inverting singular matrices w/o error msg) by adding
+       23* *	code to scan the diagonal of U looking for zeroes.
+       24*   Modified 771110 by PG to fix bug 293 by setting up our own underflow handler...since apl's
+       25*	seems to be broken.
+       26*   Modified 771130 by PG to remove our own underflow handler, now that apl's works again.
+       27*   Modified 771205 by PG to permute AtA completely before performing decomposition, thus
+       28*	fixing bug 294 causing Hilbert (and other ill-conditioned) matrices to fail.
+       29*   Modified 771221 by PG to increase precision of result when A is square by not multiplying through by At.
+       30*   Modified 790411 by William M. York to allocate temporaries on the APL value
+       31*	stack instead of the Multics stack, avoiding storage conditions.
+       32*   Modified 810125 by WMY to fix bug 481, the shape of the result is incorrect
+       33*	when the operand is on the stack.
+       34*
+       35*   Modified 811211 by TO to correct pivoting algorithm.
+       36*   Modified 811211 by TO to correct stack allocation problem.
+       37* */
+       38 
+       39 /* description of the algorithm
+       40*
+       41*    let A be the right operand, B be the left operand.
+       42*    If used monadically, B is identity matrix of appropriate size
+       43*    We solve
+       44*	  T        T
+       45*	(A A) X = A B	for X.
+       46*
+       47*    We check for singularity by enabling the overflow and zerodivide conditions, and by
+       48*    checking the diagonal of the decomposition of AtA.
+       49*    We do use "partial pivoting" and scaling.
+       50*    The algorithm has not been particularly optimized for speed.
+       51*    Much better code could be produced by zero-origin indexing.
+       52*
+       53*    The major variables are:
+       54*
+       55*	A	right operand
+       56*	B	left operand
+       57*	At	A-transpose, isub defined on A.
+       58*	AtA	the computed product of At and A
+       59*	AtB	the computed product of At and B
+       60*	LU	the L-U triangular decomposition of AtA,[1]AtB
+       61*	X	the answer
+       62*	H	first part of rho A, kept in times-reduced form
+       63*	U	last element of rho A
+       64*	T	last part of rho B, in times-reduced form.  rho B is H|T.  T may be empty
+       65*
+       66*	Note this is a slight generalization of IBM's domino, in that
+       67*	arrays of equations may be solved.
+       68*
+       69*	Note:  The APL/SV extensions to accept vectors as column matrices,
+       70*	       and scalars as 1x1 matrices, have been included.
+       71*
+       72*   The reference for the algorithm implemented here is:
+       73*	"Applied Linear Algebra," Ben Noble, Prentice Hall, 1969.
+       74*   Pages 142ff describe the generalized inverse of a nonsquare matrix.
+       75*   Pages 216ff describe the LU decomposition algorithm used here.
+       76*
+       77*   No library of books on computerized algorithms for matrix manipulation
+       78*   would be complete without:
+       79*	"Computer Solution of Linear Algebraic Systems," George Forsythe and Cleve B. Moler,
+       80*	Prentice Hall, 1967.
+       81*
+       82*   This book has an excellent treatment of the computational
+       83*   problems that occur, such as round-off, finite precision, and
+       84*   treatment of nearly-singular matrices.
+       85*
+       86**/
+       87 
+       88 /* automatic */
+       89 
+       90 declare
+       91     (H, T, U) fixed bin (17),		 	/* maximum number of elements/dimension is 2**17 */
+       92     (rhoH, rhoT) fixed bin,
+       93     rhoU fixed bin static init (1);
+       94 
+       95 dcl right_vb pointer,
+       96     right pointer,
+       97     left_vb pointer,
+       98     left pointer,
+       99     final_result_vb pointer,
+      100     final_result pointer,
+      101     end_of_operands pointer,
+      102     saved_stack_ptr pointer;
+      103 
+      104 dcl i fixed bin (21),
+      105     (colx, j, joinx, rowx) fixed bin (17),
+      106     data_elements fixed bin (17),
+      107     result_rhorho fixed bin,
+      108     n_words fixed bin (19),
+      109     monadic bit (1) aligned,
+      110 
+      111     (z, zz) float,
+      112     pivot float,
+      113     the_max float,
+      114 
+      115     pivot_row fixed bin (17),
+      116     pivot_col fixed bin (17);
+      117 
+      118 dcl A dim (H, U) float based (right),
+      119     B dim (H, T) float based (left),
+      120     AtA dim (U, U) float based (AtA_ptr),
+      121     AtB dim (U, T) float based (AtB_ptr),
+      122     LU dim (U, U+T) float based (LU_ptr),
+      123     X dim (U, T) float based (X_ptr),
+      124 
+      125     permute dim (U) fixed bin (17) based (permute_ptr),
+      126 
+      127     (AtA_ptr, AtB_ptr, LU_ptr, X_ptr, permute_ptr) pointer;
+      128 
+      129 /* external static */
+      130 
+      131 dcl (apl_error_table_$domain, apl_error_table_$length, apl_error_table_$rank) fixed bin (35) external;
+      132 
+      133 /* builtins */
+      134 
+      135 dcl (abs, addr, addrel, hbound, null, rel, size, string, substr) builtin;
+      136 
+      137 /* conditions */
+      138 
+      139 dcl (overflow, zerodivide) condition;
+      140 
+      141 /* include files */
+      142 
+  1     1 /* ====== BEGIN INCLUDE SEGMENT	apl_number_data.incl.pl1 ================================== */
+  1     2 
+  1     3 /*
+  1     4*   This include file contains information about the machine representation of numbers.
+  1     5*   In all programs numbers should simply be declared 'float'.
+  1     6*   All default statements should be in this include file.
+  1     7*
+  1     8*   This is the binary version.  The manifest constant Binary should be used by programs
+  1     9*   that need to know whether we are using binary or decimal.
+  1    10* */
+  1    11 
+  1    12 /* format: style3,initlm0,idind30 */
+  1    13 
+  1    14 default (float & ^decimal & ^binary & ^precision & ^constant) float binary (63);
+  1    15 
+  1    16 declare	(
+  1    17 	TheBiggestNumberWeveGot	float initial (0.1701411834604692317e+39),
+  1    18 	TheSmallestNumberWeveGot	float initial (.1469367938527859385e-38),
+  1    19 	Binary			bit (1) aligned initial ("1"b)
+  1    20 	)			internal static options (constant);
+  1    21 
+  1    22 /* Number of characters in a number datum entry; used for copying float number arrays as strings.
+  1    23*   (Obsolete! use array copies!) */
+  1    24 
+  1    25 declare	NumberSize		fixed binary precision (4) internal static initial (8);
+  1    26 
+  1    27 /* ------ END INCLUDE SEGMENT		apl_number_data.incl.pl1 ---------------------------------- */
+      143 
+  2     1 /* ====== BEGIN INCLUDE SEGMENT	apl_ws_info.incl.pl1 ====================================== */
+  2     2 
+  2     3 /* This structure contains all of the global data (or pointers to it) for the APL subsystem */
+  2     4 
+  2     5 /* automatic */
+  2     6 
+  2     7 declare	ws_info_ptr ptr initial (apl_static_$ws_info_ptr.static_ws_info_ptr);
+  2     8 
+  2     9 /* external static */
+  2    10 
+  2    11 declare	1 apl_static_$ws_info_ptr	external static aligned structure,
+  2    12 	  2 static_ws_info_ptr	unaligned pointer;
+  2    13 
+  2    14 /* based */
+  2    15 
+  2    16 declare	1 ws_info			aligned based (ws_info_ptr),
+  2    17 	  2 version_number		fixed bin,	/* version of this structure (3) */
+  2    18 	  2 switches		unaligned,	/* mainly ws parameters */
+  2    19 	    3 long_error_mode	bit,		/* if 1, long Multics format, else APL/360 format */
+  2    20 	    3 debug_mode		bit,		/* if 1, system error causes escape to command level */
+  2    21 	    3 canonicalize_mode	bit,		/* if 1, the editor canonicalizes user input */
+  2    22 	    3 restrict_exec_command	bit,		/* if 1, the )EXEC command may not be used */
+  2    23 	    3 restrict_debug_command	bit,		/* if 1, the )DEBUG command may not be used */
+  2    24 	    3 restrict_external_functions
+  2    25 				bit,		/* if 1, the )ZFN, )MFN, and )DFN commands may not be used */
+  2    26 	    3 restrict_load		bit,		/* if 1, the )LOAD and )COPY commands may not be used */
+  2    27 	    3 restrict_load_directory	bit,		/* if 1, no directory allowed in )LOAD or )COPY pathnames */
+  2    28 	    3 restrict_save		bit,		/* if 1, the )SAVE command may not be used */
+  2    29 	    3 restrict_save_directory	bit,		/* if 1, no directory allowed in )SAVE pathnames */
+  2    30 	    3 off_hold		bit,		/* if 1, )OFF HOLD was typed, else just )OFF */
+  2    31 	    3 transparent_to_signals	bit,		/* if 1, any conditions slip right past APL */
+  2    32 	    3 meter_mode		bit,		/* if 1, metering may be done, else speed is all-important */
+  2    33 	    3 restrict_msg_command	bit,		/* if 1, the )MSG command may not be used. */
+  2    34 	    3 compatibility_check_mode
+  2    35 				bit,		/* if 1, check for incompatible operators */
+  2    36 	    3 no_quit_handler	bit,		/* if 1, do not trap QUITs. */
+  2    37 						/* remaining 20 bits not presently used */
+  2    38 
+  2    39 	  2 values,				/* attributes of the workspace */
+  2    40 	    3 digits		fixed bin,	/* number of digits of precision printed on output */
+  2    41 	    3 width		fixed bin,	/* line length for formatted output */
+  2    42 	    3 index_origin		fixed bin,	/* the index origin (0 or 1) */
+  2    43 	    3 random_link		fixed bin(35),	/* seed for random number generator */
+  2    44 	    3 fuzz		float,		/* comparison tolerance (relative fuzz) */
+  2    45 	    3 float_index_origin	float,		/* the index origin	in floating point */
+  2    46 	    3 number_of_symbols	fixed bin,	/* the number of symbol_beads currently in existence */
+  2    47 	    3 maximum_value_stack_size
+  2    48 				fixed bin (18),	/* maximum number of words in one segment of value stack */
+  2    49 
+  2    50 	  2 pointers,				/* pointers to various internal tables */
+  2    51 	    3 symbol_table_ptr	unaligned pointer,	/* -> symbol_table (apl_symbol_table.incl.pl1) */
+  2    52 	    3 current_parse_frame_ptr	unaligned pointer,	/* -> topmost parse frame */
+  2    53 	    3 value_stack_ptr	unaligned pointer,	/* -> next free location on value stack */
+  2    54 	    3 alloc_free_info_ptr	unaligned pointer,	/* -> apl_storage_mngr_ data (apl_storage_system_data.incl.pl1) */
+  2    55 
+  2    56 	  2 time_invoked		fixed bin(71),	/* clock time that APL was entered */
+  2    57 	  2 integer_fuzz		float,		/* the absolute fuzz used in checking for integers */
+  2    58 	  2 user_number		fixed bin(35),	/* number under which the user is signed on */
+  2    59 	  2 latent_expression	unaligned pointer,	/* -> value_bead for QuadLX */
+  2    60 	  2 lock			char(32),		/* the lock currently set on this workspace (password) */
+  2    61 	  2 wsid			char(100),	/* the workspace identification: name, number name, or clear ws */
+  2    62 	  2 last_error_code		fixed bin(35),	/* last code passed to apl_error_ */
+  2    63 	  2 signoff_lock		character (32),
+  2    64 
+  2    65 	  2 interrupt_info		aligned,		/* bits used by apl_interpreter_ to tell when to abort */
+  2    66 	    3 dont_interrupt_parse	bit,		/* if 1, don't do a dirty stop because the parser is running */
+  2    67 	    3 dont_interrupt_operator	bit,		/* if 1, don't do a dirty stop because an operator is running */
+  2    68 	    3 dont_interrupt_storage_manager		/* if 1, don't stop because apl_storage_mngr_ is */
+  2    69 				bit,		/*       munging his tables */
+  2    70 	    3 unused_interrupt_bit	bit,		/* not presently used */
+  2    71 	    3 dont_interrupt_command	bit,
+  2    72 	    3 can_be_interrupted	bit,		/* if 1, OK to do a clean stop (we are between lines, reading) */
+  2    73 	    3 clean_interrupt_pending	bit,		/* interrupt occured, break cleanly (between lines) */
+  2    74 	    3 dirty_interrupt_pending	bit,		/* interrupt occured, break as soon as not inhibited */
+  2    75 
+  2    76 	  2 user_name		char (32),	/* process group id of user */
+  2    77 	  2 immediate_input_prompt	char (32) varying,	/* normal input */
+  2    78 	  2 evaluated_input_prompt	char (32) varying,	/* quad input */
+  2    79 	  2 character_input_prompt	char (32) varying,	/* quad-quote input */
+  2    80 	  2 vcpu_time		aligned,
+  2    81 	    3 total		fixed bin (71),
+  2    82 	    3 setup		fixed bin (71),
+  2    83 	    3 parse		fixed bin (71),
+  2    84 	    3 lex			fixed bin (71),
+  2    85 	    3 operator		fixed bin (71),
+  2    86 	    3 storage_manager	fixed bin (71),
+  2    87 	  2 output_info		aligned,		/* data pertaining to output buffer */
+  2    88 	    3 output_buffer_ptr	unal ptr,		/* ptr to output buffer */
+  2    89 	    3 output_buffer_len	fixed bin (21),	/* length (bytes) of output buffer */
+  2    90 	    3 output_buffer_pos	fixed bin (21),	/* index of next byte to write in */
+  2    91 	    3 output_buffer_ll	fixed bin (21),	/* print positions used up so far */
+  2    92 	  2 tab_width		fixed bin (21);	/* number of columns a tabs moves cursor */
+  2    93 
+  2    94 declare	output_buffer char (ws_info.output_buffer_len) based (ws_info.output_buffer_ptr);
+  2    95 
+  2    96 /* internal static */
+  2    97 
+  2    98 declare	max_parse_stack_depth fixed bin int static init(64536);
+  2    99 
+  2   100 /* ------ END INCLUDE SEGMENT		apl_ws_info.incl.pl1 -------------------------------------- */
+      144 
+  3     1 /* ====== BEGIN INCLUDE SEGEMENT	apl_operators_argument.incl.pl1 =========================== */
+  3     2 
+  3     3 declare	1 operators_argument	aligned,
+  3     4 	  2 operands (2)		aligned,		/* these are the operands to the operator to be executed.
+  3     5*						   if operand (1).value is null, operator is monadic */
+  3     6 	    3 value		pointer unaligned,	/* a pointer to the value bead for this operand */
+  3     7 	    3 on_stack		bit (1) aligned,	/* ON if this value resides on the value stack */
+  3     8 	  2 operator		aligned,		/* information about the operator to be executed */
+  3     9 	    3 dimension		fixed bin,	/* (optional) dimension along which to operate */
+  3    10 	    3 padding		bit (18) unaligned,	/* unused part of operator bead */
+  3    11 	    3 op2			fixed bin (8) unal,	/* a modifier for op1, or a 2nd operator if inner product */
+  3    12 	    3 op1			fixed bin (8) unal,	/* code for the actual operator to be executed */
+  3    13 	  2 result		pointer unal,	/* (output) set by operator to point to result bead in stack */
+  3    14 	  2 error_code		fixed bin (35),	/* (output) set before signaling apl_operator_error_ */
+  3    15 	  2 where_error		fixed bin;	/* parseme index of where error was - parse sets to operator */
+  3    16 
+  3    17 /* ------ END INCLUDE SEGMENT		apl_operators_argument.incl.pl1 --------------------------- */
+      145 
+  4     1 /* ====== BEGIN INCLUDE SEGMENT	apl_bead_format.incl.pl1 ================================== */
+  4     2 
+  4     3 declare 1 general_bead  		aligned based,	/* The Venerable Bead		*/
+  4     4 	2 type 			unaligned,
+  4     5 	  3 bead_type		unaligned,
+  4     6 	    4 operator		bit (1),		/* ON if operator bead		*/
+  4     7 	    4 symbol		bit (1),		/* ON if symbol bead		*/
+  4     8 	    4 value		bit (1),		/* ON if value bead			*/
+  4     9 	    4 function		bit (1),		/* ON if function bead		*/
+  4    10 	    4 group		bit (1),		/* ON if group bead			*/
+  4    11 	    4 label		bit (1),		/* ON if label bead			*/
+  4    12 	    4 shared_variable	bit (1),		/* ON if shared variable bead 	*/
+  4    13 	    4 lexed_function	bit (1),		/* ON if lexed function bead  	*/
+  4    14 	  3 data_type		unaligned,
+  4    15 	    4 list_value		bit (1),		/* ON if a list value bead		*/
+  4    16 	    4 character_value	bit (1),		/* ON if a character value bead	*/
+  4    17 	    4 numeric_value		bit (1),		/* ON if a numeric value bead		*/
+  4    18 	    4 integral_value	bit (1),		/* ON if an integral value bead	*/
+  4    19 	    4 zero_or_one_value	bit (1),		/* ON if a boolean value bead		*/
+  4    20 	    4 complex_value		bit (1),		/* ON if a complex, numeric value bead   */
+  4    21 	  3 unused_bits		bit (4) unaligned,	/* pad to 18 bits (for future use)	*/
+  4    22 	2 size			bit (18) unaligned,	/* Number of words this bead occupies
+  4    23*						   (used by bead storage manager)	*/
+  4    24 	2 reference_count 		fixed binary (29);	/* Number of pointers which point
+  4    25*						   to this bead (used by bead manager)	*/
+  4    26 
+  4    27 
+  4    28 /* constant strings for initing type field in various beads */
+  4    29 
+  4    30 declare (
+  4    31 	operator_type		init("100000000000000000"b),
+  4    32 	symbol_type		init("010000000000000000"b),
+  4    33     	value_type		init("001000000000000000"b),
+  4    34 	function_type		init("000100000000000000"b),
+  4    35 	group_type		init("000010000000000000"b),
+  4    36 	label_type		init("001001000011000000"b),
+  4    37 	shared_variable_type	init("001000100000000000"b),
+  4    38 	lexed_function_type		init("000000010000000000"b),
+  4    39 
+  4    40 	list_value_type		init("000000001000000000"b),
+  4    41 	character_value_type 	init("001000000100000000"b),
+  4    42 	numeric_value_type		init("001000000010000000"b),
+  4    43 	integral_value_type		init("001000000011000000"b),
+  4    44 	zero_or_one_value_type	init("001000000011100000"b),
+  4    45 	complex_value_type		init("001000000000010000"b),
+  4    46 
+  4    47 	not_integer_mask		init("111111111110011111"b),		/* to clear integral, zero_or_one bits */
+  4    48 	not_zero_or_one_mask	init("111111111111011111"b)		/* to clear zero_or_one bit */
+  4    49         ) bit(18) internal static;
+  4    50 
+  4    51 /* ------ END INCLUDE SEGMENT		apl_bead_format.incl.pl1 ---------------------------------- */
+      146 
+  5     1 /* ====== BEGIN INCLUDE SEGMENT	apl_value_bead.incl.pl1 =================================== */
+  5     2 
+  5     3 declare
+  5     4 	number_of_dimensions fixed bin,
+  5     5 
+  5     6 	1 value_bead		aligned based,
+  5     7 	2 header			aligned like general_bead,
+  5     8 	2 total_data_elements	fixed binary (21),	/* length of ,[value] in APL		*/
+  5     9 	2 rhorho			fixed binary,	/* number of dimensions of value	*/
+  5    10 	2 data_pointer		pointer unaligned,	/* packed pointer to the data in value	*/
+  5    11 	2 rho			fixed binary (21) dimension (number_of_dimensions refer (value_bead.rhorho));
+  5    12 						/* dimensions of value (zero-origin)	*/
+  5    13 
+  5    14 
+  5    15 declare 1 character_data_structure	aligned based,	/* alignment trick for PL/I compiler	*/
+  5    16 	2 character_datum		character (1) unaligned dimension (0:data_elements - 1);
+  5    17 						/* actual elements of character array	*/
+  5    18 
+  5    19 declare   character_string_overlay	character (data_elements) aligned based;
+  5    20 						/* to overlay on above structure	 */
+  5    21 
+  5    22 
+  5    23 declare   numeric_datum		float aligned dimension (0:data_elements - 1) based;
+  5    24 						/* actual elements of numeric array	*/
+  5    25 
+  5    26 declare	complex_datum		complex float aligned dimension (0:data_elements -1) based;
+  5    27 
+  5    28 declare	MAX_VALUE_BEAD_SIZE		fixed bin (19) init (261120) int static options (constant);
+  5    29 
+  5    30 /* ------ END INCLUDE SEGMENT		apl_value_bead.incl.pl1 ----------------------------------- */
+      147 
+      148 
+      149 /* save stack height and pick up arguments.  determine whether monadic or dyadic */
+      150 
+      151 	right_vb = operands (2).value;
+      152 	right = right_vb -> value_bead.data_pointer;
+      153 	left_vb = operands (1).value;
+      154 	if left_vb = null then monadic = "1"b;
+      155 	else do;
+      156 	   monadic = "0"b;		/* dyadic */
+      157 	   left = left_vb -> value_bead.data_pointer;
+      158 	   end;
+      159 
+      160 	if operands (2).on_stack then final_result_vb = right_vb;	/* where to leave result value_bead */
+      161 	else if ^monadic & operands (1).on_stack then final_result_vb = left_vb;
+      162 	else final_result_vb = value_stack_ptr;
+      163 
+      164 /* make checks for errors and compute the parameters H, T, and U from the arguments' rhos */
+      165 
+      166 	if ^ right_vb -> value_bead.data_type.numeric_value then go to domain_error_right;
+      167 	rhoH = right_vb -> value_bead.rhorho - 1;
+      168 	if rhoH < 0 then rhoH = 0;
+      169 
+      170 	if right_vb -> value_bead.rhorho > 1 then U = right_vb -> value_bead.rho (rhoH+1);
+      171 	else if right_vb -> value_bead.rhorho = 1 then do;	/* accept vector as column matrix */
+      172 		U = right_vb -> value_bead.rho (1);
+      173 		H = 1;
+      174 		go to special_H;
+      175 		end;
+      176 	else do;						/* accept scalar as 1x1 matrix */
+      177 		U, H = 1;
+      178 		go to special_H;
+      179 		end;
+      180 
+      181 	H = right_vb -> value_bead.rho (1);
+      182 	do i = 2 by 1 while (i <= rhoH);
+      183 	   H = H * right_vb -> value_bead.rho (i);
+      184 	   end;
+      185 	if H > 131072 then go to domain_error_right;
+      186 	if H < U then go to domain_error_right;
+      187 
+      188 special_H:
+      189 	if ^monadic then do;	/* check left operand */
+      190 
+      191 	   if ^ left_vb -> value_bead.data_type.numeric_value then go to domain_error_left;
+      192 	   if left_vb -> value_bead.rhorho = 0 then do;	/* APL/SV extension: accept scalar as 1-long vector here */
+      193 	      if H ^= 1 then go to length_error;
+      194 	      rhoT = 1;
+      195 	      T = 1;
+      196 	      go to special_T;
+      197 	      end;
+      198 	   if left_vb -> value_bead.rhorho < rhoH then go to rank_error_left;
+      199 	   do i = 1 by 1 while (i <= rhoH);
+      200 	      if left_vb -> value_bead.rho (i) ^= right_vb -> value_bead.rho (i)
+      201 		then go to length_error;		/* both rhos must start with H */
+      202 	      end;
+      203 
+      204 	   rhoT = 0;
+      205 	   T = 1;
+      206 	   do i = i by 1 while (i <= left_vb -> value_bead.rhorho);
+      207 		T = T * left_vb -> value_bead.rho (i);
+      208 		rhoT = rhoT + 1;
+      209 		end;				/* picks up rest of rho of B in T */
+      210 
+      211 special_T:
+      212 	   end;
+      213 
+      214 	if monadic then do;
+      215 	   result_rhorho = right_vb -> value_bead.rhorho;		/* normally rhoU + rhoH */
+      216 	   T = H;
+      217 	   data_elements = U * H;
+      218 	   end;
+      219 	else do;
+      220 	   result_rhorho = rhoU + rhoT;
+      221 	   if left_vb -> value_bead.rhorho = 0 then result_rhorho = result_rhorho - 1;	/* fudge rank for scalar args */
+      222 	   if right_vb -> value_bead.rhorho = 0 then result_rhorho = result_rhorho - 1;	/* .. */
+      223 	   data_elements = U * T;
+      224 	   end;
+      225 
+      226 /* prepare space in stack for result.  Don't write in it
+      227*   yet since may overlay operands */
+      228 
+      229 	end_of_operands = ws_info.value_stack_ptr;	/* remember end of operand area */
+      230 
+      231 	ws_info.value_stack_ptr = final_result_vb;	/* pop operands */
+      232 	number_of_dimensions = result_rhorho;
+      233 	n_words = size (value_bead) + size (numeric_datum) + 1;
+      234 	final_result_vb = apl_push_stack_ (n_words);
+      235 	final_result = addr (final_result_vb -> value_bead.rho (result_rhorho+1));
+      236 	if substr (rel (final_result), 18, 1) 	/* double word align these numbers */
+      237 	then final_result = addrel (final_result, 1);
+      238 
+      239 
+      240 /* begin block here to declare At, so it can be defined on A */
+      241 
+      242 begin;
+      243 
+      244 dcl    At dim (U, H) float defined (A (2sub, 1sub));
+      245 
+      246 /* Allocate temporary storage for computations */
+      247 
+      248 	saved_stack_ptr = ws_info.value_stack_ptr;
+      249 
+      250 	if rel (end_of_operands) > rel (ws_info.value_stack_ptr) then /* don't overlay operands */
+      251 	     ws_info.value_stack_ptr = end_of_operands;
+      252 
+      253 	AtA_ptr = apl_push_stack_ (size (AtA));
+      254 	AtB_ptr = apl_push_stack_ (size (AtB));
+      255 	LU_ptr = apl_push_stack_ (size (LU));
+      256 	X_ptr = apl_push_stack_ (size (X));
+      257 	permute_ptr = apl_push_stack_ (size (permute));
+      258 
+      259 /* set up condition handlers to detect singularity */
+      260 
+      261 	on overflow, zerodivide go to singularity;
+      262 
+      263 /* compute AtB, using identity for B if monadic */
+      264 
+      265 	if ^monadic
+      266 	then if H = U
+      267 	     then do rowx = 1 to U;			/* dyadic, square case. */
+      268 		     do colx = 1 to T;
+      269 			AtB (rowx, colx) = B (rowx, colx);
+      270 		     end;
+      271 		end;
+      272 	     else do rowx = 1 to U;			/* dyadic, nonsquare case. */
+      273 		     do colx = 1 to T;
+      274 			z = 0.0e0;
+      275 			do joinx = 1 to H;
+      276 			     z = z + At (rowx, joinx) * B (joinx, colx);
+      277 			end;
+      278 			AtB (rowx, colx) = z;
+      279 		     end;
+      280 		end;
+      281 	else if H = U
+      282 	     then do rowx = 1 to U;			/* monadic, square case */
+      283 		     do colx = 1 to T;
+      284 			if rowx = colx
+      285 			then AtB (rowx, colx) = 1e0;
+      286 			else AtB (rowx, colx) = 0e0;
+      287 		     end;
+      288 		end;
+      289 	     else do rowx = 1 to U;			/* monadic, nonsquare case */
+      290 		     do colx = 1 to T;
+      291 			AtB (rowx, colx) = At (rowx, colx);
+      292 		     end;
+      293 		end;
+      294 
+      295 /* compute AtA */
+      296 
+      297 	if H = U
+      298 	then do rowx = 1 to U;			/* square case */
+      299 		do colx = 1 to U;
+      300 		     AtA (rowx, colx) = A (rowx, colx);
+      301 		end;
+      302 	     end;
+      303 	else do rowx = 1 to U;			/* nonsquare case */
+      304 		do colx = 1 to U;
+      305 		     z = 0.0e0;
+      306 		     do joinx = 1 to H;
+      307 			z = z + At (rowx, joinx) * A (joinx, colx);
+      308 		     end;
+      309 		     AtA (rowx, colx) = z;
+      310 		end;
+      311 	     end;
+      312 
+      313 /* 1) Initialize permute vector, which controls re-ordering of equations (rows) of AtA and AtB.
+      314*   2) Scale AtA and AtB so that the largest element in any row is of magnitude 1. */
+      315 
+      316 	do rowx = 1 to U;
+      317 	     permute (rowx) = rowx;
+      318 
+      319 	     the_max = abs (AtA (rowx, 1));
+      320 	     do colx = 2 to U;
+      321 		z = abs (AtA (rowx, colx));		/* assign to temp only to get better code */
+      322 
+      323 		if z > the_max
+      324 		then the_max = z;
+      325 	     end;
+      326 
+      327 	     do colx = 1 to T;
+      328 		z = abs (AtB (rowx, colx));		/* .. */
+      329 
+      330 		if z > the_max
+      331 		then the_max = z;
+      332 	     end;
+      333 
+      334 	     AtA (rowx, *) = AtA (rowx, *) / the_max;
+      335 	     AtB (rowx, *) = AtB (rowx, *) / the_max;
+      336 	end;
+      337 
+      338 	do pivot_col = 1 to U;			/* translform one row of AtA to LU */
+      339 	     do colx = 1 to U;
+      340 		z = AtA (permute (colx), pivot_col);
+      341 		do j = 1 by 1 while (j<colx & j<pivot_col);
+      342 		     z = z-LU (permute (colx), j)*LU (permute (j), pivot_col);
+      343 		end;
+      344 		LU (permute (colx), pivot_col) = z;
+      345 	     end;
+      346 
+      347 /*  search for the next pivot  */
+      348 
+      349 	     pivot = LU (permute (pivot_col), pivot_col);
+      350 	     pivot_row = pivot_col;
+      351 	     do j = pivot_col+1 by 1 while (j <= U);
+      352 		if abs (LU (permute (j), pivot_col)) > abs (pivot) then do;
+      353 		     pivot = (LU (permute (j), pivot_col));
+      354 		     pivot_row = j;
+      355 		end;
+      356 	     end;
+      357 
+      358 /*  swap the indices  */
+      359 
+      360 	     i = permute (pivot_col);
+      361 	     permute (pivot_col) = permute (pivot_row);
+      362 	     permute (pivot_row) = i;
+      363 
+      364 /*  check singular matrix  */
+      365 /*   If any of the diagonal elements of U are zero, AtA is singular.
+      366*   (The product of the diagonal elements of U is the determinant). */
+      367 
+      368 	     if abs (pivot) < ws_info.integer_fuzz
+      369 	     then go to domain_error_right;
+      370 
+      371 /*  transform the pivot column to LU */
+      372 
+      373 	     do j = pivot_col+1 by 1 while (j <= U);
+      374 		LU (permute (j), pivot_col) = LU (permute (j), pivot_col)/pivot;
+      375 	     end;
+      376 
+      377 /*  transform the pivot row of AtB to LU */
+      378 
+      379 	     do colx = U+1 to hbound (LU, 2);
+      380 		z = AtB (permute (pivot_col), colx - U);
+      381 		do j = 1 by 1 while (j < pivot_col);
+      382 		     z = z - LU (permute (j), colx) * LU (permute (pivot_col), j);
+      383 		end;
+      384 		LU (permute (pivot_col), colx) = z;
+      385 	     end;
+      386 	end;
+      387 
+      388 	do rowx = U by -1 to 1;			/* compute answer by back substitution */
+      389 	     do colx = 1 to T;			/* uses only the U portion of LU */
+      390 		z = LU (permute (rowx), U+colx);
+      391 		do j = rowx+1 to U;
+      392 		     z = z - LU (permute (rowx), j) * X (j, colx);
+      393 		end;
+      394 		X (rowx, colx) = z / LU (permute (rowx), rowx);
+      395 	     end;
+      396 	end;
+      397 
+      398 /* iterative improvement */
+      399 
+      400 	/* TO BE SUPPLIED - requires proceduring of some of the above code. */
+      401 
+      402 end;	/* the begin block for At */
+      403 
+      404 
+      405 /* fill rho vector of the result.  Careful inspection and consideration of all cases reveals
+      406*	   that we will never over-write an operand's rho before we copy into result's rho! */
+      407 
+      408 	do i = result_rhorho by -1 to 2;
+      409 	     if monadic
+      410 	     then final_result_vb -> value_bead.rho (i) = right_vb -> value_bead.rho (i-1);
+      411 	     else final_result_vb -> value_bead.rho (i) = left_vb -> value_bead.rho (rhoH+i-1);
+      412 	end;
+      413 
+      414 	if result_rhorho >= 1			/* fudge for scalar arg */
+      415 	then final_result_vb -> value_bead.rho (1) = U;
+      416 
+      417 	string (final_result_vb -> value_bead.type) = numeric_value_type;
+      418 	final_result_vb -> value_bead.rhorho = result_rhorho;
+      419 	final_result_vb -> value_bead.total_data_elements = data_elements;
+      420 	final_result_vb -> value_bead.data_pointer = final_result;
+      421 
+      422 /* copy from automatic storage into APL stack (data_elements is still set) */
+      423 
+      424 	final_result -> numeric_datum (*) = addr (X) -> numeric_datum (*);
+      425 
+      426 	operators_argument.result = final_result_vb;
+      427 
+      428 	/* Free temporary storage. */
+      429    
+      430 	ws_info.value_stack_ptr = saved_stack_ptr;
+      431    
+      432 	return;
+      433 
+      434 /* error exits */
+      435 
+      436 domain_error_right:
+      437 	operators_argument.where_error = operators_argument.where_error - 2;
+      438 
+      439 domain_error_left:
+      440 	operators_argument.where_error = operators_argument.where_error + 1;
+      441 
+      442 singularity:
+      443 	operators_argument.error_code = apl_error_table_$domain;
+      444 	return;
+      445 
+      446 length_error:
+      447 	operators_argument.error_code = apl_error_table_$length;
+      448 	return;
+      449 
+      450 rank_error_left:
+      451 	operators_argument.where_error = operators_argument.where_error + 1;
+      452 	operators_argument.error_code = apl_error_table_$rank;
+      453 	return;
+      454 
+  6     1 /* ====== BEGIN INCLUDE SEGMENT	apl_push_stack_fcn.incl.pl1 =============================== */
+  6     2 
+  6     3 /* format: style3 */
+  6     4 apl_push_stack_:
+  6     5      procedure (P_n_words) returns (ptr);
+  6     6 
+  6     7 /* Function to (1) double-word align ws_info.value_stack_ptr, and
+  6     8*   (2) make sure allocation request will fit on current value stack.
+  6     9*
+  6    10*   Written 770413 by PG
+  6    11*   Modified 780210 by PG to round allocations up to an even number of words.
+  6    12**/
+  6    13 
+  6    14 /* parameters */
+  6    15 
+  6    16 declare	P_n_words		fixed bin (19) parameter;
+  6    17 
+  6    18 /* automatic */
+  6    19 
+  6    20 declare	block_ptr		ptr,
+  6    21 	num_words		fixed bin (19);
+  6    22 
+  6    23 /* builtins */
+  6    24 
+  6    25 declare	(addrel, binary, rel, substr, unspec)
+  6    26 			builtin;
+  6    27 
+  6    28 /* entries */
+  6    29 
+  6    30 declare	apl_get_value_stack_
+  6    31 			entry (fixed bin (19));
+  6    32 
+  6    33 /* program */
+  6    34 
+  6    35 	num_words = P_n_words;
+  6    36 
+  6    37 	if substr (unspec (num_words), 36, 1) = "1"b	/* num_words odd */
+  6    38 	then num_words = num_words + 1;
+  6    39 
+  6    40 	if binary (rel (ws_info.value_stack_ptr), 18) + num_words > ws_info.maximum_value_stack_size
+  6    41 	then call apl_get_value_stack_ (num_words);
+  6    42 
+  6    43 	block_ptr = ws_info.value_stack_ptr;
+  6    44 	ws_info.value_stack_ptr = addrel (ws_info.value_stack_ptr, num_words);
+  6    45 	return (block_ptr);
+  6    46 
+  6    47      end apl_push_stack_;
+  6    48 
+  6    49 /* ------ END INCLUDE SEGMENT		apl_push_stack_fcn.incl.pl1 ------------------------------- */
+      455 
+      456 end; /* apl_domino_operator_ */
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    11/29/83  1346.3  apl_domino_operator_.pl1          >special_ldd>on>apl.1129>apl_domino_operator_.pl1
+143          1    03/27/82  0429.8  apl_number_data.incl.pl1          >ldd>include>apl_number_data.incl.pl1
+144          2    03/27/82  0439.2  apl_ws_info.incl.pl1              >ldd>include>apl_ws_info.incl.pl1
+145          3    03/27/82  0439.0  apl_operators_argument.incl.pl1   >ldd>include>apl_operators_argument.incl.pl1
+146          4    03/27/82  0438.5  apl_bead_format.incl.pl1          >ldd>include>apl_bead_format.incl.pl1
+147          5    03/27/82  0439.2  apl_value_bead.incl.pl1           >ldd>include>apl_value_bead.incl.pl1
+455          6    03/27/82  0429.8  apl_push_stack_fcn.incl.pl1       >ldd>include>apl_push_stack_fcn.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+A                                      based           float bin(63)            array dcl 118 ref 276 276 291 291 300 307 307 307
+At                                     defined         float bin(63)            array dcl 244 ref 276 291 307
+AtA                                    based           float bin(63)            array dcl 118 set ref 253 253 300* 309* 319 321 334*
+                                                                                  334 340
+AtA_ptr                         000150 automatic       pointer                  dcl 118 set ref 253* 253 253 300 309 319 321 334 334
+                                                                                  340
+AtB                                    based           float bin(63)            array dcl 118 set ref 254 254 269* 278* 284* 286*
+                                                                                  291* 328 335* 335 380
+AtB_ptr                         000152 automatic       pointer                  dcl 118 set ref 254* 254 254 269 278 284 286 291 328
+                                                                                  335 335 380
+B                                      based           float bin(63)            array dcl 118 ref 269 276
+H                               000100 automatic       fixed bin(17,0)          dcl 90 set ref 173* 177* 181* 183* 183 185 186 193
+                                                                                  216 217 244 265 275 281 297 306
+LU                                     based           float bin(63)            array dcl 118 set ref 255 255 342 342 344* 349 352
+                                                                                  353 374* 374 379 382 382 384* 390 392 394
+LU_ptr                          000154 automatic       pointer                  dcl 118 set ref 255* 255 255 342 342 344 349 352 353
+                                                                                  374 374 379 382 382 384 390 392 394
+P_n_words                              parameter       fixed bin(19,0)          dcl 6-16 ref 6-4 6-35
+T                               000101 automatic       fixed bin(17,0)          dcl 90 set ref 195* 205* 207* 207 216* 223 254 254
+                                                                                  255 255 256 256 268 269 269 269 269 273 276 276
+                                                                                  278 278 283 284 284 286 286 290 291 291 327 328
+                                                                                  328 335 335 335 335 335 335 342 342 342 342 344
+                                                                                  344 349 349 352 352 353 353 374 374 374 374 379
+                                                                                  380 380 382 382 382 382 384 384 389 390 390 392
+                                                                                  392 392 392 394 394 394 394
+U                               000102 automatic       fixed bin(17,0)          dcl 90 set ref 170* 172* 177* 186 217 223 244 253
+                                                                                  253 253 253 254 254 255 255 255 255 256 256 257
+                                                                                  257 265 265 272 276 276 281 281 289 291 291 297
+                                                                                  297 299 300 300 300 300 303 304 307 307 307 307
+                                                                                  309 309 316 319 319 320 321 321 334 334 334 334
+                                                                                  334 334 338 339 340 340 342 342 342 342 344 344
+                                                                                  349 349 351 352 352 353 353 373 374 374 374 374
+                                                                                  379 379 380 382 382 382 382 384 384 388 390 390
+                                                                                  390 391 392 392 394 394 414
+X                                      based           float bin(63)            array dcl 118 set ref 256 256 392 394* 424
+X_ptr                           000156 automatic       pointer                  dcl 118 set ref 256* 256 256 392 394 424
+abs                                                    builtin function         dcl 135 ref 319 321 328 352 352 368
+addr                                                   builtin function         dcl 135 ref 235 424
+addrel                                                 builtin function         dcl 135 in procedure "apl_domino_operator_" ref 236
+addrel                                                 builtin function         dcl 6-25 in procedure "apl_push_stack_" ref 6-44
+apl_error_table_$domain         000010 external static fixed bin(35,0)          dcl 131 ref 442
+apl_error_table_$length         000012 external static fixed bin(35,0)          dcl 131 ref 446
+apl_error_table_$rank           000014 external static fixed bin(35,0)          dcl 131 ref 452
+apl_get_value_stack_            000020 constant        entry                    external dcl 6-30 ref 6-40
+apl_static_$ws_info_ptr         000016 external static structure                level 1 dcl 2-11
+binary                                                 builtin function         dcl 6-25 ref 6-40
+block_ptr                       000100 automatic       pointer                  dcl 6-20 set ref 6-43* 6-45
+colx                            000127 automatic       fixed bin(17,0)          dcl 104 set ref 268* 269 269* 273* 276 278* 283* 284
+                                                                                  284 286* 290* 291 291* 299* 300 300* 304* 307 309*
+                                                                                  320* 321* 327* 328* 339* 340 341 342 344* 379* 380
+                                                                                  382 384* 389* 390 392 394*
+data_elements                   000133 automatic       fixed bin(17,0)          dcl 104 set ref 217* 223* 233 419 424
+data_pointer              4            based           pointer                  level 2 packed unaligned dcl 5-3 set ref 152 157
+                                                                                  420*
+data_type                 0(08)        based           structure                level 4 packed unaligned dcl 5-3
+end_of_operands                 000122 automatic       pointer                  dcl 95 set ref 229* 250 250
+error_code                7            parameter       fixed bin(35,0)          level 2 dcl 3-3 set ref 442* 446* 452*
+final_result                    000120 automatic       pointer                  dcl 95 set ref 235* 236 236* 236 420 424
+final_result_vb                 000116 automatic       pointer                  dcl 95 set ref 160* 161* 162* 231 234* 235 409 411
+                                                                                  414 417 418 419 420 426
+general_bead                           based           structure                level 1 dcl 4-3
+hbound                                                 builtin function         dcl 135 ref 379
+header                                 based           structure                level 2 dcl 5-3
+i                               000126 automatic       fixed bin(21,0)          dcl 104 set ref 182* 182* 183* 199* 199* 200 200*
+                                                                                  206* 206 206* 207* 360* 362 408* 409 409 411 411*
+integer_fuzz             22            based           float bin(63)            level 2 dcl 2-16 ref 368
+j                               000130 automatic       fixed bin(17,0)          dcl 104 set ref 341* 341 341* 342 342* 351* 351* 352
+                                                                                  353 354* 373* 373* 374 374* 381* 381* 382 382*
+                                                                                  391* 392 392*
+joinx                           000131 automatic       fixed bin(17,0)          dcl 104 set ref 275* 276 276* 306* 307 307*
+left                            000114 automatic       pointer                  dcl 95 set ref 157* 269 276
+left_vb                         000112 automatic       pointer                  dcl 95 set ref 153* 154 157 161 191 192 198 200 206
+                                                                                  207 221 411
+maximum_value_stack_size
+                         13            based           fixed bin(18,0)          level 3 dcl 2-16 ref 6-40
+monadic                         000136 automatic       bit(1)                   dcl 104 set ref 154* 156* 161 188 214 265 409
+n_words                         000135 automatic       fixed bin(19,0)          dcl 104 set ref 233* 234*
+null                                                   builtin function         dcl 135 ref 154
+num_words                       000102 automatic       fixed bin(19,0)          dcl 6-20 set ref 6-35* 6-37 6-37* 6-37 6-40 6-40*
+                                                                                  6-44
+number_of_dimensions            000164 automatic       fixed bin(17,0)          dcl 5-3 set ref 232* 233
+numeric_datum                          based           float bin(63)            array dcl 5-23 set ref 233 424* 424
+numeric_value             0(10)        based           bit(1)                   level 5 packed unaligned dcl 5-3 set ref 166 191
+numeric_value_type                     constant        bit(18)                  initial unaligned dcl 4-30 ref 417
+on_stack                  1            parameter       bit(1)                   array level 3 dcl 3-3 ref 160 161
+operands                               parameter       structure                array level 2 dcl 3-3
+operators_argument                     parameter       structure                level 1 dcl 3-3 set ref 10
+overflow                        000000 stack reference condition                dcl 139 ref 261
+permute                                based           fixed bin(17,0)          array dcl 118 set ref 257 257 317* 340 342 342 344
+                                                                                  349 352 353 360 361* 361 362* 374 374 380 382 382
+                                                                                  384 390 392 394
+permute_ptr                     000160 automatic       pointer                  dcl 118 set ref 257* 257 257 317 340 342 342 344 349
+                                                                                  352 353 360 361 361 362 374 374 380 382 382 384
+                                                                                  390 392 394
+pivot                           000142 automatic       float bin(63)            dcl 104 set ref 349* 352 353* 368 374
+pivot_col                       000147 automatic       fixed bin(17,0)          dcl 104 set ref 338* 340 341 342 344 349 349 350 351
+                                                                                  352 353 360 361 373 374 374 380 381 382 384*
+pivot_row                       000146 automatic       fixed bin(17,0)          dcl 104 set ref 350* 354* 361 362
+pointers                 14            based           structure                level 2 dcl 2-16
+rel                                                    builtin function         dcl 135 in procedure "apl_domino_operator_" ref 236
+                                                                                  250 250
+rel                                                    builtin function         dcl 6-25 in procedure "apl_push_stack_" ref 6-40
+result                    6            parameter       pointer                  level 2 packed unaligned dcl 3-3 set ref 426*
+result_rhorho                   000134 automatic       fixed bin(17,0)          dcl 104 set ref 215* 220* 221* 221 222* 222 232 235
+                                                                                  408 414 418
+rho                       5            based           fixed bin(21,0)          array level 2 dcl 5-3 set ref 170 172 181 183 200
+                                                                                  200 207 235 409* 409 411* 411 414*
+rhoH                            000103 automatic       fixed bin(17,0)          dcl 90 set ref 167* 168 168* 170 182 198 199 411
+rhoT                            000104 automatic       fixed bin(17,0)          dcl 90 set ref 194* 204* 208* 208 220
+rhoU                                   constant        fixed bin(17,0)          initial dcl 90 ref 220
+rhorho                    3            based           fixed bin(17,0)          level 2 dcl 5-3 set ref 167 170 171 192 198 206 215
+                                                                                  221 222 418*
+right                           000110 automatic       pointer                  dcl 95 set ref 152* 276 291 300 307 307
+right_vb                        000106 automatic       pointer                  dcl 95 set ref 151* 152 160 166 167 170 170 171 172
+                                                                                  181 183 200 215 222 409
+rowx                            000132 automatic       fixed bin(17,0)          dcl 104 set ref 265* 269 269* 272* 276 278* 281* 284
+                                                                                  284 286* 289* 291 291* 297* 300 300* 303* 307 309*
+                                                                                  316* 317 317 319 321 328 334 334 335 335* 388* 390
+                                                                                  391 392 394 394 394*
+saved_stack_ptr                 000124 automatic       pointer                  dcl 95 set ref 248* 430
+size                                                   builtin function         dcl 135 ref 233 233 253 253 254 254 255 255 256 256
+                                                                                  257 257
+static_ws_info_ptr              000016 external static pointer                  level 2 packed unaligned dcl 2-11 ref 2-7
+string                                                 builtin function         dcl 135 set ref 417*
+substr                                                 builtin function         dcl 6-25 in procedure "apl_push_stack_" ref 6-37
+substr                                                 builtin function         dcl 135 in procedure "apl_domino_operator_" ref 236
+the_max                         000144 automatic       float bin(63)            dcl 104 set ref 319* 323 323* 330 330* 334 335
+total_data_elements       2            based           fixed bin(21,0)          level 2 dcl 5-3 set ref 419*
+type                                   based           structure                level 3 packed unaligned dcl 5-3 set ref 417*
+unspec                                                 builtin function         dcl 6-25 ref 6-37
+value                                  parameter       pointer                  array level 3 packed unaligned dcl 3-3 ref 151 153
+value_bead                             based           structure                level 1 dcl 5-3 set ref 233
+value_stack_ptr          16            based           pointer                  level 3 packed unaligned dcl 2-16 set ref 162 229
+                                                                                  231* 248 250 250* 430* 6-40 6-43 6-44* 6-44
+values                    2            based           structure                level 2 dcl 2-16
+where_error              10            parameter       fixed bin(17,0)          level 2 dcl 3-3 set ref 436* 436 439* 439 450* 450
+ws_info                                based           structure                level 1 dcl 2-16
+ws_info_ptr                     000162 automatic       pointer                  initial dcl 2-7 set ref 162 229 231 430 2-7* 248 250
+                                                                                  250 368 6-40 6-40 6-43 6-44 6-44
+z                               000140 automatic       float bin(63)            dcl 104 set ref 274* 276* 276 278 305* 307* 307 309
+                                                                                  321* 323 323 328* 330 330 340* 342* 342 344 380*
+                                                                                  382* 382 384 390* 392* 392 394
+zerodivide                      000000 stack reference condition                dcl 139 ref 261
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+Binary                                 internal static bit(1)                   initial dcl 1-16
+MAX_VALUE_BEAD_SIZE                    internal static fixed bin(19,0)          initial dcl 5-28
+NumberSize                             internal static fixed bin(4,0)           initial dcl 1-25
+TheBiggestNumberWeveGot                internal static float bin(63)            initial dcl 1-16
+TheSmallestNumberWeveGot               internal static float bin(63)            initial dcl 1-16
+character_data_structure               based           structure                level 1 dcl 5-15
+character_string_overlay               based           char                     dcl 5-19
+character_value_type                   internal static bit(18)                  initial unaligned dcl 4-30
+complex_datum                          based           complex float bin(63)    array dcl 5-26
+complex_value_type                     internal static bit(18)                  initial unaligned dcl 4-30
+function_type                          internal static bit(18)                  initial unaligned dcl 4-30
+group_type                             internal static bit(18)                  initial unaligned dcl 4-30
+integral_value_type                    internal static bit(18)                  initial unaligned dcl 4-30
+label_type                             internal static bit(18)                  initial unaligned dcl 4-30
+lexed_function_type                    internal static bit(18)                  initial unaligned dcl 4-30
+list_value_type                        internal static bit(18)                  initial unaligned dcl 4-30
+max_parse_stack_depth                  internal static fixed bin(17,0)          initial dcl 2-98
+not_integer_mask                       internal static bit(18)                  initial unaligned dcl 4-30
+not_zero_or_one_mask                   internal static bit(18)                  initial unaligned dcl 4-30
+operator_type                          internal static bit(18)                  initial unaligned dcl 4-30
+output_buffer                          based           char                     unaligned dcl 2-94
+shared_variable_type                   internal static bit(18)                  initial unaligned dcl 4-30
+symbol_type                            internal static bit(18)                  initial unaligned dcl 4-30
+value_type                             internal static bit(18)                  initial unaligned dcl 4-30
+zero_or_one_value_type                 internal static bit(18)                  initial unaligned dcl 4-30
+zz                                     automatic       float bin(63)            dcl 104
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+apl_domino_operator_            000045 constant        entry                    external dcl 10
+apl_push_stack_                 002357 constant        entry                    internal dcl 6-4 ref 234 253 254 255 256 257
+domain_error_left               002330 constant        label                    dcl 439 ref 191
+domain_error_right              002324 constant        label                    dcl 436 ref 166 185 186 368
+length_error                    002341 constant        label                    dcl 446 set ref 193 200
+rank_error_left                 002347 constant        label                    dcl 450 set ref 198
+singularity                     002333 constant        label                    dcl 442 ref 261
+special_H                       000175 constant        label                    dcl 188 ref 174 178
+special_T                       000253 constant        label                    dcl 211 ref 196
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      2540        2562    2425        2550
+Length      3066    2425        22         270     113           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+apl_domino_operator_                126 external procedure  is an external procedure.  
+begin block on line 242             118 begin block         enables or reverts conditions.  
+on unit on line 261                  64 on unit               
+apl_push_stack_                      74 internal procedure  is called by several nonquick procedures.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+apl_domino_operator_     000100 H                           apl_domino_operator_
+                         000101 T                           apl_domino_operator_
+                         000102 U                           apl_domino_operator_
+                         000103 rhoH                        apl_domino_operator_
+                         000104 rhoT                        apl_domino_operator_
+                         000106 right_vb                    apl_domino_operator_
+                         000110 right                       apl_domino_operator_
+                         000112 left_vb                     apl_domino_operator_
+                         000114 left                        apl_domino_operator_
+                         000116 final_result_vb             apl_domino_operator_
+                         000120 final_result                apl_domino_operator_
+                         000122 end_of_operands             apl_domino_operator_
+                         000124 saved_stack_ptr             apl_domino_operator_
+                         000126 i                           apl_domino_operator_
+                         000127 colx                        apl_domino_operator_
+                         000130 j                           apl_domino_operator_
+                         000131 joinx                       apl_domino_operator_
+                         000132 rowx                        apl_domino_operator_
+                         000133 data_elements               apl_domino_operator_
+                         000134 result_rhorho               apl_domino_operator_
+                         000135 n_words                     apl_domino_operator_
+                         000136 monadic                     apl_domino_operator_
+                         000140 z                           apl_domino_operator_
+                         000142 pivot                       apl_domino_operator_
+                         000144 the_max                     apl_domino_operator_
+                         000146 pivot_row                   apl_domino_operator_
+                         000147 pivot_col                   apl_domino_operator_
+                         000150 AtA_ptr                     apl_domino_operator_
+                         000152 AtB_ptr                     apl_domino_operator_
+                         000154 LU_ptr                      apl_domino_operator_
+                         000156 X_ptr                       apl_domino_operator_
+                         000160 permute_ptr                 apl_domino_operator_
+                         000162 ws_info_ptr                 apl_domino_operator_
+                         000164 number_of_dimensions        apl_domino_operator_
+apl_push_stack_          000100 block_ptr                   apl_push_stack_
+                         000102 num_words                   apl_push_stack_
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+alloc_temp          enter_begin         leave_begin         call_ext_out        call_int_this       call_int_other
+return              tra_ext             enable              shorten_stack       ext_entry           int_entry
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+apl_get_value_stack_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+apl_error_table_$domain       apl_error_table_$length       apl_error_table_$rank         apl_static_$ws_info_ptr
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     10 000042    2    7 000052       151 000054       152 000060       153 000062       154 000064       156 000073
+    157 000074       160 000076       161 000105       162 000114       166 000117       167 000122       168 000126
+    170 000130       171 000137       172 000140       173 000142       174 000144       177 000145       178 000150
+    181 000151       182 000153       183 000161       184 000166       185 000170       186 000173       188 000175
+    191 000177       192 000202       193 000205       194 000210       195 000212       196 000213       198 000214
+    199 000216       200 000223       202 000231       204 000233       205 000234       206 000236       207 000244
+    208 000250       209 000251       214 000253       215 000255       216 000260       217 000262       218 000264
+    220 000265       221 000270       222 000275       223 000302       229 000305       231 000310       232 000313
+    233 000315       234 000325       235 000335       236 000341       242 000347       244 000352       248 000362
+    250 000365       253 000377       254 000414       255 000432       256 000451       257 000467       261 000503
+    265 000527       268 000546       269 000556       270 000574       271 000576       272 000601       273 000612
+    274 000622       275 000624       276 000634       277 000665       278 000667       279 000704       280 000706
+    281 000711       283 000724       284 000734       286 000754       287 000771       288 000773       289 000776
+    290 001006       291 001016       292 001045       293 001047       297 001051       299 001066       300 001076
+    301 001114       302 001116       303 001121       304 001132       305 001142       306 001144       307 001154
+    308 001177       309 001201       310 001216       311 001220       316 001222       317 001234       319 001236
+    320 001250       321 001260       323 001276       325 001301       327 001303       328 001314       330 001332
+    332 001335       334 001337       335 001367       336 001452       338 001455       339 001466       340 001476
+    341 001514       342 001524       343 001557       344 001561       345 001601       349 001603       350 001622
+    351 001624       352 001632       353 001662       354 001664       356 001666       360 001670       361 001674
+    362 001677       368 001701       373 001712       374 001722       375 001743       379 001745       380 001760
+    381 001777       382 002006       383 002041       384 002043       385 002063       386 002065       388 002067
+    389 002076       390 002106       391 002126       392 002140       393 002175       394 002177       395 002233
+    396 002235       402 002240       408 002241       409 002247       411 002257       412 002265       414 002270
+    417 002276       418 002301       419 002304       420 002306       424 002310       426 002315       430 002320
+    432 002323       436 002324       439 002330       442 002333       444 002340       446 002341       448 002346
+    450 002347       452 002352       453 002355    6    4 002356    6   35 002364    6   37 002367    6   40 002374
+ 6   43 002411    6   44 002415    6   45 002422
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

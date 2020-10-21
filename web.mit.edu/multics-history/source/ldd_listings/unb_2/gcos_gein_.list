@@ -1,0 +1,2840 @@
+	COMPILATION LISTING OF SEGMENT gcos_gein_
+	Compiled by: Multics PL/I Compiler, Release 28b, of April 11, 1983
+	Compiled at: Honeywell LCPD Phoenix, System M
+	Compiled on: 09/09/83  1132.6 mst Fri
+	    Options: optimize map
+
+        1 /* ***********************************************************
+        2*   *                                                         *
+        3*   * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        4*   *                                                         *
+        5*   *********************************************************** */
+        6 gcos_gein_: proc;
+        7 
+        8 /*
+        9*   This module receives control from the gcos command procedure. It is the
+       10*   "main loop" of the simulator; it controls the running of the entire job.
+       11*
+       12*   It calls gcos_gein_pass1_ which performs (optional) cannonicalization (on an
+       13*   ASCII segment), copies $ SELECTed files into the job stream,
+       14*   and looks for activity-defining cards in the job.
+       15*
+       16*   The input file must contain a job deck. It may be either an ASCII segment,
+       17*   as created by one of the Multics editors, or a gcos standard system format file,
+       18*   as created by the gcos daemon from a deck or an IMCV tape.  The appendage ".gcos" is one of
+       19*   two ways of identifying the latter type of job deck segment, the other being
+       20*   the -gcos (-gc) control argument.
+       21*
+       22*   This procedure also initializes all the external static variables
+       23*   in gcos_ext_stat_ which need initialization and it opens a number of gcos files.
+       24*
+       25*   Once initialization is complete, it reads card images from the
+       26*   job stream file and passes these on to the appropriate processing routines.
+       27*
+       28*   When all the cards defining an activity have been processed, gcos_run_activity_
+       29*   will be called to run the activity. Processing will then continue with the
+       30*   cards for subsequent activities. When a $ ENDJOB card is read, its
+       31*   processing routine, gcos_cc_endjob_ will clean up all open files, perform
+       32*   other end-of-job bookkeeping, and then transfer to the label "normal_termination"
+       33*   in this procedure, via a non local goto, thus cleaning up the stack. However,
+       34*   if execution of the simulator (not a gcos activity) is aborted because of
+       35*   some error, control will be passed to the label "fatalerror" in the command
+       36*   procedure, gcos, causing the stack frame for this procedure to be cleaned
+       37*   up, and its cleanup handler, gein_cleanup, to be invoked.
+       38**/
+       39 
+       40 /*
+       41*   Author: DICK SNYDER AUGUST 4,1970
+       42*   Change: T.CASEY APRIL 1973, OCTOBER 1973, DECEMBER 1973, FEBRUARY 1974, APRIL 1974, AUGUST 1974
+       43*   Change: D. KAYDEN  MAY 1974, JULY 1974, FEBRUARY 1975
+       44*   Change: R.H. MORRISON MAY 1975
+       45*   Change: M. WEAVER JUNE 1975
+       46*   Change: M. R. Jordan, August 1977
+       47*   Change: A. N. Kepner, March 1978 to allow courtesy call i/o  within cc routines
+       48*   Change: Dave Ward, March 1978 to report $ SNUMB not first jcl card.
+       49*   Change: Mel Wilson, March, 1979 to remove snumb_then_ident check for gtss
+       50*   Change: Dave Ward	08/18/81 cleanup. octal constants.
+       51*   Change: Dave Ward	09/09/81 replaced use of alm vector gcos_cc_caller_ with goto cc.
+       52*   Change: Dave Ward	09/11/81 changed search_rules from allocated to auto.
+       53*   Change: Dave Ward	09/13/81 converted fibs & buffers from allocated space
+       54*			         to arrays in a temp segment.
+       55*   Change: Dave Ward	09/17/81 removed fctptr. clock_ to clock. unspec init.
+       56*   Change: Scott C. Akers	12/21/81	Fix bugs wherein GEIN references the wrong
+       57*				directory (syot_dir and save_dir get confused with
+       58*				wdir and each other).
+       59*   Change: Ron Barstad         11/12/82 Add cleanup handler for attached IDS2 files
+       60*   Change: Ron Barstad         12/02/82 Fix bug; $SELECT not writing binary object records to R*
+       61*   Change: Ron Barstad  83-08-02  Add 4JS3 to version message and 4js3 cards.
+       62**/
+       63 
+       64 /* INITIALIZE THE SIMULATOR -
+       65*   START BY CLEARING THE FILE INFORMATION BLOCKS,
+       66*   AND THEN OPENING THE FILES THAT ARE USED DURING THE WHOLE JOB
+       67**/
+       68 
+       69 start:	;
+       70 	unspec (save_data.fibs) = "0"b;
+       71 
+       72 	fct.filecode = "";				/* clear the file code table */
+       73 	fct.sysout = "0"b;
+       74 	fct.fibptr = null ();
+       75 
+       76 	on condition (cleanup) call gein_cleanup;	/* establish cleanup handler before opening any files */
+       77 
+       78 /* Once per process initialization		 */
+       79 	if ^initialized then do;
+       80 	     initialized = "1"b;
+       81 	     gcos_ext_stat_$gcos_slave_area_seg = null;	/* init ptr to gcos seg once per process */
+       82 	     gcos_ext_stat_$max_mem = sys_info$max_seg_size; /* and max memory size */
+       83 	end;
+       84 
+       85 	gcos_ext_stat_$save_data.endjob = "1"b;		/* Tell gcos_error_ to not call cc_endjob_ if we */
+       86 						/* abort during init.  Instead use gein_cleanup_. */
+       87 
+       88 
+       89 /* Use the search rules to search for the gcos libraries */
+       90 	if gcos_ext_stat_$save_data.userlib then do;	/* if user wants his own libraries */
+       91 						/* move "referencing_dir" to end of search rules,
+       92*						   to allow user's libraries to be found */
+       93 	     call hcs_$get_search_rules (addr (search_rules));
+       94 
+       95 	     do i = 1 to search_rules.number
+       96 		     while (search_rules.names (i) ^= "referencing_dir");
+       97 	     end;
+       98 
+       99 	     if i < search_rules.number then do;	/* if "referencing_dir" was found */
+      100 						/* and it was not last */
+      101 		search_rules.names (i) = "";		/* delete it from its present position */
+      102 		if search_rules.number = 21 then	/* if rule structure full */
+      103 		     do j = i to 20;		/* move the remaining rules up 1 */
+      104 		     search_rules.names (j) = search_rules.names (j+1);
+      105 		end;
+      106 		else search_rules.number = search_rules.number + 1; /* otherwise, save time */
+      107 
+      108 		search_rules.names (search_rules.number) = "referencing_dir"; /* put it last */
+      109 	     end;
+      110 
+      111 	     lib_count = 4;				/* allow search for gcos_second_software_ */
+      112 	end;
+      113 	else lib_count = 3;				/* -userlib not given so do not search for second software */
+      114 
+      115 	do i = 1 to lib_count;
+      116 
+      117 	     if gcos_ext_stat_$save_data.userlib then
+      118 		call execute_search_rules_$s_r_ptr (
+      119 		lib_names (i)
+      120 		, "1"b				/* (input) return target type & bit count. */
+      121 		||"1"b				/* (input) return target path. */
+      122 		||"1"b				/* (input) return primary name on entry. */
+      123 		|| (5)"0"b			/* (NOT USED). */
+      124 		, addr (search_rules)
+      125 		, fullname
+      126 		, ename
+      127 		, type
+      128 		, bit_count
+      129 		, code
+      130 		);
+      131 	     else
+      132 	     call execute_search_rules_ (
+      133 		lib_names (i)
+      134 		, "1"b				/* (input) return target type & bit count. */
+      135 		||"1"b				/* (input) return target path. */
+      136 		||"1"b				/* (input) return primary name on entry. */
+      137 		|| (5)"0"b			/* (NOT USED). */
+      138 		, fullname
+      139 		, ename
+      140 		, type
+      141 		, bit_count
+      142 		, code
+      143 		);
+      144 	     if code ^= 0 then do;
+      145 		if code = error_table_$noentry then do;
+      146 		     if i = 4 then do;		/* not error if second software not found */
+      147 			gcos_ext_stat_$save_data.userlib = "0"b; /* reset so gcos_mme_call_ will not try to use it */
+      148 			goto cont_init;
+      149 		     end;
+      150 		     else
+      151 		     if i = 2 then do;
+      152 			gcos_ext_stat_$patchfile_ptr = null ();
+      153 			goto end_lib_loop;
+      154 		     end;
+      155 
+      156 		     if type = 0 then		/* if it was a link */
+      157 			err_msg = "target of link to system library ^a in ^a";
+      158 		     else
+      159 		     err_msg = "system library ^a";
+      160 		end;
+      161 		else
+      162 		err_msg = "while searching for system library ^a in ^a";
+      163 lib_err:		;
+      164 		call com_err_ (
+      165 		     code
+      166 		     , "gcos_gein_"
+      167 		     , err_msg
+      168 		     , lib_names (i)
+      169 		     , fullname
+      170 		     );
+      171 		if code ^= error_table_$no_s_permission then do;
+      172 fatal_error:	     ;
+      173 		     call gein_cleanup;
+      174 		     return;
+      175 		end;
+      176 
+      177 	     end;
+      178 
+      179 	     if bit_count = 0 then do;
+      180 		code = 0;
+      181 		err_msg = "zero bit count for system library ^a";
+      182 		goto lib_err;
+      183 	     end;
+      184 
+      185 
+      186 /* make full pathname of library */
+      187 	     lib_path = rtrim (fullname) || ">" || ename;
+      188 	     if i = 1 then do;			/* save subroutine library pathname */
+      189 		call gcos_open_file_ ("", "l*$", fibptr, sw);
+      190 
+      191 		fib.pathnm = lib_path;
+      192 		fib.type = "1"b;			/* random file */
+      193 		fib.read = "1"b;			/* read only */
+      194 		fib.disp = "10"b;			/* disposition = save */
+      195 		fib.perm = "1"b;			/* do not delete when detaching */
+      196 	     end;
+      197 	     else
+      198 	     if i = 2 then do;
+      199 		gcos_ext_stat_$patchfile_ptr = null ();
+      200 		call hcs_$initiate (
+      201 		     fullname
+      202 		     , (ename)
+      203 		     , ""
+      204 		     , 0
+      205 		     , 0
+      206 		     , gcos_ext_stat_$patchfile_ptr
+      207 		     , code
+      208 		     );
+      209 	     end;
+      210 	     else do;
+      211 		call ios_$attach (
+      212 		     lib_streams (i-2)
+      213 		     , "file"
+      214 		     , lib_path
+      215 		     , "r"
+      216 		     , status
+      217 		     );
+      218 		if code ^= 0 then do;
+      219 lib_att_err:	     ;
+      220 		     err_msg = "trying to attach system library ^a";
+      221 		     goto lib_err;
+      222 		end;
+      223 		call ios_$setsize (lib_streams (i-2), 36, status);
+      224 		if code ^= 0 then goto lib_att_err;
+      225 	     end;
+      226 end_lib_loop:  ;
+      227 	end;
+      228 
+      229 cont_init: ;
+      230 
+      231 /* Obtain temporary segment for fibs and buffers. */
+      232 
+      233 	call get_temp_segment_ (
+      234 	     "gcos"
+      235 	     , gcos_ext_stat_$temp_seg_ptr
+      236 	     , code
+      237 	     );
+      238 	if code ^= 0 then do;
+      239 	     call com_err_ (			/* Can not obtain temp segment. */
+      240 		code
+      241 		, "gcos"
+      242 		, "^/Attempting to get temporary segment."
+      243 		);
+      244 	     goto fatal_error;
+      245 	end;
+      246 
+      247 /* INITIALIZE MISCELLANEOUS VARIABLES */
+      248 	gcos_ext_stat_$snumb = "4546452520"b3 ;		/* 4546452520 => "NONE" in bcd. */
+      249 	save_data.actid = "   NONE ";
+      250 
+      251 	gcos_ext_stat_$normal_return = normal_termination; /* set up normal termination nonlocal goto */
+      252 	gcos_ext_stat_$default_nondollar,
+      253 	     gcos_ext_stat_$sought_label,
+      254 	     gcos_ext_stat_$abort_reason = "";
+      255 
+      256 	unspec (gcos_ext_stat_$statistics) = "0"b;	/* 3*mme number word array being zeroed */
+      257 
+      258 /* Indicate that cc_queue is initially empty. */
+      259 	courtesy_call.next_avail = 1;			/* next available empty location */
+      260 	courtesy_call.next_out = 1;			/* next entry to remove from queue */
+      261 
+      262 	gcos_ext_stat_$job_real_time = clock ();	/* save job start time */
+      263 	call date_time_ (
+      264 	     gcos_ext_stat_$job_real_time
+      265 	     , execution_msg.date_time
+      266 	     );					/* put date and time in execution */
+      267 						/* report header message */
+      268 
+      269 	call hcs_$get_usage_values (k, gcos_ext_stat_$job_cpu_time, k); /* get cpu time at start of job */
+      270 
+      271 /* RESTART */
+      272 
+      273 	if ^gcos_ext_stat_$save_data.nosave then do;
+      274 	     call hcs_$make_seg (
+      275 		(gcos_ext_stat_$save_dir)
+      276 		, gcos_ext_stat_$job_id || ".save_data"
+      277 		, ""
+      278 		, 11
+      279 		, gcos_ext_stat_$saveseg_ptr
+      280 		, code
+      281 		);
+      282 
+      283 	     if gcos_ext_stat_$saveseg_ptr = null then
+      284 		call gcos_error_ (
+      285 		code
+      286 		, "creating ^a>^a.save_data"
+      287 		, gcos_ext_stat_$save_dir
+      288 		, gcos_ext_stat_$job_id
+      289 		);
+      290 
+      291 	     if restart_control.saved then do;		/* job was interrupted */
+      292 		call gcos_restart_ (i);		/* do restart */
+      293 		goto restart (i);			/* (i) depends on restart options and saved data */
+      294 
+      295 restart (1):	;				/* job restart if activity restart failed */
+      296 
+      297 		call gein_cleanup;
+      298 		goto start;			/* start over from scratch */
+      299 	     end;
+      300 	end;
+      301 
+      302 restart (4): ;					/* job restart if act. restart not attempted */
+      303 	save_data.psw = "0"b;			/* clear pgm sw. word */
+      304 
+      305 	save_data.sqindex = 1;			/* init sysout queue index */
+      306 
+      307 	save_data.activity_no = 0;			/* use activity number of zero in job file pathnames */
+      308 
+      309 /* 	"Open" the following files		 */
+      310 
+      311 /*	sysprint collector file */
+      312 /*	syspunch collector file */
+      313 /* 	execution report		 */
+      314 /*	geload r* collector file	*/
+      315 
+      316 
+      317 	do i = 1 to 4;
+      318 	     call gcos_open_file_ ("", "", fibptr, sw);	/* get a fib */
+      319 	     fib.disp = "10"b;			/* set disp = save for each file */
+      320 	     goto fib_init (i);			/* goto init rtn */
+      321 continue:	     ;					/* init rtns return here */
+      322 	end;
+      323 
+      324 /*  Write head of form with report code 74 and header message on execution report */
+      325 	call gcos_write_$ptr (gcos_ext_stat_$er, FF, "11111100"b); /* write head-of-form */
+      326 	call gcos_write_$ptr (
+      327 	     gcos_ext_stat_$er
+      328 	     , string (execution_msg)
+      329 	     , "11111100"b
+      330 	     );					/* execution report header */
+      331 
+      332 /* Get information from object or bound segment, and print it on execution
+      333*   report and console, to identify the version of the simulator being used */
+      334 
+      335 	gptr = addr (gcos$);			/* get address of object or bound segment */
+      336 	call hcs_$status_mins (gptr, type, bit_count, code); /* get its bit count */
+      337 	if code ^= 0 then goto skip_version;		/* don't abort job - just skip printing version.
+      338*						   user might not have s access on the directory */
+      339 	obj_info.version_number = object_info_version_2;
+      340 	call object_info_$display (gptr, bit_count, addr (obj_info), code);
+      341 	if code ^= 0 then goto skip_version;
+      342 	call date_time_ (obj_info.compile_time, vrsn_msg.date_time); /* format time into message */
+      343 	call gcos_write_$ptr (
+      344 	     gcos_ext_stat_$er
+      345 	     , string (vrsn_msg)
+      346 	     , "11111100"b
+      347 	     );					/* write it on execution report */
+      348 	if ^gcos_ext_stat_$save_data.brief then		/* and, if user did not say -brief, */
+      349 	     call ioa_$nnl ("GCOS 4JS3 ^a", string (vrsn_msg)); /* on console */
+      350 
+      351 	if gcos_ext_stat_$save_data.debug then do;	/* for benefit of debugger of simulator,
+      352*						   print pathname, author, and whether bound or not */
+      353 	     call hcs_$fs_get_path_name (
+      354 		gptr
+      355 		, fullname
+      356 		, i
+      357 		, ename
+      358 		, code
+      359 		);
+      360 	     if code ^= 0 then goto skip_version;
+      361 	     if obj_info.format.bound then seg_type = "bound";
+      362 	     else seg_type = "compiled";
+      363 	     call ioa_$rs (
+      364 		"^a>^a ^a by ^a^/"
+      365 		, err_msg
+      366 		, j
+      367 		, fullname
+      368 		, ename
+      369 		, seg_type
+      370 		, obj_info.userid
+      371 		);
+      372 	     if gcos_ext_stat_$save_data.long then	/* if user said -long, */
+      373 		call ioa_$nnl ("^a", err_msg);	/* print it on the terminal */
+      374 	     call gcos_write_$ascii_ptr (
+      375 		gcos_ext_stat_$er
+      376 		, var_msg
+      377 		, "11111100"b
+      378 		);				/* and always on ex rpt, in ASCII */
+      379 
+      380 	end;
+      381 
+      382 skip_version: ;
+      383 						/* come here on any error getting version information */
+      384 
+      385 	gcos_ext_stat_$save_data.endjob = "0"b;		/* Initialization complete, reset flag */
+      386 
+      387 pass1:	;
+      388 	call gcos_gein_pass1_;			/* go put job stream in shape to run job */
+      389 
+      390 	if save_data.last_execute_act_no > 0 then	/* if job contains any EXECUTE cards */
+      391 	     save_data.psw = "01"b3 ;			/* turn on psw bit 5 */
+      392 
+      393 	if ^gcos_ext_stat_$save_data.nosave then do;	/* save restart data */
+      394 	     call gcos_write_$force_ptr (gcos_ext_stat_$er);
+      395 	     call gcos_restart_$save;
+      396 	end;
+      397 
+      398 
+      399 /* Write header record on sysout print collector file. This record identifies
+      400*   the file as sysout (to be sorted) rather than print (not to be sorted). It
+      401*   also reserves space for the snumb and the offset within the file where the
+      402*   execution report begins, to be put in later */
+      403 
+      404 restart (2): ;
+      405 	call gcos_write_$record_ptr (
+      406 	     gcos_ext_stat_$prt
+      407 	     , firstrecord
+      408 	     , (8)"0"b
+      409 	     );
+      410 						/* come here for activity restart of first act. */
+      411 
+      412 restart (3): ;					/* come here for activity restart */
+      413 
+      414 /* Initialization is now complete. Here begins the main processing loop of GEIN.
+      415*   Cards or line images are read here from the job stream file
+      416*   and then looked up in a table to obtain a pointer to the appropriate
+      417*   processing routine.  Some cards are processed in-line, however. */
+      418 
+      419 
+      420 /* Come here after each card is processed, to read the next card */
+      421 
+      422 loop:	;
+      423 	call gcos_read_card_ (gcos_ptr, gcos_len, card, dollar_sw); /* get card image */
+      424 	gcos_ext_stat_$gf = 0;			/* init sw for gcos_get_cc_field_ rtn */
+      425 
+      426 	if ^dollar_sw then goto nondollar;		/* if not a dollar card */
+      427 
+      428 /* WE HAVE A $ CONTROL CARD;
+      429*   CHECK FOR VARIOUS SPECIAL CASES BEFORE LOOKING IT UP IN THE TABLE */
+      430 
+      431 	dollar_card_count = dollar_card_count+1;
+      432 	card_type = translate (substr (card, 8, 6), LOWER_CASE, UPPER_CASE); /* pick out card type, for faster access */
+      433 
+      434 	if gcos_ext_stat_$save_data.copy then do;	/* copy $ control cards */
+      435 	     if card_type ^= "endcop" then goto nondollar; /* go write on file */
+      436 	     if gcos_ext_stat_$save_data.endfc then
+      437 		if gcos_ext_stat_$endfc ^= translate (substr (card, 16, 2), LOWER_CASE, UPPER_CASE) then goto nondollar;
+      438 	     gcos_ext_stat_$save_data.copy
+      439 		, gcos_ext_stat_$save_data.nondollar
+      440 		, gcos_ext_stat_$save_data.endfc
+      441 		= "0"b;				/* turn off sw if endcopy card */
+      442 	     gcos_ext_stat_$nondollar = "";		/* no nondollar file is defined now */
+      443 	     goto loop;				/* get another card */
+      444 	end;
+      445 
+      446 	if ^gcos_ext_stat_$save_data.brief then		/* unless told not to */
+      447 	     if nondollar_cards_skipped > 0 then do;	/* warn user of out-of-place nondollar cards
+      448*						   that preceeded this one */
+      449 		call ioa_ (
+      450 		     "^d nondollar cards skipped before:^/^a"
+      451 		     , nondollar_cards_skipped
+      452 		     , card
+      453 		     );
+      454 		nondollar_cards_skipped = 0;		/* reset the count */
+      455 	     end;
+      456 	     else if cc_print_sw then call ioa_ ("^a", card); /* print card if requested, for debugging */
+      457 
+      458 	if substr (card, 1, 7) ^= "$" then		/* possible label card */
+      459 	     goto label_card;			/* go see if we are looking for one */
+      460 
+      461 	if card_type ^= "etc   " then
+      462 	     gcos_ext_stat_$save_data.write_etc = "0"b;	/* the only way to make sure this switch is not
+      463*						   left on too long is to turn it off every time a
+      464*						   non-ETC card is read */
+      465 
+      466 	if card_type ^= "incode" then
+      467 	     if gcos_ext_stat_$save_data.nondollar then do; /* if we were reading nondollar cards */
+      468 		gcos_ext_stat_$save_data.nondollar = "0"b; /* we aren't any more */
+      469 		gcos_ext_stat_$nondollar = "";	/* and no nondollar file is defined now */
+      470 		gcos_ext_stat_$incode = 0;		/* turn off any incode processing */
+      471 	     end;
+      472 
+      473 /* Look up card in table */
+      474 	do i = 1 to gcos_control_tables_$tablelen;
+      475 	     if card_type = gcos_control_tables_$cardtable (i) then goto found; /* look for card type */
+      476 	end;
+      477 
+      478 /* An unknown card is not an error, in real GCOS */
+      479 
+      480 unknown_card: ;
+      481 	if gcos_ext_stat_$save_data.long then		/* if told to do so, warn user of bad $ card */
+      482 	     call ioa_ (
+      483 	     "gcos simulator will ignore the following unknown dollar card:^/^a"
+      484 	     , card
+      485 	     );
+      486 	goto loop;
+      487 
+      488 found:	;					/* come here when card is found in cardtable;
+      489*						   "i" is its position in the table, and is used from here on */
+      490 
+      491 
+      492 
+      493 /* BEFORE CALLING THE PROCESSOR FOR THIS CARD, CHECK VARIOUS SPECIAL CASES */
+      494 	if dollar_card_count = 1 then
+      495 	     if card_type ^= "snumb" then goto no_snumb;
+      496 
+      497 /* FIRST, ARE WE SKIPPING THROUGH THE DECK, LOOKING FOR SOMETHING? */
+      498 
+      499 
+      500 	if gcos_ext_stat_$save_data.seeking then do;	/* if we are seeking a label or terminator */
+      501 						/* "seeking" do group */
+      502 	     if gcos_ext_stat_$sought_label ^= "" then do; /* if we are seeking a label */
+      503 						/* we already know we do not have one */
+      504 						/* "seeking label" do group (for GOTO, IF, or WHEN card) */
+      505 		if i >= gcos_control_tables_$exc_offset then
+      506 		     if i < gcos_control_tables_$nonact then do; /* if this is an activity card, */
+      507 						/* we will delete the activity */
+      508 
+      509 delete_activity:		;			/* come here from below to delete activities */
+      510 						/* of aborts or compilation errors in previous */
+      511 						/* activities */
+      512 			gcos_ext_stat_$save_data.this_act_abort = "0"b; /* make sure this switch does not stay on
+      513*						   past the end of the aborting activity */
+      514 
+      515 /*  Bump the activity number 	 */
+      516 
+      517 			save_data.activity_no = save_data.activity_no + 1;
+      518 
+      519 /* Write activity deletion messages on console and execution report */
+      520 
+      521 /* format the message */
+      522 			call ioa_$rs (
+      523 			     "* ^a ACTIVITY -^2d- DELETED"
+      524 			     , err_msg
+      525 			     , j
+      526 			     , card_type
+      527 			     , save_data.activity_no
+      528 			     );
+      529 
+      530 /* write it on the console, for the benefit of the interactive user */
+      531 			if gcos_ext_stat_$save_data.long then /* provided he said -long */
+      532 			     call ioa_$nnl ("^a", var_msg);
+      533 
+      534 /* and on the execution report */
+      535 			call gcos_write_$ptr (
+      536 			     gcos_ext_stat_$er
+      537 			     , var_msg
+      538 			     , "11111100"b
+      539 			     );
+      540 
+      541 
+      542 			goto loop;		/* go read next card */
+      543 
+      544 		     end;
+      545 
+      546 
+      547 
+      548 		if i = gcos_control_tables_$tablelen then /* if ENDJOB card, */
+      549 		     goto call_caller;		/* then terminate job normally */
+      550 
+      551 		goto loop;			/* if not from $ WHEN card, or if current card is
+      552*						   not a terminator, then keep looking for the label */
+      553 	     end;					/* end of "seeking label" do group */
+      554 
+      555 /* So we are just seeking a terminator. We could be skipping an abort subactivity,
+      556*   or skipping a deleted execution activity. In either case, a $ ABORT card is not
+      557*   an acceptable terminator for the search */
+      558 
+      559 	     if i < gcos_control_tables_$exc_offset then goto loop; /* not a terminator. keep looking for one */
+      560 
+      561 /* it is a terminator - it might be a $ ABORT card, though */
+      562 	     if i = gcos_control_tables_$nonact then goto loop; /* if so keep looking */
+      563 
+      564 /* We found a terminator. Turn off the switches that make us look for one */
+      565 	     gcos_ext_stat_$save_data.seeking, gcos_ext_stat_$save_data.seeking_terminator = "0"b;
+      566 
+      567 /* And fall thru to process the terminator */
+      568 	end;					/* end of "seeking" do group */
+      569 
+      570 
+      571 
+      572 /* SECOND, WE WILL ENFORCE RESTRICTIONS ON POSITION OF SNUMB AND IDENT CARDS */
+      573 
+      574 	if gcos_ext_stat_$save_data.flgs.ident then goto activtst; /* snumb and ident already found ? */
+      575 	if card_type = "snumb " then goto activtst;	/* snumb? */
+      576 	if ^gcos_ext_stat_$save_data.snumb then goto loop; /* no..if none read yet continue */
+      577 
+      578 
+      579 
+      580 /* THIRD, ACTIVITY TERMINATING CARDS NEED SOME SPECIAL HANDLING */
+      581 
+      582 activtst:	;
+      583 	if i >= gcos_control_tables_$exc_offset then do;	/* if this card is an activity terminator */
+      584 	     if gcos_ext_stat_$save_data.activ then do;	/* and an activity was being defined, run it now */
+      585 
+      586 		if ^gcos_ext_stat_$save_data.flgs.ident then
+      587 		     goto jobort;			/* require $ident before first activity execution */
+      588 
+      589 		if ^gcos_ext_stat_$save_data.nosave then
+      590 		     restart_control.na_restart = restart_control.na_hold; /* copy activity restart option */
+      591 
+      592 		call gcos_run_activity_;
+      593 
+      594 		if ^gcos_ext_stat_$save_data.nosave then do; /* if user requested save */
+      595 		     call gcos_write_$force_ptr (gcos_ext_stat_$er);
+      596 		     call gcos_write_$force_ptr (gcos_ext_stat_$rs);
+      597 		     call gcos_write_$force_ptr (gcos_ext_stat_$pch);
+      598 		     call gcos_restart_$save;		/* save state of simulator at activity end */
+      599 		end;
+      600 						/* so that we could restart from the beginning
+      601*						   of the next activity if we had to */
+      602 	     end;
+      603 
+      604 /* Control also comes here to continue after running an activity,
+      605*   or after skipping a deleted activity. */
+      606 
+      607 /* Here, check for two types of activity deletion, before beginning to
+      608*   define the next activity:
+      609*   1) run only compilations after an abort (and before a $ BREAK)
+      610*   2) if a compiler turns off psw bit 5, delete all execution activities,
+      611*   until somebody turns it back on.
+      612*
+      613*
+      614*   Execution activities are $ EXECUTE and $ 355SIM */
+      615 	     if i >= gcos_control_tables_$comp_offset then
+      616 		goto dont_delete;			/* never delete a compilation activity */
+      617 	     if gcos_ext_stat_$save_data.prev_act_abort then
+      618 		goto do_delete;			/* after an abort, delete all non-compilation activities */
+      619 
+      620 	     if i > gcos_control_tables_$exc_offset + 1 then /* if not EXECUTE or 355SIM */
+      621 		goto dont_delete;			/* run regardless of PSW bit 5 */
+      622 
+      623 	     if substr (save_data.psw, 6, 1) then	/* if PSW bit 5 is on */
+      624 		goto dont_delete;			/* then run EXECUTE OR 355SIM */
+      625 
+      626 
+      627 do_delete:     ;
+      628 	     gcos_ext_stat_$save_data.seeking
+      629 		, gcos_ext_stat_$save_data.seeking_terminator
+      630 		= "1"b;				/* set save_data to look for next terminator card */
+      631 
+      632 	     goto delete_activity;			/* go print message and increment activity number */
+      633 
+      634 dont_delete:   ;
+      635 
+      636 	end;
+      637 
+      638 	if (gcos_ext_stat_$activity_name = "geload")	/* if we are defining an EXECUTE activity */
+      639 	& (i <= gcos_control_tables_$filecard_count) then do; /* and this is a file card */
+      640 	     call gcos_write_$record ("r*", gcos_record, (8)"0"b); /* write it on R* */
+      641 	     gcos_ext_stat_$save_data.write_etc = "1"b;	/* and remember to write its continuation */
+      642 	     gcos_ext_stat_$etc_filecode = "r*";	/* (if any) on R* too */
+      643 	end;
+      644 
+      645 
+      646 
+      647 /* FINALLY, CALL THE PROCESSOR FOR THIS CARD */
+      648 
+      649 
+      650 call_caller: ;
+      651 	goto cc (i);
+      652 
+      653 cc (001):	;
+      654 	call gcos_cc_file_cards_$cc_print (card);	/* print card */
+      655 	goto loop;
+      656 
+      657 cc (002):	;
+      658 	call gcos_cc_file_cards_$cc_punch (card);	/* punch card */
+      659 	goto loop;
+      660 
+      661 cc (004):	;
+      662 /* disc card */
+      663 
+      664 cc (005):	;
+      665 /* drum card */
+      666 
+      667 cc (006):	;
+      668 /* file card */
+      669 
+      670 cc (007):	;
+      671 /* mass card */
+      672 
+      673 cc (003):	;
+      674 	call gcos_cc_file_cards_$cc_file (card);	/* disk card */
+      675 	goto loop;
+      676 
+      677 cc (008):	;
+      678 	call gcos_cc_file_cards_$cc_prmfl (card);	/* prmfl card */
+      679 	goto loop;
+      680 
+      681 cc (009):	;
+      682 	call gcos_cc_data_ (card);			/* data card */
+      683 	goto loop;
+      684 
+      685 cc (010):	;
+      686 	call gcos_cc_file_cards_$cc_tape (card);	/* tape card */
+      687 	goto loop;
+      688 
+      689 cc (011):	;
+      690 	call gcos_cc_file_cards_$cc_tape7 (card);	/* tape7 card */
+      691 	goto loop;
+      692 
+      693 cc (012):	;
+      694 	call gcos_cc_file_cards_$cc_tape9 (card);	/* tape9 card */
+      695 	goto loop;
+      696 
+      697 cc (013):	;
+      698 /* sysout card */
+      699 
+      700 cc (014):	;
+      701 	call gcos_cc_file_cards_$cc_sysout (card);	/* remote card */
+      702 	goto loop;
+      703 
+      704 cc (015):	;
+      705 	call gcos_cc_file_cards_$cc_dac (card);		/* dac card */
+      706 	goto loop;
+      707 
+      708 cc (016):	;
+      709 	call gcos_cc_file_cards_$cc_type (card);	/* type card */
+      710 	goto loop;
+      711 
+      712 cc (017):	;
+      713 	call gcos_cc_file_cards_$cc_read (card);	/* read card */
+      714 	goto loop;
+      715 
+      716 cc (018):	;
+      717 	call gcos_cc_snumb_ (card);			/* snumb card */
+      718 	goto loop;
+      719 
+      720 cc (019):	;
+      721 	call gcos_cc_misc_cards_$cc_comment (card);	/* comment card */
+      722 	goto loop;
+      723 
+      724 cc (020):	;
+      725 	call gcos_cc_incode_ (card);			/* incode card */
+      726 	goto loop;
+      727 
+      728 cc (021):	;
+      729 	call gcos_cc_misc_cards_$cc_etc (card, i, gcos_record); /* etc card */
+      730 	goto loop;
+      731 
+      732 cc (022):	;
+      733 	call gcos_cc_misc_cards_$cc_endcopy (card);	/* endcopy card */
+      734 	goto loop;
+      735 
+      736 cc (023):	;
+      737 	call gcos_cc_update_ (card, i, gcos_record);	/* update card */
+      738 	goto loop;
+      739 
+      740 cc (024):	;
+      741 	call gcos_cc_limits_ (card);			/* limits card */
+      742 	goto loop;
+      743 
+      744 cc (025):	;
+      745 	call gcos_cc_misc_cards_$cc_msg1 (card);	/* msg1 card */
+      746 	goto loop;
+      747 
+      748 cc (026):	;
+      749 	call gcos_cc_misc_cards_$cc_msg2 (card);	/* msg2 card */
+      750 	goto loop;
+      751 
+      752 cc (027):	;
+      753 	call gcos_cc_misc_cards_$cc_msg3 (card);	/* msg3 card */
+      754 	goto loop;
+      755 
+      756 cc (028):	;
+      757 	call gcos_cc_misc_cards_$cc_userid (card);	/* userid card */
+      758 	goto loop;
+      759 
+      760 cc (029):	;
+      761 	call gcos_cc_misc_cards_$cc_alter (card);	/* alter card */
+      762 	goto loop;
+      763 
+      764 cc (030):	;
+      765 	call gcos_cc_set_ (card);			/* set card */
+      766 	goto loop;
+      767 
+      768 cc (032):	;
+      769 /* copy card */
+      770 
+      771 cc (033):	;
+      772 /* delete card */
+      773 
+      774 cc (034):	;
+      775 /* endedit card */
+      776 
+      777 cc (039):	;
+      778 /* include card */
+      779 
+      780 cc (042):	;
+      781 /* list card */
+      782 
+      783 cc (043):	;
+      784 /* modify card */
+      785 
+      786 cc (045):	;
+      787 /* patch card */
+      788 
+      789 cc (047):	;
+      790 /* seq card */
+      791 
+      792 cc (048):	;
+      793 /* setsq card */
+      794 
+      795 cc (053):	;
+      796 /* assem card */
+      797 
+      798 cc (055):	;
+      799 /* get card */
+      800 
+      801 cc (056):	;
+      802 /* getrwd card */
+      803 
+      804 cc (058):	;
+      805 /* setsq1 card */
+      806 
+      807 cc (031):	;
+      808 	call gcos_cc_directive_cards_$cc_editor (card, i, gcos_record); /* compile card */
+      809 	goto loop;
+      810 
+      811 cc (036):	;
+      812 	call gcos_cc_directive_cards_$cc_ffile (card, i, gcos_record); /* ffile card */
+      813 	goto loop;
+      814 
+      815 cc (040):	;
+      816 /* input card */
+      817 
+      818 cc (041):	;
+      819 /* output card */
+      820 
+      821 cc (044):	;
+      822 /* multi card */
+      823 
+      824 cc (037):	;
+      825 	call gcos_cc_directive_cards_$cc_bmc (card, i, gcos_record); /* form card */
+      826 	goto loop;
+      827 
+      828 cc (038):	;
+      829 /* futil card */
+      830 cc (046):	;
+      831 	call gcos_cc_directive_cards_$cc_utility (card, i, gcos_record); /* qutil card */
+      832 	goto loop;
+      833 
+      834 cc (035):	;
+      835 /* endld card */
+      836 
+      837 cc (049):	;
+      838 	call gcos_cc_directive_cards_$cc_sysedit (card, i, gcos_record); /* sysld card */
+      839 	goto loop;
+      840 
+      841 cc (050):	;
+      842 	call gcos_cc_goto_$cc_when (card);		/* when card */
+      843 	goto loop;
+      844 
+      845 cc (051):	;
+      846 	call gcos_cc_abort_ (card);			/* abort card */
+      847 	goto loop;
+      848 
+      849 cc (052):	;
+      850 	call gcos_cc_directive_cards_$cc_dump (card, i, gcos_record); /* dump card */
+      851 	goto loop;
+      852 
+      853 cc (054):	;
+      854 	call gcos_cc_directive_cards_$cc_sced (card, i, gcos_record); /* change card */
+      855 	goto loop;
+      856 
+      857 cc (057):	;
+      858 	call gcos_cc_misc_cards_$cc_need (card);	/* need card */
+      859 	goto loop;
+      860 
+      861 cc (059):	;
+      862 	call gcos_cc_param_ (card);			/* param card */
+      863 	goto loop;
+      864 
+      865 cc (061):	;
+      866 /* library card */
+      867 
+      868 cc (062):	;
+      869 /* lowload card */
+      870 
+      871 cc (063):	;
+      872 /* use card */
+      873 
+      874 cc (064):	;
+      875 /* entry card */
+      876 
+      877 cc (065):	;
+      878 /* nolib card */
+      879 
+      880 cc (066):	;
+      881 /* equate card */
+      882 
+      883 cc (067):	;
+      884 /* link card */
+      885 
+      886 cc (068):	;
+      887 /* relcom card */
+      888 
+      889 cc (069):	;
+      890 /* source card */
+      891 
+      892 cc (070):	;
+      893 /* dkend card */
+      894 
+      895 cc (071):	;
+      896 /* nload card */
+      897 
+      898 cc (060):	;
+      899 	call gcos_cc_loader_cards_ (card, i, gcos_record); /* option card */
+      900 	goto loop;
+      901 
+      902 cc (104):	;    
+      903 	call gcos_cc_loader_cards_$cc_object (card, i, gcos_record); /* object card */
+      904 	goto loop;
+      905 
+      906 cc (073):	;
+      907 /* 355sim card */
+      908 
+      909 cc (074):	;
+      910 /* program card */
+      911 
+      912 cc (075):	;
+      913 /* conver card */
+      914 
+      915 cc (076):	;
+      916 /* filedit card */
+      917 
+      918 cc (077):	;
+      919 /* sysedit card */
+      920 
+      921 cc (078):	;
+      922 /* utility card */
+      923 
+      924 cc (079):	;
+      925 /* utl2 card */
+      926 
+      927 cc (080):	;
+      928 /* convrt card */
+      929 
+      930 cc (081):	;
+      931 /* fortran card */
+      932 
+      933 cc (082):	;
+      934 /* pl1 card */
+      935 
+      936 cc (083):	;
+      937 /* cobol card */
+      938 
+      939 cc (084):	;
+      940 /* gmap card */
+      941 
+      942 cc (085):	;
+      943 /* 355map card */
+      944 
+      945 cc (086):	;
+      946 /* algol card */
+      947 
+      948 cc (087):	;
+      949 /* forta card */
+      950 
+      951 cc (088):	;
+      952 /* forty card */
+      953 
+      954 cc (089):	;
+      955 /* jovial card */
+      956 
+      957 cc (090):	;
+      958 /* asm66 card */
+      959 
+      960 cc (091):	;
+      961 /* cbl74 card */
+      962 
+      963 cc (092):	;
+      964 /* cbl68 card */
+      965 
+      966 cc (093):	;
+      967 /* malt card */
+      968 
+      969 cc (094):	;
+      970 /* ilang card */
+      971 
+      972 cc (095):	;
+      973 /* ids card */
+      974 
+      975 cc (096):	;
+      976 /* ids2 card */
+      977 
+      978 cc (097):	;
+      979 /* 4tran card */
+      980 
+      981 cc (098):	;
+      982 /* g3edit card */
+      983 
+      984 cc (099):	;
+      985 /* fort77 card */
+      986 
+      987 cc (100):	;
+      988 /* fortx card */
+      989 
+      990 cc (101):	;
+      991 /* cids2 card */
+      992 
+      993 cc (102):	;
+      994 /* rpg2 card */
+      995 
+      996 cc (072):	;
+      997 	call gcos_cc_activity_cards_ (card, i, gcos_record); /* execute card */
+      998 	goto loop;
+      999 
+     1000 cc (103):	;
+     1001 	call gcos_cc_ident_ (card);			/* ident card */
+     1002 	goto loop;
+     1003 
+     1004 cc (105):	;
+     1005 	call gcos_cc_misc_cards_$cc_break (card);	/* break card */
+     1006 	goto loop;
+     1007 
+     1008 cc (106):	;
+     1009 	call gcos_cc_goto_ (card);			/* goto card */
+     1010 	goto loop;
+     1011 
+     1012 cc (107):	;
+     1013 	call gcos_cc_goto_$cc_if (card);		/* if card */
+     1014 	goto loop;
+     1015 
+     1016 cc (108):	;
+     1017 	call gcos_cc_endjob_ (card);			/* endjob card */
+     1018 	goto loop;				/* continue processing */
+     1019 
+     1020 /* Come here to abort job if snumb-ident sequence is not right */
+     1021 
+     1022 no_snumb:	;
+     1023 	call gcos_error_ (
+     1024 	     gcos_et_$cc_bad_card
+     1025 	     , "$ SNUMB must be first control card.^/^a^2x^a"
+     1026 	     , gcos_ext_stat_$card_num
+     1027 	     , card
+     1028 	     );
+     1029 
+     1030 jobort:	;
+     1031 	call gcos_error_ (
+     1032 	     gcos_et_$cc_bad_card
+     1033 	     , "$ IDENT must follow $ SNUMB imediately.^/^a^2x^a"
+     1034 	     , gcos_ext_stat_$card_num
+     1035 	     , card
+     1036 	     );
+     1037 
+     1038 
+     1039 /* Come here when a nondollar card is read */
+     1040 
+     1041 nondollar: ;
+     1042 	if gcos_ext_stat_$save_data.seeking then goto loop; /* if we are seeking a label or terminator,
+     1043*						   we skip over all nondollar cards */
+     1044 
+     1045 	gcos_ext_stat_$save_data.write_etc = "0"b;	/* the only way to be sure this switch does not get
+     1046*						   left on too long is to turn it off every time we read
+     1047*						   a non-etc card */
+     1048 
+     1049 	if gcos_ext_stat_$save_data.nondollar then goto nondl_write; /* skip if already processing nondollar cards */
+     1050 
+     1051 /* Enforce restriction on position of snumb and ident cards */
+     1052 	if ^gcos_ext_stat_$save_data.snumb then goto loop; /* skip cards before snumb */
+     1053 	if ^gcos_ext_stat_$save_data.flgs.ident then goto jobort; /* abort if cards between snumb and ident */
+     1054 
+     1055 /* Write the nondollar card on a file (maybe) */
+     1056 
+     1057 /* we are starting a new nondollar file */
+     1058 	gcos_ext_stat_$nondollar =			/* whose filecode will be */
+     1059 	     gcos_ext_stat_$default_nondollar;		/* the default nondollar filecode */
+     1060 						/* which could be blank if we have already "used it up" */
+     1061 	gcos_ext_stat_$default_nondollar = "";		/* we have used it up now, if not before */
+     1062 
+     1063 	if gcos_ext_stat_$nondollar = "" then do;	/* if we had used it up previously */
+     1064 	     nondollar_cards_skipped = nondollar_cards_skipped + 1; /* skip over the cards */
+     1065 	     goto loop;
+     1066 	end;					/* otherwise fall thru and write it on the file */
+     1067 
+     1068 	gcos_ext_stat_$save_data.nondollar = "1"b;	/* set flag to say processing a data deck */
+     1069 
+     1070 nondl_write: ;
+     1071 	if gcos_ext_stat_$nondollar ^= "" then		/*  check for writing to geload r* file */
+     1072 	     call gcos_write_$record (
+     1073 	     gcos_ext_stat_$nondollar
+     1074 	     , gcos_record
+     1075 	     , (8)"0"b
+     1076 	     );
+     1077 	else
+     1078 	call gcos_write_$record_ptr (
+     1079 	     gcos_ext_stat_$rs
+     1080 	     , gcos_record
+     1081 	     , "0"b
+     1082 	     );					/* write to r* collector file */
+     1083 	goto loop;				/* continue */
+     1084 
+     1085 
+     1086 /* Come here to process possible label cards */
+     1087 
+     1088 label_card: ;					/* columns 2-7 were not completely blank */
+     1089 
+     1090 /* get label */
+     1091 	do j = 3 to 7
+     1092 		while (substr (card, j, 1) = " ");	/* find beginning of label */
+     1093 	end;
+     1094 						/* j now points to its first character */
+     1095 	k = index (substr (card, j), " ") - 2;		/* get length of label */
+     1096 	if k < 1 then goto unknown_card;		/* bad label */
+     1097 	if k > 6 then goto unknown_card;		/* bad label */
+     1098 	if substr (card, j+k, 1) ^= ":" then		/* if it does not end in colon */
+     1099 	     if substr (card, j+k, 1) ^= "." then	/* or period */
+     1100 		goto unknown_card;			/* bad label */
+     1101 
+     1102 /* good label */
+     1103 	if ^gcos_ext_stat_$save_data.seeking then goto loop; /* skip it if not looking for anything */
+     1104 	if gcos_ext_stat_$sought_label = "" then goto loop; /* or if not seeking a label */
+     1105 	if substr (card, j, k) ^=			/* if the label */
+     1106 	gcos_ext_stat_$sought_label then		/* is not the one we sought */
+     1107 	     goto loop;				/* then keep looking for it */
+     1108 
+     1109 /* we found it */
+     1110 	gcos_ext_stat_$sought_label = "";		/* so stop looking */
+     1111 	gcos_ext_stat_$save_data.seeking, gcos_ext_stat_$save_data.seeking_terminator = "0"b;
+     1112 
+     1113 	goto loop;				/* and go get next card to process */
+     1114 
+     1115 /* Control comes here from gcos_cc_endjob_ via a nonlocal goto,
+     1116*   if that procedure was able to complete the termination of the job. */
+     1117 
+     1118 normal_termination: ;
+     1119 	call release_temp;
+     1120 	return;
+     1121 
+     1122 
+     1123 /* 	File information block initialization routines	 */
+     1124 
+     1125 
+     1126 /* 	Fib initialization for syspunch	 */
+     1127 
+     1128 fib_init (1): ;
+     1129 	gcos_ext_stat_$pch = fibptr;			/* save sysout punch collector fib pointer */
+     1130 	fib.stream = "syspunch";			/* file id is "syspunch" */
+     1131 	fib.punch = "1"b;				/* punch file */
+     1132 	goto continue;				/* return to processing loop */
+     1133 
+     1134 
+     1135 /* 	Fib initialization for sysprint	 */
+     1136 
+     1137 fib_init (2): ;
+     1138 	gcos_ext_stat_$prt = fibptr;			/* save sysout print collector fib pointer */
+     1139 	fib.stream = "sysprint";			/* file id is "sysprint" */
+     1140 	fib.print = "1"b;				/* print file */
+     1141 	goto continue;				/* return to processing loop */
+     1142 
+     1143 /* 	Fib initialization for execution report file	 */
+     1144 
+     1145 fib_init (3): ;
+     1146 	gcos_ext_stat_$er = fibptr;			/* save execution report fib pointer */
+     1147 	fib.stream = "exec_rpt";			/* file id is "exec_rpt" */
+     1148 	fib.print = "1"b;				/* print file */
+     1149 	goto continue;				/* return to processing loop */
+     1150 
+     1151 /*	Fib initialization for geload r* collector file 	*/
+     1152 
+     1153 fib_init (4): ;
+     1154 	gcos_ext_stat_$rs = fibptr;			/* save fib pointer */
+     1155 	fib.stream = "rstar";			/* file id is "rstar" */
+     1156 	goto continue;				/* return to processing loop */
+     1157 
+     1158 dollar_print: entry;
+     1159 
+     1160 /* 	Enter here to set switch to cause control cards to be printed			 */
+     1161 	cc_print_sw = ^cc_print_sw;			/* flip switch */
+     1162 	if cc_print_sw then msg_var = "on";
+     1163 	else msg_var = "off";
+     1164 	call ioa_ ("control card printing turned ^a", msg_var);
+     1165 	return;
+     1166 
+     1167 gein_cleanup: proc;					/*     CLEANUP HANDLER FOR ENTIRE SIMULATOR EXCEPT PASS1   */
+     1168 	     do i = 1 to hbound (save_data.fibs, 1);	/* go thru all fibs */
+     1169 		fibptr = addr (save_data.fibs (i));
+     1170 		if ^fib.used then goto get_next_fib;	/* if unused, skip to next one */
+     1171 		if ^fib.attached then goto get_next_fib; /* file not attached, skip to next */
+     1172 		if fib.console then goto get_next_fib;	/* a console device is never really attached */
+     1173 		if fib.null then goto get_next_fib;	/* neither is a null file */
+     1174 		call ios_$detach (fib.stream, "", "", status);
+     1175 						/* ignore errors */
+     1176 
+     1177 /* NOTE THAT ALL THE SPECIAL CASE CHECKS FOLLOWING MUST BE REVIEWED, AFTER ANY
+     1178*   MAJOR CHANGE TO THE SIMULATOR, TO MAKE CERTAIN THEY ARE STILL VALID.  */
+     1179 		if fib.print then goto keep_it;	/* don't delete print files */
+     1180 		if fib.punch then goto keep_it;	/* ... or punch files */
+     1181 		if fib.tape then goto keep_it;	/* nothing to delete here */
+     1182 		call expand_pathname_ (
+     1183 		     fib.pathnm
+     1184 		     , fullname
+     1185 		     , ename
+     1186 		     , code
+     1187 		     );
+     1188 		if code ^= 0 then goto keep_it;	/* ignore errors, but don't get into trouble doing it */
+     1189 		if fib.perm then goto keep_it;	/* don't delete perm files */
+     1190 		call delete_$path (
+     1191 		     fullname
+     1192 		     , ename
+     1193 		     , "07"b3			/* noforce,noquestion,nodirs,segs,links,chase */
+     1194 		     , "gcos"
+     1195 		     , code
+     1196 		     );
+     1197 						/* ignore errors */
+     1198 keep_it:		;
+     1199 
+     1200 /* Clean up any possible IDS2 locked files */
+     1201 		if fib.perm & fib.type /* rand */
+     1202 		     then if gcos_ids2_concur_$have_xid(fullname,ename,code)
+     1203 		         then call gcos_ids2_concur_$deallocate(
+     1204 		              fullname,ename,fib.read, fib.write,code);
+     1205 		
+     1206 
+     1207 /* Make buffer available. */
+     1208 		if fib.buffer_indx > 0 then do;
+     1209 		     fib_buffers.buffer_in_use (fib.buffer_indx) = "0"b;
+     1210 		     fib.buffer_indx = 0;
+     1211 		     fib.buffer = null ();
+     1212 		end;
+     1213 get_next_fib:	;
+     1214 	     end;					/* fall thru when all fibs examined */
+     1215 	     call ios_$detach ((lib_streams (1)), "", "", status); /* detach the system libraries */
+     1216 	     call ios_$detach ((lib_streams (2)), "", "", status);
+     1217 	     call ios_$detach ("gcos_job_stream_", "", "", status); /* it could be attached if:
+     1218*						   1) we were still in pass1, or
+     1219*						   2) it was a msf */
+     1220 	     call delete_$path (
+     1221 		string (gcos_ext_stat_$save_dir)
+     1222 		, gcos_ext_stat_$job_id || ".job_deck"
+     1223 		, "07"b3
+     1224 		, "gcos"
+     1225 		, code
+     1226 		);
+     1227 	     call delete_$path (
+     1228 		string (gcos_ext_stat_$save_dir)
+     1229 		, gcos_ext_stat_$job_id || ".save_data"
+     1230 		, "07"b3
+     1231 		, "gcos"
+     1232 		, code
+     1233 		);
+     1234 	     if gcos_ext_stat_$gcos_slave_area_seg ^= null then
+     1235 		call hcs_$truncate_seg (
+     1236 		gcos_ext_stat_$gcos_slave_area_seg
+     1237 		, 0
+     1238 		, code
+     1239 		);
+     1240 	     if gcos_ext_stat_$temp_seg_ptr ^= null () then do;
+     1241 		call release_temp;
+     1242 	     end;
+     1243 	     return;
+     1244 
+     1245 	end gein_cleanup;
+     1246 
+     1247 release_temp: proc;
+     1248 
+     1249 	     call release_temp_segment_ (
+     1250 		"gcos"
+     1251 		, gcos_ext_stat_$temp_seg_ptr
+     1252 		, code
+     1253 		);
+     1254 	     if code ^= 0 then
+     1255 		call com_err_ (			/* Could not release temp segment. */
+     1256 		code
+     1257 		, "gcos"
+     1258 		, "^/Releasing temp segment (^p)"
+     1259 		, gcos_ext_stat_$temp_seg_ptr
+     1260 		);
+     1261 	     return;
+     1262 
+     1263 	end release_temp;
+     1264 
+     1265 /*   Variables for gcos_gein_:		 */
+     1266 /*   IDENTIFIER		ATTRIBUTES	 */
+     1267 dcl  addr                     builtin;
+     1268 dcl  addrel                   builtin;
+     1269 dcl  baseno                   builtin;
+     1270 dcl  bit_count                fixed bin(24)	/* length of input segment in bits */;
+     1271 dcl  card                     char(80)	/* card image returned by gcos_read_card_ */;
+     1272 dcl  card_type                char(8) aligned	/* card type extracted from dollar card image */;
+     1273 dcl  cc_print_sw              bit(1) int static init ("0"b);
+     1274 dcl  char                     builtin;
+     1275 dcl  cleanup                  condition;
+     1276 dcl  clock                    builtin;
+     1277 dcl  code                     fixed bin(35) based (addr (status))	/* return param. for passing error codes */;
+     1278 dcl  com_err_                 entry() options(variable);
+     1279 dcl  date_time_               ext entry (fixed bin(71), char(*));
+     1280 dcl  delete_$path             entry (char(*), char(*), bit(6), char(*), fixed bin(35));
+     1281 dcl  dollar_card_count        fixed bin(24)init (0)		/* Count of "$" cards. */;
+     1282 dcl  dollar_sw                bit(1) ;
+     1283 dcl  ename                    char(32) 	/* holds entry name of input seg */;
+     1284 dcl  error_table_$noentry     ext fixed bin(35);
+     1285 dcl  error_table_$no_s_permission ext fixed bin(35);
+     1286 dcl  err_msg                  char(150)	/* for com_err calls */;
+     1287 dcl  expand_pathname_         entry (char(*), char(*), char(*), fixed bin(35));
+     1288 dcl  firstrecord              char(60) based (addr (first_record))	/* overlay for 15-word first_record structure */;
+     1289 dcl  fullname                 char(168)	/* holds pathname of input seg */;
+     1290 dcl  gcos$                    ext;
+     1291 dcl  gcos_cc_abort_           entry options(variable);
+     1292 dcl  gcos_cc_activity_cards_  entry (char(80), fixed bin(24), char(*));
+     1293 dcl  gcos_cc_data_            entry (char(80));
+     1294 dcl  gcos_cc_directive_cards_$cc_bmc entry (char(80), fixed bin(24), char(*));
+     1295 dcl  gcos_cc_directive_cards_$cc_dump entry (char(80), fixed bin(24), char(*));
+     1296 dcl  gcos_cc_directive_cards_$cc_editor entry (char(80), fixed bin(24), char(*));
+     1297 dcl  gcos_cc_directive_cards_$cc_ffile entry (char(80), fixed bin(24), char(*));
+     1298 dcl  gcos_cc_directive_cards_$cc_sced entry (char(80), fixed bin(24), char(*));
+     1299 dcl  gcos_cc_directive_cards_$cc_sysedit entry (char(80), fixed bin(24), char(*));
+     1300 dcl  gcos_cc_directive_cards_$cc_utility entry (char(80), fixed bin(24), char(*));
+     1301 dcl  gcos_cc_endjob_          entry (char(80));
+     1302 dcl  gcos_cc_file_cards_$cc_dac entry (char(80));
+     1303 dcl  gcos_cc_file_cards_$cc_file entry (char(80));
+     1304 dcl  gcos_cc_file_cards_$cc_print entry (char(80));
+     1305 dcl  gcos_cc_file_cards_$cc_prmfl entry (char(80));
+     1306 dcl  gcos_cc_file_cards_$cc_punch entry (char(80));
+     1307 dcl  gcos_cc_file_cards_$cc_read entry (char(80));
+     1308 dcl  gcos_cc_file_cards_$cc_sysout entry (char(80));
+     1309 dcl  gcos_cc_file_cards_$cc_tape entry (char(80));
+     1310 dcl  gcos_cc_file_cards_$cc_tape7 entry (char(80));
+     1311 dcl  gcos_cc_file_cards_$cc_tape9 entry (char(80));
+     1312 dcl  gcos_cc_file_cards_$cc_type entry (char(80));
+     1313 dcl  gcos_cc_goto_            entry (char(80));
+     1314 dcl  gcos_cc_goto_$cc_if      entry (char(80));
+     1315 dcl  gcos_cc_goto_$cc_when    entry (char(80));
+     1316 dcl  gcos_cc_ident_           entry (char(80));
+     1317 dcl  gcos_cc_incode_          entry (char(80));
+     1318 dcl  gcos_cc_limits_          entry (char(80));
+     1319 dcl  gcos_cc_loader_cards_    entry (char(80), fixed bin(24), char(*));
+     1320 dcl  gcos_cc_loader_cards_$cc_object   entry (char(80), fixed bin(24), char(*));
+     1321 dcl  gcos_cc_misc_cards_$cc_alter entry (char(80));
+     1322 dcl  gcos_cc_misc_cards_$cc_break entry options(variable);
+     1323 dcl  gcos_cc_misc_cards_$cc_comment entry (char(80));
+     1324 dcl  gcos_cc_misc_cards_$cc_endcopy entry (char(80));
+     1325 dcl  gcos_cc_misc_cards_$cc_etc entry (char(80), fixed bin(24), char(*));
+     1326 dcl  gcos_cc_misc_cards_$cc_msg1 entry options(variable);
+     1327 dcl  gcos_cc_misc_cards_$cc_msg2 entry (char(80));
+     1328 dcl  gcos_cc_misc_cards_$cc_msg3 entry options(variable);
+     1329 dcl  gcos_cc_misc_cards_$cc_need entry (char(80));
+     1330 dcl  gcos_cc_misc_cards_$cc_userid entry (char(80));
+     1331 dcl  gcos_cc_param_           entry (char(80));
+     1332 dcl  gcos_cc_set_             entry (char(80));
+     1333 dcl  gcos_cc_snumb_           entry (char(80));
+     1334 dcl  gcos_cc_update_          entry (char(80), fixed bin(24), char(*));
+     1335 dcl  gcos_error_              ext entry options (variable);
+     1336 dcl  gcos_et_$cc_bad_card     fixed bin(35) ext;
+     1337 dcl  gcos_gein_pass1_         ext entry;
+     1338 dcl  gcos_ids2_concur_$deallocate ext entry (char(*), char(*), bit(1), bit(1), fixed bin(35));
+     1339 dcl  gcos_ids2_concur_$have_xid ext entry (char(*), char(*), fixed bin(35)) returns (bit(1));
+     1340 dcl  gcos_len                 fixed bin(24);
+     1341 dcl  gcos_open_file_          ext entry (char(*), char(*), pointer, bit(1));
+     1342 dcl  gcos_ptr                 ptr;
+     1343 dcl  gcos_read_card_          entry (ptr, fixed bin(24), char(80), bit(1));
+     1344 dcl  gcos_record              char(gcos_len) based (gcos_ptr);
+     1345 dcl  gcos_restart_            entry (fixed bin(24));
+     1346 dcl  gcos_restart_$save       ext entry;
+     1347 dcl  gcos_run_activity_       ext entry;
+     1348 dcl  gcos_write_$ascii_ptr    ext entry (ptr, char(*), bit(8));
+     1349 dcl  gcos_write_$force_ptr    ext entry (ptr);
+     1350 dcl  gcos_write_$ptr          ext entry (ptr, char(*), bit(8));
+     1351 dcl  gcos_write_$record       ext entry (char(*), char(*), bit(8));
+     1352 dcl  gcos_write_$record_ptr   ext entry (ptr, char(*), bit(8));
+     1353 dcl  get_temp_segment_        entry (char(*), ptr, fixed bin(35));
+     1354 dcl  gptr                     ptr	/* pointer to gcos bound segment, for object_info_ */;
+     1355 dcl  hbound                   builtin;
+     1356 dcl  hcs_$fs_get_path_name    entry (ptr, char(*), fixed bin(24), char(*), fixed bin(35));
+     1357 dcl  hcs_$get_search_rules    ext entry (ptr);
+     1358 dcl  hcs_$get_usage_values    ext entry (fixed bin(24), fixed bin(71), fixed bin(24));
+     1359 dcl  hcs_$initiate            entry (char(*), char(*), char(*), fixed bin(1), fixed bin(2), ptr, fixed bin(35));
+     1360 dcl  hcs_$make_seg            ext entry (char(*), char(*), char(*), fixed bin(5), ptr, fixed bin(35));
+     1361 dcl  hcs_$status_mins         ext entry (ptr, fixed bin(2), fixed bin(24), fixed bin(35));
+     1362 dcl  hcs_$truncate_seg        ext entry (ptr, fixed bin(24), fixed bin(35));
+     1363 dcl  i                        fixed bin(24);
+     1364 dcl  index                    builtin;
+     1365 dcl  initialized              bit(1) internal static init ("0"b);
+     1366 dcl  ioa_                     entry() options(variable);
+     1367 dcl  ioa_$nnl                 entry() options(variable);
+     1368 dcl  ioa_$rs                  entry() options(variable);
+     1369 dcl  ios_$attach              ext entry (char(*) aligned, char(*), char(*) aligned, char(*), bit(72) aligned);
+     1370 dcl  ios_$detach              ext entry (char(*), char(*) aligned, char(*), bit(72) aligned);
+     1371 dcl  ios_$setsize             ext entry (char(*) aligned, fixed bin(24), bit(72) aligned);
+     1372 dcl  j                        fixed bin(24);
+     1373 dcl  k                        fixed bin(24)/* temp */;
+     1374 dcl  lib_count                fixed bin(24)/* number of libraries in use (2 or 3) */;
+     1375 dcl  lib_path                 char(168) aligned	/* temporary for library pathnames */;
+     1376 dcl  lib_streams              (2)char(4)aligned int static options(constant)init("glib", "slib") /* software library streams */;
+     1377 dcl  LOWER_CASE               char(26) static internal options (constant) init ("abcdefghijklmnopqrstuvwxyz");
+     1378 dcl  msg_var                  char(4);
+     1379 dcl  nondollar_cards_skipped  fixed bin(24)init (0)	/* to count skipped nondollar cards, for debugging */;
+     1380 dcl  null                     builtin;
+     1381 dcl  object_info_$display     ext entry (ptr, fixed bin(24), ptr, fixed bin(35));
+     1382 dcl  release_temp_segment_    entry (char(*), ptr, fixed bin(35));
+     1383 dcl  rtrim                    builtin;
+     1384 dcl  seg_type                 char(8) aligned	/* segment type (bound or compiled)  */;
+     1385 dcl  size                     builtin;
+     1386 dcl  status                   bit(72) aligned;
+     1387 dcl  string                   builtin;
+     1388 dcl  substr                   builtin;
+     1389 dcl  sw                       bit(1)	/* sw set by open. Not used here */;
+     1390 dcl  sys_info$max_seg_size    ext fixed bin(24)/* 64K or 256K ? */;
+     1391 dcl  translate                builtin;
+     1392 dcl  type                     fixed bin(2);
+     1393 dcl  UPPER_CASE               char(26) static internal options (constant) init ("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+     1394 dcl  user_info_$homedir       entry (char(*));
+     1395 dcl  var_msg                  char(j) based (addr (err_msg))	/* variable length overlay for above */;
+     1396 dcl  word                     bit(36) aligned based	/* to put bits into a word */;
+     1397 
+     1398 dcl  execute_search_rules_    entry (
+     1399 			char(32)
+     1400 ,			bit(8) aligned
+     1401 ,			char(168)
+     1402 ,			char(32)
+     1403 ,			fixed bin(2)
+     1404 ,			fixed bin(24)
+     1405 ,			fixed bin(35)
+     1406 );
+     1407 
+     1408 dcl  execute_search_rules_$s_r_ptr entry (
+     1409 			char(32)
+     1410 ,			bit(8) aligned
+     1411 ,			ptr
+     1412 ,			char(168)
+     1413 ,			char(32)
+     1414 ,			fixed bin(2)
+     1415 ,			fixed bin(24)
+     1416 ,			fixed bin(35)
+     1417 );
+     1418 
+     1419 dcl  lib_names                (4)char(32)int static options(constant) init (	/* names of libraries */
+     1420      "gcos_library_subroutines_",			/* geload l* file */
+     1421      "gcos_system_patchfile_",			/* patch file */
+     1422      "gcos_system_software_",				/* glib file */
+     1423      "gcos_second_software_");						/* slib file */
+     1424 
+     1425 dcl 1 execution_msg int static aligned,			/* execution report header msg */
+     1426     2 part1 char(54) unaligned initial ("EXECUTION REPORT, MULTICS GCOS ENVIRONMENT SIMULATOR "),
+     1427     2 date_time char(24) unaligned,
+     1428     2 spacing char(1) unaligned initial ("
+     1429 ");						/* newline */
+     1430 
+     1431 
+     1432 dcl 1 vrsn_msg int static aligned,
+     1433     2 part1 char(11) unaligned init ("Version of "),
+     1434     2 date_time char(24) unaligned,
+     1435     2 spacing char(2) unaligned init ("
+     1436 
+     1437 ");						/* two newlines */
+     1438 
+     1439 
+     1440 dcl 1 first_record int static aligned,			/* first record on sysout print collector file */
+     1441     2 rcw bit(36) init ("000016000374"b3                       ),
+     1442 						/* length=14, media code=3 (bcd print), report code=74 */
+     1443     2 newline_word bit(36) init ("770100000000"b3                       ),
+     1444 						/* the 7701 (bcd newline) prevents gcos_sys_xlate_ from
+     1445*						   trying to translate the stuff that follows */
+     1446     2 rec1 char(4) init ("rec1"),			/* to verify that this is the sysout header record */
+     1447 						/* NOTE: the ASCII characters in a record whose media code
+     1448*						   says BCD is deliberate - not an error */
+     1449     2 er_offset fixed bin(24)aligned init (0),		/* a word in which the offset of the execution report in the
+     1450*						   sysout file will be written, later, by gcos_cc_endjob_ */
+     1451     2 jobs_snumb char(5) init ("NONE "),		/* place for gcos_cc_endjob_ to put snumb */
+     1452     2 pad1 char(3),					/* to pad out to a full word */
+     1453     2 pad2 (9) fixed bin(24)aligned			/* 9 spare words, making a 14-data-word record */;
+     1454 
+     1455 dcl 1 search_rules	aligned
+     1456 ,     2 number	fixed bin(24)
+     1457 ,     2 names	(21)char(168)aligned
+     1458 ;
+     1459 
+     1460 dcl  FF                       char(1) static int options(constant)init("");
+     1461 
+  1     1 /* BEGIN INCLUDE FILE gcos_fibs.incl.pl1   (Wardd Multics)  09/13/81 1739.2 mst Sun */
+  1     2 dcl 1 fibs_control		aligned based(gcos_ext_stat_$temp_seg_ptr)
+  1     3 
+  1     4 /* Structure to save released fibs in.
+  1     5**/
+  1     6 ,     2 released_fibs
+  1     7 ,       3 nrf		fixed bin		/* Number of released fibs. */
+  1     8 ,       3 released_fib	(500) like fib	/* Copy of released fib. */
+  1     9 
+  1    10 /* Buffers. */
+  1    11 ,     2 fib_buffers
+  1    12 ,       3 buffer_in_use	(500)bit(1)unal	/* "1"b => in use. */
+  1    13 ,       3 buffer		(500)bit(320*36)	/* Space for buffer. */
+  1    14 ;
+  1    15 
+  1    16 /*   END INCLUDE FILE gcos_fibs.incl.pl1 */
+     1462 
+     1463 
+     1464 dcl 1 obj_info aligned like object_info;
+  2     1 /* BEGIN INCLUDE FILE ... object_info.incl.pl1
+  2     2*coded February 8, 1972 by Michael J. Spier	*/
+  2     3 /* modified May 26, 1972 by M. Weaver */
+  2     4 /* modified 15 April, 1975 by M. Weaver */
+  2     5 
+  2     6 declare	1 object_info aligned based,		/* structure containing object info based, returned by object_info_ */
+  2     7 	2 version_number fixed bin,		/* version number of current structure format (=2) */
+  2     8 	2 textp pointer,			/* pointer to beginning of text section */
+  2     9 	2 defp pointer,			/* pointer to beginning of definition section */
+  2    10 	2 linkp pointer,			/* pointer to beginning of linkage section */
+  2    11 	2 statp pointer,			/* pointer to beginning of static section */
+  2    12 	2 symbp pointer,			/* pointer to beginning of symbol section */
+  2    13 	2 bmapp pointer,			/* pointer to beginning of break map (may be null) */
+  2    14 	2 tlng fixed bin,			/* length in words of text section */
+  2    15 	2 dlng fixed bin,			/* length in words of definition section */
+  2    16 	2 llng fixed bin,			/* length in words of linkage section */
+  2    17 	2 ilng fixed bin,			/* length in words of static section */
+  2    18 	2 slng fixed bin,			/* length in words of symbol section */
+  2    19 	2 blng fixed bin,			/* length in words of break map */
+  2    20 	2 format,				/* word containing bit flags about object type */
+  2    21 	  3 old_format bit(1) unaligned,	/* on if segment isn't in new format, i.e. has old style object map */
+  2    22 	  3 bound bit(1) unaligned,		/* on if segment is bound */
+  2    23 	  3 relocatable bit(1) unaligned,	/* on if seg has relocation info in its first symbol block */
+  2    24 	  3 procedure bit(1) unaligned,	/* on if segment is an executable object program */
+  2    25 	  3 standard bit(1) unaligned,	/* on if seg is in standard format (more than just standard map) */
+  2    26 	  3 gate bit(1) unaligned,		/* on if segment is a gate */
+  2    27 	  3 separate_static bit(1) unaligned,	/* on if static not in linkage */
+  2    28 	  3 links_in_text bit(1) unaligned,	/* on if there are threaded links in text */
+  2    29 	  3 perprocess_static bit (1) unaligned, /* on if static is not to be per run unit */
+  2    30 	  3 pad bit(27) unaligned,
+  2    31 	2 entry_bound fixed bin,		/* entry bound if segment is a gate */
+  2    32 	2 textlinkp pointer,		/* ptr to first link in text */
+  2    33 
+  2    34 	/* LIMIT OF BRIEF STRUCTURE */
+  2    35 
+  2    36 	2 compiler char(8) aligned,		/* name of processor which generated segment */
+  2    37 	2 compile_time fixed bin(71),		/* clock reading of date/time object was generated */
+  2    38 	2 userid char(32) aligned,		/* standard Multics id of creator of object segment */
+  2    39 	2 cvers aligned,			/* generator version name in printable char string form */
+  2    40 	  3 offset bit(18) unaligned,		/* offset of name in words relative to base of symbol section */
+  2    41 	  3 length bit(18) unaligned,		/* length of name in characters */
+  2    42 	2 comment aligned,			/* printable comment concerning generator or generation of segment */
+  2    43 	  3 offset bit(18) unaligned,		/* offset of comment in words relative to base of symbol section */
+  2    44 	  3 length bit(18) unaligned,		/* length of comment in characters */
+  2    45 	2 source_map fixed bin,		/* offset, relative to base of symbol section, of source map structure */
+  2    46 
+  2    47 	/* LIMIT OF DISPLAY STRUCTURE */
+  2    48 
+  2    49 	2 rel_text pointer,			/* pointer to text section relocation info */
+  2    50 	2 rel_def pointer,			/* pointer to definition section relocation info */
+  2    51 	2 rel_link pointer,			/* pointer to linkage section relocation info */
+  2    52 	2 rel_static pointer,		/* pointer to static section relocation info */
+  2    53 	2 rel_symbol pointer,		/* pointer to symbol section relocation info */
+  2    54 	2 text_boundary fixed bin,		/* specifies mod  of text section base boundary */
+  2    55 	2 static_boundary fixed bin,		/* specifies mod of internal static base boundary */
+  2    56 					/* currently not used by system */
+  2    57 	2 default_truncate fixed bin,		/* offset rel to symbp for binder to automatically trunc. symb sect. */
+  2    58 	2 optional_truncate fixed bin;	/* offset rel to symbp for binder to optionally trunc. symb sect. */
+  2    59 
+  2    60 declare	object_info_version_2 fixed bin int static init(2);
+  2    61 
+  2    62 /* END INCLUDE FILE ... object_info.incl.pl1 */
+     1465 
+     1466 
+  3     1 /*	BEGIN INCLUDE FILE gcos_restart_control_.incl.pl1     RHM - MAY 1975  */
+  3     2 
+  3     3 dcl 1 restart_control aligned based (gcos_ext_stat_$saveseg_ptr),  /* control word for save/restart */
+  3     4       2 nj_restart	bit(1) unaligned,
+  3     5       2 na_restart	bit(1) unaligned,
+  3     6       2 chkpnt	bit(1) unaligned,
+  3     7       2 cant_do	bit(1) unaligned,
+  3     8       2 saved	bit(1) unaligned,
+  3     9       2 na_hold	bit(1) unaligned,
+  3    10       2 pad bit	(30) unaligned,
+  3    11       2 restart_data (size(save_data_entry)) bit(36) aligned;
+  3    12 
+  3    13 /*	END INCLUDE FILE gcos_restart_control_.incl.pl1  */
+     1467 
+     1468 
+  4     1 /* BEGIN INCLUDE FILE gcos_control_tables_.incl.pl1   (Wardd Multics)  09/11/80 1439.7 mst Thu */
+  4     2 
+  4     3 dcl  gcos_control_tables_$    ext static;
+  4     4 dcl  gcos_control_tables_$activity_table ext static	/* table of info on each activity */;
+  4     5 dcl  gcos_control_tables_$cardtable (151) char (8) ext static	/* card type table */;
+  4     6 dcl  gcos_control_tables_$comp_offset fixed bin ext static	/* offset in cardtable where compilation activities begin */;
+  4     7 dcl  gcos_control_tables_$exc_offset fixed bin (17) ext static	/* offset in card lookup table where activity def'ns begin */;
+  4     8 dcl  gcos_control_tables_$filecard_count fixed bin ext static	/* length of filecard section of cardtable */;
+  4     9 dcl  gcos_control_tables_$nonact fixed bin ext static	/* offset in card lookup table where activity cards end  */;
+  4    10 dcl  gcos_control_tables_$tablelen fixed bin (17) ext static	/* length of card lookup table */;
+  4    11 dcl  gcos_control_tables_$tabstops ext static	/* table of tabstops for canonicalizing ascii input lines */;
+  4    12 dcl  gcos_control_tables_$totallen fixed bin ext static	/* length of cardtable, including unimplemented cards */;
+  4    13 
+  4    14 /*   END INCLUDE FILE gcos_control_tables_.incl.pl1 */
+     1469 
+     1470 
+  5     1 /* BEGIN INCLUDE FILE gcos_gtss_dcls.incl.pl1 (MWilson Multics) 03Apr79 */
+  5     2 
+  5     3 dcl 1 gtss_snumb_xref_ based (gcos_gtss_ext.u_state_ptr),
+  5     4    2 snumb_sequence pic "9999",
+  5     5    2 entry_count fixed bin(24),
+  5     6    2 snumb_entry (100),
+  5     7       3 snumb char (5),
+  5     8       3 jout_id bit (12),
+  5     9       3 activity_no fixed bin(24),
+  5    10       3 job_status fixed bin(24);
+  5    11 
+  5    12 /** snumb_entry.job_status key values */
+  5    13 dcl (
+  5    14 	COMPLETE			init (-1)
+  5    15 ,	(READING_RMT, INITIATED)	init (3)
+  5    16 ,	WAIT_PERIPH		init (5)
+  5    17 ,	EXECUTING			init (9)
+  5    18 ,	WAIT_MEDIA 		init (11) 
+  5    19 ,	TERMINATING 		init (15) 
+  5    20 ,	OUTPUT_WAITING 		init (16) 
+  5    21 ,	OUTPUT_COMPLETE 		init (17) 
+  5    22     ) fixed bin(24)static int options(constant);
+  5    23 
+  5    24 dcl  gcos_gtss_update_$new_activity entry (fixed bin(24), fixed bin(24));
+  5    25 dcl  gcos_gtss_update_$status_update entry (fixed bin(24));
+  5    26 
+  5    27 
+  5    28 /** END INCLUDE FILE gcos_gtss.incl.pl1 */
+     1471 
+     1472 
+  6     1 /* BEGIN INCLUDE FILE gcos_ext_stat_.incl.pl1  */
+  6     2 /*
+  6     3*  Changes to gcos_ext_stat_ must be made here AND gcos_ext_stat_.cds
+  6     4**/
+  6     5 /* July 77 (MRJ) Mike Jordan. */
+  6     6 /* Change: Mel Wilson Oct 1979 for gtss compatibility (Bell Canada). */
+  6     7 /* Change: A. N. Kepner, March, 1978 to allow courtesy call i/o  within cc routines. */
+  6     8 /* Change: Dave Ward 06/01/81 Reorganized to eliminate alm object (using cds). Use of like structures. */
+  6     9 /* Change: Scott C. Akers 01/26/82 Add tape_buffer_size for GEINOS processing. */
+  6    10 /* Change: Ron Barstad  83-08-02  Added activity_card_num for execution report */
+  6    11 /*                                Increased size of statistics for 4js3 MMEs  */
+  6    12 
+  6    13 dcl  gcos_ext_stat_$abort_reason char(128) varying 	/* abort reason from gcos pgm */  ext;
+  6    14 dcl  gcos_ext_stat_$abort_return label	/* abort return point */  ext;
+  6    15 dcl  gcos_ext_stat_$activity_card_num pic "9999" ext;	/* card number defining current activity */
+  6    16 dcl  gcos_ext_stat_$activity_name char(8) 	/* name of activity to be run */  ext;
+  6    17 dcl  gcos_ext_stat_$activity_start_time fixed bin(71) 	/* TOD start of activity */  ext;
+  6    18 dcl  gcos_ext_stat_$card_num  pic "9999"	/* ordinal number of card in input stream */  ext;
+  6    19 dcl  gcos_ext_stat_$dbs       (36)bit(1)	/* Debugging switch. */  ext;
+  6    20 dcl  gcos_ext_stat_$default_nondollar char(2) 	/* filecode where nondollar cards go by default */  ext;
+  6    21 dcl  gcos_ext_stat_$dir_rings (3) fixed bin(3)	/* ring brackets for created catalogs */  ext;
+  6    22 dcl  gcos_ext_stat_$dpno      char(100) varying 	/* arguments for call to dpunch */  ext;
+  6    23 dcl  gcos_ext_stat_$dpo       char(100) varying 	/* arguments for call to dprint */  ext;
+  6    24 dcl  gcos_ext_stat_$endfc     char(2) 	/* endfc value for endcopy processing */  ext;
+  6    25 dcl  gcos_ext_stat_$er        ptr	/* fib pointer for *er */  ext;
+  6    26 dcl  gcos_ext_stat_$etc_filecode char(2) 	/* filecode where $ ETC cards should be written */  ext;
+  6    27 dcl  gcos_ext_stat_$gcos_slave_area_seg ptr	/* pointer to gcos slave area segment */  ext;
+  6    28 dcl  gcos_ext_stat_$gf        fixed bin(24)/* sw used by getfield rtn */  ext;
+  6    29 dcl  gcos_ext_stat_$incode    fixed bin(24)	/* switches to control incode processing */  ext;
+  6    30 dcl  gcos_ext_stat_$increment_hold fixed bin(24)	/* Holds increment for courtesy call returns. */  ext;
+  6    31 dcl  gcos_ext_stat_$initial_cpu_time fixed bin(71) 	/* vcu time at activity start */  ext;
+  6    32 dcl  gcos_ext_stat_$input_segment_path char(168) varying 	/* pathname of input segment */  ext;
+  6    33 dcl  gcos_ext_stat_$jcl_warnings fixed bin(24)	/* number warnings issued processing control cards */  ext;
+  6    34 dcl  gcos_ext_stat_$job_cpu_time fixed bin(71)	/* cpu usage at job start */  ext;
+  6    35 dcl  gcos_ext_stat_$job_id    char(18) varying 	/* unique job id for file naming */  ext;
+  6    36 dcl  gcos_ext_stat_$job_real_time fixed bin(71)	/* job start time in microseconds */  ext;
+  6    37 dcl  gcos_ext_stat_$last_mme  fixed bin(24)/* number of last mme executed */  ext;
+  6    38 dcl  gcos_ext_stat_$ldrss     fixed bin(24)	/* loader shared stg. */  ext;
+  6    39 dcl  gcos_ext_stat_$max_activities fixed bin(24)/* max activities in a job */  ext;
+  6    40 dcl  gcos_ext_stat_$max_mem   fixed bin(19) 	/* maximum memory available to an activity */  ext;
+  6    41 dcl  gcos_ext_stat_$mme_rtrn  label	/* where to return at activity end */  ext;
+  6    42 dcl  gcos_ext_stat_$nondollar char(2)	/* non-dollar card file code */  ext;
+  6    43 dcl  gcos_ext_stat_$nongcos   char(2) 	/* filecode where nongcos dollar cards go */  ext;
+  6    44 dcl  gcos_ext_stat_$normal_return label	/* nonlocal goto for normal termination */  ext;
+  6    45 dcl  gcos_ext_stat_$patchfile_ptr ptr	/* pointer to patchfile */  ext;
+  6    46 dcl  gcos_ext_stat_$pathname_prefix char(168)var ext;
+  6    47 dcl  gcos_ext_stat_$pch       ptr	/* pointer to fib for syspunch collector file */  ext;
+  6    48 dcl  gcos_ext_stat_$pdir      char(168) varying 	/* pathname of process directory */  ext;
+  6    49 dcl  gcos_ext_stat_$prt       ptr	/* pointer to fib for sysprint collector file */  ext;
+  6    50 dcl  gcos_ext_stat_$rs        ptr	/* pointer to fib for geload r* collector file */  ext;
+  6    51 dcl  gcos_ext_stat_$saveseg_ptr ptr 	/* pointer to save segment used by save/restart */  ext;
+  6    52 dcl  gcos_ext_stat_$save_dir  char(168) varying 	/* pathname of temp save directory */  ext;
+  6    53 dcl  gcos_ext_stat_$seg_rings (3) fixed bin(3)	/* ring brackets for created files */  ext;
+  6    54 dcl  gcos_ext_stat_$sig_ptr   ptr	/* saved pointer to signal_ */  ext;
+  6    55 dcl  gcos_ext_stat_$skip_umc  bit(1)  ext;
+  6    56 dcl  gcos_ext_stat_$snumb     bit (30) aligned 	/* snumb of the current job */  ext;
+  6    57 dcl  gcos_ext_stat_$sought_label char(8) 	/* Label from GOTO, IF, or WHEN card */  ext;
+  6    58 dcl  gcos_ext_stat_$statistics (3*44) fixed bin(24)	/* mme usage statistics- 3 per mme */  ext;
+  6    59 dcl  gcos_ext_stat_$stop_code fixed bin(24)	/* debugging, print results and stop. */  ext;
+  6    60 dcl  gcos_ext_stat_$storage_limit fixed bin(19) 	/* activity storage limit */  ext;
+  6    61 dcl  gcos_ext_stat_$sysout_limit fixed bin(35) 	/* sysout line limit */  ext;
+  6    62 dcl  gcos_ext_stat_$sysout_lines fixed bin(35)	/* sysout lines used */  ext;
+  6    63 dcl  gcos_ext_stat_$system_free_pointer ptr 	/* pointer to area for allocating in  ext; set by gcos */  ext;
+  6    64 dcl  gcos_ext_stat_$tape_buffer_size fixed bin(35) external static;	/* tape buffer size for GEINOS. */
+  6    65 dcl  gcos_ext_stat_$temp_dir  char(168) varying 	/* pathname of directory to hold temp files */  ext;
+  6    66 dcl  gcos_ext_stat_$temp_seg_ptr ptr ext;
+  6    67 dcl  gcos_ext_stat_$termination_code bit (18) 	/* termination code from gcos_mme_bort_ */  ext;
+  6    68 dcl  gcos_ext_stat_$time_limit fixed bin(71) 	/* activity time limit */  ext;
+  6    69 dcl  gcos_ext_stat_$userid    char(12) 	/* the USERID */  ext;
+  6    70 dcl  gcos_ext_stat_$validation_level fixed bin(3)	/* current ring of execution */  ext;
+  6    71 
+  6    72 /*	Courtesy Call Queue
+  6    73*   A queue for courtesy call addresses which must be saved during
+  6    74*   execution of courtesy call routines. A courtesy call address is
+  6    75*   saved each time a MME GEROUT or MME GEINOS, which specifies a
+  6    76*   courtesy call, is executed within a courtesy call routine. Each
+  6    77*   time a MME GEENDC is executed a courtesy call address will be
+  6    78*   removed from this FIFO queue and the corresponding courtesy call
+  6    79*   routine executed until the queue is empty. The FIFO "queue" is
+  6    80*   implemented in a circular fashion. "next_avail" points to the
+  6    81*   next empty location in the queue. "next_out" points to the
+  6    82*   entry in the queue which has been in the queue longest. When
+  6    83*   entering or removing entries from the queue the appropriate index
+  6    84*   is incremented modulo the length of the queue. By convention the
+  6    85*   queue is empty when "next_avail" equals "next_out". A
+  6    86*   second convention is that the queue is considered to overflow
+  6    87*   during an attempt to add an entry to the queue which would force
+  6    88*   "next_avail" to "catch up" with "next_out". This means that
+  6    89*   the last empty position in the queue will never be used.
+  6    90**/
+  6    91 
+  6    92 dcl 1 gcos_ext_stat_$courtesy_call_control aligned ext
+  6    93 ,     3 courtesy_call
+  6    94 ,       4 hold             like save_machine_conditions	/* Mach. conds. restored on courtesy call returns. */
+  6    95 ,       4 next_avail       fixed bin(24)		/* next available empty location in cc_queue. */
+  6    96 ,       4 next_out         fixed bin(24)		/* next entry to remove from cc_queue. */
+  6    97 ,       4 queue            (6) fixed bin(24)
+  6    98 ;
+  6    99 
+  7     1 /* BEGIN INCLUDE FILE gcos_save_mc.incl.pl1   (Wardd Multics)  09/12/81 0905.9 mst Sat */
+  7     2 
+  7     3 /* Structure to isolate the definition of the size of the
+  7     4*space needed to store he machine conditions structure (mc).
+  7     5**/
+  7     6 dcl 1 save_machine_conditions based
+  7     7 ,     3 save_space		bit(1728)
+  7     8 ;
+  7     9 
+  7    10 /*   END INCLUDE FILE gcos_save_mc.incl.pl1 */
+  6   100 
+  6   101 
+  6   102 dcl 1 gcos_ext_stat_$fct	aligned ext,
+  6   103       3 fct		(40) like fct_entry;
+  8     1 /* BEGIN INCLUDE FILE gcos_fct_entry.incl.pl1   (Wardd Multics)  05/30/81 1758.6 mst Sat */
+  8     2 
+  8     3 dcl 1 fct_entry	aligned based,
+  8     4       2 filecode	char(2) aligned,			/* file code (or blank) */
+  8     5 						/* flags */
+  8     6       2 sysout	bit(1) unaligned,			/* 1=file is sysout or dac */
+  8     7       2 dac	bit(1) unaligned,			/* 1=file is dac,0=file is sysout */
+  8     8       2 pad	bit(34) unaligned,			/* unused */
+  8     9       2 fibptr	ptr aligned			/*	ptr to fib for this file */
+  8    10 ;
+  8    11 
+  8    12 /*   END INCLUDE FILE gcos_fct_entry.incl.pl1 */
+  6   104 
+  6   105 
+  6   106 dcl 1 gcos_ext_stat_$save_data aligned ext,
+  6   107       3 save_data like save_data_entry;
+  9     1 /* BEGIN INCLUDE FILE gcos_save_data_entry.incl.pl1   (Wardd Multics)  07/01/81 1339.9 mst Wed */
+  9     2 /* Change: Dave Ward	07/01/81 include gcos_flags_. */
+  9     3 /* Change: Dave Ward	09/10/81 fib changed to fibs & likened to fib. */
+  9     4 
+  9     5 dcl 1 save_data_entry  aligned based
+  9     6 ,3 flgs                like flags	/* system wide flgs */
+  9     7 ,3 actid               char(8)	/* activity no. and accnt i.d. */
+  9     8 ,3 short_actid         bit(36) aligned	/* short form of activity id */
+  9     9 ,3 ident               char(60)	/* holds ident info from snumb card */
+  9    10 ,3 psw                 bit(36) aligned	/* program switch word */
+  9    11 ,3 last_execute_act_no fixed bin(24)/* activity number of last $ EXECUTE card in job */
+  9    12 ,3 activity_no         fixed bin(24)/* activity number */
+  9    13 ,3 job_time_limit      fixed bin(71)	/* job time limit */
+  9    14 ,3 job_sysout_limit    fixed bin(24)/* job sysout line limit */
+  9    15 ,3 sysout_queue        (10) char(32)	/* sysout queue */
+  9    16 ,3 sysout_queue_media  (10) fixed bin(24)/* medium (print,punch) of each file on queue */
+  9    17 ,3 sqindex             fixed bin(24)/* curr offset in sysout queue */
+  9    18 ,3 pathname_prefix     char(168)varying 	/* prefix for gcos cfdescs */
+  9    19 ,3 skip_umc            aligned bit(1) 	/* flag to tell if we should skip umc names */
+  9    20 ,3 job_deck            pointer	/* pointer to seg holding canonicalized job deck */
+  9    21 ,3 jd_size             fixed bin(24)/* size in words of job deck */
+  9    22 ,3 jd_position         fixed bin(24)	/* position of current block of job deck */
+  9    23 ,3 jd_rem_block_len    fixed bin(24)/* words remaining in current block of job deck */
+  9    24 ,3 syot_dir            char(168)varying	/* pathname of directory to hold sysout files */
+  9    25 ,3 fibs		   (40) like fib
+  9    26 ,3 param               (32) char(57)varying	/* parameters */
+  9    27 ;
+  9    28 
+ 10     1 /* BEGIN INCLUDE FILE gcos_flags.incl.pl1   (Wardd Multics)  07/01/81 1344.7 mst Wed */
+ 10     2 /* Change: Mel Wilson	03/01/79 to add gtssflag & identflag */
+ 10     3 /* Change: Dave Ward	07/01/81 revised, mad apart of gcos_ext_stat_. */
+ 10     4 
+ 10     5 
+ 10     6 /* 	Declaration of Simulator Wide Flags	 */
+ 10     7 
+ 10     8 dcl 1 flags aligned based,
+ 10     9       2 (
+ 10    10 	pad1,	/* no longer used */
+ 10    11 	copy,	/* 1=copy option on|0=off */
+ 10    12 	snumb,	/* 1=snumb card read|0=not */
+ 10    13 	ident,	/* 1=ident card read|0=not */
+ 10    14 	activ,	/* 1=activity being defined|0=not */
+ 10    15 	cc,	/* 1=courtesy call active|0=not */
+ 10    16 	pad2,	/* no longer used */
+ 10    17 	cksum,	/* 1=don't check checksums|0=do */
+ 10    18 	pad3,	/* no longer used */
+ 10    19 	wrapup,	/* 1=processing wrapup after abort */
+ 10    20 
+ 10    21 /* FOLLOWING ADDED AFTER MARCH 73 */
+ 10    22 
+ 10    23 	nosave,	/* 1=disable save/restart function,0=not */
+ 10    24 	pad4,	/* no longer used */
+ 10    25 	gcos,	/* 1=job deck segment in gcos file format */
+ 10    26 	raw,	/* 1=sysout punch files to be converted to raw bit strings */
+ 10    27 	list,	/* 1=sysout print files to be converted to ascii */
+ 10    28 	brief,	/* 1=print nothing but fatal error messages on terminal */
+ 10    29 	debug,	/* 1=give option to call debug before aborting */
+ 10    30 	no_canonicalize,	/* 1=do NOT canonicalize job deck */
+ 10    31 
+ 10    32 /* 18 bits into first word */
+ 10    33 
+ 10    34 	pad5,	/* no longer used */
+ 10    35 	dpunch,	/* 1=dpunch sysout punch files;0=don't */
+ 10    36 	dprint,	/* 1=dprint sysout print files,0=don't */
+ 10    37 	userid,	/* 1=userid card read,0=not */
+ 10    38 	userlib,	/* 1= -userlib ctl arg given, see gcos_gein_ */
+ 10    39 	dstar,	/* 1=current activity card written on d* */
+ 10    40 	write_etc,	/* 1 tells get_cc_field to write $ ETC cards on etc_filecode */
+ 10    41 	prev_act_abort,	/* turned on by abort and off by $ BREAK */
+ 10    42 	this_act_abort,	/* turned on by abort to select abort disp codes */
+ 10    43 	abort_subact,	/* 1=processing abort subactivity */
+ 10    44 	dump,	/* 1=dump option given on activity card */
+ 10    45 	nondollar,	/* 1=reading nondollar card deck in gein */
+ 10    46 	endjob,	/* 1=cc_endjob already called once in this job */
+ 10    47 	abort_card,	/* 1=the terminator for this activity was a $ ABORT card */
+ 10    48 	truncate,	/* 1=truncate option given:truncate long ascii input lines */
+ 10    49 	continue,	/* 1=continue option given:continue after nonfatal errors */
+ 10    50 	rout,	/* 1=gcos_mme_rout_ was called in this activity */
+ 10    51 	seeking,	/* 1=gein is looking for a label and/or terminator */
+ 10    52 
+ 10    53 /* end of first word */
+ 10    54 
+ 10    55 	seeking_terminator,	/* 1=gein is looking for a terminator */
+ 10    56 	lower_case,	/* 1=lower case print conversion wanted */
+ 10    57 	no_bar,	/* 1=do not run slave program in BAR mode */
+ 10    58 	long,	/* 1=print some lines from execution reort on terminal */
+ 10    59 	endfc,	/* 1=process endfc option on endcopy card */
+ 10    60 	gtssflag,	/* 1=update gtss_user_state_ during execution */
+ 10    61 	identflag,	/* 1= use $ident banner info for print & punch */
+ 10    62 	spawnflag,	/* 1= entry due to tss spawn */
+ 10    63 	taskflag	/* 1= entry due to tss drl task */
+ 10    64 		) bit(1) unal,
+ 10    65       2	pad6	  bit(27)unal
+ 10    66 ;
+ 10    67 
+ 10    68 /*   END INCLUDE FILE gcos_flags.incl.pl1 */
+  9    29 
+  9    30 
+  9    31 /*   END INCLUDE FILE gcos_save_data_entry.incl.pl1 */
+  6   108 
+  6   109 
+ 11     1 /*     BEGIN INCLUDE FILE gcos_file_info_block_.incl.pl1   DAK - APRIL 74    */
+ 11     2 
+ 11     3 /* 	Declaration of File Information Block (fib)
+ 11     4*
+ 11     5*   Change: Mel Wilson	11/01/79 for gtss compatibility
+ 11     6*   Change: Dave Ward	05/20/81 *_file constants.
+ 11     7*   Change: Dave Ward	05/29/81 separated fct structures.
+ 11     8*   Change: Dave Ward	09/02/81 provision for tape density 6250, dens_hist 2 bits (not 3).
+ 11     9**/
+ 11    10 dcl 1 fib aligned based (fibptr)			/* fib structure */
+ 11    11 
+ 11    12 ,     2 buffer	ptr aligned			/* pointer to current buffer (gcos_write_) */
+ 11    13 ,     2 buffer_indx	fixed bin			/* Index to buffer in use. */
+ 11    14 ,     2 stream	char(8)unal			/* stream name for attaching this file */
+ 11    15 ,     2 pathnm	char(168)unal			/* pathname (for disk, print or punch files) */
+ 11    16 ,     2 unique_file_id bit(36)				/* multics unique segment id for file */
+ 11    17 ,     2 indicators					/* five words of flags */
+ 11    18 
+ 11    19 ,       3 indicators_word_1
+ 11    20 ,         4 used	bit(1) unal			/* 1=fib used, 0=fib used */
+ 11    21 ,         4 attached	bit(1) unal			/* 1=stream is attached */
+ 11    22 ,         4 type	bit(1) unal			/* 1=random, 0=linked */
+ 11    23 ,         4 perm	bit(1) unal			/* 1=permanent file, 0=not */
+ 11    24 ,         4 print	bit(1) unal			/* 1=file type is printer */
+ 11    25 ,         4 punch	bit(1) unal			/* 1=file type is punch */
+ 11    26 ,         4 reader	bit(1) unal			/* 1=file type is card reader */
+ 11    27 ,         4 tape	bit(1) unal			/* 1=file type is tape */
+ 11    28 ,         4 console	bit(1) unal			/* 1=file type is console typewriter */
+ 11    29 ,         4 read	bit(1) unal			/* 1=read access permitted */
+ 11    30 ,         4 write	bit(1) unal			/* 1=write access permitted */
+ 11    31 ,         4 null	bit(1) unal			/* 1=file is null */
+ 11    32 ,         4 purge	bit(1) unal			/* 1=purge file at time on release */
+ 11    33 ,         4 gein	bit(1) unal			/* 1 = this file contains data cards from the job deck */
+ 11    34 ,         4 disp	bit(2) unal			/* disposition code:
+ 11    35*						   00 = dismount
+ 11    36*						   01 = release
+ 11    37*						   10 = save
+ 11    38*						   11 = continue	 */
+ 11    39 ,         4 adisp	bit(2) unal			/* abort disp - same codes as disp */
+ 11    40 ,         4 order	bit(1) unal			/* 1 = write, 0 = read or other */
+ 11    41 ,         4 mode	bit(2) unal			/* tape i/o mode 
+ 11    42*						   00 = binary
+ 11    43*						   01 = decimal
+ 11    44*						   10 = nine	*/
+ 11    45 ,         4 tracks	bit(2) unal			/* tape request code:
+ 11    46*						   00 = installation default
+ 11    47*						   01 = 7 track
+ 11    48*						   10 = 9 track	*/
+ 11    49 ,         4 density	bit(4) unal			/* tape density from $ TAPE card
+ 11    50*						   0000 = site standard high
+ 11    51*						   0001 = 200 bpi
+ 11    52*						   0010 = 556 bpi
+ 11    53*						   0100 = 800 bpi
+ 11    54*						   1001 = 1600 bpi
+ 11    55*						   1100 = 6250 bpi
+ 11    56*						   1111 = handler capable of any appropriate denisty */
+ 11    57 ,         4 dens_hist	bit(2) unal			/* density history for MME GEFADD */
+ 11    58 ,         4 forced_acl_flag bit(1) unal 			/* 1 => acl forced for gtss file (2.4) */
+ 11    59 ,         4 fill	bit(6) unal			/* reserved for future use */
+ 11    60 ,       3 indicators_word_2
+ 11    61 ,         4 plud	bit(18) unal			/* primary log unit designator */
+ 11    62 						/* bcd channel and channel number */
+ 11    63 
+ 11    64 ,         4 slud	bit(18) unal			/* secondary log. unit designator */
+ 11    65 						/* bcd channel and channel number */
+ 11    66 ,       3 indicators_word_3
+ 11    67 ,         4 serial_no	bit(30) unal			/* tape serial number */
+ 11    68 ,         4 pad	bit( 6) unal			/* unused */
+ 11    69 ,       3 indicators_word_4
+ 11    70 ,         4 tape_name	bit(72) unal			/* tape name */
+ 11    71 
+ 11    72 ,     2 current	fixed bin(21)			/* current file position */
+ 11    73 ,     2 last	fixed bin(21)			/* eof for sequential disk files */
+ 11    74 ,     2 size	fixed bin(24)			/* offset of end of file in words */
+ 11    75 ,     2 init_size	fixed bin(24)			/* file size at start of activity */
+ 11    76 ,     2 init_posit	fixed bin(24)			/* file position at start of activity */
+ 11    77 ,     2 iocount	fixed bin(35)			/* total no. of i/o operations */
+ 11    78 ,     2 rec_len	fixed bin(24)			/* length of current record (gcos_write_) */
+ 11    79 ,     2 command_count	fixed bin(17) unal		/* size of command table for device (gcos_mme_inos_) */
+ 11    80 ,     2 command_index	fixed bin(17) unal		/* pointer to command table entry (gcos_mme_inos_) */
+ 11    81 ,     2 error_retry	fixed bin(17) unal		/* error retry counter */
+ 11    82 ,     2 seq_no	fixed bin(17) unal		/* tape reel sequence no */
+ 11    83 ;
+ 11    84 dcl  fibptr                   ptr			/* pointer to current fib in gcos_ext_stat_ */;
+ 11    85 
+ 11    86 /* File usage classification constants: */
+ 11    87 dcl  linked_file              bit(1)static int options(constant)init("0"b);
+ 11    88 dcl  random_file              bit(1)static int options(constant)init("1"b);
+ 11    89 dcl  read_file                bit(1)static int options(constant)init("0"b);
+ 11    90 dcl  write_file               bit(1)static int options(constant)init("1"b);
+ 11    91 
+ 11    92 /*     END INCLUDE FILE gcos_file_info_block_.incl.pl1     */
+  6   110 
+  6   111 
+  6   112 dcl 1 gcos_ext_stat_$mc like mc	/* machine condition from abort or fault */  ext;
+ 12     1 /*  */
+ 12     2 /* BEGIN INCLUDE FILE  mc.incl.pl1   Created Dec 72 for 6180 - WSS. */
+ 12     3 /* Modified 06/07/76 by Greenberg for mc.resignal */
+ 12     4 /* Modified 07/07/76 by Morris for fault register data */
+ 12     5 /* Modified 08/28/80 by J. A. Bush for the DPS8/70M CVPU */
+ 12     6 /* Modified '82 to make values constant */
+ 12     7 
+ 12     8 /* words 0-15 pointer registers */
+ 12     9 
+ 12    10 dcl  mcp ptr;
+ 12    11 
+ 12    12 dcl 1 mc based (mcp) aligned,
+ 12    13     2 prs (0:7) ptr,				/* POINTER  REGISTERS */
+ 12    14    (2 regs,					/* registers */
+ 12    15       3 x (0:7) bit (18),				/* index registers */
+ 12    16       3 a bit (36),					/* accumulator */
+ 12    17       3 q bit (36),					/* q-register */
+ 12    18       3 e bit (8),					/* exponent */
+ 12    19       3 pad1 bit (28),
+ 12    20       3 t bit (27),					/* timer register */
+ 12    21       3 pad2 bit (6),
+ 12    22       3 ralr bit (3),				/* ring alarm register */
+ 12    23 
+ 12    24     2 scu (0:7) bit (36),
+ 12    25 
+ 12    26     2 mask bit (72),				/* mem controller mask at time of fault */
+ 12    27     2 ips_temp bit (36),				/* Temporary storage for IPS info */
+ 12    28     2 errcode fixed bin (35),				/* fault handler's error code */
+ 12    29     2 fim_temp,
+ 12    30       3 unique_index bit (18) unal,			/* unique index for restarting faults */
+ 12    31       3 resignal bit (1) unal,			/* recompute signal name with fcode below */
+ 12    32       3 fcode bit (17) unal,				/* fault code used as index to FIM table and SCT */
+ 12    33     2 fault_reg bit (36),				/* fault register */
+ 12    34     2 pad2 bit (1),
+ 12    35     2 cpu_type fixed bin (2) unsigned,			/* L68 = 0, DPS8/70M = 1 */
+ 12    36     2 ext_fault_reg bit (15),				/* extended fault reg for DPS8/70M CPU */
+ 12    37     2 fault_time bit (54),				/* time of fault */
+ 12    38 
+ 12    39     2 eis_info (0:7) bit (36)) unaligned;
+ 12    40 
+ 12    41 
+ 12    42 dcl (apx fixed bin init (0),
+ 12    43      abx fixed bin init (1),
+ 12    44      bpx fixed bin init (2),
+ 12    45      bbx fixed bin init (3),
+ 12    46      lpx fixed bin init (4),
+ 12    47      lbx fixed bin init (5),
+ 12    48      spx fixed bin init (6),
+ 12    49      sbx fixed bin init (7)) internal static options (constant);
+ 12    50 
+ 12    51 
+ 12    52 
+ 12    53 
+ 12    54 dcl  scup ptr;
+ 12    55 
+ 12    56 dcl 1 scu based (scup) aligned,			/* SCU DATA */
+ 12    57 
+ 12    58 
+ 12    59 /*	WORD (0)		*/
+ 12    60 
+ 12    61    (2 ppr,					/* PROCEDURE POINTER REGISTER */
+ 12    62       3 prr bit (3),				/* procedure ring register */
+ 12    63       3 psr bit (15),				/* procedure segment register */
+ 12    64       3 p bit (1),					/* procedure privileged bit */
+ 12    65 
+ 12    66     2 apu,					/* APPENDING UNIT STATUS */
+ 12    67       3 xsf bit (1),				/* ext seg flag - IT modification */
+ 12    68       3 sdwm bit (1),				/* match in SDW Ass. Mem. */
+ 12    69       3 sd_on bit (1),				/* SDW Ass. Mem.  ON */
+ 12    70       3 ptwm bit (1),				/* match in PTW Ass. Mem. */
+ 12    71       3 pt_on bit (1),				/* PTW Ass. Mem.  ON */
+ 12    72       3 pi_ap bit (1),				/* Instr Fetch or Append cycle */
+ 12    73       3 dsptw bit (1),				/* Fetch of DSPTW */
+ 12    74       3 sdwnp bit (1),				/* Fetch of SDW non paged */
+ 12    75       3 sdwp bit (1),				/* Fetch of SDW paged */
+ 12    76       3 ptw bit (1),				/* Fetch of PTW */
+ 12    77       3 ptw2 bit (1),				/* Fetch of pre-paged PTW */
+ 12    78       3 fap bit (1),				/* Fetch of final address paged */
+ 12    79       3 fanp bit (1),				/* Fetch of final address non-paged */
+ 12    80       3 fabs bit (1),				/* Fetch of final address absolute */
+ 12    81 
+ 12    82     2 fault_cntr bit (3),				/* number of retrys of EIS instructions */
+ 12    83 
+ 12    84 
+ 12    85 /*	WORD (1)		*/
+ 12    86 
+ 12    87     2 fd,						/* FAULT  DATA */
+ 12    88       3 iro bit (1),				/* illegal ring order */
+ 12    89       3 oeb bit (1),				/* out of execute bracket */
+ 12    90       3 e_off bit (1),				/* no execute */
+ 12    91       3 orb bit (1),				/* out of read bracket */
+ 12    92       3 r_off bit (1),				/* no read */
+ 12    93       3 owb bit (1),				/* out of write bracket */
+ 12    94       3 w_off bit (1),				/* no write */
+ 12    95       3 no_ga bit (1),				/* not a gate */
+ 12    96       3 ocb bit (1),				/* out of call bracket */
+ 12    97       3 ocall bit (1),				/* outward call */
+ 12    98       3 boc bit (1),				/* bad outward call */
+ 12    99       3 inret bit (1),				/* inward return */
+ 12   100       3 crt bit (1),				/* cross ring transfer */
+ 12   101       3 ralr bit (1),				/* ring alarm register */
+ 12   102       3 am_er bit (1),				/* associative memory fault */
+ 12   103       3 oosb bit (1),				/* out of segment bounds */
+ 12   104       3 paru bit (1),				/* processor parity upper */
+ 12   105       3 parl bit (1),				/* processor parity lower */
+ 12   106       3 onc_1 bit (1),				/* op not complete type 1 */
+ 12   107       3 onc_2 bit (1),				/* op not complete type 2 */
+ 12   108 
+ 12   109     2 port_stat,					/* PORT  STATUS */
+ 12   110       3 ial bit (4),				/* illegal action lines */
+ 12   111       3 iac bit (3),				/* illegal action channel */
+ 12   112       3 con_chan bit (3),				/* connect channel */
+ 12   113 
+ 12   114     2 fi_num bit (5),				/* (fault/interrupt)  number */
+ 12   115     2 fi_flag bit (1),				/*  1 => fault,  0 => interrupt  */
+ 12   116 
+ 12   117 
+ 12   118 /*	WORD (2)		*/
+ 12   119 
+ 12   120     2 tpr,					/* TEMPORARY POINTER REGISTER */
+ 12   121       3 trr bit (3),				/* temporary ring register */
+ 12   122       3 tsr bit (15),				/* temporary segment register */
+ 12   123 
+ 12   124     2 pad2 bit (9),
+ 12   125 
+ 12   126     2 cpu_no bit (3),				/* CPU number */
+ 12   127 
+ 12   128     2 delta bit (6),				/* tally modification DELTA */
+ 12   129 
+ 12   130 
+ 12   131 /*	WORD (3)		*/
+ 12   132 
+ 12   133     2 word3 bit (18),
+ 12   134 
+ 12   135     2 tsr_stat,					/* TSR STATUS for 1,2,&3 word instructions */
+ 12   136       3 tsna,					/* Word 1 status */
+ 12   137         4 prn bit (3),				/* Word 1  PR  number */
+ 12   138         4 prv bit (1),				/* Word 1  PR  valid bit */
+ 12   139       3 tsnb,					/* Word 2  status */
+ 12   140         4 prn bit (3),				/* Word 2  PR  number */
+ 12   141         4 prv bit (1),				/* Word 2  PR  valid bit */
+ 12   142       3 tsnc,					/* Word 3  status */
+ 12   143         4 prn bit (3),				/* Word 3  PR  number */
+ 12   144         4 prv bit (1),				/* Word 3  PR  valid bit */
+ 12   145 
+ 12   146     2 tpr_tbr bit (6),				/* TPR.TBR  field */
+ 12   147 
+ 12   148 
+ 12   149 /* 	WORD (4)		*/
+ 12   150 
+ 12   151     2 ilc bit (18),					/* INSTRUCTION  COUNTER */
+ 12   152 
+ 12   153     2 ir,						/* INDICATOR  REGISTERS */
+ 12   154       3 zero bit (1),				/* zero indicator */
+ 12   155       3 neg bit (1),				/* negative indicator */
+ 12   156       3 carry bit (1),				/* carryry indicator */
+ 12   157       3 ovfl bit (1),				/* overflow indicator */
+ 12   158       3 eovf bit (1),				/* eponent overflow */
+ 12   159       3 eufl bit (1),				/* exponent underflow */
+ 12   160       3 oflm bit (1),				/* overflow mask */
+ 12   161       3 tro bit (1),				/* tally runout */
+ 12   162       3 par bit (1),				/* parity error */
+ 12   163       3 parm bit (1),				/* parity mask */
+ 12   164       3 bm bit (1),					/* ^bar mode */
+ 12   165       3 tru bit (1),				/* truncation mode */
+ 12   166       3 mif bit (1),				/* multi-word instruction mode */
+ 12   167       3 abs bit (1),				/* absolute mode */
+ 12   168       3 pad bit (4),
+ 12   169 
+ 12   170 
+ 12   171 /*	WORD (5)		*/
+ 12   172 
+ 12   173     2 ca bit (18),					/* COMPUTED  ADDRESS */
+ 12   174 
+ 12   175     2 cu,						/* CONTROL UNIT STATUS */
+ 12   176       3 rf bit (1),					/* on first cycle of repeat instr */
+ 12   177       3 rpt bit (1),				/* repeat instruction */
+ 12   178       3 rd bit (1),					/* repeat double instruction */
+ 12   179       3 rl bit (1),					/* repeat link instruciton */
+ 12   180       3 pot bit (1),				/* IT  modification */
+ 12   181       3 pon bit (1),				/* return type instruction */
+ 12   182       3 xde bit (1),				/* XDE from Even location */
+ 12   183       3 xdo bit (1),				/* XDE from Odd  location */
+ 12   184       3 poa bit (1),				/* operation preparation */
+ 12   185       3 rfi bit (1),				/* tells CPU to refetch instruction */
+ 12   186       3 its bit (1),				/* ITS modification */
+ 12   187       3 if bit (1),					/* fault occured during instruction fetch */
+ 12   188 
+ 12   189     2 cpu_tag bit (6)) unaligned,			/* computed tag field */
+ 12   190 
+ 12   191 
+ 12   192 /*	WORDS (6,7)	*/
+ 12   193 
+ 12   194     2 even_inst bit (36),				/* even instruction of faulting pair */
+ 12   195 
+ 12   196     2 odd_inst bit (36);				/* odd  instruction of faulting pair */
+ 12   197 
+ 12   198 
+ 12   199 
+ 12   200 
+ 12   201 
+ 12   202 
+ 12   203 /*	ALTERNATE   SCU  DECLARATION		*/
+ 12   204 
+ 12   205 
+ 12   206 dcl 1 scux based (scup) aligned,
+ 12   207 
+ 12   208    (2 pad0 bit (36),
+ 12   209 
+ 12   210     2 fd,						/* GROUP II  FAULT DATA */
+ 12   211       3 isn bit (1),				/* illegal segment number */
+ 12   212       3 ioc bit (1),				/* illegal op  code  */
+ 12   213       3 ia_am bit (1),				/* illegal address - modifier */
+ 12   214       3 isp bit (1),				/* illegal slave  procedure */
+ 12   215       3 ipr bit (1),				/* illegal procedure */
+ 12   216       3 nea bit (1),				/* non existent address */
+ 12   217       3 oobb bit (1),				/* out of bounds */
+ 12   218       3 pad bit (29),
+ 12   219 
+ 12   220     2 pad2 bit (36),
+ 12   221 
+ 12   222     2 pad3a bit (18),
+ 12   223 
+ 12   224     2 tsr_stat (0:2),				/* TSR  STATUS  as an  ARRAY */
+ 12   225       3 prn bit (3),				/* PR  number */
+ 12   226       3 prv bit (1),				/* PR  valid bit */
+ 12   227 
+ 12   228     2 pad3b bit (6)) unaligned,
+ 12   229 
+ 12   230     2 pad45 (0:1) bit (36),
+ 12   231 
+ 12   232     2 instr (0:1) bit (36);				/* Instruction ARRAY */
+ 12   233 
+ 12   234 
+ 12   235 
+ 12   236 /*  END INCLUDE FILE   mc.incl.pl1 */
+  6   113 
+  6   114 
+  6   115 dcl 1 gcos_ext_stat_$gcos_gtss	ext
+  6   116 ,     3 gcos_gtss_ext
+  6   117 ,       4 u_state_ptr ptr
+  6   118 ,       4 snumb_index fixed bin(24)
+  6   119 ,       4 home_path char(168)
+  6   120 ;
+  6   121 
+  6   122 /*   END INCLUDE FILE gcos_ext_stat_.incl.pl1 */
+     1473 
+     1474      end gcos_gein_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    09/09/83  1006.8  gcos_gein_.pl1                    >spec>on>09/07/83-gcos>gcos_gein_.pl1
+1462         1    03/31/82  1614.5  gcos_fibs.incl.pl1                >ldd>include>gcos_fibs.incl.pl1
+1465         2    08/05/77  1022.5  object_info.incl.pl1              >ldd>include>object_info.incl.pl1
+1467         3    03/27/82  0424.8  gcos_restart_control_.incl.pl1    >ldd>include>gcos_restart_control_.incl.pl1
+1469         4    09/08/83  1229.3  gcos_control_tables_.incl.pl1     >spec>on>09/07/83-gcos>gcos_control_tables_.incl.pl1
+1471         5    03/27/82  0424.8  gcos_gtss_dcls.incl.pl1           >ldd>include>gcos_gtss_dcls.incl.pl1
+1473         6    09/08/83  1229.3  gcos_ext_stat_.incl.pl1           >spec>on>09/07/83-gcos>gcos_ext_stat_.incl.pl1
+6-100        7    03/27/82  0424.8  gcos_save_mc.incl.pl1             >ldd>include>gcos_save_mc.incl.pl1
+6-104        8    03/27/82  0424.8  gcos_fct_entry.incl.pl1           >ldd>include>gcos_fct_entry.incl.pl1
+6-108        9    03/27/82  0424.8  gcos_save_data_entry.incl.pl1     >ldd>include>gcos_save_data_entry.incl.pl1
+9-29        10    09/08/83  1230.3  gcos_flags.incl.pl1               >spec>on>09/07/83-gcos>gcos_flags.incl.pl1
+6-110       11    03/27/82  0424.8  gcos_file_info_block_.incl.pl1    >ldd>include>gcos_file_info_block_.incl.pl1
+6-113       12    08/17/83  1135.7  mc.incl.pl1                       >ldd>include>mc.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+FF                              000164 constant        char(1)                  initial unaligned dcl 1460 set ref 325*
+LOWER_CASE                      000234 constant        char(26)                 initial unaligned dcl 1377 ref 432 436
+UPPER_CASE                      000225 constant        char(26)                 initial unaligned dcl 1393 ref 432 436
+actid                     2     000446 external static char(8)                  level 3 dcl 6-106 set ref 249*
+activ                     0(04) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 ref 584
+activity_no              26     000446 external static fixed bin(24,0)          level 3 dcl 6-106 set ref 307* 517* 517 522*
+addr                                                   builtin function         dcl 1267 ref 93 93 117 117 117 131 144 145 164 171
+                                                                                  180 200 218 224 233 238 239 274 283 335 336 337
+                                                                                  340 340 340 341 353 360 374 405 531 535 1169 1182
+                                                                                  1188 1190 1201 1201 1220 1227 1234 1249 1254 1254
+attached                 60(01)        based           bit(1)                   level 4 packed unaligned dcl 11-10 ref 1171
+bit_count                       000100 automatic       fixed bin(24,0)          dcl 1270 set ref 117* 131* 179 336* 340*
+bound                    24(01) 002150 automatic       bit(1)                   level 3 packed unaligned dcl 1464 set ref 361
+brief                     0(15) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 ref 348 446
+buffer                                 based           pointer                  level 2 dcl 11-10 set ref 1211*
+buffer_in_use         74432            based           bit(1)                   array level 3 packed unaligned dcl 1-2 set ref 1209*
+buffer_indx               2            based           fixed bin(17,0)          level 2 dcl 11-10 set ref 1208 1209 1210*
+card                            000101 automatic       char(80)                 unaligned dcl 1271 set ref 423* 432 436 449* 456*
+                                                                                  458 481* 654* 658* 674* 678* 682* 686* 690* 694*
+                                                                                  701* 705* 709* 713* 717* 721* 725* 729* 733* 737*
+                                                                                  741* 745* 749* 753* 757* 761* 765* 808* 812* 825*
+                                                                                  831* 838* 842* 846* 850* 854* 858* 862* 899* 903*
+                                                                                  997* 1001* 1005* 1009* 1013* 1017* 1023* 1031*
+                                                                                  1091 1095 1098 1098 1105
+card_type                       000126 automatic       char(8)                  dcl 1272 set ref 432* 435 461 466 475 494 522* 575
+cc_print_sw                     000010 internal static bit(1)                   initial unaligned dcl 1273 set ref 456 1161* 1161
+                                                                                  1162
+cleanup                         000130 stack reference condition                dcl 1275 ref 76
+clock                                                  builtin function         dcl 1276 ref 262
+code                                   based           fixed bin(35,0)          dcl 1277 set ref 117* 131* 144 145 164* 171 180*
+                                                                                  200* 218 224 233* 238 239* 274* 283* 336* 337 340*
+                                                                                  341 353* 360 1182* 1188 1190* 1201* 1201* 1220*
+                                                                                  1227* 1234* 1249* 1254 1254*
+com_err_                        000070 constant        entry                    external dcl 1278 ref 164 239 1254
+compile_time             32     002150 automatic       fixed bin(71,0)          level 2 dcl 1464 set ref 342*
+console                  60(08)        based           bit(1)                   level 4 packed unaligned dcl 11-10 ref 1172
+copy                      0(01) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 set ref 434 438*
+courtesy_call                   000442 external static structure                level 2 dcl 6-92
+date_time                15(18) 000012 internal static char(24)                 level 2 in structure "execution_msg" packed
+                                                                                  unaligned dcl 1425 in procedure "gcos_gein_" set
+                                                                                  ref 263*
+date_time                 2(27) 000036 internal static char(24)                 level 2 in structure "vrsn_msg" packed unaligned
+                                                                                  dcl 1432 in procedure "gcos_gein_" set ref 342*
+date_time_                      000072 constant        entry                    external dcl 1279 ref 263 342
+debug                     0(16) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 ref 351
+delete_$path                    000074 constant        entry                    external dcl 1280 ref 1190 1220 1227
+disp                     60(14)        based           bit(2)                   level 4 packed unaligned dcl 11-10 set ref 194* 319*
+dollar_card_count               000136 automatic       fixed bin(24,0)          initial dcl 1281 set ref 431* 431 494 1281*
+dollar_sw                       000137 automatic       bit(1)                   unaligned dcl 1282 set ref 423* 426
+ename                           000140 automatic       char(32)                 unaligned dcl 1283 set ref 117* 131* 187 200 353*
+                                                                                  363* 1182* 1190* 1201* 1201*
+endfc                     1(04) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 set ref 436 438*
+endjob                    0(30) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 set ref 85* 385*
+err_msg                         000150 automatic       char(150)                unaligned dcl 1286 set ref 156* 158* 161* 164* 181*
+                                                                                  220* 363* 372* 374 522* 531 535
+error_table_$no_s_permission    000100 external static fixed bin(35,0)          dcl 1285 ref 171
+error_table_$noentry            000076 external static fixed bin(35,0)          dcl 1284 ref 145
+execute_search_rules_           000336 constant        entry                    external dcl 1398 ref 131
+execute_search_rules_$s_r_ptr   000340 constant        entry                    external dcl 1408 ref 117
+execution_msg                   000012 internal static structure                level 1 dcl 1425 set ref 326 326
+expand_pathname_                000102 constant        entry                    external dcl 1287 ref 1182
+fct                             000444 external static structure                array level 2 dcl 6-102
+fct_entry                              based           structure                level 1 dcl 8-3
+fib                                    based           structure                level 1 dcl 11-10
+fib_buffers           74432            based           structure                level 2 dcl 1-2
+fibptr                    2     000444 external static pointer                  array level 3 in structure "gcos_ext_stat_$fct"
+                                                                                  dcl 6-102 in procedure "gcos_gein_" set ref 74*
+fibptr                          002236 automatic       pointer                  dcl 11-84 in procedure "gcos_gein_" set ref 189* 191
+                                                                                  192 193 194 195 318* 319 1129 1130 1131 1138 1139
+                                                                                  1140 1146 1147 1148 1154 1155 1169* 1170 1171 1172
+                                                                                  1173 1174 1179 1180 1181 1182 1189 1201 1201 1201
+                                                                                  1201 1208 1209 1210 1211
+fibs                    322     000446 external static structure                array level 3 dcl 6-106 set ref 70* 1168 1169
+fibs_control                           based           structure                level 1 dcl 1-2
+filecode                        000444 external static char(2)                  array level 3 dcl 6-102 set ref 72*
+first_record                    000050 internal static structure                level 1 dcl 1440 set ref 405
+firstrecord                            based           char(60)                 unaligned dcl 1288 set ref 405*
+flags                                  based           structure                level 1 dcl 10-8
+flgs                            000446 external static structure                level 3 dcl 6-106
+format                   24     002150 automatic       structure                level 2 dcl 1464
+fullname                        000216 automatic       char(168)                unaligned dcl 1289 set ref 117* 131* 164* 187 200*
+                                                                                  353* 363* 1182* 1190* 1201* 1201*
+gcos$                           000104 external static fixed bin(17,0)          dcl 1290 set ref 335
+gcos_cc_abort_                  000106 constant        entry                    external dcl 1291 ref 846
+gcos_cc_activity_cards_         000110 constant        entry                    external dcl 1292 ref 997
+gcos_cc_data_                   000112 constant        entry                    external dcl 1293 ref 682
+gcos_cc_directive_cards_$cc_bmc 000114 constant        entry                    external dcl 1294 ref 825
+gcos_cc_directive_cards_$cc_dump
+                                000116 constant        entry                    external dcl 1295 ref 850
+gcos_cc_directive_cards_$cc_editor
+                                000120 constant        entry                    external dcl 1296 ref 808
+gcos_cc_directive_cards_$cc_ffile
+                                000122 constant        entry                    external dcl 1297 ref 812
+gcos_cc_directive_cards_$cc_sced
+                                000124 constant        entry                    external dcl 1298 ref 854
+gcos_cc_directive_cards_$cc_sysedit
+                                000126 constant        entry                    external dcl 1299 ref 838
+gcos_cc_directive_cards_$cc_utility
+                                000130 constant        entry                    external dcl 1300 ref 831
+gcos_cc_endjob_                 000132 constant        entry                    external dcl 1301 ref 1017
+gcos_cc_file_cards_$cc_dac      000134 constant        entry                    external dcl 1302 ref 705
+gcos_cc_file_cards_$cc_file     000136 constant        entry                    external dcl 1303 ref 674
+gcos_cc_file_cards_$cc_print    000140 constant        entry                    external dcl 1304 ref 654
+gcos_cc_file_cards_$cc_prmfl    000142 constant        entry                    external dcl 1305 ref 678
+gcos_cc_file_cards_$cc_punch    000144 constant        entry                    external dcl 1306 ref 658
+gcos_cc_file_cards_$cc_read     000146 constant        entry                    external dcl 1307 ref 713
+gcos_cc_file_cards_$cc_sysout   000150 constant        entry                    external dcl 1308 ref 701
+gcos_cc_file_cards_$cc_tape     000152 constant        entry                    external dcl 1309 ref 686
+gcos_cc_file_cards_$cc_tape7    000154 constant        entry                    external dcl 1310 ref 690
+gcos_cc_file_cards_$cc_tape9    000156 constant        entry                    external dcl 1311 ref 694
+gcos_cc_file_cards_$cc_type     000160 constant        entry                    external dcl 1312 ref 709
+gcos_cc_goto_                   000162 constant        entry                    external dcl 1313 ref 1009
+gcos_cc_goto_$cc_if             000164 constant        entry                    external dcl 1314 ref 1013
+gcos_cc_goto_$cc_when           000166 constant        entry                    external dcl 1315 ref 842
+gcos_cc_ident_                  000170 constant        entry                    external dcl 1316 ref 1001
+gcos_cc_incode_                 000172 constant        entry                    external dcl 1317 ref 725
+gcos_cc_limits_                 000174 constant        entry                    external dcl 1318 ref 741
+gcos_cc_loader_cards_           000176 constant        entry                    external dcl 1319 ref 899
+gcos_cc_loader_cards_$cc_object 000200 constant        entry                    external dcl 1320 ref 903
+gcos_cc_misc_cards_$cc_alter    000202 constant        entry                    external dcl 1321 ref 761
+gcos_cc_misc_cards_$cc_break    000204 constant        entry                    external dcl 1322 ref 1005
+gcos_cc_misc_cards_$cc_comment  000206 constant        entry                    external dcl 1323 ref 721
+gcos_cc_misc_cards_$cc_endcopy  000210 constant        entry                    external dcl 1324 ref 733
+gcos_cc_misc_cards_$cc_etc      000212 constant        entry                    external dcl 1325 ref 729
+gcos_cc_misc_cards_$cc_msg1     000214 constant        entry                    external dcl 1326 ref 745
+gcos_cc_misc_cards_$cc_msg2     000216 constant        entry                    external dcl 1327 ref 749
+gcos_cc_misc_cards_$cc_msg3     000220 constant        entry                    external dcl 1328 ref 753
+gcos_cc_misc_cards_$cc_need     000222 constant        entry                    external dcl 1329 ref 858
+gcos_cc_misc_cards_$cc_userid   000224 constant        entry                    external dcl 1330 ref 757
+gcos_cc_param_                  000226 constant        entry                    external dcl 1331 ref 862
+gcos_cc_set_                    000230 constant        entry                    external dcl 1332 ref 765
+gcos_cc_snumb_                  000232 constant        entry                    external dcl 1333 ref 717
+gcos_cc_update_                 000234 constant        entry                    external dcl 1334 ref 737
+gcos_control_tables_$cardtable  000342 external static char(8)                  array unaligned dcl 4-5 ref 475
+gcos_control_tables_$comp_offset
+                                000344 external static fixed bin(17,0)          dcl 4-6 ref 615
+gcos_control_tables_$exc_offset 000346 external static fixed bin(17,0)          dcl 4-7 ref 505 559 583 620
+gcos_control_tables_$filecard_count
+                                000350 external static fixed bin(17,0)          dcl 4-8 ref 638
+gcos_control_tables_$nonact     000352 external static fixed bin(17,0)          dcl 4-9 ref 505 562
+gcos_control_tables_$tablelen   000354 external static fixed bin(17,0)          dcl 4-10 ref 474 548
+gcos_error_                     000236 constant        entry                    external dcl 1335 ref 283 1023 1031
+gcos_et_$cc_bad_card            000240 external static fixed bin(35,0)          dcl 1336 set ref 1023* 1031*
+gcos_ext_stat_$abort_reason     000356 external static varying char(128)        dcl 6-13 set ref 252*
+gcos_ext_stat_$activity_name    000360 external static char(8)                  unaligned dcl 6-16 ref 638
+gcos_ext_stat_$card_num         000362 external static picture(4)               unaligned dcl 6-18 set ref 1023* 1031*
+gcos_ext_stat_$courtesy_call_control
+                                000442 external static structure                level 1 dcl 6-92
+gcos_ext_stat_$default_nondollar
+                                000364 external static char(2)                  unaligned dcl 6-20 set ref 252* 1058 1061*
+gcos_ext_stat_$endfc            000366 external static char(2)                  unaligned dcl 6-24 ref 436
+gcos_ext_stat_$er               000370 external static pointer                  dcl 6-25 set ref 325* 326* 343* 374* 394* 535* 595*
+                                                                                  1146*
+gcos_ext_stat_$etc_filecode     000372 external static char(2)                  unaligned dcl 6-26 set ref 642*
+gcos_ext_stat_$fct              000444 external static structure                level 1 dcl 6-102
+gcos_ext_stat_$gcos_slave_area_seg
+                                000374 external static pointer                  dcl 6-27 set ref 81* 1234 1234*
+gcos_ext_stat_$gf               000376 external static fixed bin(24,0)          dcl 6-28 set ref 424*
+gcos_ext_stat_$incode           000400 external static fixed bin(24,0)          dcl 6-29 set ref 470*
+gcos_ext_stat_$job_cpu_time     000402 external static fixed bin(71,0)          dcl 6-34 set ref 269*
+gcos_ext_stat_$job_id           000404 external static varying char(18)         dcl 6-35 set ref 274 283* 1220 1227
+gcos_ext_stat_$job_real_time    000406 external static fixed bin(71,0)          dcl 6-36 set ref 262* 263*
+gcos_ext_stat_$max_mem          000410 external static fixed bin(19,0)          dcl 6-40 set ref 82*
+gcos_ext_stat_$nondollar        000412 external static char(2)                  unaligned dcl 6-42 set ref 442* 469* 1058* 1063 1071
+                                                                                  1071*
+gcos_ext_stat_$normal_return    000414 external static label variable           dcl 6-44 set ref 251*
+gcos_ext_stat_$patchfile_ptr    000416 external static pointer                  dcl 6-45 set ref 152* 199* 200*
+gcos_ext_stat_$pch              000420 external static pointer                  dcl 6-47 set ref 597* 1129*
+gcos_ext_stat_$prt              000422 external static pointer                  dcl 6-49 set ref 405* 1138*
+gcos_ext_stat_$rs               000424 external static pointer                  dcl 6-50 set ref 596* 1077* 1154*
+gcos_ext_stat_$save_data        000446 external static structure                level 1 dcl 6-106
+gcos_ext_stat_$save_dir         000430 external static varying char(168)        dcl 6-52 set ref 274 283* 1220 1220 1227 1227
+gcos_ext_stat_$saveseg_ptr      000426 external static pointer                  dcl 6-51 set ref 274* 283 291 589 589
+gcos_ext_stat_$snumb            000432 external static bit(30)                  dcl 6-56 set ref 248*
+gcos_ext_stat_$sought_label     000434 external static char(8)                  unaligned dcl 6-57 set ref 252* 502 1104 1105 1110*
+gcos_ext_stat_$statistics       000436 external static fixed bin(24,0)          array dcl 6-58 set ref 256*
+gcos_ext_stat_$temp_seg_ptr     000440 external static pointer                  dcl 6-66 set ref 233* 1209 1240 1249* 1254*
+gcos_gein_pass1_                000242 constant        entry                    external dcl 1337 ref 388
+gcos_ids2_concur_$deallocate    000244 constant        entry                    external dcl 1338 ref 1201
+gcos_ids2_concur_$have_xid      000246 constant        entry                    external dcl 1339 ref 1201
+gcos_len                        000270 automatic       fixed bin(24,0)          dcl 1340 set ref 423* 640 640 729 729 737 737 808
+                                                                                  808 812 812 825 825 831 831 838 838 850 850 854
+                                                                                  854 899 899 903 903 997 997 1071 1071 1077 1077
+gcos_open_file_                 000250 constant        entry                    external dcl 1341 ref 189 318
+gcos_ptr                        000272 automatic       pointer                  dcl 1342 set ref 423* 640 729 737 808 812 825 831
+                                                                                  838 850 854 899 903 997 1071 1077
+gcos_read_card_                 000252 constant        entry                    external dcl 1343 ref 423
+gcos_record                            based           char                     unaligned dcl 1344 set ref 640* 729* 737* 808* 812*
+                                                                                  825* 831* 838* 850* 854* 899* 903* 997* 1071*
+                                                                                  1077*
+gcos_restart_                   000254 constant        entry                    external dcl 1345 ref 292
+gcos_restart_$save              000256 constant        entry                    external dcl 1346 ref 395 598
+gcos_run_activity_              000260 constant        entry                    external dcl 1347 ref 592
+gcos_write_$ascii_ptr           000262 constant        entry                    external dcl 1348 ref 374
+gcos_write_$force_ptr           000264 constant        entry                    external dcl 1349 ref 394 595 596 597
+gcos_write_$ptr                 000266 constant        entry                    external dcl 1350 ref 325 326 343 535
+gcos_write_$record              000270 constant        entry                    external dcl 1351 ref 640 1071
+gcos_write_$record_ptr          000272 constant        entry                    external dcl 1352 ref 405 1077
+get_temp_segment_               000274 constant        entry                    external dcl 1353 ref 233
+gptr                            000274 automatic       pointer                  dcl 1354 set ref 335* 336* 340* 353*
+hbound                                                 builtin function         dcl 1355 ref 1168
+hcs_$fs_get_path_name           000276 constant        entry                    external dcl 1356 ref 353
+hcs_$get_search_rules           000300 constant        entry                    external dcl 1357 ref 93
+hcs_$get_usage_values           000302 constant        entry                    external dcl 1358 ref 269
+hcs_$initiate                   000304 constant        entry                    external dcl 1359 ref 200
+hcs_$make_seg                   000306 constant        entry                    external dcl 1360 ref 274
+hcs_$status_mins                000310 constant        entry                    external dcl 1361 ref 336
+hcs_$truncate_seg               000312 constant        entry                    external dcl 1362 ref 1234
+i                               000276 automatic       fixed bin(24,0)          dcl 1363 set ref 95* 95* 99 101 102 115* 117 131 146
+                                                                                  150 164 188 197 211 223* 292* 293 317* 320* 353*
+                                                                                  474* 475* 505 505 548 559 562 583 615 620 638 651
+                                                                                  729* 737* 808* 812* 825* 831* 838* 850* 854* 899*
+                                                                                  903* 997* 1168* 1169*
+ident                     0(03) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 ref 574 586 1053
+index                                                  builtin function         dcl 1364 ref 1095
+indicators               60            based           structure                level 2 dcl 11-10
+indicators_word_1        60            based           structure                level 3 dcl 11-10
+initialized                     000011 internal static bit(1)                   initial unaligned dcl 1365 set ref 79 80*
+ioa_                            000314 constant        entry                    external dcl 1366 ref 449 456 481 1164
+ioa_$nnl                        000316 constant        entry                    external dcl 1367 ref 348 372 531
+ioa_$rs                         000320 constant        entry                    external dcl 1368 ref 363 522
+ios_$attach                     000322 constant        entry                    external dcl 1369 ref 211
+ios_$detach                     000324 constant        entry                    external dcl 1370 ref 1174 1215 1216 1217
+ios_$setsize                    000326 constant        entry                    external dcl 1371 ref 223
+j                               000277 automatic       fixed bin(24,0)          dcl 1372 set ref 102* 104 104* 363* 374 374 522* 531
+                                                                                  531 535 535 1091* 1091* 1095 1098 1098 1105
+k                               000300 automatic       fixed bin(24,0)          dcl 1373 set ref 269* 269* 1095* 1096 1097 1098 1098
+                                                                                  1105
+last_execute_act_no      25     000446 external static fixed bin(24,0)          level 3 dcl 6-106 ref 390
+lib_count                       000301 automatic       fixed bin(24,0)          dcl 1374 set ref 111* 113* 115
+lib_names                       000165 constant        char(32)                 initial array unaligned dcl 1419 set ref 117* 131*
+                                                                                  164*
+lib_path                        000302 automatic       char(168)                dcl 1375 set ref 187* 191 211*
+lib_streams                     000244 constant        char(4)                  initial array dcl 1376 set ref 211* 223* 1215 1216
+long                      1(03) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 ref 372 481 531
+mc                                     based           structure                level 1 dcl 12-12
+msg_var                         000354 automatic       char(4)                  unaligned dcl 1378 set ref 1162* 1163* 1164*
+na_hold                   0(05)        based           bit(1)                   level 2 packed unaligned dcl 3-3 ref 589
+na_restart                0(01)        based           bit(1)                   level 2 packed unaligned dcl 3-3 set ref 589*
+names                     1     000364 automatic       char(168)                array level 2 dcl 1455 set ref 95 101* 104* 104 108*
+next_avail               60     000442 external static fixed bin(24,0)          level 3 dcl 6-92 set ref 259*
+next_out                 61     000442 external static fixed bin(24,0)          level 3 dcl 6-92 set ref 260*
+nondollar                 0(29) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 set ref 438* 466
+                                                                                  468* 1049 1068*
+nondollar_cards_skipped         000355 automatic       fixed bin(24,0)          initial dcl 1379 set ref 446 449* 454* 1064* 1064
+                                                                                  1379*
+nosave                    0(10) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 ref 273 393 589
+                                                                                  594
+null                     60(11)        based           bit(1)                   level 4 in structure "fib" packed unaligned
+                                                                                  dcl 11-10 in procedure "gcos_gein_" ref 1173
+null                                                   builtin function         dcl 1380 in procedure "gcos_gein_" ref 74 81 152 199
+                                                                                  283 1211 1234 1240
+number                          000364 automatic       fixed bin(24,0)          level 2 dcl 1455 set ref 95 99 102 106* 106 108
+obj_info                        002150 automatic       structure                level 1 dcl 1464 set ref 340 340
+object_info                            based           structure                level 1 dcl 2-6
+object_info_$display            000330 constant        entry                    external dcl 1381 ref 340
+object_info_version_2                  constant        fixed bin(17,0)          initial dcl 2-60 ref 339
+pathnm                    5            based           char(168)                level 2 packed unaligned dcl 11-10 set ref 191*
+                                                                                  1182*
+perm                     60(03)        based           bit(1)                   level 4 packed unaligned dcl 11-10 set ref 195* 1189
+                                                                                  1201
+prev_act_abort            0(25) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 ref 617
+print                    60(04)        based           bit(1)                   level 4 packed unaligned dcl 11-10 set ref 1140*
+                                                                                  1148* 1179
+psw                      24     000446 external static bit(36)                  level 3 dcl 6-106 set ref 303* 390* 623
+punch                    60(05)        based           bit(1)                   level 4 packed unaligned dcl 11-10 set ref 1131*
+                                                                                  1180
+read                     60(09)        based           bit(1)                   level 4 packed unaligned dcl 11-10 set ref 193*
+                                                                                  1201*
+release_temp_segment_           000332 constant        entry                    external dcl 1382 ref 1249
+restart_control                        based           structure                level 1 dcl 3-3
+rtrim                                                  builtin function         dcl 1383 ref 187
+save_data                       000446 external static structure                level 2 dcl 6-106
+save_data_entry                        based           structure                level 1 dcl 9-5
+save_machine_conditions                based           structure                level 1 packed unaligned dcl 7-6
+saved                     0(04)        based           bit(1)                   level 2 packed unaligned dcl 3-3 ref 291
+search_rules                    000364 automatic       structure                level 1 dcl 1455 set ref 93 93 117 117
+seeking                   0(35) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 set ref 500 565*
+                                                                                  628* 1042 1103 1111*
+seeking_terminator        1     000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 set ref 565* 628*
+                                                                                  1111*
+seg_type                        000356 automatic       char(8)                  dcl 1384 set ref 361* 362* 363*
+snumb                     0(02) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 ref 576 1052
+sqindex                 165     000446 external static fixed bin(24,0)          level 3 dcl 6-106 set ref 305*
+status                          000360 automatic       bit(72)                  dcl 1386 set ref 117 131 144 145 164 171 180 200
+                                                                                  211* 218 223* 224 233 238 239 274 283 336 337 340
+                                                                                  341 353 360 1174* 1182 1188 1190 1201 1201 1215*
+                                                                                  1216* 1217* 1220 1227 1234 1249 1254 1254
+stream                    3            based           char(8)                  level 2 packed unaligned dcl 11-10 set ref 1130*
+                                                                                  1139* 1147* 1155* 1174*
+string                                                 builtin function         dcl 1387 ref 326 326 343 343 348 348 1220 1220 1227
+                                                                                  1227
+substr                                                 builtin function         dcl 1388 ref 432 436 458 623 1091 1095 1098 1098
+                                                                                  1105
+sw                              000362 automatic       bit(1)                   unaligned dcl 1389 set ref 189* 318*
+sys_info$max_seg_size           000334 external static fixed bin(24,0)          dcl 1390 ref 82
+sysout                    1     000444 external static bit(1)                   array level 3 packed unaligned dcl 6-102 set ref 73*
+tape                     60(07)        based           bit(1)                   level 4 packed unaligned dcl 11-10 ref 1181
+this_act_abort            0(26) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 set ref 512*
+translate                                              builtin function         dcl 1391 ref 432 436
+type                     60(02)        based           bit(1)                   level 4 in structure "fib" packed unaligned
+                                                                                  dcl 11-10 in procedure "gcos_gein_" set ref 192*
+                                                                                  1201
+type                            000363 automatic       fixed bin(2,0)           dcl 1392 in procedure "gcos_gein_" set ref 117* 131*
+                                                                                  156 336*
+used                     60            based           bit(1)                   level 4 packed unaligned dcl 11-10 ref 1170
+userid                   34     002150 automatic       char(32)                 level 2 dcl 1464 set ref 363*
+userlib                   0(22) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 set ref 90 117
+                                                                                  147*
+var_msg                                based           char                     unaligned dcl 1395 set ref 374* 531* 535*
+version_number                  002150 automatic       fixed bin(17,0)          level 2 dcl 1464 set ref 339*
+vrsn_msg                        000036 internal static structure                level 1 dcl 1432 set ref 343 343 348 348
+write                    60(10)        based           bit(1)                   level 4 packed unaligned dcl 11-10 set ref 1201*
+write_etc                 0(24) 000446 external static bit(1)                   level 4 packed unaligned dcl 6-106 set ref 461* 641*
+                                                                                  1045*
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+COMPLETE                               internal static fixed bin(24,0)          initial dcl 5-13
+EXECUTING                              internal static fixed bin(24,0)          initial dcl 5-13
+INITIATED                              internal static fixed bin(24,0)          initial dcl 5-13
+OUTPUT_COMPLETE                        internal static fixed bin(24,0)          initial dcl 5-13
+OUTPUT_WAITING                         internal static fixed bin(24,0)          initial dcl 5-13
+READING_RMT                            internal static fixed bin(24,0)          initial dcl 5-13
+TERMINATING                            internal static fixed bin(24,0)          initial dcl 5-13
+WAIT_MEDIA                             internal static fixed bin(24,0)          initial dcl 5-13
+WAIT_PERIPH                            internal static fixed bin(24,0)          initial dcl 5-13
+abx                                    internal static fixed bin(17,0)          initial dcl 12-42
+addrel                                                 builtin function         dcl 1268
+apx                                    internal static fixed bin(17,0)          initial dcl 12-42
+baseno                                                 builtin function         dcl 1269
+bbx                                    internal static fixed bin(17,0)          initial dcl 12-42
+bpx                                    internal static fixed bin(17,0)          initial dcl 12-42
+char                                                   builtin function         dcl 1274
+gcos_control_tables_$                  external static fixed bin(17,0)          dcl 4-3
+gcos_control_tables_$activity_table    external static fixed bin(17,0)          dcl 4-4
+gcos_control_tables_$tabstops          external static fixed bin(17,0)          dcl 4-11
+gcos_control_tables_$totallen          external static fixed bin(17,0)          dcl 4-12
+gcos_ext_stat_$abort_return            external static label variable           dcl 6-14
+gcos_ext_stat_$activity_card_num       external static picture(4)               unaligned dcl 6-15
+gcos_ext_stat_$activity_start_time     external static fixed bin(71,0)          dcl 6-17
+gcos_ext_stat_$dbs                     external static bit(1)                   array unaligned dcl 6-19
+gcos_ext_stat_$dir_rings               external static fixed bin(3,0)           array dcl 6-21
+gcos_ext_stat_$dpno                    external static varying char(100)        dcl 6-22
+gcos_ext_stat_$dpo                     external static varying char(100)        dcl 6-23
+gcos_ext_stat_$gcos_gtss               external static structure                level 1 unaligned dcl 6-115
+gcos_ext_stat_$increment_hold          external static fixed bin(24,0)          dcl 6-30
+gcos_ext_stat_$initial_cpu_time        external static fixed bin(71,0)          dcl 6-31
+gcos_ext_stat_$input_segment_path      external static varying char(168)        dcl 6-32
+gcos_ext_stat_$jcl_warnings            external static fixed bin(24,0)          dcl 6-33
+gcos_ext_stat_$last_mme                external static fixed bin(24,0)          dcl 6-37
+gcos_ext_stat_$ldrss                   external static fixed bin(24,0)          dcl 6-38
+gcos_ext_stat_$max_activities          external static fixed bin(24,0)          dcl 6-39
+gcos_ext_stat_$mc                      external static structure                level 1 unaligned dcl 6-112
+gcos_ext_stat_$mme_rtrn                external static label variable           dcl 6-41
+gcos_ext_stat_$nongcos                 external static char(2)                  unaligned dcl 6-43
+gcos_ext_stat_$pathname_prefix         external static varying char(168)        dcl 6-46
+gcos_ext_stat_$pdir                    external static varying char(168)        dcl 6-48
+gcos_ext_stat_$seg_rings               external static fixed bin(3,0)           array dcl 6-53
+gcos_ext_stat_$sig_ptr                 external static pointer                  dcl 6-54
+gcos_ext_stat_$skip_umc                external static bit(1)                   unaligned dcl 6-55
+gcos_ext_stat_$stop_code               external static fixed bin(24,0)          dcl 6-59
+gcos_ext_stat_$storage_limit           external static fixed bin(19,0)          dcl 6-60
+gcos_ext_stat_$sysout_limit            external static fixed bin(35,0)          dcl 6-61
+gcos_ext_stat_$sysout_lines            external static fixed bin(35,0)          dcl 6-62
+gcos_ext_stat_$system_free_pointer     external static pointer                  dcl 6-63
+gcos_ext_stat_$tape_buffer_size        external static fixed bin(35,0)          dcl 6-64
+gcos_ext_stat_$temp_dir                external static varying char(168)        dcl 6-65
+gcos_ext_stat_$termination_code        external static bit(18)                  unaligned dcl 6-67
+gcos_ext_stat_$time_limit              external static fixed bin(71,0)          dcl 6-68
+gcos_ext_stat_$userid                  external static char(12)                 unaligned dcl 6-69
+gcos_ext_stat_$validation_level        external static fixed bin(3,0)           dcl 6-70
+gcos_gtss_update_$new_activity  000000 constant        entry                    external dcl 5-24
+gcos_gtss_update_$status_update 000000 constant        entry                    external dcl 5-25
+gtss_snumb_xref_                       based           structure                level 1 unaligned dcl 5-3
+lbx                                    internal static fixed bin(17,0)          initial dcl 12-42
+linked_file                            internal static bit(1)                   initial unaligned dcl 11-87
+lpx                                    internal static fixed bin(17,0)          initial dcl 12-42
+mcp                                    automatic       pointer                  dcl 12-10
+random_file                            internal static bit(1)                   initial unaligned dcl 11-88
+read_file                              internal static bit(1)                   initial unaligned dcl 11-89
+sbx                                    internal static fixed bin(17,0)          initial dcl 12-42
+scu                                    based           structure                level 1 dcl 12-56
+scup                                   automatic       pointer                  dcl 12-54
+scux                                   based           structure                level 1 dcl 12-206
+size                                                   builtin function         dcl 1385
+spx                                    internal static fixed bin(17,0)          initial dcl 12-42
+user_info_$homedir              000000 constant        entry                    external dcl 1394
+word                                   based           bit(36)                  dcl 1396
+write_file                             internal static bit(1)                   initial unaligned dcl 11-90
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+activtst                        003271 constant        label                    dcl 582 ref 574 575
+call_caller                     003451 constant        label                    dcl 650 ref 548
+cc                              000004 constant        label                    array(108) dcl 653 ref 651
+cont_init                       001547 constant        label                    dcl 229 ref 148
+continue                        002136 constant        label                    dcl 321 ref 1132 1141 1149 1156
+delete_activity                 003123 constant        label                    dcl 509 ref 632
+do_delete                       003373 constant        label                    dcl 627 ref 617
+dollar_print                    005141 constant        entry                    external dcl 1158
+dont_delete                     003402 constant        label                    dcl 634 ref 615 620 623
+end_lib_loop                    001544 constant        label                    dcl 226 ref 153
+fatal_error                     001252 constant        label                    dcl 172 ref 244
+fib_init                        000160 constant        label                    array(4) dcl 1128 set ref 320
+found                           003074 constant        label                    dcl 488 set ref 475
+gcos_gein_                      000636 constant        entry                    external dcl 6
+gein_cleanup                    005202 constant        entry                    internal dcl 1167 ref 76 173 297
+get_next_fib                    005500 constant        label                    dcl 1213 ref 1170 1171 1172 1173
+jobort                          004610 constant        label                    dcl 1030 ref 586 1053
+keep_it                         005365 constant        label                    dcl 1198 ref 1179 1180 1181 1188 1189
+label_card                      004767 constant        label                    dcl 1088 ref 458
+lib_att_err                     001511 constant        label                    dcl 219 ref 224
+lib_err                         001205 constant        label                    dcl 163 ref 182 221
+loop                            002621 constant        label                    dcl 422 ref 443 486 542 551 559 562 576 655 659 675
+                                                                                  679 683 687 691 695 702 706 710 714 718 722 726
+                                                                                  730 734 738 742 746 750 754 758 762 766 809 813
+                                                                                  826 832 839 843 847 851 855 859 863 900 904 998
+                                                                                  1002 1006 1010 1014 1018 1042 1052 1065 1083 1103
+                                                                                  1104 1105 1113
+no_snumb                        004560 constant        label                    dcl 1022 set ref 494
+nondl_write                     004702 constant        label                    dcl 1070 ref 1049
+nondollar                       004641 constant        label                    dcl 1041 ref 426 435 436
+normal_termination              005070 constant        label                    dcl 1118 ref 251
+pass1                           002543 constant        label                    dcl 387
+release_temp                    006024 constant        entry                    internal dcl 1247 ref 1119 1241
+restart                         000000 constant        label                    array(4) dcl 295 ref 293
+skip_version                    002537 constant        label                    dcl 382 ref 337 341 360
+start                           000644 constant        label                    dcl 69 ref 298
+unknown_card                    003046 constant        label                    dcl 480 set ref 1096 1097 1098
+
+NAME DECLARED BY CONTEXT OR IMPLICATION.
+unspec                                                 builtin function         set ref 70 256*
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0     10026       10476    6326       10036
+Length     11476    6326       450         763    1477          60
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+gcos_gein_                         1272 external procedure  is an external procedure.  
+on unit on line 76                   64 on unit               
+gein_cleanup                        113 internal procedure  is called by several nonquick procedures.  
+release_temp                         98 internal procedure  is called by several nonquick procedures.  
+
+STORAGE FOR INTERNAL STATIC VARIABLES.
+
+   LOC IDENTIFIER                  BLOCK NAME
+000010 cc_print_sw                 gcos_gein_
+000011 initialized                 gcos_gein_
+000012 execution_msg               gcos_gein_
+000036 vrsn_msg                    gcos_gein_
+000050 first_record                gcos_gein_
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+gcos_gein_               000100 bit_count                   gcos_gein_
+                         000101 card                        gcos_gein_
+                         000126 card_type                   gcos_gein_
+                         000136 dollar_card_count           gcos_gein_
+                         000137 dollar_sw                   gcos_gein_
+                         000140 ename                       gcos_gein_
+                         000150 err_msg                     gcos_gein_
+                         000216 fullname                    gcos_gein_
+                         000270 gcos_len                    gcos_gein_
+                         000272 gcos_ptr                    gcos_gein_
+                         000274 gptr                        gcos_gein_
+                         000276 i                           gcos_gein_
+                         000277 j                           gcos_gein_
+                         000300 k                           gcos_gein_
+                         000301 lib_count                   gcos_gein_
+                         000302 lib_path                    gcos_gein_
+                         000354 msg_var                     gcos_gein_
+                         000355 nondollar_cards_skipped     gcos_gein_
+                         000356 seg_type                    gcos_gein_
+                         000360 status                      gcos_gein_
+                         000362 sw                          gcos_gein_
+                         000363 type                        gcos_gein_
+                         000364 search_rules                gcos_gein_
+                         002150 obj_info                    gcos_gein_
+                         002236 fibptr                      gcos_gein_
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+alloc_cs            cat_realloc_cs      call_ext_out_desc   call_ext_out        call_int_this       call_int_other
+return              enable              shorten_stack       ext_entry           int_entry           clock
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+com_err_                      date_time_                    delete_$path                  execute_search_rules_
+execute_search_rules_$s_r_ptr expand_pathname_              gcos_cc_abort_                gcos_cc_activity_cards_
+gcos_cc_data_                 gcos_cc_directive_cards_$cc_bmc
+gcos_cc_directive_cards_$cc_dump                            gcos_cc_directive_cards_$cc_editor
+gcos_cc_directive_cards_$cc_ffile                           gcos_cc_directive_cards_$cc_sced
+gcos_cc_directive_cards_$cc_sysedit                         gcos_cc_directive_cards_$cc_utility
+gcos_cc_endjob_               gcos_cc_file_cards_$cc_dac    gcos_cc_file_cards_$cc_file   gcos_cc_file_cards_$cc_print
+gcos_cc_file_cards_$cc_prmfl  gcos_cc_file_cards_$cc_punch  gcos_cc_file_cards_$cc_read   gcos_cc_file_cards_$cc_sysout
+gcos_cc_file_cards_$cc_tape   gcos_cc_file_cards_$cc_tape7  gcos_cc_file_cards_$cc_tape9  gcos_cc_file_cards_$cc_type
+gcos_cc_goto_                 gcos_cc_goto_$cc_if           gcos_cc_goto_$cc_when         gcos_cc_ident_
+gcos_cc_incode_               gcos_cc_limits_               gcos_cc_loader_cards_
+gcos_cc_loader_cards_$cc_object                             gcos_cc_misc_cards_$cc_alter  gcos_cc_misc_cards_$cc_break
+gcos_cc_misc_cards_$cc_comment                              gcos_cc_misc_cards_$cc_endcopy
+gcos_cc_misc_cards_$cc_etc    gcos_cc_misc_cards_$cc_msg1   gcos_cc_misc_cards_$cc_msg2   gcos_cc_misc_cards_$cc_msg3
+gcos_cc_misc_cards_$cc_need   gcos_cc_misc_cards_$cc_userid gcos_cc_param_                gcos_cc_set_
+gcos_cc_snumb_                gcos_cc_update_               gcos_error_                   gcos_gein_pass1_
+gcos_ids2_concur_$deallocate  gcos_ids2_concur_$have_xid    gcos_open_file_               gcos_read_card_
+gcos_restart_                 gcos_restart_$save            gcos_run_activity_            gcos_write_$ascii_ptr
+gcos_write_$force_ptr         gcos_write_$ptr               gcos_write_$record            gcos_write_$record_ptr
+get_temp_segment_             hcs_$fs_get_path_name         hcs_$get_search_rules         hcs_$get_usage_values
+hcs_$initiate                 hcs_$make_seg                 hcs_$status_mins              hcs_$truncate_seg
+ioa_                          ioa_$nnl                      ioa_$rs                       ios_$attach
+ios_$detach                   ios_$setsize                  object_info_$display          release_temp_segment_
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$no_s_permission  error_table_$noentry          gcos$
+gcos_control_tables_$cardtable                              gcos_control_tables_$comp_offset
+gcos_control_tables_$exc_offset                             gcos_control_tables_$filecard_count
+gcos_control_tables_$nonact   gcos_control_tables_$tablelen gcos_et_$cc_bad_card          gcos_ext_stat_$abort_reason
+gcos_ext_stat_$activity_name  gcos_ext_stat_$card_num       gcos_ext_stat_$courtesy_call_control
+gcos_ext_stat_$default_nondollar                            gcos_ext_stat_$endfc          gcos_ext_stat_$er
+gcos_ext_stat_$etc_filecode   gcos_ext_stat_$fct            gcos_ext_stat_$gcos_slave_area_seg
+gcos_ext_stat_$gf             gcos_ext_stat_$incode         gcos_ext_stat_$job_cpu_time   gcos_ext_stat_$job_id
+gcos_ext_stat_$job_real_time  gcos_ext_stat_$max_mem        gcos_ext_stat_$nondollar      gcos_ext_stat_$normal_return
+gcos_ext_stat_$patchfile_ptr  gcos_ext_stat_$pch            gcos_ext_stat_$prt            gcos_ext_stat_$rs
+gcos_ext_stat_$save_data      gcos_ext_stat_$save_dir       gcos_ext_stat_$saveseg_ptr    gcos_ext_stat_$snumb
+gcos_ext_stat_$sought_label   gcos_ext_stat_$statistics     gcos_ext_stat_$temp_seg_ptr   sys_info$max_seg_size
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+   1281 000631      1379 000632         6 000635        69 000644        70 000645        72 000653        73 000670
+     74 000704        76 000721        79 000743        80 000746        81 000750        82 000752        85 000754
+     90 000756        93 000761        95 000771        97 001007        99 001011       101 001014       102 001021
+    104 001031       105 001037       106 001042       108 001043       111 001051       112 001053       113 001054
+    115 001056       117 001065       131 001123       144 001150       145 001152       146 001155       147 001160
+    148 001162       150 001163       152 001165       153 001167       156 001170       158 001176       160 001201
+    161 001202       163 001205       164 001206       171 001246       172 001252       173 001253       174 001257
+    179 001260       180 001262       181 001263       182 001266       187 001267       188 001326       189 001332
+    191 001361       192 001365       193 001367       194 001371       195 001375       196 001377       197 001400
+    199 001402       200 001405       209 001452       211 001453       218 001507       219 001511       220 001512
+    221 001515       223 001516       224 001542       226 001544       227 001545       229 001547       233 001550
+    238 001573       239 001577       244 001624       248 001625       249 001630       251 001634       252 001640
+    256 001647       259 001653       260 001656       262 001657       263 001662       269 001700       273 001713
+    274 001717       283 002005       291 002044       292 002051       293 002057       295 002061       297 002062
+    298 002066       302 002067       303 002070       305 002073       307 002075       317 002076       318 002103
+    319 002127       320 002134       321 002136       322 002137       325 002141       326 002164       335 002212
+    336 002215       337 002231       339 002233       340 002235       341 002254       342 002256       343 002275
+    348 002323       351 002353       353 002357       360 002407       361 002411       362 002417       363 002421
+    372 002466       374 002511       382 002537       385 002540       387 002543       388 002544       390 002550
+    393 002556       394 002561       395 002567       404 002574       405 002575       412 002620       422 002621
+    423 002622       424 002637       426 002641       431 002644       432 002645       434 002655       435 002660
+    436 002664       438 002700       442 002706       443 002710       446 002711       449 002716       454 002741
+    455 002742       456 002743       458 002763       461 002775       466 003004       468 003014       469 003016
+    470 003021       474 003022       475 003033       476 003044       480 003046       481 003047       486 003073
+    488 003074       494 003075       500 003104       502 003107       505 003116       509 003123       512 003124
+    517 003127       522 003131       531 003163       535 003211       542 003237       548 003240       551 003242
+    559 003243       562 003246       565 003250       574 003255       575 003262       576 003266       582 003271
+    583 003272       584 003275       586 003300       589 003302       592 003313       594 003317       595 003323
+    596 003331       597 003340       598 003347       615 003354       617 003360       620 003363       623 003367
+    627 003373       628 003374       632 003401       634 003402       638 003403       640 003415       641 003444
+    642 003447       650 003451       651 003452       653 003454       654 003455       655 003463       657 003464
+    658 003465       659 003473       661 003474       664 003475       667 003476       670 003477       673 003500
+    674 003501       675 003507       677 003510       678 003511       679 003517       681 003520       682 003521
+    683 003527       685 003530       686 003531       687 003537       689 003540       690 003541       691 003547
+    693 003550       694 003551       695 003557       697 003560       700 003561       701 003562       702 003570
+    704 003571       705 003572       706 003600       708 003601       709 003602       710 003610       712 003611
+    713 003612       714 003620       716 003621       717 003622       718 003630       720 003631       721 003632
+    722 003640       724 003641       725 003642       726 003650       728 003651       729 003652       730 003675
+    732 003676       733 003677       734 003705       736 003706       737 003707       738 003732       740 003733
+    741 003734       742 003742       744 003743       745 003744       746 003754       748 003755       749 003756
+    750 003764       752 003765       753 003766       754 003776       756 003777       757 004000       758 004006
+    760 004007       761 004010       762 004016       764 004017       765 004020       766 004026       768 004027
+    771 004030       774 004031       777 004032       780 004033       783 004034       786 004035       789 004036
+    792 004037       795 004040       798 004041       801 004042       804 004043       807 004044       808 004045
+    809 004070       811 004071       812 004072       813 004115       815 004116       818 004117       821 004120
+    824 004121       825 004122       826 004145       828 004146       830 004147       831 004150       832 004173
+    834 004174       837 004175       838 004176       839 004221       841 004222       842 004223       843 004231
+    845 004232       846 004233       847 004243       849 004244       850 004245       851 004270       853 004271
+    854 004272       855 004315       857 004316       858 004317       859 004325       861 004326       862 004327
+    863 004335       865 004336       868 004337       871 004340       874 004341       877 004342       880 004343
+    883 004344       886 004345       889 004346       892 004347       895 004350       898 004351       899 004352
+    900 004375       902 004376       903 004377       904 004422       906 004423       909 004424       912 004425
+    915 004426       918 004427       921 004430       924 004431       927 004432       930 004433       933 004434
+    936 004435       939 004436       942 004437       945 004440       948 004441       951 004442       954 004443
+    957 004444       960 004445       963 004446       966 004447       969 004450       972 004451       975 004452
+    978 004453       981 004454       984 004455       987 004456       990 004457       993 004460       996 004461
+    997 004462       998 004505      1000 004506      1001 004507      1002 004515      1004 004516      1005 004517
+   1006 004527      1008 004530      1009 004531      1010 004537      1012 004540      1013 004541      1014 004547
+   1016 004550      1017 004551      1018 004557      1022 004560      1023 004561      1030 004610      1031 004611
+   1041 004641      1042 004642      1045 004646      1049 004650      1052 004653      1053 004656      1058 004661
+   1061 004664      1063 004666      1064 004676      1065 004677      1068 004700      1070 004702      1071 004703
+   1077 004741      1083 004766      1088 004767      1091 004770      1093 005001      1095 005003      1096 005021
+   1097 005023      1098 005025      1103 005036      1104 005042      1105 005051      1110 005057      1111 005062
+   1113 005067      1118 005070      1119 005071      1120 005075      1128 005076      1129 005077      1130 005101
+   1131 005104      1132 005106      1137 005107      1138 005110      1139 005112      1140 005115      1141 005117
+   1145 005120      1146 005121      1147 005123      1148 005126      1149 005130      1153 005131      1154 005132
+   1155 005134      1156 005137      1158 005140      1161 005147      1162 005153      1163 005157      1164 005161
+   1165 005200      1167 005201      1168 005207      1169 005216      1170 005223      1171 005226      1172 005231
+   1173 005234      1174 005237      1179 005262      1180 005267      1181 005272      1182 005275      1188 005321
+   1189 005324      1190 005330      1198 005365      1201 005366      1208 005462      1209 005466      1210 005475
+   1211 005476      1213 005500      1214 005501      1215 005503      1216 005531      1217 005560      1220 005611
+   1227 005677      1234 005766      1240 006010      1241 006015      1243 006022      1247 006023      1249 006031
+   1254 006054      1261 006111
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

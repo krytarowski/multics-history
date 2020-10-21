@@ -1,0 +1,1677 @@
+	COMPILATION LISTING OF SEGMENT load_mpc
+	Compiled by: Multics PL/I Compiler, Release 30, of February 16, 1988
+	Compiled at: Honeywell Bull, Phoenix AZ, SysM
+	Compiled on: 03/08/88  0935.7 mst Tue
+	    Options: optimize map
+
+        1 /****^  ***********************************************************
+        2*        *                                                         *
+        3*        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        4*        *                                                         *
+        5*        * Copyright (c) 1972 by Massachusetts Institute of        *
+        6*        * Technology and Honeywell Information Systems, Inc.      *
+        7*        *                                                         *
+        8*        *********************************************************** */
+        9 
+       10 /* format: style4,indattr */
+       11 
+       12 load_mpc: proc;
+       13 
+       14 /* LOAD_MPC - A command to load firmware into an MPC */
+       15 
+       16 /* Written in 1975 by Larry Johnson */
+       17 /* Installed as a tool in February 1980 */
+       18 /* Modified May 1982 by Rich Coppola to add support of the EURC */
+       19 /* Modified Sept 1982 by Rich Coppola to dc reset the EURC before running
+       20*   self-test. */
+       21 /* Modified June 1984 by Paul Farley to add calls to phcs_$ring_0_message
+       22*   for informing the operator(and syserr log) that a MPC's state is changing.
+       23*   This will include Suspending IO, Running tests, Loading firmware(and what
+       24*   revision) and Resuming IO(or leaving IO suspended if error occurred).
+       25*   This means the user will now be required to also have phcs_ access.
+       26*   Changed the "special" code in run_dcw to allow for multiple specials,
+       27*   where the ones after the first will be discarded and to allow for the
+       28*   special to be before the terminate or visa-versa...
+       29*   Also added code to allow for a 10 second retry period for power off faults.
+       30*   Modified June 1985 by Paul Farley to extend POF retry to 20 seconds.
+       31**/
+       32 
+       33 /****^  HISTORY COMMENTS:
+       34*  1) change(85-09-09,Farley), approve(85-09-09,MCR6979),
+       35*     audit(86-02-11,Coppola), install(86-03-21,MR12.0-1033):
+       36*     Support IMU.
+       37*  2) change(86-01-23,Farley), approve(86-03-03,MCR7360),
+       38*     audit(86-07-11,Coppola), install(86-08-18,MR12.0-1096):
+       39*     Changed to check DAU after firmware load to see if really operational. DAU
+       40*     continues to do initialization after good FW load terminate, so OPI may
+       41*     not be up yet.
+       42*  3) change(86-08-14,Farley), approve(86-10-24,MCR7529),
+       43*     audit(86-10-28,Fawcett), install(86-10-28,MR12.0-1200):
+       44*     Extended post firmware load status test to ALL DISK MPCs, as it has been
+       45*     found that they all have the timing window, but very small.
+       46*     
+       47*     Added one second pause time between ITR test pages, to give the IMU and
+       48*     MPC time to bring OPI back up.
+       49*  4) change(86-10-24,Farley), approve(86-10-24,MCR7545),
+       50*     audit(86-10-28,Fawcett), install(86-10-28,MR12.0-1200):
+       51*     Add a call to dc_reset after sucessfully running ITRs. The ITRs now leave
+       52*     the MPC in a state where firmware does not operate properly after being
+       53*     loaded unless the dc_reset is done.
+       54*                                                   END HISTORY COMMENTS */
+       55 
+       56 /* Automatic storage */
+       57 
+       58 dcl  code		        fixed bin (35);		/* Standard system status code */
+       59 dcl  arg_cnt	        fixed bin;			/* Count of command arguments */
+       60 dcl  i		        fixed bin;			/* Indexes for loops */
+       61 dcl  phcs_access	        fixed bin (5);		/* current access to phcs_ */
+       62 dcl  execute	        bit (5) init ("00100"b);	/* mask for checking for execute permission */
+       63 dcl  arg_ptr	        ptr;			/* Pointer to a command argument */
+       64 dcl  arg_len	        fixed bin;			/* Length of that argument */
+       65 dcl  arg		        char (arg_len) based (arg_ptr); /* The argument */
+       66 dcl  firm_sw	        bit (1) init ("1"b);		/* "1"b if firmware is to be reloaded */
+       67 dcl  itr_sw	        bit (1) init ("1"b);		/* "1"b if itrs are to be run */
+       68 dcl  eurc_data_error        bit (1) init ("0"b);		/* "1"b if an error is detected in self-test data xfer */
+       69 dcl  pcw_words	        bit (72) aligned;		/* This is a pcw */
+       70 dcl  err_msg	        char (20) var init ("terminate"); /* For building error messages */
+       71 dcl  msg_sw	        bit (1) init ("1"b);		/* This is reset if -brief is used */
+       72 dcl  timer_sw	        bit (1) init ("0"b);		/* This is set if -time is requested */
+       73 dcl  eurc_sw	        bit (1) init ("0"b);		/* MPC is an EURC */
+       74 dcl  (start_time, end_time) fixed bin (52);		/* For measuring elapsed time */
+       75 dcl  elapsed_time	        fixed bin (35);		/* End_time-start_time */
+       76 dcl  stopped_io	        bit (1) init ("0"b);		/* This is set if I have suspended io */
+       77 dcl  mpc_dead	        bit (1) init ("0"b);		/* Set while mpc has no firmware loaded */
+       78 dcl  io_begun	        bit (1) init ("0"b);		/* Set when i/o started on mpc */
+       79 dcl  buf_ptr	        ptr;			/* Pointer to workspace */
+       80 dcl  fw_revision	        char (2);			/* Firmware revision */
+       81 dcl  timer_channel	        fixed bin (71) init (-1);	/* Channel for timing operations */
+       82 dcl  eurc_test	        char (14) init ("EURC Self-test");
+       83 dcl  TEST_NAME	        char (32) var init ("");
+       84 dcl  1 wait_list,					/* List of events to wait for */
+       85        2 nchan	        fixed bin,			/* 1 to wait for i/o event, 2 to wait for i/o or timer */
+       86        2 channel_id	        (2) fixed bin (71);		/* This is the list */
+       87 dcl  special_status_flag    bit (1) aligned;		/* "1"b syas special status valid */
+       88 dcl  special_status_word    bit (36) aligned;		/* a place to put special status */
+       89 dcl  ioi_io_tm	        fixed bin (71);		/* time of IOI connect */
+       90 dcl  RETRY_IO_LABEL	        label variable;		/* used to restart the I/O */
+       91 dcl  seconds_from_last_io   fixed bin;
+       92 
+       93 
+       94 dcl  1 auto_attach_mpc_data like attach_mpc_data aligned automatic;
+       95 dcl  1 auto_event_wait_info aligned like event_wait_info automatic;
+       96 
+       97 /* Based */
+       98 
+       99 dcl  1 buf	        aligned based (buf_ptr),	/* The ioi workspace */
+      100        2 idcw	        bit (36),
+      101        2 dcw	        (2) bit (36),
+      102        2 port_mask	        bit (36),			/* Urmpc port mask for device firmware */
+      103        2 data	        (8192) bit (36);		/* Most that can be loaded with 2 DCW's */
+      104 
+      105 dcl  1 eurc_buf	        aligned based (buf_ptr),	/* The IOI buffer segment */
+      106        2 idcw1	        bit (36),			/* will be execute self-test */
+      107        2 dcw1	        bit (36),			/* Addr = control.dummy_data */
+      108        2 idcw2	        bit (36),			/* initiate data xfer idcw */
+      109        2 dcw2	        bit (36),			/* Addr = control.eurc_self_test_data */
+      110        2 control,
+      111          3 dummy_data       (2) bit (36),
+      112          3 eurc_self_test_data (40) bit (36);		/* Only need twenty words, but leave some room for a crazy EURC */
+      113 
+      114 dcl  eurc_test_data	        (6) bit (36) based (eurc_test_datap) aligned;
+      115 dcl  eurc_test_datap        ptr;
+      116 
+      117 
+      118 /* Static data */
+      119 
+      120 dcl  MAX_TIMEOUT	        fixed bin internal static options (constant) init (20);
+      121 						/* Maximum length of time in seconds to wait for IO completion */
+      122 dcl  ONE_SECOND	        fixed bin (71) internal static options (constant) init (1);
+      123 dcl  TWO_SECOND	        fixed bin (71) internal static options (constant) init (2);
+      124 dcl  eurc_check_data        (6) bit (36) internal static options (constant) init
+      125 		        ("252525252525"b3,
+      126 		        "525252525252"b3,
+      127 		        "252525252525"b3,
+      128 		        "525252525252"b3,
+      129 		        "525252525252"b3,
+      130 		        "252525252525"b3);
+      131 dcl  name		        char (8) internal static options (constant) init ("load_mpc"); /* Name of this program */
+      132 
+      133 /* Entry constants and externals */
+      134 
+      135 dcl  attach_mpc_	        entry (ptr, fixed bin (35));
+      136 dcl  cu_$arg_ptr	        entry (fixed bin, ptr, fixed bin, fixed bin (35));
+      137 dcl  cu_$arg_count	        entry (fixed bin);
+      138 dcl  com_err_	        entry options (variable);
+      139 dcl  convert_ipc_code_      entry (fixed bin (35));
+      140 dcl  detach_mpc_	        entry (ptr, fixed bin (35));
+      141 dcl  hcs_$get_user_effmode  entry (char (*), char (*), char (*), fixed bin, fixed bin (5), fixed bin (35));
+      142 dcl  ioa_		        entry options (variable);
+      143 dcl  ioi_$connect	        entry (fixed bin, fixed bin, fixed bin (35));
+      144 dcl  ioi_$connect_pcw       entry (fixed bin, fixed bin, bit (36) aligned, fixed bin (35));
+      145 dcl  ioi_$workspace	        entry (fixed bin, ptr, fixed bin (18), fixed bin (35));
+      146 dcl  ioi_$release_devices   entry (fixed bin, fixed bin (35));
+      147 dcl  ioi_$suspend_devices   entry (fixed bin, fixed bin (35));
+      148 dcl  ioi_$get_special_status entry (fixed bin, bit (1) aligned, bit (36) aligned, fixed bin (35));
+      149 dcl  ipc_$block	        entry (ptr, ptr, fixed bin (35));
+      150 dcl  ipc_$create_ev_chn     entry (fixed bin (71), fixed bin (35));
+      151 dcl  ipc_$delete_ev_chn     entry (fixed bin (71), fixed bin (35));
+      152 dcl  ipc_$drain_chn	        entry (fixed bin (71), fixed bin (35));
+      153 dcl  load_mpc_fw_info_      entry (ptr, char (*), bit (1), bit (1), ptr, fixed bin (35));
+      154 dcl  parse_io_channel_name_ entry (char (*), fixed bin (3), fixed bin (6), fixed bin (35));
+      155 dcl  release_temp_segment_  entry (char (*), pointer, fixed bin (35));
+      156 dcl  timer_manager_$alarm_wakeup entry (fixed bin (71), bit (2), fixed bin (71));
+      157 dcl  timer_manager_$reset_alarm_wakeup entry (fixed bin (71));
+      158 
+      159 dcl  error_table_$noarg     fixed bin (35) ext static;
+      160 dcl  error_table_$request_not_recognized fixed bin (35) ext static;
+      161 dcl  error_table_$badopt    fixed bin (35) ext static;
+      162 dcl  error_table_$noentry   fixed bin (35) ext static;
+      163 
+      164 dcl  (addr, addrel, bin, bit, clock, float, hbound, min, null, rel, rtrim, size, string, substr, unspec, divide) builtin;
+      165 
+      166 dcl  cleanup	        condition;
+      167 
+      168 /* Some initialization first */
+      169 
+      170 	call cu_$arg_count (arg_cnt);			/* This is a useful number */
+      171 	if arg_cnt = 0 then do;
+      172 	     call com_err_ (0, name, "Usage: ^a mpc_name {-chn -itr -firm -bf -time}", name);
+      173 	     return;
+      174 	end;
+      175 
+      176 	attach_mpc_datap = addr (auto_attach_mpc_data);
+      177 	unspec (attach_mpc_data) = "0"b;
+      178 	attach_mpc_data.version = attach_mpc_data_version_1;
+      179 	attach_mpc_data.mpc_name = "";
+      180 	attach_mpc_data.caller_name = name;
+      181 	attach_mpc_data.bootload_channel = "1"b;	/* We always need a bootable channel! */
+      182 	fw_revision = "";
+      183 
+      184 	event_wait_info_ptr = addr (auto_event_wait_info);
+      185 	imp = addr (event_wait_info.message);
+      186 	statp = addr (imess.status);
+      187 	io_special_status_ptr = addr (special_status_word);
+      188 	fwlistp = null ();
+      189 
+      190 	on cleanup call clean_up;			/* Setup cleanup handler */
+      191 
+      192 /* Scan arguments */
+      193 
+      194 	do i = 1 to arg_cnt;			/* Scan remaining arguments */
+      195 	     call cu_$arg_ptr (i, arg_ptr, arg_len, code);
+      196 	     if code ^= 0 then go to err_1;		/* This can't happen */
+      197 	     if substr (arg, 1, 1) ^= "-" then do;	/* If not a control argument */
+      198 		if attach_mpc_data.mpc_name = "" then attach_mpc_data.mpc_name = arg;
+      199 		else do;
+      200 req_err:		     call com_err_ (error_table_$request_not_recognized, name, "^a", arg);
+      201 		     go to exit;
+      202 		end;
+      203 	     end;
+      204 	     else if arg = "-channel" | arg = "-chn" then do;
+      205 		i = i + 1;
+      206 		call cu_$arg_ptr (i, arg_ptr, arg_len, code);
+      207 		if code ^= 0 then do;
+      208 		     call com_err_ (code, name, "After -channel");
+      209 		     go to exit;
+      210 		end;
+      211 		call parse_io_channel_name_ (arg, attach_mpc_data.iom, attach_mpc_data.channel, code);
+      212 		if code ^= 0 then do;
+      213 		     call com_err_ (code, name, "^a", arg);
+      214 		     go to exit;
+      215 		end;
+      216 		attach_mpc_data.channel_required = "1"b;
+      217 	     end;
+      218 	     else if arg = "-itr" then firm_sw = "0"b;	/* -itr means don't load firmware */
+      219 	     else if arg = "-firm" then itr_sw = "0"b;	/* -firm means don't run itrs */
+      220 	     else if arg = "-brief" | arg = "-bf" then msg_sw = "0"b; /* Quiet mode */
+      221 	     else if arg = "-time" then timer_sw = "1"b;
+      222 	     else if arg = "-revision" | arg = "-rv" | arg = "-rev" then do; /* Firmware revision */
+      223 		i = i + 1;
+      224 		call cu_$arg_ptr (i, arg_ptr, arg_len, code);
+      225 		if code ^= 0 then do;
+      226 		     call com_err_ (code, name, "After -revision");
+      227 		     go to exit;
+      228 		end;
+      229 		fw_revision = arg;
+      230 	     end;
+      231 	     else do;				/* Ran out of cases  */
+      232 		call com_err_ (error_table_$badopt, name, "^a", arg);
+      233 		go to exit;
+      234 	     end;
+      235 	end;
+      236 
+      237 	if attach_mpc_data.mpc_name = "" & ^attach_mpc_data.channel_required then do;
+      238 	     call com_err_ (error_table_$noarg, name, "MPC name or channel ");
+      239 	     go to exit;
+      240 	end;
+      241 
+      242 	if ^(itr_sw | firm_sw) then itr_sw, firm_sw = "1"b; /* If -firm and -itr specified */
+      243 
+      244 /* Check callers access to phcs_ for sending messages to the console
+      245*   and syserr log. */
+      246 
+      247 	call hcs_$get_user_effmode (">system_library_1", "phcs_", "", -1, phcs_access, code);
+      248 
+      249 	if code ^= 0 then do;
+      250 	     call com_err_ (code, name, "Cannot get effective access to >sl1>phcs_.");
+      251 	     goto exit;
+      252 	end;
+      253 
+      254 	if bit (phcs_access) & execute
+      255 	then ;
+      256 	else do;
+      257 	     call com_err_ (code, name, "Improper access to >sl1>phcs_ gate.");
+      258 	     goto exit;
+      259 	end;
+      260 
+      261 /* Initialize event channels */
+      262 
+      263 	call ipc_$create_ev_chn (timer_channel, code);	/* Get timer channel */
+      264 	if code ^= 0 then go to err_3;
+      265 	wait_list.channel_id (2) = timer_channel;
+      266 
+      267 	attach_mpc_data.report = "1"b;
+      268 	attach_mpc_data.channel_required = "1"b;	/* If not previously set, do it NOW! */
+      269 
+      270 	call attach_mpc_ (attach_mpc_datap, code);
+      271 	if code ^= 0 then go to exit;
+      272 	wait_list.channel_id (1) = attach_mpc_data.ioi_channel;
+      273 
+      274 	eurc_sw = "0"b;
+      275 	if attach_mpc_data.type = "urp" then
+      276 	     do i = 1 to hbound (eurc_model_numbers, 1) while (eurc_sw = "0"b);
+      277 
+      278 	     if attach_mpc_data.model = eurc_model_numbers (i) then
+      279 		eurc_sw = "1"b;
+      280 	end;
+      281 
+      282 	if eurc_sw then do;				/* perform basic option checks for EURC */
+      283 	     if (firm_sw & ^itr_sw) then do;
+      284 		call com_err_ (error_table_$badopt, name, "Cannot load FW in EURC.");
+      285 		go to exit;
+      286 	     end;
+      287 	end;
+      288 
+      289 /* Figure out firmware requirements for this mpc */
+      290 	if ^eurc_sw then do;
+      291 	     call load_mpc_fw_info_ (attach_mpc_data.mpc_cardp, fw_revision, itr_sw, firm_sw, fwlistp, code);
+      292 	     if code ^= 0 then go to exit;
+      293 	end;
+      294 
+      295 /* Perform workspace initialization */
+      296 
+      297 	call ioi_$workspace (attach_mpc_data.ioi_index, buf_ptr, size (buf), code); /* Assign work area */
+      298 	if code ^= 0 then do;
+      299 	     call com_err_ (code, name, "Unable to set workspace size to ^d words.", size (buf));
+      300 	     go to exit;
+      301 	end;
+      302 
+      303 /* First, suspend all io and do a do a dc reset of the mpc */
+      304 
+      305 	call ioi_$suspend_devices (attach_mpc_data.ioi_index, code); /* This waits for all i/o to finish */
+      306 	if code ^= 0 then do;
+      307 	     call com_err_ (code, name, "Unable to suspend I/O on ^a.", attach_mpc_data.mpc_name);
+      308 	     go to exit;
+      309 	end;
+      310 
+      311 	stopped_io = "1"b;				/* Remember that I did this */
+      312 
+      313 	call opr_notify ("Suspended I/O");		/* notify/log */
+      314 
+      315 	call dc_reset;				/* Using this routine */
+      316 
+      317 	if eurc_sw then do;
+      318 	     firm_sw = "0"b;
+      319 	     TEST_NAME = eurc_test;
+      320 	     call make_eurc_dcw;
+      321 	     if msg_sw then call ioa_ ("^a: Executing EURC self-test.", name);
+      322 	     call opr_notify ("Executing EURC self-test");/* notify/log */
+      323 	     call run_dcw ("0"b);
+      324 						/* If we come back here all went well */
+      325 						/* Now verify the self-test data */
+      326 	     eurc_data_error = "0"b;
+      327 	     eurc_test_datap = addr (eurc_self_test_data (15));
+      328 	     if unspec (eurc_test_data) ^= unspec (eurc_check_data) then
+      329 		do i = 1 to 6;
+      330 		if eurc_test_data (i) ^= eurc_check_data (i) then do;
+      331 		     call com_err_ (0, name, "Data from EURC is incorrect:,^/data was:^-^w^/should be:^-^w",
+      332 			eurc_test_data (i), eurc_check_data (i));
+      333 		     eurc_data_error = "1"b;
+      334 		end;
+      335 	     end;
+      336 	     if ^eurc_data_error then mpc_dead = "0"b;
+      337 	     go to exit;
+      338 	end;
+      339 
+      340 	if itr_sw then do;
+      341 	     call run_itrs;				/* Run itr's */
+      342 	     call dc_reset;				/* itr's ran, reset mpc */
+      343 	end;
+      344 
+      345 	if firm_sw then call load_firmware;		/* Load firmware */
+      346 
+      347 	if substr (attach_mpc_data.mpc_name, 1, 3) = "msp" & ^mpc_dead then do;
+      348 						/* See if DISK MPC really ready */
+      349 	     mpc_dead = "1"b;			/* mark as dead until IO is complete */
+      350 	     call make_dcw ("00"b3, "02"b3, 0);		/* request-status */
+      351 	     call run_dcw ("0"b);			/* execute */
+      352 	     mpc_dead = "0"b;			/* MPC is OK */
+      353 	end;
+      354 
+      355 exit:	call clean_up;
+      356 
+      357 
+      358 	if io_begun & ^mpc_dead & ^msg_sw then		/* Print msg if brief mode and all worked ok */
+      359 	     call ioa_ ("^a: Completed run of ^a.", name, attach_mpc_data.mpc_name);
+      360 
+      361 	return;					/* Command is done */
+      362 
+      363 /* Run all its's */
+      364 
+      365 run_itrs: proc;
+      366 
+      367 dcl  i		        fixed bin;
+      368 dcl  opr_not_notified       bit (1) init ("1"b);
+      369 
+      370 	do i = 1 to fwlist.n;
+      371 	     fwep = addr (fwlist.entry (i));
+      372 	     if fwe.type = FWE_TYPE_ITR then do;
+      373 		unspec (buf.data) = unspec (control_store_overlay);
+      374 		call make_dcw ("10"b3, "00"b3, fwe.cs_len); /* Build dcw list */
+      375 		if msg_sw then call ioa_ ("^a: Running ^a.", name, fwe.name);
+      376 		if opr_not_notified then do;
+      377 		     call opr_notify ("Executing ITRs");/* notify/log */
+      378 		     opr_not_notified = "0"b;
+      379 		end;
+      380 		TEST_NAME = fwe.name;
+      381 		call run_dcw ("1"b);		/* Run it */
+      382 		call pause (ONE_SECOND);
+      383 	     end;
+      384 	end;
+      385 
+      386 	return;
+      387 
+      388      end run_itrs;
+      389 
+      390 /* Procedure to restore the standard firmware to an mpc */
+      391 
+      392 load_firmware: proc;
+      393 
+      394 dcl  (cs_ok, rw_ok, df_ok)  bit (1) init ("0"b);		/* These bits are set as firmware components restored */
+      395 dcl  fwx		        fixed bin;
+      396 
+      397 	do fwx = 1 to fwlist.n;
+      398 	     fwep = addr (fwlist.entry (fwx));
+      399 	     if fwe.type = FWE_TYPE_FW then go to got_firmware;
+      400 	end;
+      401 	call com_err_ (error_table_$noentry, name, "Firmware for ^a got lost somewhere.", attach_mpc_data.mpc_name);
+      402 	go to exit;				/* Sorry */
+      403 
+      404 got_firmware:
+      405 	call opr_notify ("Loading firmware, revision " || fw_revision); /* notify/log */
+      406 	unspec (buf.data) = unspec (control_store_overlay);
+      407 	call make_dcw ("10"b3, "00"b3, fwe.cs_len);	/* Build dcw list */
+      408 	if msg_sw then call ioa_ ("^a: Loading ^a control store.", name, fwe.name);
+      409 	TEST_NAME = fwe.name;
+      410 	call run_dcw ("0"b);			/* Run it */
+      411 	cs_ok = "1"b;				/* Control store overlay restored */
+      412 
+      413 	unspec (buf.data) = unspec (read_write_overlay);
+      414 	call make_dcw ("11"b3, "00"b3, fwe.rw_len);	/* Build dcw list */
+      415 	if msg_sw then call ioa_ ("^a: Loading ^a read/write.", name, fwe.name);
+      416 	TEST_NAME = fwe.name;
+      417 	call run_dcw ("0"b);			/* Run it */
+      418 	rw_ok = "1"b;				/* Read write overlay restored */
+      419 	if attach_mpc_data.type = "urp" then call dev_firm (df_ok); /* Reload device firmware */
+      420 	else df_ok = "1"b;				/* If none, just set the flag */
+      421 
+      422 	mpc_dead = ^(rw_ok & cs_ok & df_ok);		/* If all restored, mpc not dead any more */
+      423 
+      424 	return;
+      425 
+      426      end load_firmware;
+      427 
+      428 /* Procedure to load special device firmware for urmpc */
+      429 
+      430 dev_firm: proc (load_ok);
+      431 
+      432 dcl  load_ok	        bit (1);			/* This is "1"b if this routine suceeds */
+      433 
+      434 dcl  i		        fixed bin;
+      435 
+      436 	load_ok = "1"b;				/* Assume this routine will work */
+      437 
+      438 	do i = 1 to fwlist.n;
+      439 	     fwep = addr (fwlist.entry (i));
+      440 	     if fwe.type = FWE_TYPE_DEV & fwe.port_mask ^= "0"b then do;
+      441 		unspec (buf.data) = unspec (control_store_overlay);
+      442 		buf.port_mask = "0"b;
+      443 		substr (buf.port_mask, 2, 8) = fwe.port_mask;
+      444 		call make_mask_dcw ("36"b3, "00"b3, fwe.cs_len);
+      445 		idcwp = addr (buf.idcw);		/* Point at idcw */
+      446 		idcw.device = "01"b3;		/* This is addressed to device 1 */
+      447 		idcw.chan_cmd = "40"b3;
+      448 		if msg_sw then call ioa_ ("^a: Loading ^a; ports: ^b", name,
+      449 			fwe.name, fwe.port_mask);
+      450 		TEST_NAME = fwe.name;
+      451 		call run_dcw ("0"b);		/* Run it */
+      452 	     end;
+      453 	end;
+      454 
+      455 	return;
+      456 
+      457      end dev_firm;
+      458 
+      459 /* Procedure to build pcw and dcw list to load firmware */
+      460 
+      461 make_dcw: proc (op_code, channel_cmd, data_len);
+      462 
+      463 dcl  op_code	        bit (6);			/* The device command to use */
+      464 dcl  channel_cmd	        bit (6);			/* The channel cmd to use */
+      465 dcl  data_len	        fixed bin;			/* The length of the data */
+      466 dcl  tally_len	        fixed bin;			/* The length of the data in the current DCW */
+      467 dcl  data_loc	        fixed bin (18) uns;		/* Location of data */
+      468 dcl  len		        fixed bin;
+      469 
+      470 	len = data_len;
+      471 	data_loc = bin (rel (addr (buf.data)));
+      472 
+      473 join:	idcwp = addr (buf.idcw);			/* IDCW is built in first word of buffer */
+      474 	string (idcw) = "0"b;			/* Reset it */
+      475 	idcw.command = op_code;			/* Copy in opcode */
+      476 	idcw.chan_cmd = channel_cmd;
+      477 	idcw.code = "111"b;				/* This must be set to make an IDCW */
+      478 
+      479 	dcwp = addr (buf.dcw);			/* An IOTD will be built here */
+      480 	string (dcw) = "0"b;
+      481 	do while (len > 0);
+      482 	     string (dcw) = "0"b;			/* Reset it first */
+      483 	     dcw.address = bit (data_loc, 18);
+      484 	     tally_len = min (len, 4096);
+      485 	     len = len - tally_len;
+      486 	     data_loc = data_loc + tally_len;
+      487 	     if tally_len = 4096 then tally_len = 0;
+      488 	     dcw.tally = bit (bin (tally_len, 12), 12);
+      489 	     dcw.type = "01"b;
+      490 	     if len > 0 then dcwp = addrel (dcwp, 1);
+      491 	end;
+      492 	dcw.type = "00"b;
+      493 
+      494 	return;
+      495 
+      496 make_eurc_dcw: entry;
+      497 
+      498 /* Build dcw list to initiate EURC self-test */
+      499 
+      500 	idcwp = addr (eurc_buf.idcw1);		/* First IDCW */
+      501 	eurc_buf.idcw1 = "0"b;
+      502 	idcw.command = "31"b3;			/* Command is Set Diagnostic Mode */
+      503 	idcw.code = "111"b;				/* This makes it an IDCW */
+      504 	idcw.control = "10"b;			/* Set continue bit */
+      505 	idcw.chan_cmd = "40"b3;			/* Indicate special controller command */
+      506 	idcw.count = "22"b3;			/* Run self-test */
+      507 	dcwp = addr (eurc_buf.dcw1);
+      508 	eurc_buf.dcw1 = "0"b;
+      509 	dcw.address = rel (addr (eurc_buf.control));	/* Get offset to control word */
+      510 	dcw.tally = "000000000010"b;
+      511 	idcwp = addr (eurc_buf.idcw2);		/* Set up Second IDCW */
+      512 	eurc_buf.idcw2 = "0"b;
+      513 	idcw.command = "06"b3;			/* Initiate read data xfer */
+      514 	idcw.code = "111"b;				/* This makes it an IDCW */
+      515 	idcw.chan_cmd = "40"b3;			/* Special controller command */
+      516 	dcwp = addr (eurc_buf.dcw2);
+      517 	eurc_buf.dcw2 = "0"b;
+      518 	dcw.address = rel (addr (eurc_buf.eurc_self_test_data));
+      519 	dcw.tally = "0024"b3;			/* need 20 words */
+      520 
+      521 /* Now fill in the data for the EURC */
+      522 
+      523 	unspec (eurc_buf.control) = "0"b;
+      524 						/* zero it out first */
+      525 						/* This is the TO EURC data, checked by the EURC */
+      526 
+      527 	eurc_buf.eurc_self_test_data (2) = "777777777777"b3;
+      528 	eurc_buf.eurc_self_test_data (3) = "525252525252"b3;
+      529 	eurc_buf.eurc_self_test_data (4) = "252525252525"b3;
+      530 	eurc_buf.eurc_self_test_data (5) = "252525252525"b3;
+      531 	eurc_buf.eurc_self_test_data (6) = "525252525252"b3;
+      532 	eurc_buf.eurc_self_test_data (7) = "525252525252"b3;
+      533 	eurc_buf.eurc_self_test_data (8) = "252525252525"b3;
+      534 	eurc_buf.eurc_self_test_data (9) = "400400400400"b3;
+      535 	eurc_buf.eurc_self_test_data (10) = "377377377377"b3;
+      536 	eurc_buf.eurc_self_test_data (11) = "125125125125"b3;
+      537 	eurc_buf.eurc_self_test_data (12) = "252252252252"b3;
+      538 	eurc_buf.eurc_self_test_data (13) = "017017017017"b3;
+      539 	eurc_buf.eurc_self_test_data (14) = "360360360360"b3;
+      540 
+      541 /* The next 6 words in the buffer will contain data FROM the EURC, they are already zeroed out */
+      542 
+      543 	return;
+      544 
+      545 
+      546 make_mask_dcw: entry (op_code, channel_cmd, data_len);	/* Include port mask */
+      547 
+      548 	len = data_len + 1;
+      549 	data_loc = bin (rel (addr (buf.port_mask)));
+      550 	go to join;
+      551 
+      552      end make_dcw;
+      553 
+      554 /* Procedure to run a dcw list and check status */
+      555 
+      556 run_dcw: proc (spec_sw);
+      557 
+      558 dcl  spec_sw	        bit (1);			/* Set if a special interrupt is expected */
+      559 
+      560 	RETRY_IO_LABEL = start_io;			/* used to retry POFs */
+      561 	ioi_io_tm = clock ();			/* setup new time for POF retry */
+      562 start_io: call ipc_$drain_chn (attach_mpc_data.ioi_channel, code); /* Be sure no events  */
+      563 	if code ^= 0 then go to err_3;
+      564 	call ioi_$connect (attach_mpc_data.ioi_index, 0, code); /* Attempt the connect */
+      565 	if code ^= 0 then go to err_1;		/* If it failed, give up */
+      566 	if timer_sw then start_time = clock ();		/* Record start time */
+      567 	wait_list.nchan = 1;			/* Only waiting on 1 channel, for i/o */
+      568 run_block: call ipc_$block (addr (wait_list), event_wait_info_ptr, code); /* Now wait for something to happen */
+      569 	if code ^= 0 then go to err_3;
+      570 	if timer_sw then end_time = clock ();
+      571 
+      572 
+      573 /* See what did happen and act accoridingly */
+      574 
+      575 	if imess.time_out then do;			/* If termination because of time out */
+      576 time_err:	     call com_err_ (0, name, "Timeout running ^a while waiting for ^a",
+      577 		TEST_NAME, err_msg);
+      578 	     go to exit;
+      579 	end;
+      580 
+      581 /* If special status expected when running ITRs, we get a terminate and then a special */
+      582 /* ** BUT ** we could get several of the same specials(over different channels)
+      583*   and the order of special/terminate may be different... */
+      584 
+      585 	if spec_sw then do;
+      586 	     if imess.level = "3"b3 then do;		/* this must be from the command */
+      587 		err_msg = "terminate";
+      588 		call check_status;			/* verify good status */
+      589 
+      590 		err_msg = "special";		/* Special interupt expected now */
+      591 		call timer_manager_$reset_alarm_wakeup (timer_channel); /* Remove outstanding alarm */
+      592 		call ipc_$drain_chn (timer_channel, code); /* Reset timer channel */
+      593 		if code ^= 0 then go to err_3;
+      594 		call timer_manager_$alarm_wakeup (60, "11"b, timer_channel); /* Set 60 second timer */
+      595 		wait_list.nchan = 2;		/* Waiting for i/o or timer event now */
+      596 		call ipc_$block (addr (wait_list), event_wait_info_ptr, code); /* Wait for something to happen */
+      597 		if code ^= 0 then go to err_3;
+      598 		if timer_sw then end_time = clock ();	/* Record end time */
+      599 		if event_wait_info.channel_id = timer_channel then go to time_err; /* If time out */
+      600 		if imess.level ^= "7"b3 then go to wrong_stat;
+      601 						/* check status */
+      602 		call ioi_$get_special_status (attach_mpc_data.ioi_index,
+      603 		     special_status_flag, special_status_word, code);
+      604 		if code ^= 0 then do;
+      605 		     call com_err_ (code, name, "Atempting to get special status word.");
+      606 		     go to exit;
+      607 		end;
+      608 		if ^(special_status_flag | io_special_status.t) then do;
+      609 		     call com_err_ (0, name, "No special status recieved.");
+      610 		     go to exit;
+      611 		end;
+      612 		if substr (special_status_word, 25, 1) = "0"b then do;
+      613 						/* ITR had an error */
+      614 		     call ioa_ ("^a: ^a Failed.", name, fwe.name);
+      615 		     go to exit;
+      616 		end;
+      617 		return;
+      618 
+      619 	     end;
+      620 	     else if imess.level = "7"b3 then do;	/* ITR complete */
+      621 		err_msg = "special";
+      622 						/* check status */
+      623 		call ioi_$get_special_status (attach_mpc_data.ioi_index,
+      624 		     special_status_flag, special_status_word, code);
+      625 		if code ^= 0 then do;
+      626 		     call com_err_ (code, name, "Atempting to get special status word.");
+      627 		     go to exit;
+      628 		end;
+      629 		if ^(special_status_flag | io_special_status.t) then do;
+      630 		     call com_err_ (0, name, "No special status recieved.");
+      631 		     go to exit;
+      632 		end;
+      633 		if substr (special_status_word, 25, 1) = "0"b then do;
+      634 						/* ITR had an error */
+      635 		     call ioa_ ("^a: ^a Failed.", name, fwe.name);
+      636 		     go to exit;
+      637 		end;
+      638 		err_msg = "terminate";
+      639 wait_for_term:
+      640 		call timer_manager_$reset_alarm_wakeup (timer_channel); /* Remove outstanding alarm */
+      641 		call ipc_$drain_chn (timer_channel, code); /* Reset timer channel */
+      642 		if code ^= 0 then go to err_3;
+      643 		call timer_manager_$alarm_wakeup (60, "11"b, timer_channel); /* Set 60 second timer */
+      644 		wait_list.nchan = 2;		/* Waiting for i/o or timer event now */
+      645 		call ipc_$block (addr (wait_list), event_wait_info_ptr, code); /* Wait for something to happen */
+      646 		if code ^= 0 then go to err_3;
+      647 		if timer_sw then end_time = clock ();	/* Record end time */
+      648 		if event_wait_info.channel_id = timer_channel then go to time_err; /* If time out */
+      649 		if imess.level = "7"b3 then go to wait_for_term; /* discard special */
+      650 		call check_status;			/* verify good status */
+      651 		return;
+      652 
+      653 	     end;
+      654 	end;
+      655 
+      656 	err_msg = "termination";			/* Looking for termination now */
+      657 
+      658 	if imess.level ^= "3"b3 then do;		/* If not termination */
+      659 wrong_stat:    call com_err_ (0, name, "Unexpected level ^.3b status when ^a expected running ^a",
+      660 		imess.level, err_msg, TEST_NAME);
+      661 	     go to exit;
+      662 	end;
+      663 
+      664 	call check_status;
+      665 						/* check for good status */
+      666 
+      667 	if timer_sw then do;			/* If time requested */
+      668 	     elapsed_time = end_time - start_time;
+      669 	     if elapsed_time < 1000 then call com_err_ (0, name, "time = ^d usec", elapsed_time);
+      670 	     else if elapsed_time < 1000000 then call com_err_ (0, name, "time = ^.1f msec",
+      671 		     float (elapsed_time) / 1000.);
+      672 	     else call com_err_ (0, name, "time = ^.1f sec", float (elapsed_time) / 1.0e6);
+      673 	end;
+      674 
+      675 	return;
+      676 
+      677      end run_dcw;
+      678 
+      679 
+      680 /* Routine to  check IOM status for any error indications */
+      681 check_status: proc;
+      682 
+      683 
+      684 	if ^status.t then do;			/* If no status.. */
+      685 	     call send_err ("IOM did not set status bit running ^a.",
+      686 		(TEST_NAME));
+      687 	     go to exit;
+      688 	end;
+      689 
+      690 	if status.power then do;			/* If power off */
+      691 	     seconds_from_last_io = divide (clock () - ioi_io_tm, 1000000, 17, 0);
+      692 	     if seconds_from_last_io < MAX_TIMEOUT then do; /* try IO again? */
+      693 		call pause (ONE_SECOND);		/* take small breather */
+      694 		goto RETRY_IO_LABEL;		/* Try it again, Sam! */
+      695 	     end;
+      696 	     call send_err ("Power off error running ^a.", (TEST_NAME));
+      697 	     go to exit;
+      698 	end;
+      699 
+      700 	if status.major | status.sub | status.channel_stat | status.central_stat then do; /* If any other error */
+      701 	     call com_err_ (0, name, "Bad status returned running ^a: major=^b sub=^b",
+      702 		TEST_NAME, status.major, status.sub);
+      703 	     if eurc_sw then if status.major = "12"b3 then
+      704 		     call com_err_ (0, name, "^a failed. Fault Vector = ^2o",
+      705 			eurc_test, status.sub);
+      706 
+      707 	     if status.channel_stat then call com_err_ (0, name, "IOM channel status=^b",
+      708 		     status.channel_stat);
+      709 	     if status.central_stat then call com_err_ (0, name, "IOM central status=^b",
+      710 		     status.central_stat);
+      711 	     go to exit;
+      712 	end;
+      713 	return;
+      714      end check_status;
+      715 
+      716 
+      717 
+      718 /* Procedure to dc reset of an mpc by isuing a reset pcw */
+      719 
+      720 dc_reset: proc;
+      721 
+      722 	mpc_dead = "1"b;				/* This routine will almost certainly kill it */
+      723 	io_begun = "1"b;				/* Real stuff is starting */
+      724 
+      725 	pcwp = addr (pcw_words);			/* Get PCW pointer */
+      726 	string (pcw) = "0"b;			/* Reset it */
+      727 	pcw.code = "111"b;				/* Set PCW code */
+      728 	pcw.mask = "1"b;				/* Make it a reset PCW */
+      729 	pcw.control = "11"b;
+      730 
+      731 	idcwp = addr (buf.idcw);
+      732 	string (idcw) = "0"b;
+      733 	idcw.code = "111"b;
+      734 	idcw.chan_cmd = "000010"b;
+      735 
+      736 	ioi_io_tm = clock ();			/* remember time */
+      737 	call ioi_$connect_pcw (attach_mpc_data.ioi_index, 0, substr (pcw_words, 1, 36), code); /* Do connect */
+      738 	if code ^= 0 then go to err_1;
+      739 	wait_list.nchan = 1;			/* Only waiting for io channel */
+      740 	call ipc_$block (addr (wait_list), event_wait_info_ptr, code);
+      741 	if code ^= 0 then go to err_3;
+      742 	if imess.level ^= "3"b3 | ^imess.time_out then do;/* Ioi should set time out flag */
+      743 	     call send_err ("Abnormal status resetting channel", "");
+      744 	     go to exit;
+      745 	end;
+      746 
+      747 /* Since time out was only simulated by ioi, a real delay must be done to allow the mpc to reset */
+      748 
+      749 	call timer_manager_$reset_alarm_wakeup (timer_channel); /* Be sure no alarm already set */
+      750 	call ipc_$drain_chn (timer_channel, code);	/* In case event occured */
+      751 	if code ^= 0 then go to err_3;
+      752 	call timer_manager_$alarm_wakeup (1, "11"b, timer_channel); /* Set 1 second timer */
+      753 	wait_list.channel_id (1) = timer_channel;	/* Must wait on timer channel */
+      754 	call ipc_$block (addr (wait_list), event_wait_info_ptr, code); /* Wait for a second */
+      755 	if code ^= 0 then go to err_3;
+      756 	wait_list.channel_id (1) = attach_mpc_data.ioi_channel; /* Restore wait list */
+      757 
+      758 	return;
+      759 
+      760      end dc_reset;
+      761 
+      762 /* Various error messages */
+      763 
+      764 err_1:	call send_err ("", "");
+      765 	go to exit;
+      766 
+      767 err_2:	call send_err ("^a", arg);
+      768 	go to exit;
+      769 
+      770 err_3:	call convert_ipc_code_ (code);
+      771 	go to err_1;
+      772 
+      773 
+      774 
+      775 /* Routine to send an error message */
+      776 
+      777 send_err: proc (arg1, arg2);
+      778 
+      779 dcl  (arg1, arg2)	        char (*);
+      780 
+      781 	call com_err_ (code, name, arg1, arg2);
+      782 	return;
+      783 
+      784      end send_err;
+      785 
+      786 /* Routine to notify system Operator of changes to the state of a MPC.. */
+      787 
+      788 opr_notify: proc (opr_mess);
+      789 
+      790 dcl  opr_mess	        char (*) parameter;
+      791 dcl  phcs_$ring_0_message   entry (char (*));
+      792 
+      793 	call phcs_$ring_0_message (opr_mess || " for " ||
+      794 	     rtrim (attach_mpc_data.mpc_name) || ".");
+      795 	return;
+      796      end opr_notify;
+      797 
+      798 /* Routine to pause for N seconds */
+      799 
+      800 pause: proc (pause_time);
+      801 dcl  pause_time	        fixed bin (71) parm;
+      802 
+      803 	call timer_manager_$reset_alarm_wakeup (timer_channel); /* Be sure no alarm already set */
+      804 	call ipc_$drain_chn (timer_channel, code);	/* In case event occured */
+      805 	call timer_manager_$alarm_wakeup (pause_time, "11"b, timer_channel); /* Set timer */
+      806 	wait_list.channel_id (1) = timer_channel;	/* Must wait on timer channel */
+      807 	wait_list.nchan = 1;
+      808 	call ipc_$block (addr (wait_list), event_wait_info_ptr, code); /* Wait for a second */
+      809 	wait_list.channel_id (1) = attach_mpc_data.ioi_channel; /* Restore wait list */
+      810 	return;
+      811      end pause;
+      812 
+      813 /* Cleanup handler */
+      814 
+      815 clean_up: proc;
+      816 
+      817 	if stopped_io then do;			/* If I suspended io on the mpc */
+      818 	     if mpc_dead then do;
+      819 		call opr_notify ("I/O not released, firmware not restored"); /* notify/log */
+      820 		call com_err_ (0, name,
+      821 		     "I/O not released on ^a controller because firmware not restored.", attach_mpc_data.mpc_name);
+      822 	     end;
+      823 	     else do;
+      824 		call pause (TWO_SECOND);		/* short pause */
+      825 		call ioi_$release_devices (attach_mpc_data.ioi_index, code);
+      826 		stopped_io = "0"b;
+      827 		call opr_notify ("I/O resumed");	/* notify/log */
+      828 	     end;
+      829 	end;
+      830 	call detach_mpc_ (attach_mpc_datap, code);
+      831 	if timer_channel ^= -1 then do;
+      832 	     call timer_manager_$reset_alarm_wakeup (timer_channel);
+      833 	     call ipc_$delete_ev_chn (timer_channel, code);
+      834 	     timer_channel = -1;
+      835 	end;
+      836 
+      837 	if fwlistp ^= null () then do;
+      838 	     do i = 1 to fwlist.n;
+      839 		fwep = addr (fwlist.entry (i));
+      840 		if fwe.segp ^= null () then call release_temp_segment_ (name, fwe.segp, code);
+      841 	     end;
+      842 	     free fwlist;
+      843 	end;
+      844 
+      845 	return;
+      846 
+      847      end clean_up;
+      848 
+  1     1 
+  1     2 /* Begin include file ...... iom_pcw.incl.pl1 */
+  1     3 
+  1     4 dcl  pcwp ptr;					/* pointer to PCW */
+  1     5 
+  1     6 dcl 1 pcw based (pcwp) aligned,			/* Peripheral Control Word */
+  1     7      (2 command bit (6),				/* device command */
+  1     8       2 device bit (6),				/* device code */
+  1     9       2 ext bit (6),				/* address extension */
+  1    10       2 code bit (3),				/* should be "111"b for PCW */
+  1    11       2 mask bit (1),				/* channel mask bit */
+  1    12       2 control bit (2),				/* terminate/proceed and marker control bits */
+  1    13       2 chan_cmd bit (6),				/* type of I/O operation */
+  1    14       2 count bit (6),				/* record count or control character */
+  1    15       2 mbz1 bit (3),
+  1    16       2 channel bit (6),				/* channel number */
+  1    17       2 mbz2 bit (27)) unal;
+  1    18 
+  1    19 dcl  idcwp ptr;					/* pointer to IDCW */
+  1    20 
+  1    21 dcl 1 idcw based (idcwp) aligned,			/* Instruction DCW */
+  1    22      (2 command bit (6),				/* device command */
+  1    23       2 device bit (6),				/* device code */
+  1    24       2 ext bit (6),				/* address extension */
+  1    25       2 code bit (3),				/* should be "111"b for PCW */
+  1    26       2 ext_ctl bit (1),				/* "1"b if address extension to be used */
+  1    27       2 control bit (2),				/* terminate/proceed and marker control bits */
+  1    28       2 chan_cmd bit (6),				/* type of I/O operation */
+  1    29       2 count bit (6)) unal;				/* record count or control character */
+  1    30 
+  1    31 /* End include file ...... iom_pcw.incl.pl1 */
+  1    32 
+      849 
+      850 
+  2     1 
+  2     2 /* Begin include file ...... iom_dcw.incl.pl1 */
+  2     3 
+  2     4 dcl  dcwp ptr,					/* pointer to DCW */
+  2     5      tdcwp ptr;					/* pointer to TDCW */
+  2     6 
+  2     7 dcl 1 dcw based (dcwp) aligned,			/* Data Control Word */
+  2     8      (2 address bit (18),				/* address for data transfer */
+  2     9       2 char_pos bit (3),				/* character position */
+  2    10       2 m64 bit (1),				/* non-zero for mod 64 address */
+  2    11       2 type bit (2),				/* DCW type */
+  2    12       2 tally bit (12)) unal;				/* tally for data transfer */
+  2    13 
+  2    14 dcl 1 tdcw based (tdcwp) aligned,			/* Transfer DCW */
+  2    15      (2 address bit (18),				/* address to transfer to */
+  2    16       2 mbz1 bit (4),
+  2    17       2 type bit (2),				/* should be "10"b for TDCW */
+  2    18       2 mbz2 bit (9),
+  2    19       2 ec bit (1),					/* non-zero to set LPW AE bit */
+  2    20       2 res bit (1),				/* non-zero to restrict further use of IDCW */
+  2    21       2 rel bit (1)) unal;				/* non-zero to set relative mode after transfer */
+  2    22 
+  2    23 /* End of include file ...... iom_dcw.incl.pl1 */
+  2    24 
+      851 
+      852 
+  3     1 
+  3     2 /* Begin include file ...... ioi_stat.incl.pl1 */
+  3     3 /* Last modified 3/24/75 by Noel I. Morris */
+  3     4 
+  3     5 dcl  isp ptr;					/* pointer to status structure */
+  3     6 
+  3     7 dcl 1 istat based (isp) aligned,			/* I/O Interfacer status structure */
+  3     8     2 completion,					/* completion flags */
+  3     9      (3 st bit (1),					/* "1"b if status returned */
+  3    10       3 er bit (1),					/* "1"b if status indicates error condition */
+  3    11       3 run bit (1),				/* "1"b if channel still running */
+  3    12       3 time_out bit (1)) unal,			/* "1"b if time-out occurred */
+  3    13     2 level fixed bin (3),				/* IOM interrupt level */
+  3    14     2 offset fixed bin (18),				/* DCW list offset */
+  3    15     2 absaddr fixed bin (24),				/* absolute address of workspace */
+  3    16     2 iom_stat bit (72),				/* IOM status */
+  3    17     2 lpw bit (72);					/* LPW residue */
+  3    18 
+  3    19 dcl  imp ptr;					/* pointer to message structure */
+  3    20 
+  3    21 dcl 1 imess based (imp) aligned,			/* I/O Interfacer event message structure */
+  3    22    (2 completion like istat.completion,			/* completion flags */
+  3    23     2 pad bit (11),
+  3    24     2 level bit (3),				/* interrupt level */
+  3    25     2 offset bit (18),				/* DCW list offset */
+  3    26     2 status bit (36)) unal;				/* first 36 bits of status */
+  3    27 
+  3    28 /* End of include file ...... ioi_stat.incl.pl1 */
+  3    29 
+      853 
+      854 
+  4     1 
+  4     2 /* Begin include file ...... iom_stat.incl.pl1 */
+  4     3 /* Last modified on 10/31/74 by Noel I. Morris */
+  4     4 
+  4     5 dcl  statp ptr;					/* pointer to status */
+  4     6 
+  4     7 dcl 1 status based (statp) aligned,			/* IOM status information */
+  4     8      (2 t bit (1),					/* set to "1"b by IOM */
+  4     9       2 power bit (1),				/* non-zero if peripheral absent or power off */
+  4    10       2 major bit (4),				/* major status */
+  4    11       2 sub bit (6),				/* substatus */
+  4    12       2 eo bit (1),					/* even/odd bit */
+  4    13       2 marker bit (1),				/* non-zero if marker status */
+  4    14       2 soft bit (2),				/* software status */
+  4    15       2 initiate bit (1),				/* initiate bit */
+  4    16       2 abort bit (1),				/* software abort bit */
+  4    17       2 channel_stat bit (3),				/* IOM channel status */
+  4    18       2 central_stat bit (3),				/* IOM central status */
+  4    19       2 mbz bit (6),
+  4    20       2 rcount bit (6),				/* record count residue */
+  4    21       2 address bit (18),				/* DCW address residue */
+  4    22       2 char_pos bit (3),				/* character position residue */
+  4    23       2 r bit (1),					/* non-zero if reading */
+  4    24       2 type bit (2),				/* type of last DCW */
+  4    25       2 tally bit (12)) unal;				/* DCW tally residue */
+  4    26 
+  4    27 dcl 1 faultword based (statp) aligned,			/* system fault word */
+  4    28      (2 mbz1 bit (9),
+  4    29       2 channel bit (9),				/* channel number */
+  4    30       2 serv_req bit (5),				/* service request */
+  4    31       2 mbz2 bit (3),
+  4    32       2 controller_fault bit (4),			/* system controller fault code */
+  4    33       2 io_fault bit (6)) unal;			/* I/O fault code */
+  4    34 
+  4    35 dcl 1 special_status based (statp) aligned,		/* special status from PSIA */
+  4    36    (2 t bit (1),					/* entry present bit */
+  4    37     2 channel bit (8),				/* channel number */
+  4    38     2 pad1 bit (3),
+  4    39     2 device bit (6),				/* device address */
+  4    40     2 pad2 bit (1),
+  4    41     2 byte2 bit (8),				/* device dependent information */
+  4    42     2 pad3 bit (1),
+  4    43     2 byte3 bit (8)) unal;				/* device dependent information */
+  4    44 
+  4    45 /* End of include file iom_stat.incl.pl1 */
+  4    46 
+      855 
+      856 
+  5     1 /* BEGIN INCLUDE FILE event_wait_info.incl.pl1 */
+  5     2 
+  5     3 /* T. Casey, May 1978 */
+  5     4 
+  5     5 dcl  event_wait_info_ptr ptr;
+  5     6 
+  5     7 dcl 1 event_wait_info aligned based (event_wait_info_ptr),	/* argument structure filled in on return from ipc_$block */
+  5     8     2 channel_id fixed bin (71),			/* event channel on which wakeup occurred */
+  5     9     2 message fixed bin (71),				/* 72 bits of information passed by sender of wakeup */
+  5    10     2 sender bit (36),				/* process id of sender */
+  5    11     2 origin,
+  5    12       3 dev_signal bit (18) unaligned,			/* "1"b if device signal */
+  5    13       3 ring fixed bin (17) unaligned,			/* ring from which sent */
+  5    14     2 channel_index fixed bin;			/* index of this channel in the event wait list */
+  5    15 
+  5    16 /* END INCLUDE FILE event_wait_info.incl.pl1 */
+      857 
+      858 
+  6     1 /* Begin include file ..... attach_mpc_data.incl.pl1 */
+  6     2 
+  6     3 /* Defines the arguments to the attach_mpc_ subroutine */
+  6     4 /* Prepared January 1980 by Larry Johnson */
+  6     5 
+  6     6 dcl  attach_mpc_datap ptr;
+  6     7 dcl  attach_mpc_data_version_1 fixed bin int static options (constant) init (1);
+  6     8 
+  6     9 dcl 1 attach_mpc_data aligned based (attach_mpc_datap),
+  6    10     2 version fixed bin,				/* Version of this structure (I) */
+  6    11     2 mpc_name char (32),				/* Name of mpc to attach (I/O) */
+  6    12     2 caller_name char (32),				/* Name of caller, for error mesages (I) */
+  6    13     2 flags unal,
+  6    14       3 channel_required bit (1),			/* Caller has specified IOM and channel (I) */
+  6    15       3 bootload_channel bit (1),			/* Caller wants bootload channel (I) */
+  6    16       3 report bit (1),				/* Allow com_err_ cals (I) */
+  6    17       3 mbz bit (33),				/* (I) */
+  6    18     2 iom fixed bin (3),				/* Which IOM to use (I/O) */
+  6    19     2 channel fixed bin (6),				/* Which channel to use (I/O) */
+  6    20     2 ioi_index fixed bin,				/* Index for caller to talk to ioi  (O) */
+  6    21     2 rcp_id bit (36),				/* ID for calling RCP (O) */
+  6    22     2 ioi_channel fixed bin (71),			/* Event channel for ioi wakeups (O) */
+  6    23     2 max_time_limit fixed bin (71),			/* Longest time to wait for I/O to complete (O) */
+  6    24     2 max_workspace_size fixed bin (19),		/* Largest workspace to use (O) */
+  6    25     2 type char (4),				/* MPC type, urp, msp, or mtp (O) */
+  6    26     2 model fixed bin,				/* MPC model number (O) */
+  6    27     2 mpc_cardp ptr,				/* Pointer to mpc card of mpc attached (O) */
+  6    28     2 prph_cardp ptr,				/* Pointer to prph card of device attached (O) */
+  6    29     2 status_tablep ptr,				/* Address of status table for decoding errors (O) */
+  6    30     2 device_name char (32);				/* Name of device actually attached (O) */
+  6    31 
+  6    32 /* End include file ..... attach_mpc_data.incl.pl1 */
+      859 
+      860 
+  7     1 /* Begin include file . . . . . load_mpc_info.incl.pl1 */
+  7     2 
+  7     3 /* Written February 1979 by Larry Johnson */
+  7     4 
+  7     5 /* This include file describes a structure setup by load_mpc_fw_info_ 
+  7     6*   with information about the firmware to be run */
+  7     7 
+  7     8 dcl  fwlistp ptr;
+  7     9 dcl  fwlist_n fixed bin;
+  7    10 
+  7    11 dcl 1 fwlist aligned based (fwlistp),
+  7    12     2 n fixed bin,
+  7    13     2 entry (fwlist_n refer (fwlist.n)) like fwe;
+  7    14 
+  7    15 
+  7    16 dcl  fwep ptr;
+  7    17 
+  7    18 dcl 1 fwe aligned based (fwep),
+  7    19     2 name char (32),				/* Name of program */
+  7    20     2 segp ptr,					/* Pointer to segment containing it */
+  7    21     2 type fixed bin,				/* Type, itr, fw, dev */
+  7    22     2 device (4) char (3) unal,			/* If device fw, device types it is for */
+  7    23     2 port_mask bit (8),				/* for device firmware, which ports it is for */
+  7    24     2 cs_ptr ptr,					/* Pointer to control store overlay */
+  7    25     2 rw_ptr ptr,					/* Pointer to read/wrote overlay */
+  7    26     2 cs_len fixed bin,
+  7    27     2 rw_len fixed bin;
+  7    28 
+  7    29 dcl  control_store_overlay (fwe.cs_len) bit (36) aligned based (fwe.cs_ptr);
+  7    30 dcl  read_write_overlay    (fwe.rw_len) bit (36) aligned based (fwe.rw_ptr);
+  7    31 
+  7    32 dcl (FWE_TYPE_ITR init (1),				/* An itr program */
+  7    33      FWE_TYPE_FW  init (2),				/* Application firmware */
+  7    34      FWE_TYPE_DEV init (3)) int static options (constant);	/* Device firmware overlays */
+  7    35 
+  7    36 /* End include file . . . . . load_mpc_info.incl.pl1 */
+      861 
+      862 
+  8     1 /* BEGIN INCLUDE FILE ... eurc_model_numbers.incl.pl1 ... 11/13/81 E. N. Kittlitz */
+  8     2 
+  8     3 dcl  eurc_model_numbers (4) fixed bin internal static init (8001, 8002, 8003, 8004);
+  8     4 
+  8     5 /* END INCLUDE FILE ... eurc_model_numbers.incl.pl1 ... */
+      863 
+      864 
+  9     1 /* Begin include file ...... io_special_status.incl.pl1 */
+  9     2 /* Written February 1981 by Chris Jones (from iom_stat.incl.pl1) */
+  9     3 
+  9     4 
+  9     5 /****^  HISTORY COMMENTS:
+  9     6*  1) change(88-01-06,Farley), approve(88-03-01,MCR7831),
+  9     7*     audit(88-03-01,Parisek), install(88-03-08,MR12.2-1032):
+  9     8*     Corrected channel size to 6 bits, was incorrectly set to 8.
+  9     9*                                                   END HISTORY COMMENTS */
+  9    10 
+  9    11 
+  9    12 dcl  io_special_status_ptr ptr;			/* pointer to status */
+  9    13 
+  9    14 dcl  1 io_special_status based (io_special_status_ptr) aligned,
+  9    15 						/* special status from PSIA */
+  9    16        (
+  9    17        2 t bit (1),					/* entry present bit */
+  9    18        2 pad bit (2),
+  9    19        2 channel bit (6),				/* channel number */
+  9    20        2 pad1 bit (3),
+  9    21        2 device bit (6),				/* device address */
+  9    22        2 pad2 bit (1),
+  9    23        2 byte2 bit (8),				/* device dependent information */
+  9    24        2 pad3 bit (1),
+  9    25        2 byte3 bit (8)
+  9    26        ) unal;					/* device dependent information */
+  9    27 
+  9    28 /* End of include file io_special_status.incl.pl1 */
+      865 
+      866 
+      867 
+      868      end load_mpc;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    03/08/88  0930.0  load_mpc.pl1                      >special_ldd>install>MR12.2-1032>load_mpc.pl1
+849          1    05/06/74  1742.1  iom_pcw.incl.pl1                  >ldd>include>iom_pcw.incl.pl1
+851          2    11/12/74  1550.1  iom_dcw.incl.pl1                  >ldd>include>iom_dcw.incl.pl1
+853          3    08/17/79  2215.0  ioi_stat.incl.pl1                 >ldd>include>ioi_stat.incl.pl1
+855          4    01/10/75  1343.6  iom_stat.incl.pl1                 >ldd>include>iom_stat.incl.pl1
+857          5    06/29/79  1727.8  event_wait_info.incl.pl1          >ldd>include>event_wait_info.incl.pl1
+859          6    08/11/80  1844.3  attach_mpc_data.incl.pl1          >ldd>include>attach_mpc_data.incl.pl1
+861          7    08/11/80  1844.3  load_mpc_info.incl.pl1            >ldd>include>load_mpc_info.incl.pl1
+863          8    05/27/82  1525.6  eurc_model_numbers.incl.pl1       >ldd>include>eurc_model_numbers.incl.pl1
+865          9    03/08/88  0926.7  io_special_status.incl.pl1        >special_ldd>install>MR12.2-1032>io_special_status.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+FWE_TYPE_DEV                           constant        fixed bin(17,0)          initial dcl 7-32 ref 440
+FWE_TYPE_FW                            constant        fixed bin(17,0)          initial dcl 7-32 ref 399
+FWE_TYPE_ITR                           constant        fixed bin(17,0)          initial dcl 7-32 ref 372
+MAX_TIMEOUT                            constant        fixed bin(17,0)          initial dcl 120 ref 692
+ONE_SECOND                      000016 constant        fixed bin(71,0)          initial dcl 122 set ref 382* 693*
+RETRY_IO_LABEL                  000176 automatic       label variable           dcl 90 set ref 560* 694
+TEST_NAME                       000152 automatic       varying char(32)         initial dcl 83 set ref 83* 319* 380* 409* 416* 450*
+                                                                                  576* 659* 685 696 701*
+TWO_SECOND                      000014 constant        fixed bin(71,0)          initial dcl 123 set ref 824*
+addr                                                   builtin function         dcl 164 ref 176 184 185 186 187 327 371 398 439 445
+                                                                                  471 473 479 500 507 509 511 516 518 549 568 568
+                                                                                  596 596 645 645 725 731 740 740 754 754 808 808
+                                                                                  839
+addrel                                                 builtin function         dcl 164 ref 490
+address                                based           bit(18)                  level 2 packed packed unaligned dcl 2-7 set ref 483*
+                                                                                  509* 518*
+arg                                    based           char                     packed unaligned dcl 65 set ref 197 198 200* 204 204
+                                                                                  211* 213* 218 219 220 220 221 222 222 222 229 232*
+                                                                                  767*
+arg1                                   parameter       char                     packed unaligned dcl 779 set ref 777 781*
+arg2                                   parameter       char                     packed unaligned dcl 779 set ref 777 781*
+arg_cnt                         000101 automatic       fixed bin(17,0)          dcl 59 set ref 170* 171 194
+arg_len                         000110 automatic       fixed bin(17,0)          dcl 64 set ref 195* 197 198 200 200 204 204 206* 211
+                                                                                  211 213 213 218 219 220 220 221 222 222 222 224*
+                                                                                  229 232 232 767 767
+arg_ptr                         000106 automatic       pointer                  dcl 63 set ref 195* 197 198 200 204 204 206* 211 213
+                                                                                  218 219 220 220 221 222 222 222 224* 229 232 767
+attach_mpc_                     000010 constant        entry                    external dcl 135 ref 270
+attach_mpc_data                        based           structure                level 1 dcl 6-9 set ref 177*
+attach_mpc_data_version_1              constant        fixed bin(17,0)          initial dcl 6-7 ref 178
+attach_mpc_datap                000314 automatic       pointer                  dcl 6-6 set ref 176* 177 178 179 180 181 198 198 211
+                                                                                  211 216 237 237 267 268 270* 272 275 278 291 297
+                                                                                  305 307 347 358 401 419 562 564 602 623 737 756
+                                                                                  793 809 820 825 830*
+auto_attach_mpc_data            000204 automatic       structure                level 1 dcl 94 set ref 176
+auto_event_wait_info            000260 automatic       structure                level 1 dcl 95 set ref 184
+bin                                                    builtin function         dcl 164 ref 471 488 549
+bit                                                    builtin function         dcl 164 ref 254 483 488
+bootload_channel         21(01)        based           bit(1)                   level 3 packed packed unaligned dcl 6-9 set ref 181*
+buf                                    based           structure                level 1 dcl 99 set ref 297 297 299 299
+buf_ptr                         000140 automatic       pointer                  dcl 79 set ref 297* 297 297 299 299 327 373 406 413
+                                                                                  441 442 443 445 471 473 479 500 501 507 508 509
+                                                                                  511 512 516 517 518 523 527 528 529 530 531 532
+                                                                                  533 534 535 536 537 538 539 549 731
+caller_name              11            based           char(32)                 level 2 dcl 6-9 set ref 180*
+central_stat              0(21)        based           bit(3)                   level 2 packed packed unaligned dcl 4-7 set ref 700
+                                                                                  709 709*
+chan_cmd                  0(24)        based           bit(6)                   level 2 packed packed unaligned dcl 1-21 set ref
+                                                                                  447* 476* 505* 515* 734*
+channel                  23            based           fixed bin(6,0)           level 2 dcl 6-9 set ref 211*
+channel_cmd                            parameter       bit(6)                   packed unaligned dcl 464 ref 461 476 546
+channel_id                2     000164 automatic       fixed bin(71,0)          array level 2 in structure "wait_list" dcl 84
+                                                                                  in procedure "load_mpc" set ref 265* 272* 753*
+                                                                                  756* 806* 809*
+channel_id                             based           fixed bin(71,0)          level 2 in structure "event_wait_info" dcl 5-7
+                                                                                  in procedure "load_mpc" ref 599 648
+channel_required         21            based           bit(1)                   level 3 packed packed unaligned dcl 6-9 set ref 216*
+                                                                                  237 268*
+channel_stat              0(18)        based           bit(3)                   level 2 packed packed unaligned dcl 4-7 set ref 700
+                                                                                  707 707*
+cleanup                         000272 stack reference condition                dcl 166 ref 190
+clock                                                  builtin function         dcl 164 ref 561 566 570 598 647 691 736
+code                      0(18)        based           bit(3)                   level 2 in structure "idcw" packed packed unaligned
+                                                                                  dcl 1-21 in procedure "load_mpc" set ref 477* 503*
+                                                                                  514* 733*
+code                            000100 automatic       fixed bin(35,0)          dcl 58 in procedure "load_mpc" set ref 195* 196 206*
+                                                                                  207 208* 211* 212 213* 224* 225 226* 247* 249 250*
+                                                                                  257* 263* 264 270* 271 291* 292 297* 298 299* 305*
+                                                                                  306 307* 562* 563 564* 565 568* 569 592* 593 596*
+                                                                                  597 602* 604 605* 623* 625 626* 641* 642 645* 646
+                                                                                  737* 738 740* 741 750* 751 754* 755 770* 781* 804*
+                                                                                  808* 825* 830* 833* 840*
+code                      0(18)        based           bit(3)                   level 2 in structure "pcw" packed packed unaligned
+                                                                                  dcl 1-6 in procedure "load_mpc" set ref 727*
+com_err_                        000016 constant        entry                    external dcl 138 ref 172 200 208 213 226 232 238 250
+                                                                                  257 284 299 307 331 401 576 605 609 626 630 659
+                                                                                  669 670 672 701 703 707 709 781 820
+command                                based           bit(6)                   level 2 packed packed unaligned dcl 1-21 set ref
+                                                                                  475* 502* 513*
+completion                             based           structure                level 2 in structure "istat" dcl 3-7 in procedure
+                                                                                  "load_mpc"
+completion                             based           structure                level 2 in structure "imess" packed packed unaligned
+                                                                                  dcl 3-21 in procedure "load_mpc"
+control                   0(22)        based           bit(2)                   level 2 in structure "idcw" packed packed unaligned
+                                                                                  dcl 1-21 in procedure "load_mpc" set ref 504*
+control                   0(22)        based           bit(2)                   level 2 in structure "pcw" packed packed unaligned
+                                                                                  dcl 1-6 in procedure "load_mpc" set ref 729*
+control                   4            based           structure                level 2 in structure "eurc_buf" dcl 105 in procedure
+                                                                                  "load_mpc" set ref 509 523*
+control_store_overlay                  based           bit(36)                  array dcl 7-29 ref 373 406 441
+convert_ipc_code_               000020 constant        entry                    external dcl 139 ref 770
+count                     0(30)        based           bit(6)                   level 2 packed packed unaligned dcl 1-21 set ref
+                                                                                  506*
+cs_len                   24            based           fixed bin(17,0)          level 2 dcl 7-18 set ref 373 374* 406 407* 441 444*
+cs_ok                           000346 automatic       bit(1)                   initial packed unaligned dcl 394 set ref 394* 411*
+                                                                                  422
+cs_ptr                   20            based           pointer                  level 2 dcl 7-18 ref 373 406 441
+cu_$arg_count                   000014 constant        entry                    external dcl 137 ref 170
+cu_$arg_ptr                     000012 constant        entry                    external dcl 136 ref 195 206 224
+data                      4            based           bit(36)                  array level 2 dcl 99 set ref 373* 406* 413* 441* 471
+data_len                               parameter       fixed bin(17,0)          dcl 465 ref 461 470 546 548
+data_loc                        000373 automatic       fixed bin(18,0)          unsigned dcl 467 set ref 471* 483 486* 486 549*
+dcw                       1            based           bit(36)                  array level 2 in structure "buf" dcl 99 in procedure
+                                                                                  "load_mpc" set ref 479
+dcw                                    based           structure                level 1 dcl 2-7 in procedure "load_mpc" set ref 480*
+                                                                                  482*
+dcw1                      1            based           bit(36)                  level 2 dcl 105 set ref 507 508*
+dcw2                      3            based           bit(36)                  level 2 dcl 105 set ref 516 517*
+dcwp                            000304 automatic       pointer                  dcl 2-4 set ref 479* 480 482 483 488 489 490* 490
+                                                                                  492 507* 509 510 516* 518 519
+detach_mpc_                     000022 constant        entry                    external dcl 140 ref 830
+device                    0(06)        based           bit(6)                   level 2 packed packed unaligned dcl 1-21 set ref
+                                                                                  446*
+df_ok                           000350 automatic       bit(1)                   initial packed unaligned dcl 394 set ref 394* 419*
+                                                                                  420* 422
+divide                                                 builtin function         dcl 164 ref 691
+elapsed_time                    000134 automatic       fixed bin(35,0)          dcl 75 set ref 668* 669 669* 670 670 672
+end_time                        000132 automatic       fixed bin(52,0)          dcl 74 set ref 570* 598* 647* 668
+entry                     2            based           structure                array level 2 dcl 7-11 set ref 371 398 439 839
+err_msg                         000116 automatic       varying char(20)         initial dcl 70 set ref 70* 576* 587* 590* 621* 638*
+                                                                                  656* 659*
+error_table_$badopt             000072 external static fixed bin(35,0)          dcl 161 set ref 232* 284*
+error_table_$noarg              000066 external static fixed bin(35,0)          dcl 159 set ref 238*
+error_table_$noentry            000074 external static fixed bin(35,0)          dcl 162 set ref 401*
+error_table_$request_not_recognized
+                                000070 external static fixed bin(35,0)          dcl 160 set ref 200*
+eurc_buf                               based           structure                level 1 dcl 105
+eurc_check_data                 000006 constant        bit(36)                  initial array packed unaligned dcl 124 set ref 328
+                                                                                  330 331*
+eurc_data_error                 000113 automatic       bit(1)                   initial packed unaligned dcl 68 set ref 68* 326*
+                                                                                  333* 336
+eurc_model_numbers              000000 constant        fixed bin(17,0)          initial array dcl 8-3 ref 275 278
+eurc_self_test_data       6            based           bit(36)                  array level 3 dcl 105 set ref 327 518 527* 528* 529*
+                                                                                  530* 531* 532* 533* 534* 535* 536* 537* 538* 539*
+eurc_sw                         000126 automatic       bit(1)                   initial packed unaligned dcl 73 set ref 73* 274* 275
+                                                                                  278* 282 290 317 703
+eurc_test                       000146 automatic       char(14)                 initial packed unaligned dcl 82 set ref 82* 319 703*
+eurc_test_data                         based           bit(36)                  array dcl 114 set ref 328 330 331*
+eurc_test_datap                 000270 automatic       pointer                  dcl 115 set ref 327* 328 330 331
+event_wait_info                        based           structure                level 1 dcl 5-7
+event_wait_info_ptr             000312 automatic       pointer                  dcl 5-5 set ref 184* 185 568* 596* 599 645* 648 740*
+                                                                                  754* 808*
+execute                         000104 automatic       bit(5)                   initial packed unaligned dcl 62 set ref 62* 254
+firm_sw                         000111 automatic       bit(1)                   initial packed unaligned dcl 66 set ref 66* 218* 242
+                                                                                  242* 283 291* 318* 345
+flags                    21            based           structure                level 2 packed packed unaligned dcl 6-9
+float                                                  builtin function         dcl 164 ref 670 672
+fw_revision                     000142 automatic       char(2)                  packed unaligned dcl 80 set ref 182* 229* 291* 404
+fwe                                    based           structure                level 1 dcl 7-18
+fwep                            000320 automatic       pointer                  dcl 7-16 set ref 371* 372 373 373 374 375 380 398*
+                                                                                  399 406 406 407 408 409 413 413 414 415 416 439*
+                                                                                  440 440 441 441 443 444 448 448 450 614 635 839*
+                                                                                  840 840
+fwlist                                 based           structure                level 1 dcl 7-11 set ref 842
+fwlistp                         000316 automatic       pointer                  dcl 7-8 set ref 188* 291* 370 371 397 398 438 439
+                                                                                  837 838 839 842
+fwx                             000351 automatic       fixed bin(17,0)          dcl 395 set ref 397* 398*
+hbound                                                 builtin function         dcl 164 ref 275
+hcs_$get_user_effmode           000024 constant        entry                    external dcl 141 ref 247
+i                               000334 automatic       fixed bin(17,0)          dcl 367 in procedure "run_itrs" set ref 370* 371*
+i                               000102 automatic       fixed bin(17,0)          dcl 60 in procedure "load_mpc" set ref 194* 195*
+                                                                                  205* 205 206* 223* 223 224* 275* 278* 328* 330 330
+                                                                                  331 331* 838* 839*
+i                               000362 automatic       fixed bin(17,0)          dcl 434 in procedure "dev_firm" set ref 438* 439*
+idcw                                   based           bit(36)                  level 2 in structure "buf" dcl 99 in procedure
+                                                                                  "load_mpc" set ref 445 473 731
+idcw                                   based           structure                level 1 dcl 1-21 in procedure "load_mpc" set ref
+                                                                                  474* 732*
+idcw1                                  based           bit(36)                  level 2 dcl 105 set ref 500 501*
+idcw2                     2            based           bit(36)                  level 2 dcl 105 set ref 511 512*
+idcwp                           000302 automatic       pointer                  dcl 1-19 set ref 445* 446 447 473* 474 475 476 477
+                                                                                  500* 502 503 504 505 506 511* 513 514 515 731* 732
+                                                                                  733 734
+imess                                  based           structure                level 1 dcl 3-21
+imp                             000306 automatic       pointer                  dcl 3-19 set ref 185* 186 575 586 600 620 649 658
+                                                                                  659 742 742
+io_begun                        000137 automatic       bit(1)                   initial packed unaligned dcl 78 set ref 78* 358 723*
+io_special_status                      based           structure                level 1 dcl 9-14
+io_special_status_ptr           000322 automatic       pointer                  dcl 9-12 set ref 187* 608 629
+ioa_                            000026 constant        entry                    external dcl 142 ref 321 358 375 408 415 448 614 635
+ioi_$connect                    000030 constant        entry                    external dcl 143 ref 564
+ioi_$connect_pcw                000032 constant        entry                    external dcl 144 ref 737
+ioi_$get_special_status         000042 constant        entry                    external dcl 148 ref 602 623
+ioi_$release_devices            000036 constant        entry                    external dcl 146 ref 825
+ioi_$suspend_devices            000040 constant        entry                    external dcl 147 ref 305
+ioi_$workspace                  000034 constant        entry                    external dcl 145 ref 297
+ioi_channel              26            based           fixed bin(71,0)          level 2 dcl 6-9 set ref 272 562* 756 809
+ioi_index                24            based           fixed bin(17,0)          level 2 dcl 6-9 set ref 297* 305* 564* 602* 623*
+                                                                                  737* 825*
+ioi_io_tm                       000174 automatic       fixed bin(71,0)          dcl 89 set ref 561* 691 736*
+iom                      22            based           fixed bin(3,0)           level 2 dcl 6-9 set ref 211*
+ipc_$block                      000044 constant        entry                    external dcl 149 ref 568 596 645 740 754 808
+ipc_$create_ev_chn              000046 constant        entry                    external dcl 150 ref 263
+ipc_$delete_ev_chn              000050 constant        entry                    external dcl 151 ref 833
+ipc_$drain_chn                  000052 constant        entry                    external dcl 152 ref 562 592 641 750 804
+istat                                  based           structure                level 1 dcl 3-7
+itr_sw                          000112 automatic       bit(1)                   initial packed unaligned dcl 67 set ref 67* 219* 242
+                                                                                  242* 283 291* 340
+len                             000374 automatic       fixed bin(17,0)          dcl 468 set ref 470* 481 484 485* 485 490 548*
+level                     0(15)        based           bit(3)                   level 2 packed packed unaligned dcl 3-21 set ref 586
+                                                                                  600 620 649 658 659* 742
+load_mpc_fw_info_               000054 constant        entry                    external dcl 153 ref 291
+load_ok                                parameter       bit(1)                   packed unaligned dcl 432 set ref 430 436*
+major                     0(02)        based           bit(4)                   level 2 packed packed unaligned dcl 4-7 set ref 700
+                                                                                  701* 703
+mask                      0(21)        based           bit(1)                   level 2 packed packed unaligned dcl 1-6 set ref 728*
+message                   2            based           fixed bin(71,0)          level 2 dcl 5-7 set ref 185
+min                                                    builtin function         dcl 164 ref 484
+model                    34            based           fixed bin(17,0)          level 2 dcl 6-9 set ref 278
+mpc_cardp                36            based           pointer                  level 2 dcl 6-9 set ref 291*
+mpc_dead                        000136 automatic       bit(1)                   initial packed unaligned dcl 77 set ref 77* 336* 347
+                                                                                  349* 352* 358 422* 722* 818
+mpc_name                  1            based           char(32)                 level 2 dcl 6-9 set ref 179* 198 198* 237 307* 347
+                                                                                  358* 401* 793 820*
+msg_sw                          000124 automatic       bit(1)                   initial packed unaligned dcl 71 set ref 71* 220* 321
+                                                                                  358 375 408 415 448
+n                                      based           fixed bin(17,0)          level 2 dcl 7-11 ref 370 397 438 838 842
+name                                   based           char(32)                 level 2 in structure "fwe" dcl 7-18 in procedure
+                                                                                  "load_mpc" set ref 375* 380 408* 409 415* 416 448*
+                                                                                  450 614* 635*
+name                            000004 constant        char(8)                  initial packed unaligned dcl 131 in procedure
+                                                                                  "load_mpc" set ref 172* 172* 180 200* 208* 213*
+                                                                                  226* 232* 238* 250* 257* 284* 299* 307* 321* 331*
+                                                                                  358* 375* 401* 408* 415* 448* 576* 605* 609* 614*
+                                                                                  626* 630* 635* 659* 669* 670* 672* 701* 703* 707*
+                                                                                  709* 781* 820* 840*
+nchan                           000164 automatic       fixed bin(17,0)          level 2 dcl 84 set ref 567* 595* 644* 739* 807*
+null                                                   builtin function         dcl 164 ref 188 837 840
+op_code                                parameter       bit(6)                   packed unaligned dcl 463 ref 461 475 546
+opr_mess                               parameter       char                     packed unaligned dcl 790 ref 788 793
+opr_not_notified                000335 automatic       bit(1)                   initial packed unaligned dcl 368 set ref 368* 376
+                                                                                  378*
+parse_io_channel_name_          000056 constant        entry                    external dcl 154 ref 211
+pause_time                             parameter       fixed bin(71,0)          dcl 801 set ref 800 805*
+pcw                                    based           structure                level 1 dcl 1-6 set ref 726*
+pcw_words                       000114 automatic       bit(72)                  dcl 69 set ref 725 737 737
+pcwp                            000300 automatic       pointer                  dcl 1-4 set ref 725* 726 727 728 729
+phcs_$ring_0_message            000076 constant        entry                    external dcl 791 ref 793
+phcs_access                     000103 automatic       fixed bin(5,0)           dcl 61 set ref 247* 254
+port_mask                 3            based           bit(36)                  level 2 in structure "buf" dcl 99 in procedure
+                                                                                  "load_mpc" set ref 442* 443* 549
+port_mask                16            based           bit(8)                   level 2 in structure "fwe" dcl 7-18 in procedure
+                                                                                  "load_mpc" set ref 440 443 448*
+power                     0(01)        based           bit(1)                   level 2 packed packed unaligned dcl 4-7 ref 690
+read_write_overlay                     based           bit(36)                  array dcl 7-30 ref 413
+rel                                                    builtin function         dcl 164 ref 471 509 518 549
+release_temp_segment_           000060 constant        entry                    external dcl 155 ref 840
+report                   21(02)        based           bit(1)                   level 3 packed packed unaligned dcl 6-9 set ref 267*
+rtrim                                                  builtin function         dcl 164 ref 793
+rw_len                   25            based           fixed bin(17,0)          level 2 dcl 7-18 set ref 413 414*
+rw_ok                           000347 automatic       bit(1)                   initial packed unaligned dcl 394 set ref 394* 418*
+                                                                                  422
+rw_ptr                   22            based           pointer                  level 2 dcl 7-18 ref 413
+seconds_from_last_io            000202 automatic       fixed bin(17,0)          dcl 91 set ref 691* 692
+segp                     10            based           pointer                  level 2 dcl 7-18 set ref 840 840*
+size                                                   builtin function         dcl 164 ref 297 297 299 299
+spec_sw                                parameter       bit(1)                   packed unaligned dcl 558 ref 556 585
+special_status_flag             000172 automatic       bit(1)                   dcl 87 set ref 602* 608 623* 629
+special_status_word             000173 automatic       bit(36)                  dcl 88 set ref 187 602* 612 623* 633
+start_time                      000130 automatic       fixed bin(52,0)          dcl 74 set ref 566* 668
+statp                           000310 automatic       pointer                  dcl 4-5 set ref 186* 684 690 700 700 700 700 701 701
+                                                                                  703 703 707 707 709 709
+status                    1            based           bit(36)                  level 2 in structure "imess" packed packed unaligned
+                                                                                  dcl 3-21 in procedure "load_mpc" set ref 186
+status                                 based           structure                level 1 dcl 4-7 in procedure "load_mpc"
+stopped_io                      000135 automatic       bit(1)                   initial packed unaligned dcl 76 set ref 76* 311* 817
+                                                                                  826*
+string                                                 builtin function         dcl 164 set ref 474* 480* 482* 726* 732*
+sub                       0(06)        based           bit(6)                   level 2 packed packed unaligned dcl 4-7 set ref 700
+                                                                                  701* 703*
+substr                                                 builtin function         dcl 164 set ref 197 347 443* 612 633 737 737
+t                                      based           bit(1)                   level 2 in structure "status" packed packed
+                                                                                  unaligned dcl 4-7 in procedure "load_mpc" ref 684
+t                                      based           bit(1)                   level 2 in structure "io_special_status" packed
+                                                                                  packed unaligned dcl 9-14 in procedure "load_mpc"
+                                                                                  ref 608 629
+tally                     0(24)        based           bit(12)                  level 2 packed packed unaligned dcl 2-7 set ref 488*
+                                                                                  510* 519*
+tally_len                       000372 automatic       fixed bin(17,0)          dcl 466 set ref 484* 485 486 487 487* 488
+time_out                  0(03)        based           bit(1)                   level 3 packed packed unaligned dcl 3-21 ref 575 742
+timer_channel                   000144 automatic       fixed bin(71,0)          initial dcl 81 set ref 81* 263* 265 591* 592* 594*
+                                                                                  599 639* 641* 643* 648 749* 750* 752* 753 803*
+                                                                                  804* 805* 806 831 832* 833* 834*
+timer_manager_$alarm_wakeup     000062 constant        entry                    external dcl 156 ref 594 643 752 805
+timer_manager_$reset_alarm_wakeup
+                                000064 constant        entry                    external dcl 157 ref 591 639 749 803 832
+timer_sw                        000125 automatic       bit(1)                   initial packed unaligned dcl 72 set ref 72* 221* 566
+                                                                                  570 598 647 667
+type                      0(22)        based           bit(2)                   level 2 in structure "dcw" packed packed unaligned
+                                                                                  dcl 2-7 in procedure "load_mpc" set ref 489* 492*
+type                     12            based           fixed bin(17,0)          level 2 in structure "fwe" dcl 7-18 in procedure
+                                                                                  "load_mpc" ref 372 399 440
+type                     33            based           char(4)                  level 2 in structure "attach_mpc_data" dcl 6-9
+                                                                                  in procedure "load_mpc" set ref 275 419
+unspec                                                 builtin function         dcl 164 set ref 177* 328 328 373* 373 406* 406 413*
+                                                                                  413 441* 441 523*
+version                                based           fixed bin(17,0)          level 2 dcl 6-9 set ref 178*
+wait_list                       000164 automatic       structure                level 1 unaligned dcl 84 set ref 568 568 596 596 645
+                                                                                  645 740 740 754 754 808 808
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+faultword                              based           structure                level 1 dcl 4-27
+fwlist_n                               automatic       fixed bin(17,0)          dcl 7-9
+isp                                    automatic       pointer                  dcl 3-5
+special_status                         based           structure                level 1 dcl 4-35
+tdcw                                   based           structure                level 1 dcl 2-14
+tdcwp                                  automatic       pointer                  dcl 2-4
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+check_status                    004673 constant        entry                    internal dcl 681 ref 588 650 664
+clean_up                        005730 constant        entry                    internal dcl 815 ref 190 355
+dc_reset                        005246 constant        entry                    internal dcl 720 ref 315 342
+dev_firm                        003176 constant        entry                    internal dcl 430 ref 419
+err_1                           002465 constant        label                    dcl 764 ref 196 565 738 771
+err_2                           002501 constant        label                    dcl 767
+err_3                           002523 constant        label                    dcl 770 ref 264 563 569 593 597 642 646 741 751 755
+exit                            002422 constant        label                    dcl 355 ref 201 209 214 227 233 239 251 258 271 285
+                                                                                  292 300 308 337 402 578 606 610 615 627 631 636
+                                                                                  661 687 697 711 744 765 768
+got_firmware                    002752 constant        label                    dcl 404 set ref 399
+join                            003350 constant        label                    dcl 473 ref 550
+load_firmware                   002673 constant        entry                    internal dcl 392 ref 345
+load_mpc                        000655 constant        entry                    external dcl 12
+make_dcw                        003337 constant        entry                    internal dcl 461 ref 350 374 407 414
+make_eurc_dcw                   003441 constant        entry                    internal dcl 496 ref 320
+make_mask_dcw                   003550 constant        entry                    internal dcl 546 ref 444
+opr_notify                      005531 constant        entry                    internal dcl 788 ref 313 322 377 404 819 827
+pause                           005633 constant        entry                    internal dcl 800 ref 382 693 824
+req_err                         001075 constant        label                    dcl 200
+run_block                       003634 constant        label                    dcl 568
+run_dcw                         003564 constant        entry                    internal dcl 556 ref 323 351 381 410 417 451
+run_itrs                        002533 constant        entry                    internal dcl 365 ref 341
+send_err                        005461 constant        entry                    internal dcl 777 ref 685 696 743 764 767
+start_io                        003573 constant        label                    dcl 562 ref 560
+time_err                        003662 constant        label                    dcl 576 ref 599 648
+wait_for_term                   004346 constant        label                    dcl 639 ref 649
+wrong_stat                      004460 constant        label                    dcl 659 ref 600
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      6646        6746    6251        6656
+Length      7424    6251       100         442     374           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+load_mpc                            582 external procedure  is an external procedure.  
+on unit on line 190                  64 on unit               
+run_itrs                                internal procedure  shares stack frame of external procedure load_mpc.  
+load_firmware                           internal procedure  shares stack frame of external procedure load_mpc.  
+dev_firm                                internal procedure  shares stack frame of external procedure load_mpc.  
+make_dcw                                internal procedure  shares stack frame of external procedure load_mpc.  
+run_dcw                                 internal procedure  shares stack frame of external procedure load_mpc.  
+check_status                            internal procedure  shares stack frame of external procedure load_mpc.  
+dc_reset                                internal procedure  shares stack frame of external procedure load_mpc.  
+send_err                             84 internal procedure  is called during a stack extension.  
+opr_notify                           78 internal procedure  is called by several nonquick procedures.  
+pause                                86 internal procedure  is called by several nonquick procedures.  
+clean_up                            118 internal procedure  is called by several nonquick procedures.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+load_mpc                 000100 code                        load_mpc
+                         000101 arg_cnt                     load_mpc
+                         000102 i                           load_mpc
+                         000103 phcs_access                 load_mpc
+                         000104 execute                     load_mpc
+                         000106 arg_ptr                     load_mpc
+                         000110 arg_len                     load_mpc
+                         000111 firm_sw                     load_mpc
+                         000112 itr_sw                      load_mpc
+                         000113 eurc_data_error             load_mpc
+                         000114 pcw_words                   load_mpc
+                         000116 err_msg                     load_mpc
+                         000124 msg_sw                      load_mpc
+                         000125 timer_sw                    load_mpc
+                         000126 eurc_sw                     load_mpc
+                         000130 start_time                  load_mpc
+                         000132 end_time                    load_mpc
+                         000134 elapsed_time                load_mpc
+                         000135 stopped_io                  load_mpc
+                         000136 mpc_dead                    load_mpc
+                         000137 io_begun                    load_mpc
+                         000140 buf_ptr                     load_mpc
+                         000142 fw_revision                 load_mpc
+                         000144 timer_channel               load_mpc
+                         000146 eurc_test                   load_mpc
+                         000152 TEST_NAME                   load_mpc
+                         000164 wait_list                   load_mpc
+                         000172 special_status_flag         load_mpc
+                         000173 special_status_word         load_mpc
+                         000174 ioi_io_tm                   load_mpc
+                         000176 RETRY_IO_LABEL              load_mpc
+                         000202 seconds_from_last_io        load_mpc
+                         000204 auto_attach_mpc_data        load_mpc
+                         000260 auto_event_wait_info        load_mpc
+                         000270 eurc_test_datap             load_mpc
+                         000300 pcwp                        load_mpc
+                         000302 idcwp                       load_mpc
+                         000304 dcwp                        load_mpc
+                         000306 imp                         load_mpc
+                         000310 statp                       load_mpc
+                         000312 event_wait_info_ptr         load_mpc
+                         000314 attach_mpc_datap            load_mpc
+                         000316 fwlistp                     load_mpc
+                         000320 fwep                        load_mpc
+                         000322 io_special_status_ptr       load_mpc
+                         000334 i                           run_itrs
+                         000335 opr_not_notified            run_itrs
+                         000346 cs_ok                       load_firmware
+                         000347 rw_ok                       load_firmware
+                         000350 df_ok                       load_firmware
+                         000351 fwx                         load_firmware
+                         000362 i                           dev_firm
+                         000372 tally_len                   make_dcw
+                         000373 data_loc                    make_dcw
+                         000374 len                         make_dcw
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+fx1_to_fl2          alloc_char_temp     cat_realloc_chars   call_ext_out_desc   call_ext_out        call_int_this_desc
+call_int_this       call_int_other_desc call_int_other      return_mac          tra_ext_2           enable_op
+shorten_stack       ext_entry           int_entry           int_entry_desc      divide_fx3          op_freen_
+clock_mac
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+attach_mpc_                   com_err_                      convert_ipc_code_             cu_$arg_count
+cu_$arg_ptr                   detach_mpc_                   hcs_$get_user_effmode         ioa_
+ioi_$connect                  ioi_$connect_pcw              ioi_$get_special_status       ioi_$release_devices
+ioi_$suspend_devices          ioi_$workspace                ipc_$block                    ipc_$create_ev_chn
+ipc_$delete_ev_chn            ipc_$drain_chn                load_mpc_fw_info_             parse_io_channel_name_
+phcs_$ring_0_message          release_temp_segment_         timer_manager_$alarm_wakeup
+timer_manager_$reset_alarm_wakeup
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+error_table_$badopt           error_table_$noarg            error_table_$noentry
+error_table_$request_not_recognized
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     12 000654        62 000662        66 000664        67 000666        68 000667        70 000670        71 000675
+     72 000676        73 000677        76 000700        77 000701        78 000702        81 000703        82 000705
+     83 000711       170 000712       171 000720       172 000722       173 000752       176 000753       177 000755
+    178 000760       179 000762       180 000765       181 000770       182 000772       184 000774       185 000776
+    186 001000       187 001002       188 001004       190 001006       194 001030       195 001037       196 001054
+    197 001056       198 001063       200 001075       201 001127       203 001130       204 001131       205 001142
+    206 001143       207 001160       208 001162       209 001207       211 001210       212 001241       213 001243
+    214 001275       216 001276       217 001301       218 001302       219 001311       220 001320       221 001332
+    222 001341       223 001355       224 001356       225 001373       226 001375       227 001422       229 001423
+    230 001430       232 001431       233 001463       235 001464       237 001466       238 001476       239 001522
+    242 001523       247 001535       249 001604       250 001606       251 001632       254 001633       257 001642
+    258 001666       263 001667       264 001700       265 001702       267 001704       268 001707       270 001711
+    271 001722       272 001724       274 001727       275 001730       278 001745       280 001754       282 001756
+    283 001760       284 001766       285 002015       290 002016       291 002020       292 002054       297 002056
+    298 002076       299 002100       300 002132       305 002133       306 002145       307 002147       308 002200
+    311 002201       313 002203       315 002217       317 002220       318 002222       319 002224       320 002231
+    321 002232       322 002254       323 002272       326 002276       327 002277       328 002302       330 002313
+    331 002317       333 002354       335 002356       336 002360       337 002363       340 002364       341 002367
+    342 002370       345 002371       347 002375       349 002404       350 002406       351 002415       352 002421
+    355 002422       358 002426       361 002464       764 002465       765 002500       767 002501       768 002522
+    770 002523       771 002532       365 002533       368 002534       370 002536       371 002545       372 002551
+    373 002554       374 002564       375 002602       376 002631       377 002633       378 002647       380 002650
+    381 002656       382 002662       384 002670       386 002672       392 002673       394 002674       397 002677
+    398 002707       399 002713       400 002716       401 002720       402 002751       404 002752       406 002770
+    407 003001       408 003017       409 003045       410 003053       411 003057       413 003061       414 003072
+    415 003110       416 003136       417 003144       418 003150       419 003152       420 003163       422 003165
+    424 003175       430 003176       436 003200       438 003204       439 003213       440 003217       441 003225
+    442 003235       443 003236       444 003243       445 003261       446 003263       447 003265       448 003267
+    450 003322       451 003330       453 003334       455 003336       461 003337       470 003341       471 003343
+    473 003350       474 003353       475 003354       476 003361       477 003365       479 003367       480 003372
+    481 003373       482 003376       483 003377       484 003403       485 003407       486 003411       487 003413
+    488 003416       489 003424       490 003430       491 003435       492 003436       494 003440       496 003441
+    500 003442       501 003444       502 003445       503 003447       504 003451       505 003455       506 003457
+    507 003461       508 003464       509 003466       510 003471       511 003473       512 003475       513 003476
+    514 003500       515 003502       516 003504       517 003506       518 003507       519 003512       523 003514
+    527 003517       528 003521       529 003523       530 003525       531 003526       532 003530       533 003531
+    534 003533       535 003535       536 003537       537 003541       538 003543       539 003545       543 003547
+    546 003550       548 003552       549 003556       550 003563       556 003564       560 003566       561 003571
+    562 003573       563 003605       564 003607       565 003624       566 003626       567 003632       568 003634
+    569 003651       570 003653       575 003657       576 003662       578 003717       585 003720       586 003726
+    587 003734       588 003741       590 003742       591 003747       592 003756       593 003767       594 003771
+    595 004010       596 004012       597 004027       598 004031       599 004035       600 004040       602 004045
+    604 004063       605 004065       606 004111       608 004112       609 004120       610 004145       612 004146
+    614 004151       615 004176       617 004177       620 004200       621 004202       623 004207       625 004225
+    626 004227       627 004253       629 004254       630 004262       631 004307       633 004310       635 004313
+    636 004340       638 004341       639 004346       641 004355       642 004366       643 004370       644 004407
+    645 004411       646 004426       647 004430       648 004434       649 004437       650 004444       651 004445
+    656 004446       658 004453       659 004460       661 004523       664 004524       667 004525       668 004527
+    669 004532       670 004567       672 004632       675 004672       681 004673       684 004674       685 004677
+    687 004726       690 004730       691 004733       692 004741       693 004743       694 004751       696 004753
+    697 005002       700 005004       701 005027       703 005074       707 005142       709 005203       711 005244
+    713 005245       720 005246       722 005247       723 005251       725 005252       726 005254       727 005257
+    728 005261       729 005263       731 005265       732 005267       733 005270       734 005272       736 005274
+    737 005276       738 005317       739 005321       740 005323       741 005340       742 005342       743 005352
+    744 005371       749 005372       750 005401       751 005412       752 005414       753 005433       754 005435
+    755 005452       756 005454       758 005457       777 005460       781 005501       782 005527       788 005530
+    793 005544       795 005630       800 005632       803 005640       804 005647       805 005661       806 005700
+    807 005703       808 005705       809 005722       810 005726       815 005727       817 005735       818 005740
+    819 005742       820 005756       822 006011       824 006012       825 006021       826 006034       827 006036
+    830 006053       831 006065       832 006073       833 006102       834 006114       837 006117       838 006123
+    839 006134       840 006140       841 006165       842 006170       845 006175
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved

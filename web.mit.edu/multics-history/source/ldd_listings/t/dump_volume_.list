@@ -1,0 +1,1489 @@
+	COMPILATION LISTING OF SEGMENT dump_volume_
+	Compiled by: Multics PL/I Compiler, Release 33e, of October 6, 1992
+	Compiled at: CGI                             
+	Compiled on: 2000-04-17_1927.02_Mon_mdt
+	    Options: optimize map
+
+        1 /****^  ***********************************************************
+        2*        *                                                         *
+        3*        * Copyright, (C) Honeywell Bull Inc., 1988                *
+        4*        *                                                         *
+        5*        * Copyright, (C) Honeywell Information Systems Inc., 1982 *
+        6*        *                                                         *
+        7*        * Copyright (c) 1972 by Massachusetts Institute of        *
+        8*        * Technology and Honeywell Information Systems, Inc.      *
+        9*        *                                                         *
+       10*        *********************************************************** */
+       11 
+       12 /* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+       13 
+       14 dump_volume_: proc (code);
+       15 
+       16 /* This routine dumps a single physical volume in the dump mode specified.  It also updates the appropriate
+       17*   volume log, a per physical volume log of all the output volumes that contain relevent information about that
+       18*   physical volume.In addition it maintains statistics about what is dumped from each physical volume. The incremental
+       19*   and consolidated volume dumping is driven by a ring 0 bit map of which vtoces to dump. The complete volume
+       20*   dump is driven by either a constructed bit map or a vtoce by vtoce scan, depending on which will use less resources.
+       21*   The volume log is written out befor and after the physical volume is dumped, so that the most recent copy
+       22*   is on an output volume should the online copy be lost. */
+       23 
+       24 /* Modified: 10/22/81 by GA Texada to change page_read_error to page_fault_error.     
+       25*   Modified: 11/16/81 by GAT to close and write the current volume log if aborting a dump.
+       26*   Modified: 12/17/81 by GAT to recognize when an attachment of a volume fails and abort the dump.
+       27*   Modified: 11/10/82 by GAT (PBF for MR10.1) to actually indicate that the dump 
+       28*		  should be aborted ny Operator request.
+       29*   Modified: 11/17/82 by GAT to query when a pv is found locked under 'special' circumstances.
+       30*   Modified: August 1983 by GA Texada to call dmpr_output_$new_pass_attach if necessary.
+       31**/
+       32 
+       33 /****^  HISTORY COMMENTS:
+       34*  1) change(86-03-04,Fawcett), approve(86-04-10,MCR7383),
+       35*     audit(86-06-03,GWMay), install(86-07-18,MR12.0-1098):
+       36*     Support for subvolume devices real 512_word_io.
+       37*  2) change(88-04-13,GWMay), approve(88-04-13,MCR7855), audit(88-04-14,Farley),
+       38*     install(88-04-19,MR12.2-1039):
+       39*     Changed to diagnose vtoce connection failures and continue dumping.
+       40*  3) change(88-05-27,GWMay), approve(88-05-27,MCR7883),
+       41*     audit(88-06-14,Beattie), install(88-07-19,MR12.2-1061):
+       42*     Added init for first pass flag in  dmpr_data.
+       43*                                                   END HISTORY COMMENTS */
+       44 
+       45 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+       46 
+       47     code = 0;					/* set return values */
+       48     loop_cnt = 0;					/* init */
+       49 
+       50 /* First we will set the number of vtoce in a page dependent on device_type */
+       51 
+       52     if dmpr_data_.version <= dmpr_data_version_2 then n_vtoce_per_page = 5; /* old style can not be for a sub volume device */
+       53     else n_vtoce_per_page = vtoc_per_rec (dmpr_data_.disk_type);
+       54 
+       55     recordp = dmpr_data_.recordp;
+       56     dmpr_data_.num_null_vtoce,
+       57          dmpr_data_.num_vtoce_only,
+       58          dmpr_data_.physical_volume_dir_num,
+       59          dmpr_data_.physical_volume_dir_rec,
+       60          dmpr_data_.physical_volume_seg_num,
+       61          dmpr_data_.physical_volume_seg_rec = 0;		/* reset counters */
+       62 						/* get ptr to volume log */
+       63     call dmpr_log_$init_volume_log (code);
+       64     if code ^= 0 then do;
+       65         call dmpr_report_$error_output (code, myname, "Volume log init failure of ^a.volog ", dmpr_data_.pvname);
+       66         return;
+       67       end;
+       68     bvlp = dmpr_data_.bvlp;
+       69 
+       70 /* Interlock physical volume against dumper operating in same mode, ie: two incremental dumpers.  Setup cleanup
+       71*   handler in case we abort. Also pickup newest copy of label record of physical volume and some other descriptive
+       72*   info about the state of the pack. The label record will be use by the volume reloader to check if the
+       73*   initialized pack it is given can handle the information to be reloaded. */
+       74 
+       75     on cleanup call unlock_pv;
+       76 try_again:
+       77     call hc_backup_$dmpr_lock_pv (dmpr_data_.pvid, dmpr_data_.dump_type, addr (backup_volume_log.info), code);
+       78     if code ^= 0 then do;
+       79         if dmpr_data_.restart_pvname = dmpr_data_.pvname then do;
+       80 						/* only do this IF we are restarting		*/
+       81 	  call command_query_$yes_no (ansb, 0, myname,
+       82 	       "The physical volume ^a was found locked. This could have been caused by a previous system interruption.
+       83 A ""yes"" answer will attempt to forcibly unlock it. A ""no"" answer will not.",
+       84 	       "Volume ^a is locked, do you wish to unlock it?", dmpr_data_.pvname);
+       85 	  if ansb then do;
+       86 	      call unlock_pv ();
+       87 	      if ec = 0 then goto try_again;
+       88 	    end;
+       89 	end;
+       90 bust_anyway:
+       91         call dmpr_report_$error_output (code, myname,
+       92 	   "Unable to lock  disk volume ^a",
+       93 	   dmpr_data_.pvname);
+       94         return;
+       95       end;
+       96 						/* pickup local copies */
+       97     n_vtoce = backup_volume_log.n_vtoce;
+       98     n_free_vtoce = backup_volume_log.n_free_vtoce;
+       99 
+      100 /* For each dump volume we maintain a log of which physical volume are on it. This allows us  to control
+      101*   the use of volumes and to not overwrite a volume which has useful infomation on it.
+      102*   This call updates that log. */
+      103 
+      104 /* If we need to, get an output volume. */
+      105     if dmpr_data_.detach & dmpr_data_.outputvol_iocbp = null () then do;
+      106         call dmpr_output_$new_pass_attach (code);
+      107         if code ^= 0 then do;
+      108 	  call unlock_pv;
+      109 	  return;
+      110 	end;
+      111       end;
+      112 						/* write physical volume log to dump volume */
+      113     call dmpr_output_$write_volume_log (code);
+      114     if code ^= 0 then do;
+      115         call dmpr_report_$error_output (code, myname, "Unable to write ^a.volog", dmpr_data_.pvname);
+      116         call unlock_pv;
+      117         return;
+      118       end;
+      119 						/*  Add dump volume to physical volume log */
+      120     call dmpr_log_$open_volume_log (code);
+      121     if code ^= 0 then do;
+      122         call dmpr_report_$error_output (code, myname, "Unable to open ^a.volog", dmpr_data_.pvname);
+      123         call unlock_pv;
+      124         return;
+      125       end;
+      126 
+      127     call dmpr_log_$update_pvolog (code);
+      128     if code ^= 0 then do;
+      129         call dmpr_report_$error_output (code, myname, "Unable to update ^a.pvolog", dmpr_data_.volname);
+      130         call unlock_pv;
+      131         return;
+      132 
+      133       end;
+      134 
+      135 
+      136 /* If this is a complete dump, then there are two ways to do it, either by reading each vtoce or by building
+      137*   a bit map of all in-use vtoces. The difference comes because to build the map we can read 5 vtoce in each page
+      138*   at one time by suitable use of an abs seg. Thus we compute which is the better method(uses the least resources)
+      139*   and  do the right thing. If we build the bit map, in our ring, we operate in "request" mode. */
+      140 
+      141     request = "0"b;
+      142     if (dmpr_data_.dump_type = comp) &
+      143          (n_free_vtoce * vtoce_read_time > n_vtoce * divide (page_read_time, n_vtoce_per_page, 17, 0)) then do;
+      144         request = "1"b;
+      145         vbmp = addr (vtoc_bit_map);
+      146         unspec (vtoc_bit_map) = "0"b;
+      147 
+      148         n_windows = divide (n_vtoce, max_pages_per_segment * n_vtoce_per_page, 17, 0) + 1;
+      149         on page_fault_error begin;
+      150 	  code = error_table_$device_parity;
+      151 	  call dmpr_report_$error_output (0, myname, "Page read error building volume bit map for disk ^a",
+      152 	       dmpr_data_.pvname);
+      153 	  goto map_err;
+      154 	end;
+      155         do i = 0 to n_windows - 1;
+      156 	call hc_backup_$dmpr_build_vtoc_map (vbmp, i, code);
+      157 	if code ^= 0 then do;
+      158 map_err:	    call dmpr_report_$error_output (code, myname,
+      159 	         "Unable to construct bit map for disk ^a", dmpr_data_.pvname);
+      160 	    call unlock_pv;
+      161 	    return;
+      162 	  end;
+      163         end;
+      164         revert page_fault_error;
+      165       end;
+      166 
+      167 /* Initialize the input structure to the ring 0 volume dumper */
+      168 
+      169     inputp = dmpr_data_.inputp;
+      170     dmpr_input.request_vtocx = -1;
+      171     dmpr_input.request = request;
+      172     dmpr_input.pvid = dmpr_data_.pvid;			/* changes each invocation */
+      173     dmpr_input.start_time = clock ();
+      174 
+      175 /* This is the main dump loop. We repeatedly call the ring 0 dumper to provide us with a pointer to the next
+      176*   object to be dumped until there are no more. Segments and directories are handled differently in that a directory
+      177*   must be consistent when dumped and thus are copied, while locked, into a temporyary segment. Segments, on the other
+      178*   hand are accessed through a ring 0 abs seg, we thus must be able to handle a seg fault error. Should one
+      179*   occur we call the ring 0 dumper and ask for a pointer to the segment again. We will repeat this up to 10 times
+      180*   and then give up. The final case is that of a vtoce which does not have an associated object. We dump this "null"
+      181*   vtoce as a place holder so that the volume reloader will not recover an earlier object with the same vtocx  index. */
+      182 
+      183     backup_volume_record.vtocx = -1;			/* set to beginning */
+      184     dmpr_input.Sfirst_pass_for_pv = "1"b;
+      185     do while (loop_cnt <= n_vtoce);			/* put a limit on it */
+      186       seg_fault_retry_cnt = 0;
+      187       in_use_retry_cnt = 0;
+      188       vtocx_retry_cnt = 0;
+      189       dmpr_input.retry = "0"b;
+      190       if request then dmpr_input.request_vtocx = get_next_vtocx_ ();
+      191       dmpr_input.prev_vtocx = backup_volume_record.vtocx;
+      192       dmpr_input.volid = dmpr_data_.volid;
+      193       on page_fault_error begin;
+      194 	call dmpr_report_$error_output (error_table_$device_parity, myname, "Skipping vtoce ^o on disk ^a",
+      195 	     backup_volume_record.vtocx, dmpr_data_.pvname);
+      196 	goto end_loop;
+      197         end;
+      198 						/* get pointer to object */
+      199 retry: call hc_backup_$get_dmpr_data_object (dmpr_data_.inputp, recordp, code);
+      200       if code ^= 0 then do;
+      201 	if code = error_table_$dmpr_in_use then do;
+      202 						/* object in use by other dumper so sleep */
+      203 	    in_use_retry_cnt = in_use_retry_cnt + 1;
+      204 	    if in_use_retry_cnt > 10 then do;
+      205 	        call dmpr_report_$error_output (0, myname,
+      206 		   "Skipping vtoce ^o on disk ^a because in-use too long",
+      207 		   backup_volume_record.vtocx, dmpr_data_.pvname);
+      208 	        goto end_loop;
+      209 	      end;
+      210 	    call timer_manager_$sleep (5, "11"b);
+      211 	    goto retry;
+      212 	  end;
+      213 						/*  if request could not be done */
+      214 	else if (request & code = error_table_$action_not_performed) then do;
+      215 	    code = 0;
+      216 	    goto end_loop;
+      217 	  end;
+      218 	else if code = error_table_$end_of_info then do;
+      219 	    code = 0;				/* completed sucessfully */
+      220 	    goto exit;
+      221 	  end;
+      222 	else if code = error_table_$invalid_vtoce then do;
+      223 	    backup_volume_record.uid = "0"b;
+      224 	  end;
+      225 	else if code = error_table_$vtoce_connection_fail then do;
+      226 						/* Directory damage is reported and this vtoce is not dumped until a system
+      227*   maintainer repairs the damage. */
+      228 	    call dmpr_report_$error_output (0, myname,
+      229 	         "Skipping vtoce ^o on disk volume ^a because it has the
+      230 same UID as another vtoce.  See the syserr log for more detailed information.",
+      231 	         backup_volume_record.vtocx, dmpr_data_.pvname);
+      232 	    go to end_loop;
+      233 	  end;
+      234 
+      235 	else do;					/* error condition */
+      236 	    if vtocx_retry_cnt < 10 then do;
+      237 	        call dmpr_report_$error_output (code, myname, " vtoce after ^o on disk ^a, retrying dump.",
+      238 		   dmpr_input.prev_vtocx, dmpr_data_.pvname);
+      239 	        vtocx_retry_cnt = vtocx_retry_cnt + 1;
+      240 	        goto retry;
+      241 	      end;
+      242 	    else do;
+      243 	        call dmpr_report_$error_output (code, myname, "Volume dump of ^a aborted.", dmpr_data_.pvname);
+      244 	        goto exit;				/* got to clean up what I have already dumped.	*/
+      245 	      end;
+      246 	  end;
+      247         end;
+      248 						/* type of object determines pointer	*/
+      249       if (backup_volume_record.uid = "0"b | dmpr_input.no_object) then datap = null ();
+      250       else if backup_volume_record.dirsw then datap = dmpr_data_.dirp;
+      251       else datap = dmpr_data_.segp;
+      252 						/* write out vtoce and possibly object */
+      253       call dmpr_output_$output_object (datap, code);
+      254       if code ^= 0 then do;				/* if -1, the attach/open failed, so abort	*/
+      255 	if code = -1 then do;			/* which actually says that the operatore requested abort*/
+      256 	    call dmpr_report_$error_output (0, myname, "Dump aborted by operator request.");
+      257 	    call unlock_pv;
+      258 	    return;
+      259 	  end;
+      260 						/* retry dump up to 10 times */
+      261 	if code = error_table_$segfault then do;
+      262 	    dmpr_input.retry = "1"b;
+      263 	    seg_fault_retry_cnt = seg_fault_retry_cnt + 1;
+      264 	    if seg_fault_retry_cnt > 10 then do;
+      265 	        call dmpr_report_$error_output (code, myname, "Retry of vtocx ^o on disk ^a failed",
+      266 		   backup_volume_record.vtocx, dmpr_data_.pvname);
+      267 	        dmpr_input.retry = "0"b;
+      268 	        seg_fault_retry_cnt = 0;
+      269 	        goto end_loop;
+      270 	      end;
+      271 	    dmpr_data_.retrys = dmpr_data_.retrys + 1;
+      272 	    goto retry;
+      273 	  end;
+      274 	call dmpr_report_$error_output (code, myname, "Unable to write object");
+      275         end;
+      276 						/* Update counters */
+      277       if backup_volume_record.uid = "0"b | dmpr_input.no_object then do;
+      278 	if backup_volume_record.uid = "0"b then dmpr_data_.num_null_vtoce = dmpr_data_.num_null_vtoce + 1;
+      279 	else dmpr_data_.num_vtoce_only = dmpr_data_.num_vtoce_only + 1;
+      280         end;
+      281 
+      282 /* Record the uid of the object dumped in the contents seg. This will save the retriever having to
+      283*   mount and serach an output volume, rather it can search the online contents segment. In addition record
+      284*   in the accounting data base the uid pathname of the object dumped. Dumping uses system resources and
+      285*   users should be billed for this service. Finally update some counters about what is being dumped. */
+      286 
+      287       else do;
+      288 	call dmpr_log_$log_object (code);
+      289 	if code ^= 0 then
+      290 	  call dmpr_report_$error_output (code, myname, "Error logging object");
+      291 	if backup_volume_record.dirsw then do;
+      292 	    dmpr_data_.physical_volume_dir_num = dmpr_data_.physical_volume_dir_num + 1;
+      293 	    dmpr_data_.physical_volume_dir_rec = dmpr_data_.physical_volume_dir_rec +
+      294 	         fixed (backup_volume_record.records, 9);
+      295 	    dmpr_data_.vol_log_dir_num = dmpr_data_.vol_log_dir_num + 1;
+      296 	    dmpr_data_.vol_log_dir_rec = dmpr_data_.vol_log_dir_rec +
+      297 	         fixed (backup_volume_record.records, 9);
+      298 	    dmpr_data_.dump_volume_dir_num = dmpr_data_.dump_volume_dir_num + 1;
+      299 	    dmpr_data_.dump_volume_dir_rec = dmpr_data_.dump_volume_dir_rec +
+      300 	         fixed (backup_volume_record.records, 9);
+      301 	  end;
+      302 	else do;
+      303 	    dmpr_data_.physical_volume_seg_num = dmpr_data_.physical_volume_seg_num + 1;
+      304 	    dmpr_data_.physical_volume_seg_rec = dmpr_data_.physical_volume_seg_rec +
+      305 	         fixed (backup_volume_record.records, 9);
+      306 	    dmpr_data_.vol_log_seg_num = dmpr_data_.vol_log_seg_num + 1;
+      307 	    dmpr_data_.vol_log_seg_rec = dmpr_data_.vol_log_seg_rec +
+      308 	         fixed (backup_volume_record.records, 9);
+      309 	    dmpr_data_.dump_volume_seg_num = dmpr_data_.dump_volume_seg_num + 1;
+      310 	    dmpr_data_.dump_volume_seg_rec = dmpr_data_.dump_volume_seg_rec +
+      311 	         fixed (backup_volume_record.records, 9);
+      312 	  end;
+      313         end;
+      314 end_loop:
+      315 						/* keep track of how many times in loop */
+      316       loop_cnt = loop_cnt + 1;
+      317     end;
+      318 exit:
+      319     revert page_fault_error;
+      320 
+      321 /* error exit - can't dump more then the number of vtoce on the physical volume */
+      322     if loop_cnt > n_vtoce then
+      323       call dmpr_report_$error_output (0, myname, "Bit map error - please salvage disk ^a",
+      324 	 dmpr_data_.pvname);
+      325 
+      326 /* Unlock physical volume, close volume log and write updated copy to dump volume */
+      327 
+      328     call unlock_pv;
+      329     call dmpr_log_$close_volume_log (code);
+      330     if code ^= 0 then
+      331       call dmpr_report_$error_output (code, myname,
+      332 	 "Unable to close ^a.volog", dmpr_data_.pvname);
+      333     call dmpr_output_$write_volume_log (code);
+      334     if code ^= 0 then
+      335       call dmpr_report_$error_output (code, myname, "Unable to write ^a.volog", dmpr_data_.pvname);
+      336     return;
+      337 
+      338 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      339 
+      340 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      341 
+      342 get_next_vtocx_: proc returns (fixed bin);
+      343 
+      344 /* This proc finds the next vtoce to dump from the complete volume dump bit map, described above, and
+      345*   retruns the vtocx index of it. */
+      346 
+      347     do idx = dmpr_input.request_vtocx + 1 to n_vtoce - 1 while (vtoc_bit_map (idx) = "0"b);
+      348     end;
+      349     vtoc_bit_map (idx) = "0"b;
+      350     return (idx);
+      351 
+      352   end get_next_vtocx_;
+      353 
+      354 /*  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  *  * 	*/
+      355 
+      356 
+      357 unlock_pv: proc;
+      358     if dmprp = null then return;
+      359     call hc_backup_$dmpr_unlock_pv (dmpr_data_.pvid, dmpr_data_.dump_type, ec);
+      360     if ec ^= 0 then
+      361       call dmpr_report_$error_output (ec, myname, "Unable to unlock disk ^a", dmpr_data_.pvname);
+      362   end unlock_pv;
+      363 
+      364 
+      365 dcl ansb		     bit (1);
+      366 dcl loop_cnt	     fixed bin;
+      367 dcl seg_fault_retry_cnt  fixed bin;
+      368 dcl vtocx_retry_cnt	     fixed bin;
+      369 dcl in_use_retry_cnt     fixed bin;
+      370 dcl code		     fixed bin (35);
+      371 dcl ec		     fixed bin (35);
+      372 dcl idx		     fixed bin;
+      373 dcl n_vtoce	     fixed bin;
+      374 dcl n_free_vtoce	     fixed bin;
+      375 dcl datap		     ptr;
+      376 dcl i		     fixed bin;
+      377 dcl vbmp		     ptr;
+      378 dcl request	     bit (1);
+      379 dcl vtoc_bit_map	     (0:36720 - 1) bit (1) unaligned;
+      380 dcl n_windows	     fixed bin;
+      381 dcl n_vtoce_per_page     fixed bin;
+      382 dcl myname	     char (32) int static init ("dump_volume_") options (constant);
+      383 dcl vtoce_read_time	     fixed bin int static init (25) options (constant);
+      384 dcl page_read_time	     fixed bin int static init (40) options (constant);
+      385 dcl max_pages_per_segment fixed bin int static init (255) options (constant);
+      386 
+      387 dcl error_table_$invalid_vtoce ext fixed bin (35);
+      388 dcl error_table_$dmpr_in_use ext fixed bin (35);
+      389 dcl error_table_$device_parity ext fixed bin (35);
+      390 dcl error_table_$action_not_performed ext fixed bin (35);
+      391 dcl error_table_$segfault ext fixed bin (35);
+      392 dcl error_table_$end_of_info ext fixed bin (35);
+      393 dcl error_table_$vtoce_connection_fail fixed bin (35) ext static;
+      394 
+      395 dcl command_query_$yes_no entry () options (variable);
+      396 dcl timer_manager_$sleep entry (fixed bin (71), bit (2));
+      397 dcl dmpr_report_$error_output entry options (variable);
+      398 dcl dmpr_output_$new_pass_attach entry (fixed bin (35));
+      399 dcl dmpr_output_$write_volume_log entry (fixed bin (35));
+      400 dcl dmpr_output_$output_object entry (ptr, fixed bin (35));
+      401 dcl dmpr_log_$update_pvolog entry (fixed bin (35));
+      402 dcl dmpr_log_$log_object entry (fixed bin (35));
+      403 dcl dmpr_log_$init_volume_log entry (fixed bin (35));
+      404 dcl dmpr_log_$open_volume_log entry (fixed bin (35));
+      405 dcl dmpr_log_$close_volume_log entry (fixed bin (35));
+      406 
+      407 dcl hc_backup_$dmpr_lock_pv entry (bit (36) aligned, fixed bin, ptr, fixed bin (35));
+      408 dcl hc_backup_$dmpr_unlock_pv entry (bit (36) aligned, fixed bin, fixed bin (35));
+      409 dcl hc_backup_$dmpr_build_vtoc_map entry (ptr, fixed bin, fixed bin (35));
+      410 dcl hc_backup_$get_dmpr_data_object entry (ptr, ptr, fixed bin (35));
+      411 
+      412 dcl cleanup	     condition;
+      413 dcl page_fault_error     condition;
+      414 dcl addr		     builtin;
+      415 dcl clock		     builtin;
+      416 dcl divide	     builtin;
+      417 dcl fixed		     builtin;
+      418 dcl null		     builtin;
+      419 dcl unspec	     builtin;
+      420 
+  1     1 /* BEGIN INCLUDE FILE ... dmpr_data_.incl.pl1 Feb 1976 */
+  1     2 /* format: style1,ind2,^inddcls,ifthenstmt,dclind2,declareind2,ifthendo,ifthen*/
+  1     3 /* Modified 7/79 by D. Vinograd to add new variables and change to based structure */
+  1     4 /* Modified: 1/26/83 by GA Texada to add cur_vol_open and change version to 2.	   */
+  1     5 /* Modified: 04/05/83 by GA Texada to add trace switch to support tracing.	   */
+  1     6 /* Modified 04/84 by GA Texada to change to version 3 (disk_type). This begins the adding of new items	*/
+  1     7 /* to the END of the structure to facilite easy additions.						*/
+  1     8 dcl dmprp		     ptr ext static init (null);
+  1     9 dcl dmpr_data_version_2  fixed bin int static init (2) options (constant);
+  1    10 dcl dmpr_data_version_3  fixed bin int static init (3) options (constant);
+  1    11 						/* Version 3 is current			*/
+  1    12 
+  1    13 dcl 1 dmpr_data_	     aligned based (dmprp),
+  1    14     2 version	     fixed bin,			/* version */
+  1    15     2 lock	     bit (36),			/* inter-lock */
+  1    16     2 ptrs,
+  1    17       3 pre_attach_pvlp  (50) ptr,			/* array of pvolog ptrs */
+  1    18       3 contents_namesp  ptr,				/* ptr to contents name seg */
+  1    19       3 pre_attach_iocbp (50) ptr,			/* array of output iocbp */
+  1    20       3 pvlp	     ptr,				/* ptr to dump volume log */
+  1    21       3 account_iocbp    ptr,				/* iocbp for account seg */
+  1    22       3 infop	     ptr,				/* ptr to info seg */
+  1    23       3 inputp	     ptr,				/* ptr to input storage for sup interface */
+  1    24       3 recordp	     ptr,				/* ditto for output */
+  1    25       3 control_iocbp    ptr,				/* iocbp for dump control segment */
+  1    26       3 error_iocbp	     ptr,				/* iocbp for error output file */
+  1    27       3 outputvol_iocbp  ptr,				/* iocbp for dump volume */
+  1    28       3 contentsp	     ptr,				/* ptr to dump volume table of contents */
+  1    29       3 bvlp	     ptr,				/* ptr to volume log */
+  1    30       3 dirp	     ptr,				/* ptr to directory buffer seg */
+  1    31       3 segp	     ptr,				/* ptr to segment to be dumped */
+  1    32       3 fcbp	     ptr,				/* ptr to file control block for contents_name msf */
+  1    33       3 vpp	     ptr,				/* ptr to volume pool */
+  1    34     2 fixed_bin,
+  1    35       3 retrys	     fixed bin,			/* number of time segment disappeared while being dumped */
+  1    36       3 physical_volume_dir_num fixed bin,		/* number of dirs dumped from this physical volume */
+  1    37       3 physical_volume_dir_rec fixed bin,		/* number of dir records on this physical volume */
+  1    38       3 physical_volume_seg_num fixed bin,		/* number of segs dumped from this physical volume */
+  1    39       3 physical_volume_seg_rec fixed bin,		/* number of seg records dumped from this physical volume  */
+  1    40       3 vol_log_dir_num  fixed bin,			/*  dirs dumped from pvol to dump vol */
+  1    41       3 vol_log_dir_rec  fixed bin,			/*  dir rec on this pvol to dump vol */
+  1    42       3 vol_log_seg_num  fixed bin,			/*  segs dumped from pvol to dump vol */
+  1    43       3 vol_log_seg_rec  fixed bin,			/*  seg rec dumped from pvol to dump vol  */
+  1    44       3 dump_volume_dir_num fixed bin,			/* number of dirs dumped on this dump volume */
+  1    45       3 dump_volume_dir_rec fixed bin,			/* number of dir records on this dump volume */
+  1    46       3 dump_volume_seg_num fixed bin,			/* number of segs dumped on this dump volume */
+  1    47       3 dump_volume_seg_rec fixed bin,			/* number of seg records dumped on this dump volume  */
+  1    48       3 num_null_vtoce   fixed bin,			/* number of null vtoce dumped from this physical volume */
+  1    49       3 num_vtoce_only   fixed bin,			/* number of vtoce only  */
+  1    50       3 mod_after_time   fixed bin (71),		/* dump all modified since this date */
+  1    51       3 dump_type	     fixed bin,			/* type of dump */
+  1    52       3 save_time	     fixed bin (71),		/* date, time of start of dump */
+  1    53       3 start_time	     fixed bin (71),		/* start time of physical volume pass */
+  1    54       3 wakeup_interval  fixed bin (71),		/* interval between wakeups of dumper in micro secs. */
+  1    55       3 incr_ev_chn	     fixed bin (71),		/* event chn used to wakeup incremental dumper */
+  1    56       3 incr_skip_count  fixed bin,			/* number of incr cycles skiped befor purging */
+  1    57       3 pre_attach_vol   fixed bin,			/* if greater then 1 then pre attach output streams */
+  1    58       3 vol_idx	     fixed bin,			/* index of multi volume attachment sequence */
+  1    59       3 component	     fixed bin,			/* msf component of contents_name seg */
+  1    60     2 bits,
+  1    61       3 volid	     bit (36),			/* uid of dump volume */
+  1    62       3 pre_attach_volid (50) bit (36),			/* array of volid */
+  1    63       3 cycle_uid	     bit (36),			/* uid of this dump cycle */
+  1    64       3 pvid	     bit (36),			/* uid of physical volume being dumped */
+  1    65       3 flags,
+  1    66       ( 4 purge	     bit (1),			/* if on purge volume logs */
+  1    67         4 auto_vol	     bit (1),			/* if on use automatic dump volume selection */
+  1    68         4 disable_error_report bit (1),			/* if on disables error reporting */
+  1    69         4 arg_init	     bit (1),			/* if on indicates args have been processed */
+  1    70         4 manual_free    bit (1),			/* on if manual free will be done */
+  1    71         4 err_online     bit (1),			/* Flag error output to be online, default to a file */
+  1    72         4 detach	     bit (1),			/* if on control detachment of dump volume */
+  1    73         4 no_object	     bit (1),			/* if on not copy object from ring 0 */
+  1    74         4 no_update	     bit (1),			/* if on prevent vtoce update */
+  1    75         4 data_init	     bit (1),			/* if on indicates that data structure has been initialized */
+  1    76         4 reset	     bit (1),			/* if on put items back on list */
+  1    77         4 accounting     bit (1),			/* if on enables accounting */
+  1    78         4 dmpr_asleep    bit (1),			/* dumper is asleep - interlock to prevent restart of last volume */
+  1    79         4 dump_in_progress bit (1),			/* recursive entry interlock */
+  1    80         4 not_reported   bit (1),			/* on if output counts not reported */
+  1    81         4 names	     bit (1),			/* collect all names from dirs that are dumped */
+  1    82         4 cur_vol_open   bit (1),			/* if a successful open on this volname		*/
+  1    83         4 trace	     bit (1),			/* ON => trace				*/
+  1    84         4 pad	     bit (18)) unal,		/* fill out the word properly			*/
+  1    85       3 old_256K_switch bit(2) aligned,			/* 256K segs enabled prior to this dumper invocation?*/
+  1    86       3 rpv_pvid        bit (36),			/* because the label really doesn't have it	*/
+  1    87     2 chars,
+  1    88       3 sys_dir	     char (168),			/* system directory where all volume dumper data lives */
+  1    89       3 prev_volname     char (32),
+  1    90       3 pre_attach_volname (50) char (32),		/* array of volnames */
+  1    91       3 io_module	     char (32),			/* name of attached outer module for output io */
+  1    92       3 pvname	     char (32),			/* name of physical volume being dumped */
+  1    93       3 att_desc	     char (256),			/* attach description for output */
+  1    94       3 volname	     char (32),			/* name of dump volume */
+  1    95       3 control_name     char (32),			/* dump control file name   */
+  1    96       3 myname	     char (32),			/* name of entry called */
+  1    97       3 operator	     char (32),			/* operator name */
+  1    98       3 restart_pvname   char (32),			/* where to restart complete or consolidated dump */
+  1    99       3 lvname	     char (32),			/* name of logical volume being dumped */
+  1   100    2 disk_type fixed bin;				/* disk type for recording in the volog		*/
+  1   101 	
+  1   102 
+  1   103 /* END OF INCLUDE FILE ... dmpr_data_.incl.pl1 */
+      421 
+      422 
+  2     1 /* BEGIN INCLUDE FILE ... backup_volume_header ... Feb 1976 */
+  2     2 
+  2     3 dcl  hdp ptr;					/* ptr to header */
+  2     4 
+  2     5 dcl 1 backup_volume_header based (hdp) aligned,
+  2     6     2 pattern1 bit (36),				/* unique  word 1 */
+  2     7     2 rec1_type fixed bin,				/* record 1 type */
+  2     8     2 rec1_len fixed bin,				/* length in chars */
+  2     9     2 pattern2 bit (36),				/* unique word 2 */
+  2    10     2 rec2_type fixed bin,				/* record 2 type */
+  2    11     2 rec2_len fixed bin,				/* length in chars */
+  2    12     2 pattern3 bit (36),				/* unique word 3 */
+  2    13     2 time_dumped bit (36);				/* dump time of this record */
+  2    14 
+  2    15 dcl  vtoce_type fixed bin static init (1) options (constant); /* type code for vtoce */
+  2    16 dcl  dir_type fixed bin static init (2) options (constant); /* type code for directory */
+  2    17 dcl  seg_type fixed bin static init (3) options (constant); /* type code for segment */
+  2    18 dcl  null_type fixed bin static init (4) options (constant); /* type code for null record */
+  2    19 dcl  volume_log_type fixed bin static init (5) options (constant); /* type code for volume log */
+  2    20 dcl  prev_output_log_type fixed bin static init (6) options (constant); /* type code for prev output log */
+  2    21 dcl  contents_type fixed bin static init (7) options (constant); /* type code for contents segment of previous volume */
+  2    22 dcl  info_type fixed bin static init (8) options (constant); /* type code for info structure */
+  2    23 
+  2    24 dcl  pattern1 bit (36) int static init ("110111000011001100011101101010100101"b) options (constant);
+  2    25 dcl  pattern2 bit (36) int static init ("101001010101101110001100110000111011"b) options (constant);
+  2    26 dcl  pattern3 bit (36) int static init ("001000111100110011100010010101011010"b) options (constant);
+  2    27 
+  2    28 /* END INCLUDE FILE ... backup_volume_header */
+      423 
+  3     1 /*     BEGIN INCLUDE FILE ... dmpr_input.incl.pl1 ... last modified Dec 1975 */
+  3     2 
+  3     3 
+  3     4 /****^  HISTORY COMMENTS:
+  3     5*  1) change(88-05-27,GWMay), approve(88-05-27,MCR7883),
+  3     6*     audit(88-06-14,Beattie), install(88-07-19,MR12.2-1061):
+  3     7*     Added Sfirst_pass_for_pv bit and time stamp variables for use in
+  3     8*     processing inconsistent dumper bit maps.
+  3     9*                                                   END HISTORY COMMENTS */
+  3    10 
+  3    11 
+  3    12 /* Input structure for supervisor interface for dumper */
+  3    13 
+  3    14 dcl  inputp ptr;
+  3    15 
+  3    16 dcl  dmpr_input_version_1 internal static init (1) options (constant);
+  3    17 
+  3    18 dcl 1 dmpr_input based (inputp) aligned,
+  3    19     2 version fixed bin,				/* version number of structure */
+  3    20     2 pvid bit (36),				/* physical volume id of volume to dump */
+  3    21     2 type fixed bin,				/* type of dump */
+  3    22     2 flags,
+  3    23      (3 reset bit (1),				/* if on forces reseting in control bit map */
+  3    24       3 no_update bit (1),				/* if on do not update vtoce (dtd and volid ) */
+  3    25       3 no_object bit (1),				/* if on do not return object */
+  3    26       3 retry bit (1),				/* if on indicates a retry of prev aborted call */
+  3    27       3 request bit (1),				/* if on indicates caller will control what to dump */
+  3    28       3 Sfirst_pass_for_pv bit (1),                         /* on = read disk label */
+  3    29       3 pad bit (29))unal,
+  3    30     2 prev_vtocx fixed bin,				/* vtoc index of previously dumped vtocx */
+  3    31     2 request_vtocx fixed bin,			/* vtocx to be dumped if request mode enabled */
+  3    32     2 volid bit (36),				/* volume id on which dump will be written */
+  3    33     2 start_time fixed bin (71),			/* start time of this cycle */
+  3    34     2 mod_after_time fixed bin (71),			/* time to check dtm against  */
+  3    35     2 last_incr_dump_time fixed bin (71),
+  3    36     2 last_cons_dump_time fixed bin (71);
+  3    37 
+  3    38 /*     END INCLUDE FILE ... dmpr_input.incl.pl1 ...  */
+      424 
+      425 
+  4     1 /* BEGIN INCLUDE FILE ... backup_volume_record.incl.pl1 ... March 1976 */
+  4     2 
+  4     3 
+  4     4 
+  4     5 /****^  HISTORY COMMENTS:
+  4     6*  1) change(88-10-05,GWMay), approve(88-10-05,MCR8005), audit(88-10-12,Farley),
+  4     7*     install(88-10-17,MR12.2-1173):
+  4     8*     Added a version 2 constant
+  4     9*                                                   END HISTORY COMMENTS */
+  4    10 
+  4    11 
+  4    12 dcl  recordp ptr;
+  4    13 
+  4    14 dcl  backup_volume_record_version_1 fixed bin static init (1) options (constant);
+  4    15 dcl  backup_volume_record_version_2 fixed bin static init (2) options (constant);
+  4    16 
+  4    17 dcl 1 backup_volume_record based (recordp) aligned,
+  4    18     2 header like backup_volume_header aligned,
+  4    19     2 version fixed bin,				/* version number of structure */
+  4    20     2 pvid bit (36),				/* physical volume id */
+  4    21     2 vtocx fixed bin,				/* vtoc index of returned vtoc entry */
+  4    22     2 vtoce like vtoce aligned;			/* vtoc entry */
+  4    23 
+  4    24 /* END INCLUDE FILE ... backup_volume_record.incl.pl1 */
+      426 
+  5     1 /* BEGIN INCLUDE FILE ... backup_static_variables.incl.pl1 ... March 1976 */
+  5     2 
+  5     3 
+  5     4 dcl  incr fixed bin init (1) internal static options (constant); /* incremental dump mode */
+  5     5 dcl  cons fixed bin init (2) internal static options (constant); /* consolidated dump mode */
+  5     6 dcl  comp fixed bin init (3) internal static options (constant); /* complete dump mode */
+  5     7 dcl  backup_version_1 fixed bin init (1) static internal options (constant); /* backup_version_1 of input/output structures */
+  5     8 
+  5     9 
+  5    10 
+  5    11 /* END INCLUDE FILE ... backup_static_variables.incl.pl1 */
+      427 
+      428 
+  6     1 /*	BEGIN INCLUDE FILE ...vtoce.incl.pl1 ... last modified September 1982 */
+  6     2 /* Template for a VTOC entry. Length = 192 words. (3 * 64). */
+  6     3 /* NOTE: vtoc_man clears pad fields before writing a vtoce. */
+  6     4 
+  6     5 dcl  vtocep ptr;
+  6     6 
+  6     7 dcl 1 vtoce based (vtocep) aligned,
+  6     8 
+  6     9 
+  6    10     (2 pad_free_vtoce_chain bit (36),			/* Used to be pointer to next free VTOCE */
+  6    11 
+  6    12     2 uid bit (36),					/* segment's uid - zero if vtoce is free */
+  6    13 
+  6    14     2 msl bit (9),					/* maximum segment length in 1024 word units */
+  6    15     2 csl bit (9),					/* current segment length - in 1024 word units */
+  6    16     2 records bit (9),				/* number of records used by the seg in second storage */
+  6    17     2 pad2 bit (9),
+  6    18 
+  6    19     2 dtu bit (36),					/* date and time segment was last used */
+  6    20 
+  6    21     2 dtm bit (36),					/* date and time segment was last modified */
+  6    22 
+  6    23     2 nqsw bit (1),					/* no quota switch - no checking for pages of this seg */
+  6    24     2 deciduous bit (1),				/* true if hc_sdw */
+  6    25     2 nid bit (1),					/* no incremental dump switch */
+  6    26     2 dnzp bit (1),					/* Dont null zero pages */
+  6    27     2 gtpd bit (1),					/* Global transparent paging device */
+  6    28     2 per_process bit (1),				/* Per process segment (deleted every bootload) */
+  6    29     2 damaged bit (1),				/* TRUE if contents damaged */
+  6    30     2 fm_damaged bit (1),				/* TRUE if filemap checksum bad */
+  6    31     2 fm_checksum_valid bit (1),			/* TRUE if the checksum has been computed */
+  6    32     2 synchronized bit (1),				/* TRUE if this is a data management synchronized segment */
+  6    33     2 pad3 bit (8),
+  6    34     2 dirsw bit (1),				/* directory switch */
+  6    35     2 master_dir bit (1),				/* master directory - a root for the logical volume */
+  6    36     2 pad4 bit (16)) unaligned,			/* not used */
+  6    37 
+  6    38     2 fm_checksum bit (36) aligned,			/* Checksum of used portion of file map */
+  6    39 
+  6    40     (2 quota (0:1) fixed bin (18) unsigned,		/* sec storage quota - (0) for non dir pages */
+  6    41 
+  6    42     2 used (0:1) fixed bin (18) unsigned,		/* sec storage used  - (0) for non dir pages */
+  6    43 
+  6    44     2 received (0:1) fixed bin (18) unsigned,		/* total amount of storage this dir has received */
+  6    45 
+  6    46     2 trp (0:1) fixed bin (71),			/* time record product - (0) for non dir pages */
+  6    47 
+  6    48     2 trp_time (0:1) bit (36),			/* time time_record_product was last calculated */
+  6    49 
+  6    50 
+  6    51 
+  6    52 
+  6    53 
+  6    54     2 fm (0:255) bit (18),				/* file map - 256 entries - 18 bits per entry */
+  6    55 
+  6    56     2 pad6 (10) bit (36),				/* not used */
+  6    57 
+  6    58     2 ncd bit (1),					/* no complete dump switch */
+  6    59     2 pad7 bit (17),
+  6    60     2 pad8 bit (18),
+  6    61 
+  6    62     2 dtd bit (36),					/* date-time-dumped */
+  6    63 
+  6    64     2 volid (3) bit (36),				/* volume ids of last incremental, consolidated, and complete dumps */
+  6    65 
+  6    66     2 master_dir_uid bit (36),			/* superior master directory uid */
+  6    67 
+  6    68 
+  6    69 
+  6    70 
+  6    71     2 uid_path (0:15) bit (36),			/* uid pathname of all parents starting after the root */
+  6    72 
+  6    73     2 primary_name char (32),				/* primary name of the segment */
+  6    74 
+  6    75     2 time_created bit (36),				/* time the segment was created */
+  6    76 
+  6    77     2 par_pvid bit (36),				/* physical volume id of the parent */
+  6    78 
+  6    79     2 par_vtocx fixed bin (17),			/* vtoc entry index of the parent */
+  6    80     2 branch_rp bit (18)) unaligned,			/* rel pointer of the branch of this segment */
+  6    81 
+  6    82     2 cn_salv_time bit (36),				/* time branch - vtoce connection checked */
+  6    83 
+  6    84     2 access_class bit (72),				/* access class in branch */
+  6    85     2 perm_flags aligned,
+  6    86       3 per_bootload bit (1) unal,			/* ON => deleted each bootload */
+  6    87       3 pad9 bit (35) unal,
+  6    88     2 owner bit (36);				/* pvid of this volume */
+  6    89 
+  6    90 dcl  vtoce_parts (3) bit (36 * 64) aligned based (vtocep);
+  6    91 
+  6    92 dcl 1 seg_vtoce based (vtocep) aligned,			/* Overlay for vtoce of segments, which don't have quota */
+  6    93     2 pad1 bit (7*36),
+  6    94     2 usage fixed bin (35),				/* page fault count: overlays quota */
+  6    95     2 pad2 bit (184*36);
+  6    96 
+  6    97 /*	END INCLUDE FILE vtoce.incl.pl1 */
+      429 
+      430 
+  7     1 /* BEGIN INCLUDE FILE ... backup_volume_log.incl.pl1 ... Feb 1976 */
+  7     2 
+  7     3 
+  7     4 /****^  HISTORY COMMENTS:
+  7     5*  1) change(88-03-03,GWMay), approve(89-10-03,MCR8135),
+  7     6*     audit(89-10-04,Beattie), install(89-10-10,MR12.3-1089):
+  7     7*     Added values for storing the number of incremental and consolidated dump
+  7     8*     sets to retain in the volume log.  Incremented version number to 3.
+  7     9*                                                   END HISTORY COMMENTS */
+  7    10 
+  7    11 
+  7    12 /*     Modified: 3/7/84 by GA Texada to change to version 2						*/
+  7    13 dcl  bvlp ptr;
+  7    14 dcl  bvlep ptr;
+  7    15 
+  7    16 dcl  backup_volume_log_version_1 fixed bin static init (1) options (constant);
+  7    17 dcl  backup_volume_log_version_2 fixed bin init(2) int static options(constant);
+  7    18 dcl  backup_volume_log_version_3 fixed bin init(3) int static options(constant);
+  7    19 
+  7    20 dcl 1 backup_volume_log based (bvlp) aligned,
+  7    21     2 header like backup_volume_header aligned,
+  7    22     2 info like backup_pvol_info aligned,
+  7    23     2 version fixed bin,				/* version number */
+  7    24     2 lock bit (36),				/* shared data base */
+  7    25     2 pvname char (32),				/* physical volume name */
+  7    26     2 pvid bit (36),				/* physical volume id */
+  7    27     2 next fixed bin,				/* next available dump record */
+  7    28     2 reload_groups fixed bin,			/* number of reload groups in log */
+  7    29     2 purge_control (3),				/* control selective purging by dump type */
+  7    30       3 group (36) bit (1) unaligned,			/* up to 36 reload groups */
+  7    31     2 disk_type fixed bin unal,			/* type of disk drive			*/	
+  7    32     2 half_word_pad bit(18) unal,			/* MBZ					*/
+  7    33     2 rpv_pvid bit(36),				/* pvid of this volumes RPV			*/
+  7    34     2 Nsaved_incr_sets fixed bin,			/* number of incr cycles to retain */
+  7    35     2 Nsaved_cons_sets fixed bin,			/* number of incr cycles to retain */
+  7    36     2 pad (31) bit (36),				/* for future expansion (MBZ)			*/
+  7    37     2 array (1:1 refer (backup_volume_log.next)) like bvle aligned;
+  7    38 
+  7    39 dcl 1 bvle based (bvlep) aligned,
+  7    40     2 cycle_uid bit (36),				/* uid of this dump cycle */
+  7    41     2 dump_type fixed bin,				/* type of dump */
+  7    42     2 volname char (32),				/* name of output volume */
+  7    43     2 open_time fixed bin (71),			/* opening time of dump pass on this physical volume */
+  7    44     2 close_time fixed bin (71),			/* ending time of dump pass */
+  7    45     2 volid bit (36),				/* uid of output volume */
+  7    46     2 io_module char (32),				/* outer module name that wrote this volume */
+  7    47     2 flags,					/* flags */
+  7    48       3 purge_scan_logged bit (1) unaligned,		/* if on object looged during purge scan */
+  7    49       3 pad1 bit (35) unaligned,
+  7    50     2 pad (7) bit (36),				/* for future expansion */
+  7    51    (2 dir_num fixed bin,				/* number of dirs dumped on this pass */
+  7    52     2 dir_rec fixed bin,				/* number of records of dirs */
+  7    53     2 seg_num fixed bin,				/* number of segs dumped on this pass */
+  7    54     2 seg_rec fixed bin) unaligned;			/* number of records of segs */
+  7    55 
+  7    56 /* END INCLUDE FILE ... backup_volume_log */
+      431 
+  8     1 /* BEGIN INCLUDE FILE ... backup_pvol_info.incl.pl1 */
+  8     2 
+  8     3 dcl  bpvip ptr;
+  8     4 
+  8     5 dcl 1 backup_pvol_info based (bpvip) aligned,
+  8     6     2 label like label aligned,
+  8     7     2 n_vtoce fixed bin,
+  8     8     2 n_free_vtoce fixed bin,
+  8     9     2 n_rec fixed bin,
+  8    10     2 baseadd fixed bin,
+  8    11     2 n_free_rec fixed bin;
+  8    12 
+  8    13 /* END INCLUDE FILE ... backup_pvol_info.incl.pl1 */
+      432 
+      433 
+  9     1 /* BEGIN INCLUDE FILE ... fs_vol_label.incl.pl1 .. last modified January 1982 for new volume map format  */
+  9     2 
+  9     3 /****^  HISTORY COMMENTS:
+  9     4*  1) change(86-04-10,Fawcett), approve(86-04-10,MCR7383),
+  9     5*     audit(86-05-12,Coppola), install(86-07-18,MR12.0-1098):
+  9     6*     Add the subvolume info.
+  9     7*  2) change(88-05-27,GWMay), approve(88-05-27,MCR7883),
+  9     8*     audit(88-06-14,Beattie), install(88-07-19,MR12.2-1061):
+  9     9*     Added inconsistent_dbm bit used to determine consistency of volume
+  9    10*     dumper bit maps.
+  9    11*                                                   END HISTORY COMMENTS */
+  9    12 
+  9    13 /* This is the label at fixed location of each physical volume. Length 1 page */
+  9    14 /* Note: fsout_vol clears pad fields before writing the label */
+  9    15 
+  9    16 dcl  labelp ptr;
+  9    17 
+  9    18 dcl 1 label based (labelp) aligned,
+  9    19 
+  9    20 /* First comes data not used by Multics.. for compatibility with GCOS */
+  9    21 
+  9    22     2 gcos (5*64) fixed bin,
+  9    23 
+  9    24 /* Now we have the Multics label */
+  9    25 
+  9    26     2 Multics char (32) init ("Multics Storage System Volume"), /* Identifier */
+  9    27     2 version fixed bin,				/* Version 1 */
+  9    28     2 mfg_serial char (32),				/* Manufacturer's serial number */
+  9    29     2 pv_name char (32),				/* Physical volume name. */
+  9    30     2 lv_name char (32),				/* Name of logical volume for pack */
+  9    31     2 pvid bit (36),				/* Unique ID of this pack */
+  9    32     2 lvid bit (36),				/* unique ID of its logical vol */
+  9    33     2 root_pvid bit (36),				/* unique ID of the pack containing the root. everybody must agree. */
+  9    34     2 time_registered fixed bin (71),			/* time imported to system */
+  9    35     2 n_pv_in_lv fixed bin,				/* # phys volumes in logical */
+  9    36     2 vol_size fixed bin,				/* total size of volume, in records */
+  9    37     2 vtoc_size fixed bin,				/* number of recs in fixed area + vtoc */
+  9    38     2 not_used bit (1) unal,				/* used to be multiple_class */
+  9    39     2 private bit (1) unal,				/* TRUE if was registered as private */
+  9    40     2 inconsistent_dbm bit (1) unal,			/* TRUE if ESD-less crash */
+  9    41     2 flagpad bit (33) unal,
+  9    42     2 max_access_class bit (72),			/* Maximum access class for stuff on volume */
+  9    43     2 min_access_class bit (72),			/* Minimum access class for stuff on volume */
+  9    44     2 password bit (72),				/* not yet used */
+  9    45     2 number_of_sv fixed bin,				/* if = 0 not a subvolume else the number of svs */
+  9    46     2 this_sv fixed bin,				/* what subvolume number it is */
+  9    47     2 sub_vol_name char (1),				/* what subvolume name (a b c d) it is */
+  9    48     2 pad1 (13) fixed bin,
+  9    49     2 time_mounted fixed bin (71),			/* time mounted */
+  9    50     2 time_map_updated fixed bin (71),			/* time vmap known good */
+  9    51 
+  9    52 /* The next two words overlay time_unmounted on pre-MR10 systems. This
+  9    53*   forces a salvage if an MR10 pack is mounted on an earlier system.
+  9    54* */
+  9    55     2 volmap_version fixed bin,			/* version of volume map (currently 1) */
+  9    56     2 pad6 fixed bin,				
+  9    57 
+  9    58     2 time_salvaged fixed bin (71),			/* time salvaged */
+  9    59     2 time_of_boot fixed bin (71),			/* time of last bootload */
+  9    60     2 time_unmounted fixed bin (71),			/* time unmounted cleanly */
+  9    61     2 last_pvtx fixed bin,				/* pvtx in that PDMAP */
+  9    62     2 pad1a (2) fixed bin,
+  9    63     2 err_hist_size fixed bin,			/* size of pack error history */
+  9    64     2 time_last_dmp (3) fixed bin (71),			/* time last completed dump pass started */
+  9    65     2 time_last_reloaded fixed bin (71),		/* what it says */
+  9    66     2 pad2 (40) fixed bin,
+  9    67     2 root,
+  9    68       3 here bit (1),				/* TRUE if the root is on this pack */
+  9    69       3 root_vtocx fixed bin (35),			/* VTOC index of root, if it is here */
+  9    70       3 shutdown_state fixed bin,			/* Status of hierarchy */
+  9    71       3 pad7 bit (1) aligned,				
+  9    72       3 disk_table_vtocx fixed bin,			/* VTOC index of disk table on RPV */
+  9    73       3 disk_table_uid bit (36) aligned,		/* UID of disk table */
+  9    74       3 esd_state fixed bin,				/* State of esd */
+  9    75     2 volmap_record fixed bin,			/* Begin record of volume map */
+  9    76     2 size_of_volmap fixed bin,			/* Number of records in volume map */
+  9    77     2 vtoc_map_record fixed bin,			/* Begin record of VTOC map */
+  9    78     2 size_of_vtoc_map fixed bin,			/* Number of records in VTOC map */
+  9    79     2 volmap_unit_size fixed bin,			/* Number of words per volume map section */
+  9    80     2 vtoc_origin_record fixed bin,			/* Begin record of VTOC */
+  9    81     2 dumper_bit_map_record fixed bin,			/* Begin record of dumper bit-map */
+  9    82     2 vol_trouble_count fixed bin,			/* Count of inconsistencies found since salvage */
+  9    83     2 pad3 (52) fixed bin,
+  9    84     2 nparts fixed bin,				/* Number of special partitions on pack */
+  9    85     2 parts (47),
+  9    86       3 part char (4),				/* Name of partition */
+  9    87       3 frec fixed bin,				/* First record */
+  9    88       3 nrec fixed bin,				/* Number of records */
+  9    89       3 pad5 fixed bin,
+  9    90     2 pad4 (5*64) fixed bin;
+  9    91 
+  9    92 dcl  Multics_ID_String char (32) init ("Multics Storage System Volume") static;
+  9    93 
+  9    94 /* END INCLUDE FILE fs_vol_label.incl.pl1 */
+      434 
+      435 
+ 10     1 /* Begin include file ...... fs_dev_types.incl.pl1 */
+ 10     2 
+ 10     3 /****^  HISTORY COMMENTS:
+ 10     4*  1) change(85-09-09,Farley), approve(85-09-09,MCR6979),
+ 10     5*     audit(86-01-17,CLJones), install(86-03-21,MR12.0-1033):
+ 10     6*     Add support for FIPS
+ 10     7*     3380.
+ 10     8*  2) change(86-04-21,Fawcett), approve(86-04-21,MCR7383),
+ 10     9*     audit(86-05-15,Coppola), install(86-07-18,MR12.0-1098):
+ 10    10*     Add the support for subvolumes for the MSU3380 and MSU3390.
+ 10    11*  3) change(86-10-02,Fawcett), approve(86-10-02,PBF7383),
+ 10    12*     audit(86-10-23,Farley), install(86-10-28,MR12.0-1200):
+ 10    13*     Changed 3390 to 3381, "d338" to "3380" & "d339" to "3381".
+ 10    14*                                                   END HISTORY COMMENTS */
+ 10    15 
+ 10    16 /* Modified 5/19/76 by N. I. Morris */
+ 10    17 /* Modified 12/27/78 by Michael R. Jordan to correct MSS0500 information */
+ 10    18 /* Modified 4/79 by R.J.C. Kissel to add msu0501 information. */
+ 10    19 /* Modified '82 by BIM for needs_alt_part */
+ 10    20 /* Modified 4/84 by Chris Jones for FIPS disks */
+ 10    21 /* Modified 12/84 by Paul Farley for FIPS disks formatted for 512wd sectors */
+ 10    22 /* Modified 1/85 by Paul Farley to decrease the size of the 3380, until the
+ 10    23*   volmap and record stock can be expanded. */
+ 10    24 
+ 10    25 /*
+ 10    26********************************************************************************
+ 10    27**							        *
+ 10    28**                           WARNING:                                          *
+ 10    29**							        *
+ 10    30**   There exists fs_dev_types.incl.alm that must me updated when a new device *
+ 10    31**   type is added.						        *
+ 10    32**							        *
+ 10    33**   There are other include files that contain arrays indexed by the device   *
+ 10    34**   index obtained by references to MODELX or MODELN in this include file.    *
+ 10    35**   These must be modified when a new device type is added:		        *
+ 10    36**   disk_pack.incl.pl1					        *
+ 10    37**   fs_dev_types_sector.incl.pl1 (included in this include)		        *
+ 10    38**							        *
+ 10    39********************************************************************************
+ 10    40**/
+ 10    41 
+ 10    42 
+ 10    43 dcl (maxdevt init (9),				/* maximum legal devt */
+ 10    44      bulkdevt init (1),				/* bulk store devt */
+ 10    45      msu0500devt init (2),				/* MSU0500 device type */
+ 10    46      msu0451devt init (3),				/* MSU0451 device type */
+ 10    47      msu0450devt init (3),				/* MSU0450 device type */
+ 10    48      msu0400devt init (4),				/* MSU0400 device type */
+ 10    49      dsu191devt init (4),				/* DSU191 device type */
+ 10    50      dsu190devt init (5),				/* DSU190 device type */
+ 10    51      dsu181devt init (6),				/* DSU181 device type */
+ 10    52      msu0501devt init (7),				/* MSU0501 device type */
+ 10    53      fips3380devt init (8),				/* 3380D FIPS device type */
+ 10    54      fips3381devt init (9)				/* 3380E FIPS device type */
+ 10    55      ) fixed bin (4) static options (constant);
+ 10    56 
+ 10    57 dcl  MODEL (12) fixed bin static options (constant) init	/* Known device model numbers */
+ 10    58      (0, 500, 451, 450, 400, 402, 191, 190, 181, 501, 3380, 3381);
+ 10    59 
+ 10    60 dcl  MODELX (12) fixed bin static options (constant) init	/* translation from model number to device type */
+ 10    61      (1, 2, 3, 3, 4, 4, 4, 5, 6, 7, 8, 9);
+ 10    62 
+ 10    63 dcl  MODELN (9) fixed bin static options (constant) init	/* translation from device type to model number */
+ 10    64      (0, 500, 451, 400, 190, 181, 501, 3380, 3381);
+ 10    65 
+ 10    66 dcl  device_names (9) char (4) aligned static options (constant) init /* device names indexed by device type */
+ 10    67      ("bulk", "d500", "d451", "d400", "d190", "d181", "d501", "3380", "3381");
+ 10    68 
+ 10    69 dcl  first_dev_number (9) fixed bin (17) static options (constant) init /* First valid device_number */
+ 10    70      (1, 1, 1, 1, 1, 1, 1, 0, 0);
+ 10    71 
+ 10    72 dcl  fips_type_disk (9) bit (1) unal static options (constant) init /* ON => FIPS disk */
+ 10    73      ("0"b,"0"b,"0"b,"0"b,"0"b,"0"b,"0"b,"1"b,"1"b);
+ 10    74 
+ 10    75 dcl  media_removable (9) bit (1) static options (constant) init /* ON => demountable pack on device */
+ 10    76      ("0"b, "0"b, "1"b, "1"b, "1"b, "1"b, "0"b, "0"b, "0"b);
+ 10    77 
+ 10    78 dcl  shared_spindle (9) bit (1) static options (constant) init /* ON => 2 devices per spindle */
+ 10    79      ("0"b, "1"b, "0"b, "0"b, "0"b, "0"b, "1"b, "0"b, "0"b);
+ 10    80 
+ 10    81 dcl  needs_alt_part (9) bit (1) static options (constant) init /* ON => needs alternate partition to run alternate tracks */
+ 10    82      ("0"b, "0"b, "1"b, "1"b, "1"b, "1"b, "0"b, "0"b, "0"b);
+ 10    83 
+ 10    84 dcl  seek_command (9) bit (6) init /* Seek command: 00 => N/A, 30 => Seek_512, 34 => seek_64 */
+ 10    85      ("00"b3,"34"b3,"34"b3,"34"b3,"34"b3,"34"b3,"34"b3,"30"b3, "30"b3);
+ 10    86 
+ 10    87 dcl  rec_per_dev (9) fixed bin (21) static options (constant) init /* table of # of records on each device */
+ 10    88      (0, 38258, 38258, 19270, 14760, 4444, 67200, 112395, 224790);
+ 10    89 
+ 10    90 dcl  rec_per_sv (9) fixed bin static options (constant) init /* table of  # of records on each subvol */
+ 10    91      (0, 38258, 38258, 19270, 14760, 4444, 67200, 56134, 74930);
+ 10    92 
+ 10    93 dcl  number_of_sv (9) fixed bin static options (constant) init /* table of subvolumes */
+ 10    94      (0, 0, 0, 0, 0, 0, 0, 2, 3);
+ 10    95 
+ 10    96 dcl  valid_sv_string char (3) static options (constant) init  /* string of valid subvolume names */
+ 10    97      ("abc");
+ 10    98 
+ 10    99 dcl  valid_sv_array (0:2) char (1) static options (constant) /* array of valid subvolume names */
+ 10   100      init ("a","b","c");
+ 10   101 
+ 10   102 dcl  cyl_per_dev (9) fixed bin static options (constant) init /* table of # of cylinders on each device */
+ 10   103      (0, 814, 814, 410, 410, 202, 840, 885, 1770);
+ 10   104 
+ 10   105 dcl  cyl_per_sv (9) fixed bin static options (constant) init /* table of # of cylinders on each subvolume */
+ 10   106      (0, 814, 814, 410, 410, 202, 840, 442, 590);
+ 10   107 
+ 10   108 dcl  rec_per_cyl (9) fixed bin static options (constant) init /* table of # of records per cylinder on each device */
+ 10   109      (0, 47, 47, 47, 36, 22, 80, 127, 127);
+ 10   110 
+ 10   111 dcl  tracks_per_cyl (9) fixed bin static options (constant) init /* table of # of tracks per cylinder on each device */
+ 10   112      (0, 19, 19, 19, 19, 20, 20, 15, 15);
+ 10   113 
+ 10   114 
+ 10   115 dcl  first_rec_num (9) fixed bin static options (constant) init /* table of # of first record on each device */
+ 10   116      (0, 0, 0, 0, 0, 0, 0, 0, 0);
+ 10   117 
+ 10   118 dcl  last_rec_num (9) fixed bin (18) static options (constant) init /* table of # of last record on each device */
+ 10   119      (0, 38257, 38116, 19128, 14651, 4399, 67199, 112394, 224789);
+ 10   120 
+ 10   121 dcl  last_sv_rec_num (9) fixed bin (18) static options (constant) init /* table of # of last record on each subvolume */
+ 10   122      (0, 38257, 38116, 19128, 14651, 4399, 67199, 56133, 74929);
+ 10   123 
+ 10   124 dcl  first_sect_num (9) fixed bin (24) static options (constant) init /* table of # of first sector for each device */
+ 10   125      (0, 0, 0, 0, 0, 0, 0, 0, 0);
+ 10   126 
+ 10   127 dcl  last_sect_num (9) fixed bin (24) static options (constant) init /* table of # last sector number for each device */
+ 10   128      (0, 618639, 616359, 309319, 239722, 71999, 1075199, 225674, 451349);
+ 10   129 
+ 10   130 dcl  first_alt_sect_num (9) fixed bin (24) static options (constant) init /* table of # of first sector of alt partition */
+ 10   131      (0, 638400, 616360, 309320, 239723, 72000, 1075200, 225675, 451350);
+ 10   132 
+ 10   133 dcl  last_alt_sect_num (9) fixed bin (24) static options (constant) init /* table of # of last sector of alt partition */
+ 10   134      (0, 639919, 618639, 311599, 241489, 72719, 1077759, 225930, 451605);
+ 10   135 
+ 10   136 dcl  last_physical_sect_num (9) fixed bin (24) static options (constant) init /* table of # of last sector on device (includes T&D cylinders) */
+ 10   137      (0, 639919, 619399, 312359, 242249, 72359, 1077759, 225674, 451859);
+ 10   138 
+ 10   139 dcl  dev_time (9) float bin (27) static options (constant) init /* table of average access times for each device */
+ 10   140      (384e0, 33187e0, 33187e0, 34722e0, 46935e0, 52631e0, 33187e0, 26260e0, 26260e0);
+ 10   141 
+ 11     1 /* Begin fs_dev_types_sector.incl.pl1 */
+ 11     2 
+ 11     3 
+ 11     4 /****^  HISTORY COMMENTS:
+ 11     5*  1) change(86-04-21,Fawcett), approve(86-04-21,MCR7383),
+ 11     6*     audit(86-05-12,Coppola), install(86-07-18,MR12.0-1098):
+ 11     7*     Add the sector differance for devices that do 64 word IO and devices that
+ 11     8*     do 512 word IO.
+ 11     9*                                                   END HISTORY COMMENTS */
+ 11    10 
+ 11    11 /* Created by R. A. Fawcett for 512 word IO. for procedures that do not
+ 11    12*	 need all the data in fs_dev_types. This is also included in
+ 11    13*	 fs_dev_types.incl.pl1  */
+ 11    14 
+ 11    15 dcl  sect_per_cyl (9) fixed bin static options (constant) init /* table of # of sectors per cylinder on each device */
+ 11    16     (0, 760, 760, 760, 589, 360, 1280, 255, 255);
+ 11    17 
+ 11    18 dcl  sect_per_sv (9) fixed bin (24) static options (constant) init /* table of # of sectors per cylinder on each subvolume */
+ 11    19      (0, 0, 0, 0, 0, 0, 0, 112710, 150450);
+ 11    20 
+ 11    21 dcl  sect_per_rec (9) fixed bin static options (constant) init
+ 11    22  /* table of # of sectors per record on each device */
+ 11    23  /* coresponding array in disk_pack.incl.pl1 called SECTORS_PER_RECORD */
+ 11    24     (0, 16, 16, 16, 16, 16, 16, 2, 2);
+ 11    25 
+ 11    26 dcl  sect_per_vtoc (9) fixed bin static options (constant) init
+ 11    27      (0, 3, 3, 3, 3, 3, 3, 1, 1);
+ 11    28 	
+ 11    29 dcl  vtoc_per_rec (9) fixed bin  static options  (constant) init
+ 11    30 /* corespending array in disk_pack.incl.pl1 named VTOCES_PER_RECORD */
+ 11    31      (0, 5, 5, 5, 5, 5, 5, 2, 2);
+ 11    32 
+ 11    33 dcl  sect_per_track (9) fixed bin static options (constant) init /* table of # of sectors per track on each device */
+ 11    34     (0, 40, 40, 40, 31, 18, 64, 17, 17);
+ 11    35 
+ 11    36 dcl  words_per_sect (9) fixed bin static options (constant) init /* table of # of words per sector on each device */
+ 11    37     (0, 64, 64, 64, 64, 64, 64, 512, 512);
+ 11    38 
+ 11    39 /* End fs_dev_types_sector.incl.pl1 */
+ 11    40 
+ 10   142 
+ 10   143 
+ 10   144 /* End of include file ...... fs_dev_types.incl.pl1 */
+      436 
+      437 
+      438   end dump_volume_;
+	SOURCE FILES USED IN THIS COMPILATION.
+
+LINE      NUMBER  DATE MODIFIED     NAME			PATHNAME
+             0    04/17/00  1927.0  dump_volume_.pl1                  >udd>sm>ds>w>ml>dump_volume_.pl1
+421          1    10/24/84  1033.1  dmpr_data_.incl.pl1               >ldd>incl>dmpr_data_.incl.pl1
+423          2    09/05/80  1236.5  backup_volume_header.incl.pl1     >ldd>incl>backup_volume_header.incl.pl1
+424          3    07/21/88  2136.0  dmpr_input.incl.pl1               >ldd>incl>dmpr_input.incl.pl1
+426          4    10/18/88  1315.0  backup_volume_record.incl.pl1     >ldd>incl>backup_volume_record.incl.pl1
+427          5    09/05/80  1236.5  backup_static_variables.incl.pl1  >ldd>incl>backup_static_variables.incl.pl1
+429          6    10/04/83  1205.1  vtoce.incl.pl1                    >ldd>incl>vtoce.incl.pl1
+431          7    10/12/89  2113.4  backup_volume_log.incl.pl1        >ldd>incl>backup_volume_log.incl.pl1
+432          8    06/07/77  1333.6  backup_pvol_info.incl.pl1         >ldd>incl>backup_pvol_info.incl.pl1
+434          9    07/21/88  2136.0  fs_vol_label.incl.pl1             >ldd>incl>fs_vol_label.incl.pl1
+436         10    10/30/86  2110.5  fs_dev_types.incl.pl1             >ldd>incl>fs_dev_types.incl.pl1
+10-142      11    07/24/86  2151.8  fs_dev_types_sector.incl.pl1      >ldd>incl>fs_dev_types_sector.incl.pl1
+	NAMES DECLARED IN THIS COMPILATION.
+
+IDENTIFIER	     OFFSET    LOC STORAGE CLASS   DATA TYPE		ATTRIBUTES AND REFERENCES
+								(* indicates a set context)
+
+NAMES DECLARED BY DECLARE STATEMENT.
+Sfirst_pass_for_pv        3(05)        based           bit(1)                   level 3 packed packed unaligned dcl 3-18 set ref
+                                                                                  184*
+addr                                                   builtin function         dcl 414 ref 76 76 145
+ansb                            000100 automatic       bit(1)                   packed unaligned dcl 365 set ref 81* 85
+backup_pvol_info                       based           structure                level 1 dcl 8-5
+backup_volume_header                   based           structure                level 1 dcl 2-5
+backup_volume_log                      based           structure                level 1 dcl 7-20
+backup_volume_record                   based           structure                level 1 dcl 4-17
+bits                    410            based           structure                level 2 dcl 1-13
+bvle                                   based           structure                level 1 dcl 7-39
+bvlp                            002140 automatic       pointer                  dcl 7-13 in procedure "dump_volume_" set ref 68* 76
+                                                                                  76 97 98
+bvlp                    336            based           pointer                  level 3 in structure "dmpr_data_" dcl 1-13
+                                                                                  in procedure "dump_volume_" ref 68
+chars                   500            based           structure                level 2 dcl 1-13
+cleanup                         002120 stack reference condition                dcl 412 ref 75
+clock                                                  builtin function         dcl 415 ref 173
+code                                   parameter       fixed bin(35,0)          dcl 370 set ref 14 47* 63* 64 65* 76* 78 90* 106*
+                                                                                  107 113* 114 115* 120* 121 122* 127* 128 129* 150*
+                                                                                  156* 157 158* 199* 200 201 214 215* 218 219* 222
+                                                                                  225 237* 243* 253* 254 255 261 265* 274* 288* 289
+                                                                                  289* 329* 330 330* 333* 334 334*
+command_query_$yes_no           000026 constant        entry                    external dcl 395 ref 81
+comp                                   constant        fixed bin(17,0)          initial dcl 5-6 ref 142
+datap                           000112 automatic       pointer                  dcl 375 set ref 249* 250* 251* 253*
+detach                  475(06)        based           bit(1)                   level 4 packed packed unaligned dcl 1-13 ref 105
+dirp                    340            based           pointer                  level 3 dcl 1-13 ref 250
+dirsw                    20(18)        based           bit(1)                   level 3 packed packed unaligned dcl 4-17 ref 250 291
+disk_type              1602            based           fixed bin(17,0)          level 2 dcl 1-13 ref 53
+divide                                                 builtin function         dcl 416 ref 142 148
+dmpr_data_                             based           structure                level 1 dcl 1-13
+dmpr_data_version_2                    constant        fixed bin(17,0)          initial dcl 1-9 ref 52
+dmpr_input                             based           structure                level 1 dcl 3-18
+dmpr_log_$close_volume_log      000052 constant        entry                    external dcl 405 ref 329
+dmpr_log_$init_volume_log       000046 constant        entry                    external dcl 403 ref 63
+dmpr_log_$log_object            000044 constant        entry                    external dcl 402 ref 288
+dmpr_log_$open_volume_log       000050 constant        entry                    external dcl 404 ref 120
+dmpr_log_$update_pvolog         000042 constant        entry                    external dcl 401 ref 127
+dmpr_output_$new_pass_attach    000034 constant        entry                    external dcl 398 ref 106
+dmpr_output_$output_object      000040 constant        entry                    external dcl 400 ref 253
+dmpr_output_$write_volume_log   000036 constant        entry                    external dcl 399 ref 113 333
+dmpr_report_$error_output       000032 constant        entry                    external dcl 397 ref 65 90 115 122 129 151 158 194
+                                                                                  205 228 237 243 256 265 274 289 322 330 334 360
+dmprp                           000064 external static pointer                  initial dcl 1-8 ref 52 53 55 56 56 56 56 56 56 65 68
+                                                                                  76 76 79 79 81 90 105 105 115 122 129 142 151 158
+                                                                                  169 172 192 194 199 205 228 237 243 250 251 265
+                                                                                  271 271 278 278 279 279 292 292 293 293 295 295
+                                                                                  296 296 298 298 299 299 303 303 304 304 306 306
+                                                                                  307 307 309 309 310 310 322 330 334 358 359 359
+                                                                                  360
+dump_type               372            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 76* 142 359*
+dump_volume_dir_num     361            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 298* 298
+dump_volume_dir_rec     362            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 299* 299
+dump_volume_seg_num     363            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 309* 309
+dump_volume_seg_rec     364            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 310* 310
+ec                              000105 automatic       fixed bin(35,0)          dcl 371 set ref 87 359* 360 360*
+error_table_$action_not_performed
+                                000016 external static fixed bin(35,0)          dcl 390 ref 214
+error_table_$device_parity      000014 external static fixed bin(35,0)          dcl 389 set ref 150 194*
+error_table_$dmpr_in_use        000012 external static fixed bin(35,0)          dcl 388 ref 201
+error_table_$end_of_info        000022 external static fixed bin(35,0)          dcl 392 ref 218
+error_table_$invalid_vtoce      000010 external static fixed bin(35,0)          dcl 387 ref 222
+error_table_$segfault           000020 external static fixed bin(35,0)          dcl 391 ref 261
+error_table_$vtoce_connection_fail
+                                000024 external static fixed bin(35,0)          dcl 393 ref 225
+fixed                                                  builtin function         dcl 417 ref 293 296 299 304 307 310
+fixed_bin               350            based           structure                level 2 dcl 1-13
+flags                     3            based           structure                level 2 in structure "dmpr_input" dcl 3-18
+                                                                                  in procedure "dump_volume_"
+flags                   475            based           structure                level 3 in structure "dmpr_data_" dcl 1-13
+                                                                                  in procedure "dump_volume_"
+hc_backup_$dmpr_build_vtoc_map  000060 constant        entry                    external dcl 409 ref 156
+hc_backup_$dmpr_lock_pv         000054 constant        entry                    external dcl 407 ref 76
+hc_backup_$dmpr_unlock_pv       000056 constant        entry                    external dcl 408 ref 359
+hc_backup_$get_dmpr_data_object 000062 constant        entry                    external dcl 410 ref 199
+i                               000114 automatic       fixed bin(17,0)          dcl 376 set ref 155* 156*
+idx                             000106 automatic       fixed bin(17,0)          dcl 372 set ref 347* 347* 349 350
+in_use_retry_cnt                000104 automatic       fixed bin(17,0)          dcl 369 set ref 187* 203* 203 204
+info                     10            based           structure                level 2 dcl 7-20 set ref 76 76
+inputp                  322            based           pointer                  level 3 in structure "dmpr_data_" dcl 1-13
+                                                                                  in procedure "dump_volume_" set ref 169 199*
+inputp                          002134 automatic       pointer                  dcl 3-14 in procedure "dump_volume_" set ref 169*
+                                                                                  170 171 172 173 184 189 190 191 192 237 249 262
+                                                                                  267 277 347
+label                                  based           structure                level 1 dcl 9-18
+loop_cnt                        000101 automatic       fixed bin(17,0)          dcl 366 set ref 48* 185 314* 314 322
+max_pages_per_segment                  constant        fixed bin(17,0)          initial dcl 385 ref 148
+myname                          000011 constant        char(32)                 initial packed unaligned dcl 382 set ref 65* 81* 90*
+                                                                                  115* 122* 129* 151* 158* 194* 205* 228* 237* 243*
+                                                                                  256* 265* 274* 289* 322* 330* 334* 360*
+n_free_vtoce                    000110 automatic       fixed bin(17,0)          dcl 374 in procedure "dump_volume_" set ref 98* 142
+n_free_vtoce           2011            based           fixed bin(17,0)          level 3 in structure "backup_volume_log" dcl 7-20
+                                                                                  in procedure "dump_volume_" set ref 98
+n_vtoce                2010            based           fixed bin(17,0)          level 3 in structure "backup_volume_log" dcl 7-20
+                                                                                  in procedure "dump_volume_" set ref 97
+n_vtoce                         000107 automatic       fixed bin(17,0)          dcl 373 in procedure "dump_volume_" set ref 97* 142
+                                                                                  148 185 322 347
+n_vtoce_per_page                002116 automatic       fixed bin(17,0)          dcl 381 set ref 52* 53* 142 148
+n_windows                       002115 automatic       fixed bin(17,0)          dcl 380 set ref 148* 155
+no_object                 3(02)        based           bit(1)                   level 3 packed packed unaligned dcl 3-18 ref 249 277
+null                                                   builtin function         dcl 418 ref 105 249 358
+num_null_vtoce          365            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 56* 278* 278
+num_vtoce_only          366            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 56* 279* 279
+outputvol_iocbp         332            based           pointer                  level 3 dcl 1-13 ref 105
+page_fault_error                002126 stack reference condition                dcl 413 ref 149 164 193 318
+page_read_time                         constant        fixed bin(17,0)          initial dcl 384 ref 142
+physical_volume_dir_num
+                        351            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 56* 292* 292
+physical_volume_dir_rec
+                        352            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 56* 293* 293
+physical_volume_seg_num
+                        353            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 56* 303* 303
+physical_volume_seg_rec
+                        354            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 56* 304* 304
+prev_vtocx                4            based           fixed bin(17,0)          level 2 dcl 3-18 set ref 191* 237*
+ptrs                      2            based           structure                level 2 dcl 1-13
+pvid                      1            based           bit(36)                  level 2 in structure "dmpr_input" dcl 3-18
+                                                                                  in procedure "dump_volume_" set ref 172*
+pvid                    474            based           bit(36)                  level 3 in structure "dmpr_data_" dcl 1-13
+                                                                                  in procedure "dump_volume_" set ref 76* 172 359*
+pvname                 1412            based           char(32)                 level 3 dcl 1-13 set ref 65* 79 81* 90* 115* 122*
+                                                                                  151* 158* 194* 205* 228* 237* 243* 265* 322* 330*
+                                                                                  334* 360*
+recordp                 324            based           pointer                  level 3 in structure "dmpr_data_" dcl 1-13
+                                                                                  in procedure "dump_volume_" ref 55
+recordp                         002136 automatic       pointer                  dcl 4-12 in procedure "dump_volume_" set ref 55* 183
+                                                                                  191 194 199* 205 223 228 249 250 265 277 278 291
+                                                                                  293 296 299 304 307 310
+records                  15(18)        based           bit(9)                   level 3 packed packed unaligned dcl 4-17 ref 293 296
+                                                                                  299 304 307 310
+request                   3(04)        based           bit(1)                   level 3 in structure "dmpr_input" packed packed
+                                                                                  unaligned dcl 3-18 in procedure "dump_volume_" set
+                                                                                  ref 171*
+request                         000120 automatic       bit(1)                   packed unaligned dcl 378 in procedure "dump_volume_"
+                                                                                  set ref 141* 144* 171 190 214
+request_vtocx             5            based           fixed bin(17,0)          level 2 dcl 3-18 set ref 170* 190* 347
+restart_pvname         1562            based           char(32)                 level 3 dcl 1-13 ref 79
+retry                     3(03)        based           bit(1)                   level 3 packed packed unaligned dcl 3-18 set ref
+                                                                                  189* 262* 267*
+retrys                  350            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 271* 271
+seek_command                    002142 automatic       bit(6)                   initial array packed unaligned dcl 10-84 set ref
+                                                                                  10-84* 10-84* 10-84* 10-84* 10-84* 10-84* 10-84*
+                                                                                  10-84* 10-84*
+seg_fault_retry_cnt             000102 automatic       fixed bin(17,0)          dcl 367 set ref 186* 263* 263 264 268*
+segp                    342            based           pointer                  level 3 dcl 1-13 ref 251
+start_time               10            based           fixed bin(71,0)          level 2 dcl 3-18 set ref 173*
+timer_manager_$sleep            000030 constant        entry                    external dcl 396 ref 210
+uid                      14            based           bit(36)                  level 3 packed packed unaligned dcl 4-17 set ref
+                                                                                  223* 249 277 278
+unspec                                                 builtin function         dcl 419 set ref 146*
+vbmp                            000116 automatic       pointer                  dcl 377 set ref 145* 156*
+version                                based           fixed bin(17,0)          level 2 dcl 1-13 ref 52
+vol_log_dir_num         355            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 295* 295
+vol_log_dir_rec         356            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 296* 296
+vol_log_seg_num         357            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 306* 306
+vol_log_seg_rec         360            based           fixed bin(17,0)          level 3 dcl 1-13 set ref 307* 307
+volid                   410            based           bit(36)                  level 3 in structure "dmpr_data_" dcl 1-13
+                                                                                  in procedure "dump_volume_" ref 192
+volid                     6            based           bit(36)                  level 2 in structure "dmpr_input" dcl 3-18
+                                                                                  in procedure "dump_volume_" set ref 192*
+volname                1522            based           char(32)                 level 3 dcl 1-13 set ref 129*
+vtoc_bit_map                    000121 automatic       bit(1)                   array packed unaligned dcl 379 set ref 145 146* 347
+                                                                                  349*
+vtoc_per_rec                    000000 constant        fixed bin(17,0)          initial array dcl 11-29 ref 53
+vtoce                    13            based           structure                level 2 in structure "backup_volume_record" dcl 4-17
+                                                                                  in procedure "dump_volume_"
+vtoce                                  based           structure                level 1 dcl 6-7 in procedure "dump_volume_"
+vtoce_read_time                        constant        fixed bin(17,0)          initial dcl 383 ref 142
+vtocx                    12            based           fixed bin(17,0)          level 2 dcl 4-17 set ref 183* 191 194* 205* 228*
+                                                                                  265*
+vtocx_retry_cnt                 000103 automatic       fixed bin(17,0)          dcl 368 set ref 188* 236 239* 239
+
+NAMES DECLARED BY DECLARE STATEMENT AND NEVER REFERENCED.
+MODEL                                  internal static fixed bin(17,0)          initial array dcl 10-57
+MODELN                                 internal static fixed bin(17,0)          initial array dcl 10-63
+MODELX                                 internal static fixed bin(17,0)          initial array dcl 10-60
+Multics_ID_String                      internal static char(32)                 initial packed unaligned dcl 9-92
+backup_version_1                       internal static fixed bin(17,0)          initial dcl 5-7
+backup_volume_log_version_1            internal static fixed bin(17,0)          initial dcl 7-16
+backup_volume_log_version_2            internal static fixed bin(17,0)          initial dcl 7-17
+backup_volume_log_version_3            internal static fixed bin(17,0)          initial dcl 7-18
+backup_volume_record_version_1         internal static fixed bin(17,0)          initial dcl 4-14
+backup_volume_record_version_2         internal static fixed bin(17,0)          initial dcl 4-15
+bpvip                                  automatic       pointer                  dcl 8-3
+bulkdevt                               internal static fixed bin(4,0)           initial dcl 10-43
+bvlep                                  automatic       pointer                  dcl 7-14
+cons                                   internal static fixed bin(17,0)          initial dcl 5-5
+contents_type                          internal static fixed bin(17,0)          initial dcl 2-21
+cyl_per_dev                            internal static fixed bin(17,0)          initial array dcl 10-102
+cyl_per_sv                             internal static fixed bin(17,0)          initial array dcl 10-105
+dev_time                               internal static float bin(27)            initial array dcl 10-139
+device_names                           internal static char(4)                  initial array dcl 10-66
+dir_type                               internal static fixed bin(17,0)          initial dcl 2-16
+dmpr_data_version_3                    internal static fixed bin(17,0)          initial dcl 1-10
+dmpr_input_version_1                   internal static fixed bin(17,0)          initial dcl 3-16
+dsu181devt                             internal static fixed bin(4,0)           initial dcl 10-43
+dsu190devt                             internal static fixed bin(4,0)           initial dcl 10-43
+dsu191devt                             internal static fixed bin(4,0)           initial dcl 10-43
+fips3380devt                           internal static fixed bin(4,0)           initial dcl 10-43
+fips3381devt                           internal static fixed bin(4,0)           initial dcl 10-43
+fips_type_disk                         internal static bit(1)                   initial array packed unaligned dcl 10-72
+first_alt_sect_num                     internal static fixed bin(24,0)          initial array dcl 10-130
+first_dev_number                       internal static fixed bin(17,0)          initial array dcl 10-69
+first_rec_num                          internal static fixed bin(17,0)          initial array dcl 10-115
+first_sect_num                         internal static fixed bin(24,0)          initial array dcl 10-124
+hdp                                    automatic       pointer                  dcl 2-3
+incr                                   internal static fixed bin(17,0)          initial dcl 5-4
+info_type                              internal static fixed bin(17,0)          initial dcl 2-22
+labelp                                 automatic       pointer                  dcl 9-16
+last_alt_sect_num                      internal static fixed bin(24,0)          initial array dcl 10-133
+last_physical_sect_num                 internal static fixed bin(24,0)          initial array dcl 10-136
+last_rec_num                           internal static fixed bin(18,0)          initial array dcl 10-118
+last_sect_num                          internal static fixed bin(24,0)          initial array dcl 10-127
+last_sv_rec_num                        internal static fixed bin(18,0)          initial array dcl 10-121
+maxdevt                                internal static fixed bin(4,0)           initial dcl 10-43
+media_removable                        internal static bit(1)                   initial array packed unaligned dcl 10-75
+msu0400devt                            internal static fixed bin(4,0)           initial dcl 10-43
+msu0450devt                            internal static fixed bin(4,0)           initial dcl 10-43
+msu0451devt                            internal static fixed bin(4,0)           initial dcl 10-43
+msu0500devt                            internal static fixed bin(4,0)           initial dcl 10-43
+msu0501devt                            internal static fixed bin(4,0)           initial dcl 10-43
+needs_alt_part                         internal static bit(1)                   initial array packed unaligned dcl 10-81
+null_type                              internal static fixed bin(17,0)          initial dcl 2-18
+number_of_sv                           internal static fixed bin(17,0)          initial array dcl 10-93
+pattern1                               internal static bit(36)                  initial packed unaligned dcl 2-24
+pattern2                               internal static bit(36)                  initial packed unaligned dcl 2-25
+pattern3                               internal static bit(36)                  initial packed unaligned dcl 2-26
+prev_output_log_type                   internal static fixed bin(17,0)          initial dcl 2-20
+rec_per_cyl                            internal static fixed bin(17,0)          initial array dcl 10-108
+rec_per_dev                            internal static fixed bin(21,0)          initial array dcl 10-87
+rec_per_sv                             internal static fixed bin(17,0)          initial array dcl 10-90
+sect_per_cyl                           internal static fixed bin(17,0)          initial array dcl 11-15
+sect_per_rec                           internal static fixed bin(17,0)          initial array dcl 11-21
+sect_per_sv                            internal static fixed bin(24,0)          initial array dcl 11-18
+sect_per_track                         internal static fixed bin(17,0)          initial array dcl 11-33
+sect_per_vtoc                          internal static fixed bin(17,0)          initial array dcl 11-26
+seg_type                               internal static fixed bin(17,0)          initial dcl 2-17
+seg_vtoce                              based           structure                level 1 dcl 6-92
+shared_spindle                         internal static bit(1)                   initial array packed unaligned dcl 10-78
+tracks_per_cyl                         internal static fixed bin(17,0)          initial array dcl 10-111
+valid_sv_array                         internal static char(1)                  initial array packed unaligned dcl 10-99
+valid_sv_string                        internal static char(3)                  initial packed unaligned dcl 10-96
+volume_log_type                        internal static fixed bin(17,0)          initial dcl 2-19
+vtoce_parts                            based           bit(2304)                array dcl 6-90
+vtoce_type                             internal static fixed bin(17,0)          initial dcl 2-15
+vtocep                                 automatic       pointer                  dcl 6-5
+words_per_sect                         internal static fixed bin(17,0)          initial array dcl 11-36
+
+NAMES DECLARED BY EXPLICIT CONTEXT.
+bust_anyway                     000765 constant        label                    dcl 90
+dump_volume_                    000436 constant        entry                    external dcl 14
+end_loop                        002427 constant        label                    dcl 314 ref 196 208 216 232 269
+exit                            002431 constant        label                    dcl 318 ref 220 244
+get_next_vtocx_                 002607 constant        entry                    internal dcl 342 ref 190
+map_err                         001412 constant        label                    dcl 158 ref 153
+retry                           001616 constant        label                    dcl 199 ref 211 240 272
+try_again                       000654 constant        label                    dcl 76 ref 87
+unlock_pv                       002640 constant        entry                    internal dcl 357 ref 75 86 108 116 123 130 160 257
+                                                                                  328
+
+THERE WERE NO NAMES DECLARED BY CONTEXT OR IMPLICATION.
+
+STORAGE REQUIREMENTS FOR THIS PROGRAM.
+
+	Object	Text	Link	Symbol	Defs	Static
+Start          0       0      3310        3376    2730        3320
+Length      4064    2730        66         451     357           0
+
+BLOCK NAME	         STACK SIZE     TYPE		WHY NONQUICK/WHO SHARES STACK FRAME
+dump_volume_                       1240 external procedure  is an external procedure.  
+on unit on line 75                   64 on unit               
+on unit on line 149                  98 on unit               
+on unit on line 193                  94 on unit               
+get_next_vtocx_                         internal procedure  shares stack frame of external procedure dump_volume_.  
+unlock_pv                            90 internal procedure  is called by several nonquick procedures.  
+
+STORAGE FOR AUTOMATIC VARIABLES.
+
+STACK FRAME                 LOC IDENTIFIER                  BLOCK NAME
+dump_volume_             000100 ansb                        dump_volume_
+                         000101 loop_cnt                    dump_volume_
+                         000102 seg_fault_retry_cnt         dump_volume_
+                         000103 vtocx_retry_cnt             dump_volume_
+                         000104 in_use_retry_cnt            dump_volume_
+                         000105 ec                          dump_volume_
+                         000106 idx                         dump_volume_
+                         000107 n_vtoce                     dump_volume_
+                         000110 n_free_vtoce                dump_volume_
+                         000112 datap                       dump_volume_
+                         000114 i                           dump_volume_
+                         000116 vbmp                        dump_volume_
+                         000120 request                     dump_volume_
+                         000121 vtoc_bit_map                dump_volume_
+                         002115 n_windows                   dump_volume_
+                         002116 n_vtoce_per_page            dump_volume_
+                         002134 inputp                      dump_volume_
+                         002136 recordp                     dump_volume_
+                         002140 bvlp                        dump_volume_
+                         002142 seek_command                dump_volume_
+
+THE FOLLOWING EXTERNAL OPERATORS ARE USED BY THIS PROGRAM.
+call_ext_out_desc   call_ext_out        call_int_this       call_int_other      return_mac          tra_ext_1
+enable_op           ext_entry           int_entry           clock_mac
+
+THE FOLLOWING EXTERNAL ENTRIES ARE CALLED BY THIS PROGRAM.
+command_query_$yes_no         dmpr_log_$close_volume_log    dmpr_log_$init_volume_log     dmpr_log_$log_object
+dmpr_log_$open_volume_log     dmpr_log_$update_pvolog       dmpr_output_$new_pass_attach  dmpr_output_$output_object
+dmpr_output_$write_volume_log dmpr_report_$error_output     hc_backup_$dmpr_build_vtoc_map
+hc_backup_$dmpr_lock_pv       hc_backup_$dmpr_unlock_pv     hc_backup_$get_dmpr_data_object
+timer_manager_$sleep
+
+THE FOLLOWING EXTERNAL VARIABLES ARE USED BY THIS PROGRAM.
+dmprp                         error_table_$action_not_performed                           error_table_$device_parity
+error_table_$dmpr_in_use      error_table_$end_of_info      error_table_$invalid_vtoce    error_table_$segfault
+error_table_$vtoce_connection_fail
+
+
+
+
+   LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC      LINE    LOC   
+     14 000433   10   84 000443        47 000532        48 000534        52 000535        53 000544        55 000550
+     56 000553        63 000561        64 000567        65 000572        66 000624        68 000625        75 000632
+     76 000654        78 000677        79 000702        81 000711        85 000754        86 000757        87 000763
+     90 000765        94 001020        97 001021        98 001024       105 001026       106 001040       107 001046
+    108 001051       109 001055       113 001056       114 001065       115 001070       116 001122       117 001126
+    120 001127       121 001136       122 001141       123 001173       124 001177       127 001200       128 001207
+    129 001212       130 001244       131 001250       141 001251       142 001252       144 001270       145 001272
+    146 001274       148 001277       149 001306       150 001322       151 001326       153 001360       155 001363
+    156 001373       157 001407       158 001412       160 001445       161 001451       163 001452       164 001454
+    169 001455       170 001462       171 001464       172 001471       173 001475       183 001500       184 001503
+    185 001505       186 001511       187 001512       188 001513       189 001514       190 001517       191 001527
+    192 001533       193 001540       194 001554       196 001613       199 001616       200 001634       201 001637
+    203 001642       204 001643       205 001646       208 001705       210 001706       211 001722       214 001723
+    215 001727       216 001730       218 001731       219 001733       220 001734       222 001735       223 001737
+    224 001741       225 001742       228 001744       232 002003       236 002004       237 002007       239 002045
+    240 002046       243 002047       244 002100       249 002101       250 002113       251 002124       253 002131
+    254 002142       255 002145       256 002147       257 002174       258 002200       261 002201       262 002204
+    263 002207       264 002210       265 002213       267 002251       268 002254       269 002255       271 002256
+    272 002261       274 002262       277 002305       278 002314       279 002323       280 002327       288 002330
+    289 002340       291 002372       292 002376       293 002402       295 002406       296 002407       298 002410
+    299 002411       301 002412       303 002413       304 002417       306 002423       307 002424       309 002425
+    310 002426       314 002427       317 002430       318 002431       322 002432       328 002470       329 002474
+    330 002504       333 002541       334 002551       336 002606       342 002607       347 002611       348 002627
+    349 002631       350 002634       357 002637       358 002645       359 002651       360 002666       362 002723
+
+
+                                          -----------------------------------------------------------
+
+
+Historical Background
+
+This edition of the Multics software materials and documentation is provided and donated
+to Massachusetts Institute of Technology by Group BULL including BULL HN Information Systems Inc. 
+as a contribution to computer science knowledge.  
+This donation is made also to give evidence of the common contributions of Massachusetts Institute of Technology,
+Bell Laboratories, General Electric, Honeywell Information Systems Inc., Honeywell BULL Inc., Groupe BULL
+and BULL HN Information Systems Inc. to the development of this operating system. 
+Multics development was initiated by Massachusetts Institute of Technology Project MAC (1963-1970),
+renamed the MIT Laboratory for Computer Science and Artificial Intelligence in the mid 1970s, under the leadership
+of Professor Fernando Jose Corbato. Users consider that Multics provided the best software architecture 
+for managing computer hardware properly and for executing programs. Many subsequent operating systems 
+incorporated Multics principles.
+Multics was distributed in 1975 to 2000 by Group Bull in Europe , and in the U.S. by Bull HN Information Systems Inc., 
+as successor in interest by change in name only to Honeywell Bull Inc. and Honeywell Information Systems Inc. .
+
+                                          -----------------------------------------------------------
+
+Permission to use, copy, modify, and distribute these programs and their documentation for any purpose and without
+fee is hereby granted,provided that the below copyright notice and historical background appear in all copies
+and that both the copyright notice and historical background and this permission notice appear in supporting
+documentation, and that the names of MIT, HIS, BULL or BULL HN not be used in advertising or publicity pertaining
+to distribution of the programs without specific prior written permission.
+    Copyright 1972 by Massachusetts Institute of Technology and Honeywell Information Systems Inc.
+    Copyright 2006 by BULL HN Information Systems Inc.
+    Copyright 2006 by Bull SAS
+    All Rights Reserved
